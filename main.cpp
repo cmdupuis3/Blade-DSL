@@ -33,10 +33,7 @@ using std::vector;
 #include "nested_array.cpp"
 #include "object_for.cpp"
 #include "method_for.cpp"
-#include "method_for_chained.cpp"
-//#include "method_for_chained2.cpp"
 #include "closure.cpp"
-//#include "tests.cpp"
 
 
 namespace sample_closures {
