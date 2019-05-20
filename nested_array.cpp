@@ -66,6 +66,7 @@ public:
     int current_extent() const;
     int next_extent() const;
     int extent(int) const;
+    int* get_extents() const;
 
     bool current_raggedness() const;
     bool next_raggedness() const;
@@ -94,7 +95,7 @@ protected:
 public:
     nested_array_t();
     nested_array_t(int*, TYPE, int index = 0);
-    nested_array_t(int*, TYPE, const nested_array_t<VTYPE, rank_t+1, symmetry_groups>*, int index = 0); //< Downward traversal pointer-type constructor; not for public consumption
+    nested_array_t(const nested_array_t<VTYPE, rank_t+1, symmetry_groups>*, int index = 0); //< Downward traversal pointer-type constructor; not for public consumption
     ~nested_array_t();
 
     const nested_array_t<VTYPE, rank_t-1, symmetry_groups> operator()(int, int) const; //< alias for 'down', plus a dereference; ragged state
@@ -150,6 +151,10 @@ int nested_base_t<VTYPE, rank_t, symmetry_groups>::next_extent() const {
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 int nested_base_t<VTYPE, rank_t, symmetry_groups>::extent(int depth_in) const {
     return this->extents[depth_in];
+}
+template<typename VTYPE, const int rank_t, const int* symmetry_groups>
+int* nested_base_t<VTYPE, rank_t, symmetry_groups>::get_extents() const {
+    return this->extents;
 }
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 bool nested_base_t<VTYPE, rank_t, symmetry_groups>::current_raggedness() const {
@@ -217,15 +222,15 @@ void nested_array_t<VTYPE, rank_t, symmetry_groups>::operator=(nested_array_t<VT
 }
 
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
-nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(int* extents_in, TYPE data_in, const nested_array_t<VTYPE, rank_t+1, symmetry_groups>* parent_in, int index_in){
+nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(const nested_array_t<VTYPE, rank_t+1, symmetry_groups>* parent_in, int index_in){
 
-    this->data = data_in;
+    this->data = parent_in->get_data()[index_in];
 
     this->c_depth = parent_in->current_depth() + 1;
     this->index = index_in;
 
     /** Shallow-copy extents and raggedness */
-    this->extents = extents_in;
+    this->extents = parent_in->get_extents();
 
     this->parent = parent_in;
 }
@@ -265,12 +270,7 @@ const nested_array_t<VTYPE, rank_t-1, symmetry_groups>* nested_array_t<VTYPE, ra
         exit(-8);
     }else{
         nested_array_t<VTYPE, rank_t-1, symmetry_groups>* out;
-        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(
-            rank_t - 1,
-            this->extents,
-            (this->data)[index_in],
-            this);
-
+        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(this);
         return out;
     }
 
@@ -294,11 +294,7 @@ const nested_array_t<VTYPE, rank_t-1, symmetry_groups>* nested_array_t<VTYPE, ra
         exit(-9);
     }else{
         nested_array_t<VTYPE, rank_t-1, symmetry_groups>* out;
-        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(
-            this->extents,
-            (this->data)[index_in],
-            this);
-
+        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(this);
         return out;
     }
 
@@ -313,23 +309,14 @@ const nested_array_t<VTYPE, rank_t, symmetry_groups>* nested_array_t<VTYPE, rank
     }
 
     nested_array_t<VTYPE, rank_t, symmetry_groups>* out;
-    out = new nested_array_t<VTYPE, rank_t, symmetry_groups>(
-        this->extent,
-        this->parent[this->index + 1],
-        this->parent,
-        this->index + 1);
-
+    out = new nested_array_t<VTYPE, rank_t, symmetry_groups>(this->parent, this->index + 1);
     return out;
 }
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 const nested_array_t<VTYPE, rank_t, symmetry_groups>* nested_array_t<VTYPE, rank_t, symmetry_groups>::first() const {
 
     nested_array_t<VTYPE, rank_t, symmetry_groups>* out;
-    out = new nested_array_t<VTYPE, rank_t, symmetry_groups>(
-        this->extent,
-        this->parent[0],
-        this->parent);
-
+    out = new nested_array_t<VTYPE, rank_t, symmetry_groups>(this->parent, 0);
     return out;
 }
 
