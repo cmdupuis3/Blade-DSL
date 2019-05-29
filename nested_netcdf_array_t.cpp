@@ -55,6 +55,7 @@ protected:
     int file_ncid;
     int var_ncid;
     int* dim_ncids;
+    int* dim_order;
 
 public:
     nested_netcdf_base_t(){};
@@ -67,8 +68,8 @@ public:
     static constexpr const int* symmetry = symmetry_groups;
     static constexpr const int rank = rank_t;
 
-    virtual void read(int[rank_t]) const {};
-    virtual void write(int[rank_t]) const {};
+    virtual void read() const {};
+    virtual void write() const {};
     auto get_data() const;
     constexpr int get_rank() const;
     int current_depth() const;
@@ -87,6 +88,9 @@ public:
     constexpr int current_symmetry_group() const;
     constexpr int next_symmetry_group() const;
     constexpr int symmetry_group(int) const;
+
+    int get_dim_order(int) const;
+    int* get_dim_order() const;
 
     const int file_id() const;
     const int var_id() const;
@@ -110,12 +114,12 @@ protected:
     const nested_netcdf_array_t<VTYPE, rank_t+1, FNAME, VNAME, symmetry_groups>* parent;
 
 public:
-    nested_netcdf_array_t();
+    nested_netcdf_array_t(int* dim_order = nullptr);
     nested_netcdf_array_t(const nested_netcdf_array_t<VTYPE, rank_t+1, FNAME, VNAME, symmetry_groups>*, int index = 0); //< Downward traversal pointer-type constructor; not for public consumption
     ~nested_netcdf_array_t();
 
-    void read(int[rank_t]);
-    void write(int[rank_t]);
+    void read();
+    void write();
 
     const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> operator()(int, int) const; //< alias for 'down', plus a dereference; ragged state
     const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> operator()(int) const;      //< alias for 'down', plus a dereference; non-ragged state
@@ -218,7 +222,14 @@ template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[
 constexpr int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::symmetry_group(int depth_in) const {
     return symmetry_groups ? symmetry_groups[depth_in] : depth_in;
 }
-
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_order(int dim_index) const {
+    return this->dim_order[dim_index];
+}
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+int* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_order() const {
+    return this->dim_order;
+}
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 const int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::file_id() const {
     return this->file_ncid;
@@ -243,7 +254,7 @@ int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_id(i
 
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netcdf_array_t(){
+nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netcdf_array_t(int* dim_order_in){
 
     /** Open file and variable */
     nc_open(FNAME, NC_NOWRITE, &(this->file_ncid));
@@ -260,6 +271,16 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
     /** Query dimension IDs */
     this->dim_ncids = new int[rank_t];
     nc_inq_var(this->file_ncid, this->var_ncid, NULL, NULL, NULL, this->dim_ncids, NULL);
+
+    /** Deep copy dimension order */
+    this->dim_order = new int[rank_t];
+    for(int i = 0; i < rank_t; i++){
+        if(dim_order_in){
+            this->dim_order[i] = i+1;
+        }else{
+            this->dim_order[i] = dim_order_in[i];
+        }
+    }
 
     /** Query extents */
     this->extents = new size_t[rank_t];
@@ -287,10 +308,12 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::operat
     this->extents = new int[rank_t];
     this->dim_ncids = new int[rank_t];
     this->indices = new int[rank_t];
+    this->dim_order = new int[rank_t];
     for(int i = 0; i < rank_t; i++){
         this->extents[i] = array_in.extent(i);
         this->dim_ncids[i] = array_in.dim_id(i);
         this->indices[i] = array_in.get_indices(i);
+        this->dim_order[i] = array_in.get_dim_order(i);
     }
 
     this->data = array_in.get_data();
@@ -308,9 +331,10 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
 
     this->c_depth = parent_in->current_depth() + 1;
 
-    /** Shallow-copy extents, raggedness, and dimension IDs */
+    /** Shallow-copy extents, raggedness, dimension IDs, and dimension order */
     this->extents = parent_in->get_extents();
     this->dim_ncids = parent_in->dim_ids();
+    this->dim_order = parent_in->get_dim_order();
 
     /** Deep-copy indices */
     this->indices = new int[rank_t + this->c_depth];
@@ -332,21 +356,21 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::~nested_net
 
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read(int dim_order[rank_t]){
+void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read(){
 
     size_t starts[rank_t + this->c_depth];
     size_t counts[rank_t + this->c_depth];
     size_t data_size = 1;
     for(int i = 0; i < rank_t + this->c_depth; i++){
-        if(i < this->c_depth){
-            starts[i] = this->indices[i];
-            counts[i] = 1;
+        if(this->dim_order[i]-1 < this->c_depth){
+            starts[this->dim_order[i]] = this->indices[this->dim_order[i]];
+            counts[this->dim_order[i]] = 1;
         }else{
-            starts[i] = 0;
-            counts[i] = this->extents[i];
-            data_size *= this->extents[i];
+            starts[this->dim_order[i]] = 0;
+            counts[this->dim_order[i]] = this->extents[this->dim_order[i]];
+            data_size *= this->extents[this->dim_order[i]];
         }
-        cout << starts[i] << "    " << counts[i] << "    " << data_size << endl;
+        cout << starts[this->dim_order[i]] << "    " << counts[this->dim_order[i]] << "    " << data_size << endl;
     }
 
     this->data = new DTYPE[data_size];
@@ -356,7 +380,7 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read(i
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write(int dim_order[rank_t]){
+void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write(){
 
     size_t starts[rank_t + this->c_depth];
     size_t counts[rank_t + this->c_depth];
