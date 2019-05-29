@@ -33,7 +33,7 @@ using std::vector;
 #include "nested_array_utilities.cpp"
 #include "curry.cpp"
 
-
+/** Compile-time available container for metadata about functions. */
 template<const int ARITY, typename FITYPE, const int FIRANK, typename FOTYPE, const int FORANK, const int commutativity_groups[ARITY] = nullptr>
 struct closure_base_t {
 
@@ -48,6 +48,7 @@ struct closure_base_t {
 
 };
 
+/** Compile-time available container for metadata about unary functions. */
 template<typename FITYPE, const int FIRANK, typename FOTYPE, const int FORANK>
 struct closure_base_unary_t : closure_base_t<1, FITYPE, FIRANK, FOTYPE, FORANK>{};
 
