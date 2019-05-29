@@ -1,7 +1,7 @@
 /***********************************************************************
  *                   GNU Lesser General Public License
  *
- * This file is part of the EDGI package, developed by the 
+ * This file is part of the EDGI package, developed by the
  * GFDL Flexible Modeling System (FMS) group.
  *
  * EDGI is free software: you can redistribute it and/or modify it under
@@ -275,7 +275,7 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
     /** Deep copy dimension order */
     this->dim_order = new int[rank_t];
     for(int i = 0; i < rank_t; i++){
-        if(dim_order_in){
+        if(!dim_order_in){
             this->dim_order[i] = i+1;
         }else{
             this->dim_order[i] = dim_order_in[i];
@@ -338,10 +338,10 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
 
     /** Deep-copy indices */
     this->indices = new int[rank_t + this->c_depth];
-    for(int i = 0; i < this->c_depth - 1; i++){
+    for(int i = 0; i < this->c_depth; i++){
         this->indices[i] = parent_in->get_indices(i);
     }
-    this->indices[this->c_depth - 1] = index_in;
+    this->indices[this->c_depth] = index_in;
 
     this->parent = parent_in;
 }
@@ -361,16 +361,26 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read()
     size_t starts[rank_t + this->c_depth];
     size_t counts[rank_t + this->c_depth];
     size_t data_size = 1;
+    int dim_ind;
+
     for(int i = 0; i < rank_t + this->c_depth; i++){
-        if(this->dim_order[i]-1 < this->c_depth){
-            starts[this->dim_order[i]] = this->indices[this->dim_order[i]];
-            counts[this->dim_order[i]] = 1;
+        cout << this->dim_order[i] << endl;
+    }
+
+    for(int i = 0; i < rank_t + this->c_depth; i++){
+        dim_ind = this->dim_order[i]-1;
+        if(dim_ind < this->c_depth){
+            starts[dim_ind] = this->indices[dim_ind];
+            counts[dim_ind] = 1;
         }else{
-            starts[this->dim_order[i]] = 0;
-            counts[this->dim_order[i]] = this->extents[this->dim_order[i]];
-            data_size *= this->extents[this->dim_order[i]];
+            starts[dim_ind] = 0;
+            counts[dim_ind] = this->extents[dim_ind];
+            data_size *= this->extents[dim_ind];
         }
-        cout << starts[this->dim_order[i]] << "    " << counts[this->dim_order[i]] << "    " << data_size << endl;
+    }
+
+    for(int i = 0; i < rank_t + this->c_depth; i++){
+        cout << starts[i] << "    " << counts[i] << endl;
     }
 
     this->data = new DTYPE[data_size];
@@ -384,13 +394,15 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write(
 
     size_t starts[rank_t + this->c_depth];
     size_t counts[rank_t + this->c_depth];
+    int dim_ind;
     for(int i = 0; i < rank_t + this->c_depth; i++){
-        if(i < this->c_depth){
-            starts[i] = this->indices[i];
-            counts[i] = 1;
+        dim_ind = this->dim_order[i]-1;
+        if(dim_ind < this->c_depth){
+            starts[dim_ind] = this->indices[dim_ind];
+            counts[dim_ind] = 1;
         }else{
-            starts[i] = 1;
-            counts[i] = this->extents[i];
+            starts[dim_ind] = 1;
+            counts[dim_ind] = this->extents[dim_ind];
         }
     }
 
@@ -429,8 +441,8 @@ const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* nes
         cout << "This is not a ragged dimension; use '(int)' instead.";
         exit(-8);
     }else{
-        this->indices[this->c_depth] = index_in;
-        this->extents[this->c_depth+1] = extent_in;
+        this->indices[this->dim_order[this->c_depth]-1] = index_in;
+        this->extents[this->dim_order[this->c_depth+1]-1] = extent_in;
         nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* out;
         out = new nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>(this, index_in);
 
@@ -457,7 +469,7 @@ const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* nes
         cout << "This is a ragged dimension; use '(int, int)' instead.";
         exit(-9);
     }else{
-        this->indices[this->c_depth] = index_in;
+        this->indices[this->dim_order[this->c_depth]-1] = index_in;
         nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* out;
         out = new nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>(this, index_in);
         return out;
