@@ -25,8 +25,6 @@
 #include <type_traits>
 
 #include "nested_array.cpp"
-#include "curry.cpp"
-#include "closure.cpp"
 
 using std::add_pointer;
 using std::remove_pointer;
@@ -37,6 +35,7 @@ using std::remove_pointer;
 // and/or hysterical screaming. If you are not afraid, you should be.
 //
 //-----------------------------------------------------------------------//
+
 
 /** The method_for loop is a grammatical orientation of the nested_for loop that allows you to tie an
  *  iteration pattern to an input array, and later pass it an output array and  a function to evaluate
@@ -65,8 +64,6 @@ using std::remove_pointer;
  *  grouping will break this optimization. A 1-D array of arbitrary integers; equal values
  *  imply symmetry between different dimensions.
  *
- * @tparam ARITY    The number of arguments the function will accept. In other words, the function will
- *                  require this many elements from the input array to be calculated.
  * @tparam ITYPE    The input array's value type.
  * @tparam IRANK    The rank (or dimensionality) of the input array.
  * @tparam ISYM     The input array's symmetry vector.
@@ -74,9 +71,7 @@ using std::remove_pointer;
  * @tparam ICOM     The function's commutativity vector.
  * @tparam OTYPE    The output array's value type.
  * @tparam ORANK    The rank (or dimensionality) of the output array.
- * @tparam OSYM     The output array's symmetry vector.
  * @tparam FORANK   The rank (or dimensionality) of array that will be passed to the function as output.
- * @tparam FOTYPE   The function ouput type.
  * @tparam OMP_LEVELS   The number of dimensions to parallelize with OpenMP. This will apply to the first
  *                      OMP_LEVELS dimensions.
  * @tparam DEPTH    How deep we currently are in the input array. Only needed to assist with symmetry
@@ -85,150 +80,62 @@ using std::remove_pointer;
  *
  * @typedef FTYPE   The function type.
  *
- * @param loop      Stores a lambda function that iterates through the input array's top-level dimension,
- *                  and spawns new method_for_base_t objects to continue traversal when called. At the lowest
+ * @return          A lambda function that iterates through the input array's top-level dimension,
+ *                  and spawns new method_for objects to continue traversal when called. At the lowest
  *                  level, it stores a lambda function that simply calls the function on the data. method_for
  *                  loops have a recursive function type that nests with input array rank.
  */
-template<const int ARITY, typename ITYPE, const int IRANK, const int* ISYM, const int  FIRANK, const int* ICOM,
-                          typename OTYPE, const int ORANK, const int* OSYM, const int  FORANK, const int OMP_LEVELS = 0,
-                          const int DEPTH = 0>
-class method_for_base_t {
+template<typename ITYPE, const int IRANK, const int* ISYM, const int FIRANK,
+         typename OTYPE, const int ORANK,                  const int FORANK,
+         const int OMP_LEVELS = 0, const int DEPTH = 0>
+constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, const int imin_in = 0){
 
-    typedef const void (FTYPE)(nested_array_t<ITYPE, FIRANK, ISYM>, nested_array_t<OTYPE, FORANK, OSYM>);
-
-    std::function<void(FTYPE, nested_array_t<OTYPE, ORANK, OSYM>)> loop;
-
-public:
-    method_for_base_t(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, const int imin = 0);
-    ~method_for_base_t(){};
-
-    std::function<void(FTYPE, nested_array_t<OTYPE, ORANK, OSYM>)> operator()() const;
-    void operator()(FTYPE func_in, nested_array_t<OTYPE, ORANK, OSYM> oarray_in) const;
-
-};
-
-template<const int ARITY, typename ITYPE, const int IRANK, const int* ISYM, const int  FIRANK, const int* ICOM,
-                          typename OTYPE, const int ORANK, const int* OSYM, const int  FORANK, const int OMP_LEVELS,
-                          const int DEPTH>
-method_for_base_t<ARITY, ITYPE, IRANK, ISYM, FIRANK, ICOM, OTYPE, ORANK, OSYM, FORANK, OMP_LEVELS, DEPTH>::method_for_base_t(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, const int imin_in){
+    typedef const void (FTYPE)(nested_array_t<ITYPE, FIRANK, ISYM>, nested_array_t<OTYPE, FORANK>);
 
     // Are we done appending loops?
-    if constexpr (IRANK == FIRANK){
+    if constexpr (IRANK == FIRANK) {
 
-        this->loop = [iarray_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-            func(iarray_in, oarray);
+        return [iarray_in](FTYPE func, nested_array_t<OTYPE, ORANK> oarray) {
+                func(iarray_in, oarray);
         };
 
-    } else {
+    } else if constexpr (IRANK > FIRANK) {
 
-        // Are we done stripping off output dimensions?
-        if constexpr (ORANK == FORANK){
+        return [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK> oarray) {
 
-            // Is this dimension symmetric with the next one?
-            if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
-                if constexpr (OMP_LEVELS != 0) {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        #pragma omp parallel for
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK, OSYM, FORANK, OMP_LEVELS - 1, DEPTH + 1
-                                > next(iarray_in(i), i);
-                            next(func, oarray);
-                        }
-                    };
+            auto loop = [func, iarray_in, oarray](int i){
+                // Is this dimension symmetric with the next one?
+                if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
+                    // Are we done stripping off output dimensions?
+                    if constexpr (ORANK == FORANK) {
+                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray);
+                    } else {
+                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray(i));
+                    }
                 } else {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK, OSYM, FORANK, OMP_LEVELS, DEPTH + 1
-                                > next(iarray_in(i), i);
-                            next(func, oarray);
-                        }
-                    };
+                    if constexpr (ORANK == FORANK) {
+                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray);
+                    } else {
+                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray(i));
+                    }
                 }
-            } else {
-                if constexpr (OMP_LEVELS != 0) {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        #pragma omp parallel for
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK, OSYM, FORANK, OMP_LEVELS - 1, DEPTH + 1
-                                > next(iarray_in(i));
-                            next(func, oarray);
-                        }
-                    };
-                } else {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK, OSYM, FORANK, OMP_LEVELS, DEPTH + 1
-                                > next(iarray_in(i));
-                            next(func, oarray);
-                        }
-                    };
+            };
+
+            if constexpr (OMP_LEVELS > 0) {
+                #pragma omp parallel for
+                for (int i = imin_in; i < iarray_in.current_extent(); i++) {
+                    loop(i);
+                }
+            } else { // if constexpr (OMP_LEVELS == 0)
+                for (int i = imin_in; i < iarray_in.current_extent(); i++) {
+                    loop(i);
                 }
             }
 
-        }else{
-
-            // Is this dimension symmetric with the next one?
-            if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
-                if constexpr (OMP_LEVELS != 0) {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        #pragma omp parallel for
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK - 1, OSYM, FORANK, OMP_LEVELS - 1, DEPTH + 1
-                                > next(iarray_in(i), i);
-                            next(func, oarray(i));
-                        }
-                    };
-                } else {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK - 1, OSYM, FORANK, OMP_LEVELS, DEPTH + 1
-                                > next(iarray_in(i), i);
-                            next(func, oarray(i));
-                        }
-                    };
-                }
-            } else {
-                if constexpr (OMP_LEVELS != 0) {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        #pragma omp parallel for
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK - 1, OSYM, FORANK, OMP_LEVELS - 1, DEPTH + 1
-                                > next(iarray_in(i));
-                            next(func, oarray(i));
-                        }
-                    };
-                } else {
-                    this->loop = [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){
-                        for(int i = imin_in; i < iarray_in.current_extent(); i++){
-                            method_for_base_t< ARITY, ITYPE, IRANK - 1, ISYM, FIRANK, ICOM, OTYPE, ORANK - 1, OSYM, FORANK, OMP_LEVELS, DEPTH + 1
-                                > next(iarray_in(i));
-                            next(func, oarray(i));
-                        }
-                    };
-                }
-            }
-
-        }
+        };
 
     }
 
-}
-
-template<const int ARITY, typename ITYPE, const int IRANK, const int* ISYM, const int  FIRANK, const int* ICOM,
-                          typename OTYPE, const int ORANK, const int* OSYM, const int  FORANK, const int OMP_LEVELS,
-                          const int DEPTH>
-std::function<void(const void(*)(nested_array_t<ITYPE, FIRANK, ISYM>, nested_array_t<OTYPE, FORANK, OSYM>), nested_array_t<OTYPE, ORANK, OSYM>)>
-method_for_base_t<ARITY, ITYPE, IRANK, ISYM, FIRANK, ICOM, OTYPE, ORANK, OSYM, FORANK, OMP_LEVELS, DEPTH>::operator()() const {
-    return [this](FTYPE func, nested_array_t<OTYPE, ORANK, OSYM> oarray){this->loop(func, oarray);};
-}
-
-template<const int ARITY, typename ITYPE, const int IRANK, const int* ISYM, const int  FIRANK, const int* ICOM,
-                          typename OTYPE, const int ORANK, const int* OSYM, const int  FORANK, const int OMP_LEVELS,
-                          const int DEPTH>
-void method_for_base_t<ARITY, ITYPE, IRANK, ISYM, FIRANK, ICOM, OTYPE, ORANK, OSYM, FORANK, OMP_LEVELS, DEPTH>::operator()(FTYPE func_in, nested_array_t<OTYPE, ORANK, OSYM> oarray_in) const {
-    this->loop(func_in, oarray_in);
-    return;
 }
 
 /** The method_for loop is a grammatical orientation of the nested_for loop that allows you to tie an
@@ -246,12 +153,17 @@ void method_for_base_t<ARITY, ITYPE, IRANK, ISYM, FIRANK, ICOM, OTYPE, ORANK, OS
  * @tparam CLTYPE       The closure type.
  * @tparam OMP_LEVELS   The number of dimensions to parallelize with OpenMP. This will apply to the first
  *                      OMP_LEVELS dimensions.
+ *
+ * @return          A lambda function that iterates through the input array's top-level dimension,
+ *                  and spawns new method_for objects to continue traversal when called. At the lowest
+ *                  level, it stores a lambda function that simply calls the function on the data. method_for
+ *                  loops have a recursive function type that nests with input array rank.
  */
 template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0>
-class method_for_t : public method_for_base_t<CLTYPE::arity, typename NITYPE::value_type, NITYPE::rank, NITYPE::symmetry, CLTYPE::input_rank, CLTYPE::commutativity,
-                                                             typename NOTYPE::value_type, NOTYPE::rank, NOTYPE::symmetry, CLTYPE::output_rank, OMP_LEVELS>{
-              public: using method_for_base_t<CLTYPE::arity, typename NITYPE::value_type, NITYPE::rank, NITYPE::symmetry, CLTYPE::input_rank, CLTYPE::commutativity,
-                                                             typename NOTYPE::value_type, NOTYPE::rank, NOTYPE::symmetry, CLTYPE::output_rank, OMP_LEVELS>::method_for_base_t;
-};
+constexpr auto method_for(NITYPE iarray_in){
+    return method_for_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::symmetry, CLTYPE::input_rank,
+                           typename NOTYPE::value_type, NOTYPE::rank,                   CLTYPE::output_rank,
+                           OMP_LEVELS>(iarray_in);
+}
 
 #endif
