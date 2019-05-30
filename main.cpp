@@ -31,6 +31,7 @@ using std::tuple;
 using std::vector;
 
 #include "nested_array.cpp"
+#include "nested_netcdf_array.cpp"
 #include "object_for.cpp"
 #include "method_for.cpp"
 #include "closure.cpp"
@@ -1128,6 +1129,22 @@ int main(){
 //    speed_test3_omp();
 //    speed_test4();
 //    speed_test4_omp();
+    
+/*
+    static constexpr const char fname[] = "/home/Christopher.Dupuis/EDGI_PCA/vars_a.nc";
+    static constexpr const char vname[] = "SST_a";
 
+    int order[] = {2,1,3};
+    nested_netcdf_array_t<float, 3, fname, vname> block(order);
+
+    auto a = block(40);
+    auto b = a(80);
+    b.read();
+
+    for(int i = 0; i < 5; i++){
+        cout << b[i] << endl;
+    }
+*/
+    
     return 0;
 }
