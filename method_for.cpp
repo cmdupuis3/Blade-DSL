@@ -1,7 +1,7 @@
 /***********************************************************************
  *                   GNU Lesser General Public License
  *
- * This file is part of the EDGI package, developed by the 
+ * This file is part of the EDGI package, developed by the
  * GFDL Flexible Modeling System (FMS) group.
  *
  * EDGI is free software: you can redistribute it and/or modify it under
@@ -122,8 +122,9 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
             };
 
             if constexpr (OMP_LEVELS > 0) {
-                #pragma omp parallel for
-                for (int i = imin_in; i < iarray_in.current_extent(); i++) {
+                int i = imin_in;
+                #pragma omp parallel for private(i)
+                for (i = imin_in; i < iarray_in.current_extent(); i++) {
                     loop(i);
                 }
             } else { // if constexpr (OMP_LEVELS == 0)
