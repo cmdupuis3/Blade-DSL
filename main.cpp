@@ -180,7 +180,7 @@ bool test1(){
     nested_array_t<float, 3>  nin(extents,  in);
     nested_array_t<float, 3> nout(extents, out);
 
-    auto a = object_for_t<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(add10_nested<>::function);
+    auto a = object_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(add10_nested<>::function);
 
     //auto b = a();
     a(nin, nout);
@@ -238,7 +238,7 @@ int speed_test1(){
     nested_array_t<float, 3>  nin(extents,  in);
     nested_array_t<float, 3> nout(extents, out);
 
-    auto a = object_for_t<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(speed_test<>::function);
+    auto a = object_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(speed_test<>::function);
 
     time_t kstart = time(nullptr);
     a(nin, nout);
@@ -295,7 +295,7 @@ int speed_test1_omp(){
     nested_array_t<float, 3> nout(extents, out);
 
     static constexpr const int omp_levels = 1;
-    auto a = object_for_t<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels>(speed_test<>::function);
+    auto a = object_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels>(speed_test<>::function);
 
     time_t kstart = time(nullptr);
     a(nin, nout);
@@ -527,7 +527,7 @@ bool test3(){
     nested_array_t<float, 3, symmetry>  nin(extents,  in);
     nested_array_t<float, 3>           nout(extents, out);
 
-    auto a = object_for_t<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(add10_nested<symmetry>::function);
+    auto a = object_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(add10_nested<symmetry>::function);
 
     a(nin, nout);
 
@@ -595,7 +595,7 @@ int speed_test3(){
     nested_array_t<float, 3, symmetry>  nin(extents,  in);
     nested_array_t<float, 3>           nout(extents, out);
 
-    auto a = object_for_t<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(speed_test<symmetry>::function);
+    auto a = object_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1> >(speed_test<symmetry>::function);
 
     time_t kstart = time(nullptr);
     a(nin, nout);
@@ -661,7 +661,7 @@ int speed_test3_omp(){
     nested_array_t<float, 3>           nout(extents, out);
 
     static constexpr const int omp_levels = 1;
-    auto a = object_for_t<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels>(speed_test<symmetry>::function);
+    auto a = object_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels>(speed_test<symmetry>::function);
 
     time_t kstart = time(nullptr);
     a(nin, nout);
