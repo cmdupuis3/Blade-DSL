@@ -48,8 +48,8 @@ This is done most easily by setting it equal to a capture-less lambda expression
 ```cpp
     struct my_1337_closure : closure_base_unary_t<bool, 21, float, 15>{
     
-        static constexpr const void(*function)(nested_array_t<bool, 21, ISYMMETRY>, nested_array_t<float, 15>) =
-            [](nested_array_t<bool, 21, ISYMMETRY> iarray_in, nested_array_t<float, 15> oarray_in) -> const void {
+        static constexpr const void(*function)(nested_array_t<bool, 21>, nested_array_t<float, 15>) =
+            [](nested_array_t<bool, 21> iarray_in, nested_array_t<float, 15> oarray_in) -> const void {
                 // the good stuff
             };
             
@@ -64,8 +64,8 @@ Now that the boilerplate is done, we can have our way with the input data.
 ```cpp
     struct my_1337_closure : closure_base_unary_t<bool, 21, float, 15>{
     
-        static constexpr const void(*function)(nested_array_t<bool, 21, ISYMMETRY>, nested_array_t<float, 15>) =
-            [](nested_array_t<bool, 21, ISYMMETRY> iarray_in, nested_array_t<float, 15> oarray_in) -> const void {
+        static constexpr const void(*function)(nested_array_t<bool, 21>, nested_array_t<float, 15>) =
+            [](nested_array_t<bool, 21> iarray_in, nested_array_t<float, 15> oarray_in) -> const void {
                 
                 oarray_in = do_terrible_things(iarray_in);
                 
@@ -100,7 +100,7 @@ strategy for a particular function or input array, and then use it multiple time
 ```
 ## Why is it so slow?
 
-*shrug* Try OpenMP? OpenMP is off by default, but can be turned on by adding the number of dimensions you want to 
+Try OpenMP? OpenMP is off by default, but can be turned on by adding the number of dimensions you want to 
 parallelize with OpenMP to the nested iterator declaration like so...
 ```cpp
     auto mloop = method_for<decltype(my_input_array),
@@ -109,6 +109,28 @@ parallelize with OpenMP to the nested iterator declaration like so...
                             2 // <-- there will be two for-loops that will be parallelized with OpenMP
                             >(my_input_array);
 ```
+Also, if your input data is symmetric between some neighboring dimensions, you can declare a symmetry vector for it by
+initializing a native C-array of size equal to the rank of the input array. Assign a unique number for every symmetry
+group. A symmetry group contains only dimensions that are mutually symmetric. If a dimension is not symmetric with any
+other, it is in its own symmetry group. The symmetry group must be passed to the input array as a template parameter,
+and likewise the closure inputs must have it as well.
+```cpp
+    static constexpr int symmetry[3] = {1,1,1,4,4,4,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
+    nested_array_t<bool, 23, symmetry> my_input_array(input_extents, input_data);
+    
+    struct my_1337_closure : closure_base_unary_t<bool, 21, float, 15>{
+    
+        static constexpr const void(*function)(nested_array_t<bool, 21, symmetry>, nested_array_t<float, 15>) =
+            [](nested_array_t<bool, 21, symmetry> iarray_in, nested_array_t<float, 15> oarray_in) -> const void {
+                
+                oarray_in = do_terrible_things(iarray_in);
+                
+            };
+            
+    }
+```
+The nested iterators with then ignore the redundant calculations completely. To save some memory and make indexing more obvious, it is sometimes wise to alias pointers like ```cpp a[j][i] = a[i][j];``` when initializing the original data array.
+
 ## I can't even...
 
 *le sigh* Examples and speed tests are provided in main.cpp.
