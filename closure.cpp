@@ -1,7 +1,7 @@
 /***********************************************************************
  *                   GNU Lesser General Public License
  *
- * This file is part of the EDGI package, developed by the 
+ * This file is part of the EDGI package, developed by the
  * GFDL Flexible Modeling System (FMS) group.
  *
  * EDGI is free software: you can redistribute it and/or modify it under
@@ -46,6 +46,10 @@ struct closure_base_t {
     static constexpr const int output_rank = FORANK;
     static constexpr const int* commutativity = commutativity_groups;
 
+    static constexpr const void(*function)(nested_array_t<FITYPE, FIRANK>, nested_array_t<FOTYPE, FORANK>) =
+        [](nested_array_t<FITYPE, FIRANK> iarray_in, nested_array_t<FOTYPE, FORANK> oarray_in) -> const void {
+            return;
+        };
 };
 
 /** Compile-time available container for metadata about unary functions. */
