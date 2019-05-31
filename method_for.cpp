@@ -22,12 +22,15 @@
 #define METHOD_FOR_CPP
 
 #include <functional>
+#include <tuple>
 #include <type_traits>
 
 #include "nested_array.cpp"
+#include "closure.cpp"
 
 using std::add_pointer;
 using std::remove_pointer;
+using std::tuple;
 
 //-----------------------------------------------------------------------//
 //
@@ -90,6 +93,7 @@ template<typename ITYPE, const int IRANK, const int* ISYM, const int FIRANK,
 constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, const int imin_in = 0){
 
     typedef const void (FTYPE)(nested_array_t<ITYPE, FIRANK, ISYM>, nested_array_t<OTYPE, FORANK>);
+    //typedef const closure_base_t<1, ITYPE, FIRANK, OTYPE, FORANK> closure_t;
 
     // Are we done appending loops?
     if constexpr (IRANK == FIRANK) {
@@ -165,5 +169,40 @@ constexpr auto method_for(NITYPE iarray_in){
                            typename NOTYPE::value_type, NOTYPE::rank,                   CLTYPE::output_rank,
                            OMP_LEVELS>(iarray_in);
 }
+
+
+
+
+
+
+
+template<typename TUITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0, const int ARG = 0>
+constexpr auto method_for_chained(TUITYPE iarrays_in){
+
+    static_assert(std::tuple_size<TUITYPE>::value == CLTYPE::arity);
+    typedef typename std::tuple_element<ARG, TUITYPE>::type ITYPE;
+
+    if constexpr (std::tuple_size<TUITYPE>::value == ARG - 1) {
+
+        return [iarrays_in](typename CLTYPE::ftype func, NOTYPE oarray) {
+            func(std::get<ARG>(iarrays_in), oarray);
+        };
+
+    } else {
+
+        return [iarrays_in](typename CLTYPE::ftype func, NOTYPE oarray){
+            auto loop = method_for_impl<ITYPE::value_type, ITYPE::rank, ITYPE::symmetry, CLTYPE::input_rank,
+                                        typename NOTYPE::value_type, NOTYPE::rank, CLTYPE::output_rank,
+                                        OMP_LEVELS
+                    >(std::get<ARG>(iarrays_in));
+
+            loop(method_for_chained<TUITYPE, NOTYPE, CLTYPE, OMP_LEVELS>(iarrays_in)(func, oarray));
+        };
+
+    }
+
+}
+
+
 
 #endif
