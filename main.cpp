@@ -39,27 +39,6 @@ using std::vector;
 
 namespace sample_closures {
 
-    /** Sample closure that adds ten to the input array */
-    void add10(int num_in, float* array_in, float* array_out){
-        for(int i = 0; i < num_in; i++){
-            array_out[i] = array_in[i] + 10;
-        }
-
-        return;
-    }
-
-    /** Sample multiclosure that adds multiple arrays together elementwise */
-    void add(int arity_in, int num_in, float** arrays_in, float* array_out){
-        for(int i = 0; i < num_in; i++){
-            array_out[i] = 0;
-            for(int j = 0; j < arity_in; j++){
-                array_out[i] += arrays_in[j][i];
-            }
-        }
-
-        return;
-    }
-
     /** Sample closure that adds ten to the input array (for nested arrays) */
     template<const int* ISYMMETRY = nullptr>
     struct add10_nested : closure_base_unary_t<float, 1, float, 1>{
@@ -74,50 +53,23 @@ namespace sample_closures {
 
     };
 
+    /** Sample closure that adds ten to the input array (for nested arrays) */
+    template<const char IFNAME[], const char IVNAME[], const char OFNAME[], const char OVNAME[], const int* ISYMMETRY = nullptr>
+    struct add10_nested_nc : closure_base_unary_t<float, 1, float, 1>{
 
-    template<const int* ISYMMETRY = nullptr>
-    void add10_nested_vec(vector<nested_array_t<float, 1, ISYMMETRY> > array_in, nested_array_t<float, 1> array_out){
-        int num = array_in[0].current_extent();
-        //float* data_out = new float[num];
-        for(int i = 0; i < num; i++){
-            array_out[i] = array_in[0][i] + 10;
-            cout << array_in[0][i] << " + " << 10 << " = " << array_out[i] << endl;
-        }
+        static constexpr const void(*function)(nested_netcdf_array_t<float, 1, IFNAME, IVNAME, ISYMMETRY>, nested_netcdf_array_t<float, 1, OFNAME, OVNAME>) =
+            [](nested_netcdf_array_t<float, 1, IFNAME, IVNAME, ISYMMETRY> iarray_in, nested_netcdf_array_t<float, 1, OFNAME, OVNAME> oarray_in) -> const void {
+                iarray_in.read();
 
-        //array_out = data_out;
-        return;
-    }
+                int num = iarray_in.current_extent();
+                for(int i = 0; i < num; i++){
+                    oarray_in[i] = iarray_in[i] + 10;
+                }
 
-    /** Sample multiclosure that adds multiple arrays together elementwise (for nested arrays) */
-    template<const int* ISYMMETRY = nullptr>
-    void add_nested(int arity_in, nested_array_t<float, 1, ISYMMETRY>* arrays_in, nested_array_t<float, 1> array_out){
-        int num = arrays_in[0].current_extent();
-        for(int i = 0; i < num; i++){
-            array_out[i] = 0;
-            for(int j = 0; j < arity_in; j++){
-                array_out[i] += arrays_in[j][i];
-            }
-        }
+                oarray_in.write();
+            };
 
-        return;
-    }
-
-    /** Sample multiclosure that adds multiple arrays together elementwise (for nested arrays) */
-    template<const int* ISYMMETRY = nullptr>
-    void add_nested_vec(int arity_in, vector<nested_array_t<float, 1, ISYMMETRY> > arrays_in, nested_array_t<float, 1> array_out){
-
-        //assert(arity_in == arrays_in.size());
-
-        int num = arrays_in[0].current_extent();
-        for(int i = 0; i < num; i++){
-            array_out[i] = 0;
-            for(int j = 0; j < arity_in; j++){
-                array_out[i] += arrays_in[j][i];
-            }
-        }
-
-        return;
-    }
+    };
 
     template<const int* ISYMMETRY = nullptr>
     struct speed_test : closure_base_unary_t<float, 1, float, 1>{
@@ -1129,7 +1081,7 @@ int main(){
 //    speed_test3_omp();
 //    speed_test4();
 //    speed_test4_omp();
-    
+
 /*
     static constexpr const char fname[] = "/home/Christopher.Dupuis/EDGI_PCA/vars_a.nc";
     static constexpr const char vname[] = "SST_a";
@@ -1145,6 +1097,6 @@ int main(){
         cout << b[i] << endl;
     }
 */
-    
+
     return 0;
 }
