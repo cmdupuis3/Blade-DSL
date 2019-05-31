@@ -24,10 +24,10 @@ various strides and counters. Do not do this, it will break everything.
 Second, declare a nested_array_t class of the desired value type and rank, and pass the extent vector and data to
 the constructor. For example, if you have declared, allocated, and initialized a 23-dimensional boolean array for input, 
 and you want a 17-dimensional float array as output, create your nested arrays like this:
-
+```cpp
     nested_array_t<bool, 23> my_input_array(input_extents, input_data);
     nested_array_t<float, 17> my_output_array(output_extents, input_data);
-    
+```
 Now, declare your closure class. This is complicated, but they are mostly boilerplate aside from the code you actually
 want to run. Start by inheriting from closure_base_unary_t (N-ary closures are not currently supported, but future 
 support is planned) like this:
