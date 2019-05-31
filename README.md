@@ -1,18 +1,18 @@
 # EDGI_nested_iterators
 
-## wtf is this?
+## What is this?
 
 This package provides APIs for simple and efficient parallelization for calling C/C++ functions on multidimensional data.
 This code should be compiled simultaneously with whatever files you want to use these APIs in, because the templates
 cannot be instantiated unless the compiler knows which instantiations you want.
 
-## how tf do i compile this?
+## How do I compile this?
 
 Debug and Release versions can be built by calling "make all" on the command line from their respective folders. This
 package requires support for C++17, like GCC 7 or higher. A compiler bug has been found in Intel 19 which can be 
 ameliorated by declaring static arrays (like symmetry vectors) in the global scope (i.e., outside of functions).
 
-## how tf do i use this?
+## How do I use this?
 
 This package breaks down the aspects of parallel computing into three separate parts: 1) representations of 
 multidimensional arrays, 2) the functions (closures) of interest, and 3) the iteration strategy.
@@ -77,11 +77,39 @@ Note that closures may be templated if needed, but this will slightly change how
 
 You are now ready to implement your iteration strategy. There are two choices here, called "object_for" and "method_for."
 When called these "nested" for loops automatically index down through the input and output arrays until the ranks match 
-the closure input and output ranks.
+the closure input and output ranks. The difference between object_for and method_for is that object_for loops require 
+a function when declared (and can be called with input and output arrays later), and method_for loops require an input
+array when declared (and can be called with a function and an output array later). This enables you to create an iteration
+strategy for a particular function or input array, and then use it multiple times later. 
+
+    auto oloop = object_for<decltype(my_input_array),
+                            decltype(my_output_array),
+                            closure_base_unary_t<bool, 21, float, 15>
+                            >(my_1337_closure::function);
+                            
+    oloop(my_input_array, my_output_array);
+                            
+    // or...
+
+    auto mloop = method_for<decltype(my_input_array),
+                            decltype(my_output_array),
+                            closure_base_unary_t<bool, 21, float, 15>
+                            >(my_input_array);
+                            
+    mloop(my_1337_closure::function, my_output_array);
+    
+## Why is it so slow?
+
+*shrug* Try OpenMP? OpenMP is off by default, but can be turned on by adding the number of dimensions you want to 
+parallelize with OpenMP to the nested iterator declaration like so...
+
+    auto mloop = method_for<decltype(my_input_array),
+                            decltype(my_output_array),
+                            closure_base_unary_t<bool, 21, float, 15>
+                            2 // <-- there will be two for-loops that will be parallelized with OpenMP
+                            >(my_input_array);
 
 
-
-
-## i can't even...
+## I can't even...
 
 *le sigh* Examples and speed tests are provided in main.cpp.
