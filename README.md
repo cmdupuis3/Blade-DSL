@@ -129,7 +129,7 @@ and likewise the closure inputs must have it as well.
             
     }
 ```
-The nested iterators with then ignore the redundant calculations completely. To save some memory and make indexing more obvious, it is sometimes wise to alias pointers like `a[j][i] = a[i][j];` when initializing the original data array.
+The nested iterators will then ignore the redundant calculations completely. To save some memory and make indexing more obvious, it is sometimes wise to alias pointers like `a[j][i] = a[i][j];` when initializing the original data array.
 
 ## I can't even...
 
