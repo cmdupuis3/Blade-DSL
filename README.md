@@ -31,11 +31,11 @@ and you want a 17-dimensional float array as output, create your nested arrays l
 Now, declare your closure class. This is complicated, but they are mostly boilerplate aside from the code you actually
 want to run. Start by inheriting from closure_base_unary_t (N-ary closures are not currently supported, but future 
 support is planned) like this:
-
+```cpp
     struct my_1337_closure : closure_base_unary_t<bool, 21, float, 15>{
         // function goes here!
     }
-    
+```
 Note that this closure is two dimensions lower than the input and output arrays. This is equivalent to a two-dimensional
 domain decomposition when we apply this closure to my_input_array and my_output_array. However, as long as both closure
 ranks are lower than the input and output array ranks, applying the closure is still valid and will iterate correctly.
@@ -45,7 +45,7 @@ is greater are also valid.
 
 Next you have to override the dummy function pointer called "function" you got when you inherited from closure_base_unary_t.
 This is done most easily by setting it equal to a capture-less lambda expression:
-
+```cpp
     struct my_1337_closure : closure_base_unary_t<bool, 21, float, 15>{
     
         static constexpr const void(*function)(nested_array_t<bool, 21, ISYMMETRY>, nested_array_t<float, 15>) =
@@ -54,14 +54,14 @@ This is done most easily by setting it equal to a capture-less lambda expression
             };
             
     }
-    
+```
 The type of "function" MUST be void(*)(nested_array_t<hurr>, nested_array_t<durr>). Deleting the keywords "static,"
 "constexpr," and/or "const" may or may not result in a nuclear war. The lambda expression MUST be capture-less, or
 type conversion will fail, and the lambda's input argument types must match nested_array_t<hurr> and nested_array_t<durr>
 exactly, but you may name the input and output arrays whatever you choose. Finally, the lambda MUST return a const void.
 
 Now that the boilerplate is done, we can have our way with the input data.
-
+```cpp
     struct my_1337_closure : closure_base_unary_t<bool, 21, float, 15>{
     
         static constexpr const void(*function)(nested_array_t<bool, 21, ISYMMETRY>, nested_array_t<float, 15>) =
@@ -72,7 +72,7 @@ Now that the boilerplate is done, we can have our way with the input data.
             };
             
     }
-    
+```
 Note that closures may be templated if needed, but this will slightly change how the function is called later.
 
 You are now ready to implement your iteration strategy. There are two choices here, called "object_for" and "method_for."
@@ -81,7 +81,7 @@ the closure input and output ranks. The difference between object_for and method
 a function when declared (and can be called with input and output arrays later), and method_for loops require an input
 array when declared (and can be called with a function and an output array later). This enables you to create an iteration
 strategy for a particular function or input array, and then use it multiple times later. 
-
+```cpp
     auto oloop = object_for<decltype(my_input_array),
                             decltype(my_output_array),
                             closure_base_unary_t<bool, 21, float, 15>
@@ -97,19 +97,18 @@ strategy for a particular function or input array, and then use it multiple time
                             >(my_input_array);
                             
     mloop(my_1337_closure::function, my_output_array);
-    
+```
 ## Why is it so slow?
 
 *shrug* Try OpenMP? OpenMP is off by default, but can be turned on by adding the number of dimensions you want to 
 parallelize with OpenMP to the nested iterator declaration like so...
-
+```cpp
     auto mloop = method_for<decltype(my_input_array),
                             decltype(my_output_array),
                             closure_base_unary_t<bool, 21, float, 15>
                             2 // <-- there will be two for-loops that will be parallelized with OpenMP
                             >(my_input_array);
-
-
+```
 ## I can't even...
 
 *le sigh* Examples and speed tests are provided in main.cpp.
