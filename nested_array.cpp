@@ -1,7 +1,7 @@
 /***********************************************************************
  *                   GNU Lesser General Public License
  *
- * This file is part of the EDGI package, developed by the 
+ * This file is part of the EDGI package, developed by the
  * GFDL Flexible Modeling System (FMS) group.
  *
  * EDGI is free software: you can redistribute it and/or modify it under
@@ -270,7 +270,7 @@ const nested_array_t<VTYPE, rank_t-1, symmetry_groups>* nested_array_t<VTYPE, ra
         exit(-8);
     }else{
         nested_array_t<VTYPE, rank_t-1, symmetry_groups>* out;
-        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(this);
+        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(this, index_in);
         return out;
     }
 
@@ -294,7 +294,7 @@ const nested_array_t<VTYPE, rank_t-1, symmetry_groups>* nested_array_t<VTYPE, ra
         exit(-9);
     }else{
         nested_array_t<VTYPE, rank_t-1, symmetry_groups>* out;
-        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(this);
+        out = new nested_array_t<VTYPE, rank_t-1, symmetry_groups>(this, index_in);
         return out;
     }
 
