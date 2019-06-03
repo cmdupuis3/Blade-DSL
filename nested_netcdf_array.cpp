@@ -358,55 +358,76 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::~nested_net
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read(){
 
-    size_t starts[rank_t + this->c_depth];
-    size_t counts[rank_t + this->c_depth];
-    size_t data_size = 1;
-    int dim_ind;
+    if constexpr (rank_t == 1) {
 
-    for(int i = 0; i < rank_t + this->c_depth; i++){
-        cout << this->dim_order[i] << endl;
-    }
+        size_t starts[rank_t + this->c_depth];
+        size_t counts[rank_t + this->c_depth];
+        size_t data_size = 1;
+        int dim_ind;
 
-    for(int i = 0; i < rank_t + this->c_depth; i++){
-        dim_ind = this->dim_order[i]-1;
-        if(dim_ind < this->c_depth){
-            starts[dim_ind] = this->indices[dim_ind];
-            counts[dim_ind] = 1;
-        }else{
-            starts[dim_ind] = 0;
-            counts[dim_ind] = this->extents[dim_ind];
-            data_size *= this->extents[dim_ind];
+        for(int i = 0; i < rank_t + this->c_depth; i++){
+            cout << this->dim_order[i] << endl;
         }
+
+        for(int i = 0; i < rank_t + this->c_depth; i++){
+            dim_ind = this->dim_order[i]-1;
+            if(dim_ind < this->c_depth){
+                starts[dim_ind] = this->indices[dim_ind];
+                counts[dim_ind] = 1;
+            }else{
+                starts[dim_ind] = 0;
+                counts[dim_ind] = this->extents[dim_ind];
+                data_size *= this->extents[dim_ind];
+            }
+        }
+
+        for(int i = 0; i < rank_t + this->c_depth; i++){
+            cout << starts[i] << "    " << counts[i] << endl;
+        }
+
+        this->data = new DTYPE[data_size];
+
+        nc_get_vara(this->file_ncid, this->var_ncid, starts, counts, this->data);
+
+    } else {
+
+        for (int i = 0; i < this->current_extent(); i++) {
+            this->down(i).read();
+        }
+
     }
-
-    for(int i = 0; i < rank_t + this->c_depth; i++){
-        cout << starts[i] << "    " << counts[i] << endl;
-    }
-
-    this->data = new DTYPE[data_size];
-
-    nc_get_vara(this->file_ncid, this->var_ncid, starts, counts, this->data);
 
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write(){
 
-    size_t starts[rank_t + this->c_depth];
-    size_t counts[rank_t + this->c_depth];
-    int dim_ind;
-    for(int i = 0; i < rank_t + this->c_depth; i++){
-        dim_ind = this->dim_order[i]-1;
-        if(dim_ind < this->c_depth){
-            starts[dim_ind] = this->indices[dim_ind];
-            counts[dim_ind] = 1;
-        }else{
-            starts[dim_ind] = 1;
-            counts[dim_ind] = this->extents[dim_ind];
-        }
-    }
+    if constexpr (rank_t == 1) {
 
-    nc_put_vara(this->file_ncid, this->var_ncid, starts, counts, this->data);
+        size_t starts[rank_t + this->c_depth];
+        size_t counts[rank_t + this->c_depth];
+        int dim_ind;
+        for(int i = 0; i < rank_t + this->c_depth; i++){
+            dim_ind = this->dim_order[i]-1;
+            if(dim_ind < this->c_depth){
+                starts[dim_ind] = this->indices[dim_ind];
+                counts[dim_ind] = 1;
+            }else{
+                starts[dim_ind] = 1;
+                counts[dim_ind] = this->extents[dim_ind];
+            }
+        }
+
+        #pragma omp critical
+        nc_put_vara(this->file_ncid, this->var_ncid, starts, counts, this->data);
+
+    } else {
+
+        for (int i = 0; i < this->current_extent(); i++) {
+            this->down(i).write();
+        }
+
+    }
 
 }
 
