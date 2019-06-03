@@ -106,6 +106,12 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
 
         return [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK> oarray) {
 
+            if constexpr (DEPTH == 0) {
+                for (int i = 0; i < IRANK - FIRANK; i++) {
+                    oarray.set_extent(i, iarray_in.extent(i));
+                }
+            }
+
             auto loop = [func, iarray_in, oarray](int i){
                 // Is this dimension symmetric with the next one?
                 if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){

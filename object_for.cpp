@@ -98,6 +98,12 @@ constexpr auto object_for_impl(std::function<void(nested_array_t<ITYPE, FIRANK, 
 
         return [func_in, imin_in](nested_array_t<ITYPE, IRANK, ISYM> iarray, nested_array_t<OTYPE, ORANK> oarray) {
 
+            if constexpr (DEPTH == 0) {
+                for (int i = 0; i < IRANK - FIRANK; i++) {
+                    oarray.set_extent(i, iarray.extent(i));
+                }
+            }
+
             auto loop = [func_in, iarray, oarray](int i){
                 // Is this dimension symmetric with the next one?
                 if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
