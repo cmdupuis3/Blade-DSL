@@ -68,6 +68,9 @@ public:
     int extent(int) const;
     int* get_extents() const;
 
+    void set_current_extent(int);
+    void set_extent(int, int);
+
     bool current_raggedness() const;
     bool next_raggedness() const;
     bool raggedness(int) const;
@@ -155,6 +158,14 @@ int nested_base_t<VTYPE, rank_t, symmetry_groups>::extent(int depth_in) const {
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 int* nested_base_t<VTYPE, rank_t, symmetry_groups>::get_extents() const {
     return this->extents;
+}
+template<typename VTYPE, const int rank_t, const int* symmetry_groups>
+void nested_base_t<VTYPE, rank_t, symmetry_groups>::set_current_extent(int extent_in){
+    this->extents[this->c_depth] = extent_in;
+}
+template<typename VTYPE, const int rank_t, const int* symmetry_groups>
+void nested_base_t<VTYPE, rank_t, symmetry_groups>::set_extent(int dim_in, int extent_in){
+    this->extents[dim_in] = extent_in;
 }
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 bool nested_base_t<VTYPE, rank_t, symmetry_groups>::current_raggedness() const {
