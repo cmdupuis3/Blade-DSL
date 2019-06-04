@@ -76,7 +76,7 @@ Now that the boilerplate is done, we can have our way with the input data.
 Note that closures may be templated if needed, but this will slightly change how the function is called later.
 
 You are now ready to implement your iteration strategy. There are two choices here, called "object_for" and "method_for."
-When called these "nested" for loops automatically index down through the input and output arrays until the ranks match 
+When called, these "nested" for loops automatically index down through the input and output arrays until the ranks match 
 the closure input and output ranks. The difference between object_for and method_for is that object_for loops require 
 a function when declared (and can be called with input and output arrays later), and method_for loops require an input
 array when declared (and can be called with a function and an output array later). This enables you to create an iteration
@@ -115,7 +115,7 @@ group. A symmetry group contains only dimensions that are mutually symmetric. If
 other, it is in its own symmetry group. The symmetry group must be passed to the input array as a template parameter,
 and likewise the closure inputs must have it as well.
 ```cpp
-    static constexpr int symmetry[3] = {1,1,1,4,4,4,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
+    static constexpr int symmetry[23] = {1,1,1,4,4,4,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
     nested_array_t<bool, 23, symmetry> my_input_array(input_extents, input_data);
     
     struct my_1337_closure : closure_base_unary_t<bool, 21, float, 15>{
