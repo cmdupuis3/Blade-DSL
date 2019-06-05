@@ -24,6 +24,7 @@
 #include <functional>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 
 #include "nested_array.cpp"
 #include "closure.cpp"
@@ -31,6 +32,7 @@
 using std::add_pointer;
 using std::remove_pointer;
 using std::tuple;
+using std::vector;
 
 //-----------------------------------------------------------------------//
 //
@@ -90,21 +92,27 @@ using std::tuple;
 template<typename ITYPE, const int IRANK, const int* ISYM, const int FIRANK,
          typename OTYPE, const int ORANK,                  const int FORANK,
          const int OMP_LEVELS = 0, const int DEPTH = 0>
-constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, const int imin_in = 0){
+constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, vector< nested_array_t<ITYPE, FIRANK> >* vec = nullptr, const int imin_in = 0){
 
     typedef const void (FTYPE)(nested_array_t<ITYPE, FIRANK, ISYM>, nested_array_t<OTYPE, FORANK>);
     //typedef const closure_base_t<1, ITYPE, FIRANK, OTYPE, FORANK> closure_t;
 
+    if(!vec) vec = new vector< nested_array_t<ITYPE, FIRANK> >;
+    vec->empty();
+
     // Are we done appending loops?
     if constexpr (IRANK == FIRANK) {
 
-        return [iarray_in](FTYPE func, nested_array_t<OTYPE, ORANK> oarray) {
-            func(iarray_in, oarray);
+        return [iarray_in, vec](FTYPE func, nested_array_t<OTYPE, ORANK> oarray) {
+            return [func, iarray_in, oarray](vector< nested_array_t<ITYPE, FIRANK> >* vec_in) {
+                vec_in->push_back(iarray_in);
+                func(vec_in, oarray);
+            }(vec);
         };
 
     } else if constexpr (IRANK > FIRANK) {
 
-        return [iarray_in, imin_in](FTYPE func, nested_array_t<OTYPE, ORANK> oarray) {
+        return [iarray_in, imin_in, vec](FTYPE func, nested_array_t<OTYPE, ORANK> oarray) {
 
             if constexpr (DEPTH == 0) {
                 for (int i = 0; i < IRANK - FIRANK; i++) {
@@ -112,36 +120,40 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
                 }
             }
 
-            auto loop = [func, iarray_in, oarray](int i){
-                // Is this dimension symmetric with the next one?
-                if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
-                    // Are we done stripping off output dimensions?
-                    if constexpr (ORANK == FORANK) {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray);
-                    } else {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray(i));
-                    }
-                } else {
-                    if constexpr (ORANK == FORANK) {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray);
-                    } else {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray(i));
-                    }
-                }
-            };
+            return [func, iarray_in, oarray, imin_in](vector< nested_array_t<ITYPE, FIRANK> >* vec_in) {
 
-            if constexpr (OMP_LEVELS > 0) {
-                int i = imin_in;
-                #pragma omp parallel for private(i)
-                for (i = imin_in; i < iarray_in.current_extent(); i++) {
-                    loop(i);
-                }
-            } else { // if constexpr (OMP_LEVELS == 0)
-                for (int i = imin_in; i < iarray_in.current_extent(); i++) {
-                    loop(i);
-                }
-            }
 
+                auto loop = [func, iarray_in, oarray, vec_in](int i){
+                    // Is this dimension symmetric with the next one?
+                    if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
+                        // Are we done stripping off output dimensions?
+                        if constexpr (ORANK == FORANK) {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), vec_in, i)(func, oarray);
+                        } else {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), vec_in, i)(func, oarray(i));
+                        }
+                    } else {
+                        if constexpr (ORANK == FORANK) {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), vec_in)(func, oarray);
+                        } else {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), vec_in)(func, oarray(i));
+                        }
+                    }
+                };
+
+                if constexpr (OMP_LEVELS > 0) {
+                    int i = imin_in;
+                    #pragma omp parallel for private(i)
+                    for (i = imin_in; i < iarray_in.current_extent(); i++) {
+                        loop(i);
+                    }
+                } else { // if constexpr (OMP_LEVELS == 0)
+                    for (int i = imin_in; i < iarray_in.current_extent(); i++) {
+                        loop(i);
+                    }
+                }
+
+            }(vec);
         };
 
     }
@@ -178,31 +190,40 @@ constexpr auto method_for(NITYPE iarray_in){
 
 
 
+template<typename TUITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0, const int ARG = 0>
+constexpr auto gather(TUITYPE iarrays_in){
+
+}
 
 
 
 
 template<typename TUITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0, const int ARG = 0>
-constexpr auto method_for_chained(TUITYPE iarrays_in){
+constexpr auto method_for_chained(TUITYPE iarrays_in, vector< nested_array_t<CLTYPE::fitype, CLTYPE::firank> >* vec = nullptr){
 
     static_assert(std::tuple_size<TUITYPE>::value == CLTYPE::arity);
     typedef typename std::tuple_element<ARG, TUITYPE>::type ITYPE;
 
+    if(!vec) vec = new vector< nested_array_t<CLTYPE::fitype, CLTYPE::firank> >;
+    vec->empty();
+
     if constexpr (std::tuple_size<TUITYPE>::value == ARG - 1) {
 
-        return [iarrays_in](typename CLTYPE::ftype func, NOTYPE oarray) {
+        return [iarrays_in, vec](typename CLTYPE::ftype func, NOTYPE oarray) {
+
             func(std::get<ARG>(iarrays_in), oarray);
         };
 
     } else {
 
         return [iarrays_in](typename CLTYPE::ftype func, NOTYPE oarray){
+
             auto loop = method_for_impl<ITYPE::value_type, ITYPE::rank, ITYPE::symmetry, CLTYPE::input_rank,
                                         typename NOTYPE::value_type, NOTYPE::rank, CLTYPE::output_rank,
                                         OMP_LEVELS
                     >(std::get<ARG>(iarrays_in));
 
-            loop(method_for_chained<TUITYPE, NOTYPE, CLTYPE, OMP_LEVELS>(iarrays_in)(func, oarray));
+            loop(method_for_chained<TUITYPE, NOTYPE, CLTYPE, OMP_LEVELS>(iarrays_in, vec)(func, oarray));
         };
 
     }

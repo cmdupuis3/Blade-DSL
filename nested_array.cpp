@@ -106,8 +106,9 @@ public:
     DTYPE&                operator[](int);
     const DTYPE&          operator[](int) const;
 
-    void                  operator=(TYPE); //< Shallow-copy data into this array
-    void                  operator=(nested_array_t<VTYPE, rank_t, symmetry_groups>);
+    void                  operator=(const TYPE); //< Shallow-copy data into this array
+    template<const int* ext_sym> nested_array_t(const nested_array_t<VTYPE, rank_t, ext_sym>);
+    template<const int* ext_sym> void                 operator=(const nested_array_t<VTYPE, rank_t, ext_sym>);
     nested_array_t<VTYPE, rank_t,   symmetry_groups>  operator+(nested_array_t<VTYPE, rank_t, symmetry_groups>); //< merge along this dimension
     nested_array_t<VTYPE, rank_t,   symmetry_groups>* operator/(int);                    //< split along this dimension
 
@@ -216,7 +217,37 @@ nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(int* extents_in, 
 
 
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
-void nested_array_t<VTYPE, rank_t, symmetry_groups>::operator=(nested_array_t<VTYPE, rank_t, symmetry_groups> array_in){
+template<const int* ext_sym> void nested_array_t<VTYPE, rank_t, symmetry_groups>::operator=(const nested_array_t<VTYPE, rank_t, ext_sym> array_in){
+
+    // mismatched symmetry groups only allowed for sym -> nullptr conversions
+    if constexpr (symmetry_groups || symmetry_groups != ext_sym) {
+        cout << "This symmetry conversion is not allowed." << endl;
+        exit(-1242134);
+    }
+
+    this->data = array_in.get_data();
+
+    this->c_depth = array_in.current_depth();
+    this->index = array_in.get_index();
+
+    /** Deep-copy extents */
+    this->extents = new int[rank_t];
+    for(int i = 0; i < rank_t; i++){
+        this->extents[i] = array_in.extent(i);
+    }
+
+    this->parent = nullptr;
+}
+
+
+template<typename VTYPE, const int rank_t, const int* symmetry_groups>
+template<const int* ext_sym> nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(const nested_array_t<VTYPE, rank_t, ext_sym> array_in){
+
+    // mismatched symmetry groups only allowed for sym -> nullptr conversions
+    if constexpr (symmetry_groups || symmetry_groups != ext_sym) {
+        cout << "This symmetry conversion is not allowed." << endl;
+        exit(-1242134);
+    }
 
     this->data = array_in.get_data();
 
@@ -348,7 +379,7 @@ const typename remove_pointer<typename promote<VTYPE, rank_t>::type>::type& nest
     return this->data[index_in];
 }
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
-void nested_array_t<VTYPE, rank_t, symmetry_groups>::operator=(TYPE data_in){
+void nested_array_t<VTYPE, rank_t, symmetry_groups>::operator=(const TYPE data_in){
     this->data = data_in;
 }
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
