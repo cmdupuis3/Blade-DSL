@@ -47,15 +47,22 @@ let rec loopNestRec (arrayName: string) (extents: int list) (inner: string list)
                       [braced.[1]] ]
     )
 
+let rec loopNestNary (arrayNames: string list) (extents: int list list) (inner: string list) (ctr: Counter) =
+    assert (List.length arrayNames = List.length extents)
+    match arrayNames with
+    | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in loopNestRec
+    | [head] -> loopNestRec head extents.[0] inner ctr
+    | head::tail -> loopNestRec head extents.[0] (loopNestNary tail extents.[1..] inner ctr) ctr
 
-let c = Counter()
+
 
 
 
 let myfunc = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 
-let a = loop 0 10
-let b = loop 0 20
+let c = Counter()
+let a = loop 0 10 c
+let b = loop 0 20 c
 
 
 let iarray = "iarray"
