@@ -8,8 +8,6 @@ open iterators
 
 // Define your library scripting code here
 
-let loopText itype iname (imin: int) (imax: int) =
-    String.concat "" ["for("; itype; " "; iname; " = "; (string imin); "; "; iname; " < "; (string imax); "; "; iname; "++)";]
         
 type Counter() =
     let mutable num = 0
@@ -24,18 +22,14 @@ type Counter() =
         num <- num + 1
         String.concat "" ["__i"; (string num)]
 
+let loopText itype iname (imin: int) (imax: int) =
+    String.concat "" ["for("; itype; " "; iname; " = "; (string imin); "; "; iname; " < "; (string imax); "; "; iname; "++)";]
+
 let loop (imin: int) (imax: int) (ctr: int) =
     loopText "int" (String.concat "" ["__i"; (string ctr)]) imin imax
 
 let index i arrayName =
     String.concat "" [arrayName; "(__i"; i; ")"]
-
-let indexToTemp arrayName (ctr: Counter) =
-    if ctr.This = 0 then
-        String.concat "" ["auto "; arrayName; ctr.NextSuffix; " = "; (index ctr.LastSuffix arrayName); ";\n"]
-    else
-        String.concat "" ["auto "; arrayName; ctr.NextSuffix; " = "; (index ctr.LastSuffix (String.concat "" [arrayName; ctr.ThisSuffix])); ";\n"]
-
 
 let tab x = 
     x |> List.map (fun y -> String.concat "" ["\t"; y])
@@ -47,33 +41,12 @@ let brace x =
     List.append [String.concat " " [x; "{\n"]] ["\n}"]
 
 
-
-
-type ArrayIndexer(arrayName: string, extents: int list) =
-    let name = arrayName
-    let rank = List.length extents
-    let extents = extents
-    let counter = Counter()
-    let mutable names = [arrayName]
-    let mutable code = []
-
-    member this.Name = name
-    member this.Rank = rank
-    member this.Extents = extents
-    
-    member this.SetNextName(nextName) =
-        counter.Next |> ignore
-        names <- List.append names [nextName]
-    member this.LastName = List.last names
-
-
-
-let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (indCtr: Counter) (depth: int)=
+let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) =
 
     match extents with
     | [] -> (inner, String.concat "" [arrayName; "__i"; string depth])
     | head::tail -> (
-        let nextLoop, lastArrayName = unaryLoop arrayName tail inner indCtr (depth+1)
+        let nextLoop, lastArrayName = unaryLoop arrayName tail inner (depth+1)
         let braced = brace (loop 0 head depth)
         if depth = 0 then 
             (List.concat [ [braced.[0]];
@@ -93,9 +66,8 @@ let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: stri
     assert (List.length arrayNames = List.length extents)
     match arrayNames with
     | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in loopNestRec
-    | [head] -> unaryLoop head extents.[0] inner ctr 0
-    | head::tail -> unaryLoop head extents.[0] (naryLoop tail extents.[1..] inner ctr) ctr 0
-
+    | [head] -> unaryLoop head extents.[0] inner 0
+    | head::tail -> unaryLoop head extents.[0] (naryLoop tail extents.[1..] inner ctr) 0
 
 
 
@@ -106,4 +78,4 @@ let iarrays = ["iarray1"; "iarray2"]
 let iextents = [ [2;3;4]; [5;6;7] ]
 let oarray = "oarray"
 
-let p, q = unaryLoop iarrays.[0] iextents.[0] (newln inner) c 0
+let p, q = unaryLoop iarrays.[0] iextents.[0] (newln inner) 0
