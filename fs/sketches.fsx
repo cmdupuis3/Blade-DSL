@@ -45,29 +45,35 @@ let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (
 
     match extents with
     | [] -> (inner, String.concat "" [arrayName; "__i"; string depth])
-    | head::tail -> (
+    | head::tail ->
         let nextLoop, lastArrayName = unaryLoop arrayName tail inner (depth+1)
         let braced = brace (loop 0 head depth)
         if depth = 0 then 
-            (List.concat [ [braced.[0]];
-                           [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; index (string depth) arrayName; ";\n"]]
-                           tab (nextLoop);
-                           [braced.[1]] ], lastArrayName)
+            List.concat [ [braced.[0]];
+                          tab [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; index (string depth) arrayName; ";\n"]]
+                          tab (nextLoop);
+                          [braced.[1]] ], lastArrayName
         else
-            (List.concat [ [braced.[0]];
-                           [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; (index (string depth) (String.concat "" [arrayName; "__i"; string (depth-1)])); ";\n"]]
-                           tab (nextLoop);
-                           [braced.[1]] ], lastArrayName)
-    )
+            List.concat [ [braced.[0]];
+                          tab [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; (index (string depth) (String.concat "" [arrayName; "__i"; string (depth-1)])); ";\n"]]
+                          tab (nextLoop);
+                          [braced.[1]] ], lastArrayName
 
 
 
-let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (ctr: Counter) =
+let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (arg: int) =
     assert (List.length arrayNames = List.length extents)
     match arrayNames with
     | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in loopNestRec
-    | [head] -> unaryLoop head extents.[0] inner 0
-    | head::tail -> unaryLoop head extents.[0] (naryLoop tail extents.[1..] inner ctr) 0
+    | [head] -> 
+        let lastLoop, lastArrayName = unaryLoop head extents.[0] inner 0
+        lastLoop, [lastArrayName]
+    | head::tail ->
+        let nextLoop, nextArrayName = naryLoop tail extents.[1..] inner (arg+1)
+        let thisLoop, thisArrayName = unaryLoop head extents.[0] (nextLoop) 0
+        List.append thisLoop nextLoop, thisArrayName::nextArrayName
+
+
 
 
 
@@ -79,3 +85,4 @@ let iextents = [ [2;3;4]; [5;6;7] ]
 let oarray = "oarray"
 
 let p, q = unaryLoop iarrays.[0] iextents.[0] (newln inner) 0
+let r, s = naryLoop iarrays iextents (newln inner) 0
