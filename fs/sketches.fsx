@@ -1,6 +1,8 @@
 // Learn more about F# at http://fsharp.org
 // See the 'F# Tutorial' project for more help.
 
+open FSharp.Core.Option
+
 #load "sketches.fs"
 open iterators
 
@@ -13,7 +15,7 @@ type Counter() =
     let mutable num = 0
     member this.Last = num-1
     member this.This = num
-    member this.Next = num+1
+    member this.Next = num <- num + 1; num
     member this.LastSuffix = 
         String.concat "" ["__i"; (string (num - 1))]
     member this.ThisSuffix = 
@@ -22,14 +24,14 @@ type Counter() =
         num <- num + 1
         String.concat "" ["__i"; (string num)]
 
-let loop (imin: int) (imax: int) (ctr: Counter) =
-    loopText "int" ctr.ThisSuffix imin imax
+let loop (imin: int) (imax: int) (ctr: int) =
+    loopText "int" (String.concat "" ["__i"; (string ctr)]) imin imax
 
 let index i arrayName =
-    String.concat "" [arrayName; "("; i; ")"]
+    String.concat "" [arrayName; "(__i"; i; ")"]
 
-let indexToTemp i arrayName (ctr: Counter) =
-    if i = 0 then
+let indexToTemp arrayName (ctr: Counter) =
+    if ctr.This = 0 then
         String.concat "" ["auto "; arrayName; ctr.NextSuffix; " = "; (index ctr.LastSuffix arrayName); ";\n"]
     else
         String.concat "" ["auto "; arrayName; ctr.NextSuffix; " = "; (index ctr.LastSuffix (String.concat "" [arrayName; ctr.ThisSuffix])); ";\n"]
@@ -44,34 +46,64 @@ let newln x =
 let brace x = 
     List.append [String.concat " " [x; "{\n"]] ["\n}"]
 
-let rec loopNestRec (arrayName: string) (extents: int list) (inner: string list) (ctr: Counter) =
-    let argCounter = Counter()
-    match extents with
-    | [] -> inner
-    | head::tail -> (
-        let braced = brace (loop 0 head ctr)
-        List.concat [ [braced.[0]];
-                      tab [(indexToTemp ctr.This arrayName ctr)];
-                      tab (loopNestRec arrayName tail inner ctr);
-                      [braced.[1]] ]
 
+
+
+type ArrayIndexer(arrayName: string, extents: int list) =
+    let name = arrayName
+    let rank = List.length extents
+    let extents = extents
+    let counter = Counter()
+    let mutable names = [arrayName]
+    let mutable code = []
+
+    member this.Name = name
+    member this.Rank = rank
+    member this.Extents = extents
+    
+    member this.SetNextName(nextName) =
+        counter.Next |> ignore
+        names <- List.append names [nextName]
+    member this.LastName = List.last names
+
+
+
+let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (indCtr: Counter) (depth: int)=
+
+    match extents with
+    | [] -> (inner, String.concat "" [arrayName; "__i"; string depth])
+    | head::tail -> (
+        let nextLoop, lastArrayName = unaryLoop arrayName tail inner indCtr (depth+1)
+        let braced = brace (loop 0 head depth)
+        if depth = 0 then 
+            (List.concat [ [braced.[0]];
+                           [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; index (string depth) arrayName; ";\n"]]
+                           tab (nextLoop);
+                           [braced.[1]] ], lastArrayName)
+        else
+            (List.concat [ [braced.[0]];
+                           [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; (index (string depth) (String.concat "" [arrayName; "__i"; string (depth-1)])); ";\n"]]
+                           tab (nextLoop);
+                           [braced.[1]] ], lastArrayName)
     )
 
-let rec loopNestNary (arrayNames: string list) (extents: int list list) (inner: string list) (ctr: Counter) =
+
+
+let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (ctr: Counter) =
     assert (List.length arrayNames = List.length extents)
     match arrayNames with
     | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in loopNestRec
-    | [head] -> loopNestRec head extents.[0] inner ctr
-    | head::tail -> loopNestRec head extents.[0] (loopNestNary tail extents.[1..] inner ctr) ctr
-
+    | [head] -> unaryLoop head extents.[0] inner ctr 0
+    | head::tail -> unaryLoop head extents.[0] (naryLoop tail extents.[1..] inner ctr) ctr 0
 
 
 
 
 let c = Counter()
+let d = Counter()
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray2"]
 let iextents = [ [2;3;4]; [5;6;7] ]
 let oarray = "oarray"
 
-loopNestNary iarrays iextents (newln inner) c
+let p, q = unaryLoop iarrays.[0] iextents.[0] (newln inner) c 0
