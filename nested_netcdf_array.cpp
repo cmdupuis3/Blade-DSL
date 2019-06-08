@@ -49,13 +49,17 @@ protected:
     int c_depth;
     int* indices; // Current index
 
+    int* dim_order;
+
     size_t* extents; //< Length of dimensions; A value of -1 signifies a ragged dimension
-    string* dim_names;
 
     int file_ncid;
     int var_ncid;
     int* dim_ncids;
-    int* dim_order;
+    string* dim_names;
+    int* dim_var_ncids;
+    nc_type* dim_var_types;
+    void** dim_var_values;
 
 public:
     nested_netcdf_base_t(){};
@@ -249,28 +253,26 @@ template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[
 int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_id(int depth_in) const {
     return this->dim_ncids[depth_in];
 }
+/*
+auto nc_get_sanity_wrapper(nc_type type_in, void* buffer_in){
+    switch(type_in){
+        case(NC_DOUBLE):
 
-
-
+        case(NC_FLOAT):
+        case(NC_INT):
+        case(NC_LONG):
+        case():
+        case():
+        default:
+            exit(-2342);
+    }
+}
+*/
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netcdf_array_t(int* dim_order_in){
 
-    /** Open file and variable */
-    nc_open(FNAME, NC_NOWRITE, &(this->file_ncid));
-    nc_inq_varid(this->file_ncid, VNAME, &(this->var_ncid));
-
-    /** Verify variable rank */
-    int* num_dims = new int(0);
-    nc_inq_var(this->file_ncid, this->var_ncid, NULL, NULL, num_dims, NULL, NULL);
-    if(rank_t != *num_dims){
-        cout << "Forward-declared rank does not match rank of variable in file." << endl;
-        exit(-9001);
-    }
-
-    /** Query dimension IDs */
-    this->dim_ncids = new int[rank_t];
-    nc_inq_var(this->file_ncid, this->var_ncid, NULL, NULL, NULL, this->dim_ncids, NULL);
+    // OK to use runtime if/else statements here because this constructor is only called for the top level
 
     /** Deep copy dimension order */
     this->dim_order = new int[rank_t];
@@ -282,18 +284,72 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
         }
     }
 
-    /** Query extents */
-    this->extents = new size_t[rank_t];
-    for(int i = 0; i < rank_t; i++){
-        nc_inq_dimlen(this->file_ncid, this->dim_ncids[i], &(this->extents[i]));
+    /** Open file and variable */
+    int status = nc_create(FNAME, NC_NOCLOBBER, &(this->file_ncid));
+    if (status == NC_EEXIST) {
+        // The file already exists; assume read or read/write mode
+
+        nc_open(FNAME, NC_WRITE|NC_SHARE, &(this->file_ncid));
+        nc_inq_varid(this->file_ncid, VNAME, &(this->var_ncid));
+
+        /** Verify variable rank */
+        int* num_dims = new int(0);
+        nc_inq_varndims(this->file_ncid, this->var_ncid, num_dims);
+        if(rank_t != *num_dims){
+            cout << "Forward-declared rank does not match rank of variable in file." << endl;
+            exit(-9001);
+        }
+
+        /** Query dimension IDs */
+        this->dim_ncids = new int[rank_t];
+        nc_inq_vardimid(this->file_ncid, this->var_ncid, this->dim_ncids);
+
+        /** Query dimension names */
+        this->dim_names = new string[rank_t];
+        for(int i =0; i < rank_t; i++){
+            char* tmp = new char[NC_MAX_NAME+1];
+            nc_inq_dimname(this->file_ncid, this->dim_ncids[i], tmp);
+            this->dim_names[i] = string(tmp);
+        }
+
+        /** Query extents */
+        this->extents = new size_t[rank_t];
+        for(int i = 0; i < rank_t; i++){
+            nc_inq_dimlen(this->file_ncid, this->dim_ncids[i], &(this->extents[i]));
+        }
+
+        /** Query dimension variable IDs */
+        this->dim_var_ncids = new int[rank_t];
+        for(int i =0; i < rank_t; i++){
+            nc_inq_varid(this->file_ncid, this->dim_names[i].c_str(), &(this->dim_var_ncids[i]));
+        }
+
+        /** Query dimension variable types */
+        this->dim_var_types = new nc_type[rank_t];
+        for(int i = 0; i < rank_t; i++){
+            nc_inq_vartype(this->file_ncid, this->dim_var_ncids[i], &(this->dim_var_types[i]));
+        }
+
+        /** Query dimension values */
+        this->dim_var_values = new void*[rank_t];
+        for(int i = 0; i < rank_t; i++){
+            size_t* size = new size_t;
+            nc_inq_type(this->file_ncid, this->dim_var_types[i], NULL, size);
+            this->dim_var_values[i] = malloc((*size) * this->extents[i]);
+            nc_get_var(this->file_ncid, this->dim_var_ncids[i], this->dim_var_values[i]);
+        }
+
+        this->c_depth = 0;
+        this->indices = new int[rank_t];
+
+        this->parent = nullptr;
+
+    } else {
+        // The file does not exist; assume write mode
+
     }
 
-    this->c_depth = 0;
-    this->indices = new int[rank_t];
-
-    this->parent = nullptr;
 }
-
 
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
@@ -366,10 +422,6 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read()
         int dim_ind;
 
         for(int i = 0; i < rank_t + this->c_depth; i++){
-            cout << this->dim_order[i] << endl;
-        }
-
-        for(int i = 0; i < rank_t + this->c_depth; i++){
             dim_ind = this->dim_order[i]-1;
             if(dim_ind < this->c_depth){
                 starts[dim_ind] = this->indices[dim_ind];
@@ -379,10 +431,6 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read()
                 counts[dim_ind] = this->extents[dim_ind];
                 data_size *= this->extents[dim_ind];
             }
-        }
-
-        for(int i = 0; i < rank_t + this->c_depth; i++){
-            cout << starts[i] << "    " << counts[i] << endl;
         }
 
         this->data = new DTYPE[data_size];
