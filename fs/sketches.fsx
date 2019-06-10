@@ -1,8 +1,6 @@
 // Learn more about F# at http://fsharp.org
 // See the 'F# Tutorial' project for more help.
 
-open FSharp.Core.Option
-
 #load "sketches.fs"
 open iterators
 
@@ -36,12 +34,11 @@ let declLine (i: int) itype =
 
 let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) (counter: int) (ompLevels: int) =
     match extents with
-    | [] -> (newln inner, String.concat "" [arrayName; "__i"; string (counter-1)], depth-1)
-    | head::tail ->
-        let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth+1) (counter+1) (ompLevels-1)
+    | [] -> (inner, String.concat "" [arrayName; "__i"; string (counter - 1)], depth - 1)
+    | head :: tail ->
+        let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth + 1) (counter + 1) (ompLevels - 1)
         let braced = brace (loopLine 0 head counter)
         let ompline = if ompLevels > 0 then [ompLine counter] else []
-
         if depth = 0 then 
             List.concat [ newln [declLine counter "int"];
                           newln ompline;
@@ -69,17 +66,17 @@ let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: stri
     | [head] -> 
         let lastLoop, lastArrayName, lastDepth = unaryLoop head extents.[0] inner 0 0 ompLevels.[0]
         lastLoop, [lastArrayName], lastDepth
-    | head::tail ->
-        let nextLoop, nextArrayName, nextDepth = naryLoop tail extents.[1..] inner (arg+1) ompLevels.[1..]
-        let thisLoop, thisArrayName, thisDepth = unaryLoop head extents.[0] (nextLoop) 0 (nextDepth+1) ompLevels.[0]
-        thisLoop, thisArrayName::nextArrayName, (thisDepth+1)
+    | head :: tail ->
+        let nextLoop, nextArrayName, nextDepth = naryLoop tail extents.[1..] inner (arg + 1) ompLevels.[1..]
+        let thisLoop, thisArrayName, thisDepth = unaryLoop head extents.[0] (nextLoop) 0 (nextDepth + 1) ompLevels.[0]
+        thisLoop, thisArrayName :: nextArrayName, thisDepth + nextDepth + 1
 
 
 
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
-let iarrays = ["iarray1"; "iarray2"]
-let iextents = [ [2;3;4]; [5;6;7] ]
+let iarrays = ["iarray1"; "iarray2"; "iarray3"]
+let iextents = [ [2;3;4]; [5;6;7]; [7;8] ]
 let oarray = "oarray"
 
-let p, q, r = unaryLoop iarrays.[0] iextents.[0] inner 0 3 2
-let x, y, z = naryLoop iarrays iextents inner 0 [2;1]
+let p, q, r = unaryLoop iarrays.[0] iextents.[0] (newln inner) 0 3 2
+let x, y, z = naryLoop iarrays iextents (newln inner) 0 [2;1;0]
