@@ -30,6 +30,7 @@ using std::remove_pointer;
 using std::vector;
 
 #include "nested_array.cpp"
+#include "nested_netcdf_array.cpp"
 #include "nested_array_utilities.cpp"
 #include "curry.cpp"
 
@@ -52,8 +53,41 @@ struct closure_base_t {
         };
 };
 
+/** Compile-time available container for metadata about functions. */
+template<const int ARITY, typename FITYPE, const int FIRANK, const char IFNAME[], const char IVNAME[],
+                          typename FOTYPE, const int FORANK, const char OFNAME[], const char OVNAME[], const int commutativity_groups[ARITY] = nullptr>
+struct closure_nc_base_t {
+
+    typedef void(*ftype)(FITYPE, FOTYPE);
+    typedef FITYPE fitype;
+    typedef FOTYPE fotype;
+
+    static constexpr const int arity = ARITY;
+    static constexpr const int input_rank = FIRANK;
+    static constexpr const int output_rank = FORANK;
+    static constexpr const int* commutativity = commutativity_groups;
+
+    static constexpr const void(*function)(nested_netcdf_array_t<FITYPE, FIRANK, IFNAME, IVNAME>, nested_netcdf_array_t<FOTYPE, FORANK, OFNAME, OVNAME>) =
+        [](nested_netcdf_array_t<FITYPE, FIRANK, IFNAME, IVNAME> iarray_in, nested_netcdf_array_t<FOTYPE, FORANK, OFNAME, OVNAME> oarray_in) -> const void {
+            return;
+        };
+
+    /** This function is where the remaining output dimensions must be written. */
+    template<const int IRANK, const int ORANK>
+    static constexpr const void(*write_output_dims)(nested_netcdf_array_t<FITYPE, IRANK, IFNAME, IVNAME>, nested_netcdf_array_t<FOTYPE, ORANK, OFNAME, OVNAME>) =
+        [](nested_netcdf_array_t<FITYPE, IRANK, IFNAME, IVNAME> iarray_in, nested_netcdf_array_t<FOTYPE, ORANK, OFNAME, OVNAME> oarray_in) -> const void {
+            return;
+        };
+};
+
 /** Compile-time available container for metadata about unary functions. */
 template<typename FITYPE, const int FIRANK, typename FOTYPE, const int FORANK>
 struct closure_base_unary_t : closure_base_t<1, FITYPE, FIRANK, FOTYPE, FORANK>{};
+
+/** Compile-time available container for metadata about unary functions. */
+template<typename FITYPE, const int FIRANK, const char IFNAME[], const char IVNAME[],
+         typename FOTYPE, const int FORANK, const char OFNAME[], const char OVNAME[]>
+struct closure_nc_base_unary_t : closure_nc_base_t<1, FITYPE, FIRANK, IFNAME, IVNAME,
+                                                      FOTYPE, FORANK, OFNAME, OVNAME>{};
 
 #endif
