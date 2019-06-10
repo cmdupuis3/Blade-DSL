@@ -27,28 +27,31 @@ let newln x =
 let brace x = 
     List.append [String.concat " " [x; "{\n"]] ["}\n"]
 
+let ompLine i =
+    String.concat "" ["#pragma omp parallel for private(__i"; i; ")"]
 
-let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) =
+
+let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) (counter: int) =
     match extents with
-    | [] -> (newln inner, String.concat "" [arrayName; "__i"; string (depth-1)], depth-1)
+    | [] -> (newln inner, String.concat "" [arrayName; "__i"; string (counter-1)], depth-1)
     | head::tail ->
-        let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth+1)
-        let braced = brace (loop 0 head depth)
+        let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth+1) (counter+1)
+        let braced = brace (loop 0 head counter)
         if depth = 0 then 
             List.concat [ [braced.[0]];
-                          tab [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; index (string depth) arrayName; ";\n"]]
+                          tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; index (string counter) arrayName; ";\n"]]
                           tab (nextLoop);
                           [braced.[1]] ],
             lastArrayName,
             lastDepth
         else
             List.concat [ [braced.[0]];
-                          tab [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; (index (string depth) (String.concat "" [arrayName; "__i"; string (depth-1)])); ";\n"]]
+                          tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; (index (string counter) (String.concat "" [arrayName; "__i"; string (counter-1)])); ";\n"]]
                           tab (nextLoop);
                           [braced.[1]] ],
             lastArrayName,
             lastDepth
-
+      
 
 
 let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (arg: int) =
@@ -56,11 +59,11 @@ let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: stri
     match arrayNames with
     | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in loopNestRec
     | [head] -> 
-        let lastLoop, lastArrayName, lastDepth = unaryLoop head extents.[0] inner 0
+        let lastLoop, lastArrayName, lastDepth = unaryLoop head extents.[0] inner 0 0
         lastLoop, [lastArrayName], lastDepth
     | head::tail ->
         let nextLoop, nextArrayName, nextDepth = naryLoop tail extents.[1..] inner (arg+1)
-        let thisLoop, thisArrayName, thisDepth = unaryLoop head extents.[0] (nextLoop) (nextDepth+1)
+        let thisLoop, thisArrayName, thisDepth = unaryLoop head extents.[0] (nextLoop) 0 (nextDepth+1)
         thisLoop, thisArrayName::nextArrayName, (thisDepth+1)
 
 
@@ -70,5 +73,5 @@ let iarrays = ["iarray1"; "iarray2"]
 let iextents = [ [2;3;4]; [5;6;7] ]
 let oarray = "oarray"
 
-let p, q, r = unaryLoop iarrays.[0] iextents.[0] inner 0
+let p, q, r = unaryLoop iarrays.[0] iextents.[0] inner 0 3
 let x, y, z = naryLoop iarrays iextents inner 0
