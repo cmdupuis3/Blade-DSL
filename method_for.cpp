@@ -25,6 +25,7 @@
 #include <tuple>
 #include <type_traits>
 
+#include "nested_netcdf_array.cpp"
 #include "nested_array.cpp"
 #include "closure.cpp"
 
@@ -148,6 +149,91 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
 
 }
 
+template<typename ITYPE, const int IRANK, const char IFNAME[], const char IVNAME[], const int* ISYM, const int FIRANK,
+         typename OTYPE, const int ORANK, const char OFNAME[], const char OVNAME[],                  const int FORANK,
+         const int OMP_LEVELS = 0, const int DEPTH = 0>
+constexpr auto method_for_nc_impl(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IVNAME, ISYM> iarray_in, const int imin_in = 0){
+
+    typedef const void (FTYPE)(nested_netcdf_array_t<ITYPE, FIRANK, IFNAME, IVNAME, ISYM>, nested_netcdf_array_t<OTYPE, FORANK, OFNAME, OVNAME>);
+    //typedef const closure_base_t<1, ITYPE, FIRANK, OTYPE, FORANK> closure_t;
+
+    // Are we done appending loops?
+    if constexpr (IRANK == FIRANK) {
+
+        return [iarray_in](FTYPE func, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME> oarray) {
+            iarray_in.read();
+            func(iarray_in, oarray);
+            oarray.write();
+        };
+
+    } else if constexpr (IRANK > FIRANK) {
+
+        auto mloop = [iarray_in, imin_in](FTYPE func, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME> oarray) {
+
+            auto loop = [func, iarray_in, oarray](int i){
+                // Is this dimension symmetric with the next one?
+                if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
+                    // Are we done stripping off output dimensions?
+                    if constexpr (ORANK == FORANK) {
+                        method_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK,     OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray);
+                    } else {
+                        method_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK - 1, OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray(i));
+                    }
+                } else {
+                    if constexpr (ORANK == FORANK) {
+                        method_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK,     OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray);
+                    } else {
+                        method_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK - 1, OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray(i));
+                    }
+                }
+            };
+
+            if constexpr (OMP_LEVELS > 0) {
+                size_t i = imin_in;
+                #pragma omp parallel for private(i)
+                for (i = imin_in; i < iarray_in.current_extent(); i++) {
+                    loop(i);
+                }
+            } else { // if constexpr (OMP_LEVELS == 0)
+                for (size_t i = imin_in; i < iarray_in.current_extent(); i++) {
+                    loop(i);
+                }
+            }
+
+        };
+
+
+        if constexpr (DEPTH == 0) {
+
+            typedef const void (OWRFTYPE)(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IVNAME, ISYM>, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME>);
+            return [iarray_in, imin_in, mloop](FTYPE func, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME> oarray, OWRFTYPE owrfunc) {
+
+                for (int i = 0; i < ORANK - FORANK; i++) {
+                    oarray.set_extent(i, iarray_in.extent(i));
+                }
+
+                oarray.write_init(&iarray_in, FORANK); // copy all the identical metadata
+                owrfunc(iarray_in, oarray); // provide user interface for non-identical metadata, with access to both arrays
+                oarray.check_dim_completeness();
+
+                nc_redef(oarray.file_id());
+                nc_def_var(oarray.file_id(), oarray.variable_name, oarray.var_type(), ORANK, oarray.dim_ids(), oarray.var_id()); // generalize type
+                nc_enddef(oarray.file_id());
+
+                mloop(func, oarray);
+            };
+
+        } else {
+
+            return mloop;
+
+        }
+
+    }
+
+}
+
+
 /** The method_for loop is a grammatical orientation of the nested_for loop that allows you to tie an
  *  iteration pattern to an input array, and later pass it an output array and  a function to evaluate
  *  with the data. This is useful for evaluating several different functions (with the same input/output
@@ -171,44 +257,16 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
  */
 template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0>
 constexpr auto method_for(NITYPE iarray_in){
-    return method_for_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::symmetry, CLTYPE::input_rank,
-                           typename NOTYPE::value_type, NOTYPE::rank,                   CLTYPE::output_rank,
+    return method_for_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::symmetry,              CLTYPE::input_rank,
+                           typename NOTYPE::value_type, NOTYPE::rank,                                CLTYPE::output_rank,
                            OMP_LEVELS>(iarray_in);
 }
 
-
-
-
-
-
-
-template<typename TUITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0, const int ARG = 0>
-constexpr auto method_for_chained(TUITYPE iarrays_in){
-
-    static_assert(std::tuple_size<TUITYPE>::value == CLTYPE::arity);
-    typedef typename std::tuple_element<ARG, TUITYPE>::type ITYPE;
-
-    if constexpr (std::tuple_size<TUITYPE>::value == ARG - 1) {
-
-        return [iarrays_in](typename CLTYPE::ftype func, NOTYPE oarray) {
-            func(std::get<ARG>(iarrays_in), oarray);
-        };
-
-    } else {
-
-        return [iarrays_in](typename CLTYPE::ftype func, NOTYPE oarray){
-            auto loop = method_for_impl<ITYPE::value_type, ITYPE::rank, ITYPE::symmetry, CLTYPE::input_rank,
-                                        typename NOTYPE::value_type, NOTYPE::rank, CLTYPE::output_rank,
-                                        OMP_LEVELS
-                    >(std::get<ARG>(iarrays_in));
-
-            loop(method_for_chained<TUITYPE, NOTYPE, CLTYPE, OMP_LEVELS>(iarrays_in)(func, oarray));
-        };
-
-    }
-
+template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0>
+constexpr auto method_for_nc(NITYPE iarray_in){
+    return method_for_nc_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::file_name, NITYPE::variable_name, NITYPE::symmetry, CLTYPE::input_rank,
+                              typename NOTYPE::value_type, NOTYPE::rank, NOTYPE::file_name, NOTYPE::variable_name,                   CLTYPE::output_rank,
+                              OMP_LEVELS>(iarray_in);
 }
-
-
 
 #endif
