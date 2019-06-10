@@ -8,19 +8,6 @@ open iterators
 
 // Define your library scripting code here
 
-        
-type Counter() =
-    let mutable num = 0
-    member this.Last = num-1
-    member this.This = num
-    member this.Next = num <- num + 1; num
-    member this.LastSuffix = 
-        String.concat "" ["__i"; (string (num - 1))]
-    member this.ThisSuffix = 
-        String.concat "" ["__i"; (string num)]
-    member this.NextSuffix = 
-        num <- num + 1
-        String.concat "" ["__i"; (string num)]
 
 let loopText itype iname (imin: int) (imax: int) =
     String.concat "" ["for("; itype; " "; iname; " = "; (string imin); "; "; iname; " < "; (string imax); "; "; iname; "++)";]
@@ -74,10 +61,6 @@ let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: stri
 
 
 
-
-
-let c = Counter()
-let d = Counter()
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray2"]
 let iextents = [ [2;3;4]; [5;6;7] ]
