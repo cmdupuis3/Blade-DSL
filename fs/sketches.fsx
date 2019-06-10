@@ -22,15 +22,15 @@ let tab x =
     x |> List.map (fun y -> String.concat "" ["\t"; y])
 
 let newln x = 
-    x |> List.map (fun y -> String.concat "" ["\n"; y])
+    x |> List.map (fun y -> String.concat "" [y; "\n"])
     
 let brace x = 
-    List.append [String.concat " " [x; "{\n"]] ["\n}"]
+    List.append [String.concat " " [x; "{\n"]] ["}\n"]
 
 
 let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) =
     match extents with
-    | [] -> (inner, String.concat "" [arrayName; "__i"; string (depth-1)], depth-1)
+    | [] -> (newln inner, String.concat "" [arrayName; "__i"; string (depth-1)], depth-1)
     | head::tail ->
         let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth+1)
         let braced = brace (loop 0 head depth)
@@ -38,12 +38,16 @@ let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (
             List.concat [ [braced.[0]];
                           tab [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; index (string depth) arrayName; ";\n"]]
                           tab (nextLoop);
-                          [braced.[1]] ], lastArrayName, lastDepth
+                          [braced.[1]] ],
+            lastArrayName,
+            lastDepth
         else
             List.concat [ [braced.[0]];
                           tab [String.concat "" ["auto "; arrayName; "__i"; string depth; " = "; (index (string depth) (String.concat "" [arrayName; "__i"; string (depth-1)])); ";\n"]]
                           tab (nextLoop);
-                          [braced.[1]] ], lastArrayName, lastDepth
+                          [braced.[1]] ],
+            lastArrayName,
+            lastDepth
 
 
 
@@ -66,5 +70,5 @@ let iarrays = ["iarray1"; "iarray2"]
 let iextents = [ [2;3;4]; [5;6;7] ]
 let oarray = "oarray"
 
-let p, q, r = unaryLoop iarrays.[0] iextents.[0] (newln inner) 0
-let x, y, z = naryLoop iarrays iextents (newln inner) 0
+let p, q, r = unaryLoop iarrays.[0] iextents.[0] inner 0
+let x, y, z = naryLoop iarrays iextents inner 0
