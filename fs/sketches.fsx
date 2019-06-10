@@ -31,7 +31,7 @@ let ompLine (i: int) =
 let declLine (i: int) itype =
     String.concat "" [itype; " __i"; string i; ";"]
 
-
+(* Unary nested_for loop *)
 let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) (counter: int) (ompLevels: int) =
     match extents with
     | [] -> (inner, String.concat "" [arrayName; "__i"; string (counter - 1)], depth - 1)
@@ -39,26 +39,22 @@ let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (
         let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth + 1) (counter + 1) (ompLevels - 1)
         let braced = brace (loopLine 0 head counter)
         let ompline = if ompLevels > 0 then [ompLine counter] else []
+        let nextArrayLine indexed = tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; indexed; ";\n"]]
         if depth = 0 then 
-            List.concat [ newln [declLine counter "int"];
-                          newln ompline;
-                          [braced.[0]];
-                          tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; index counter arrayName; ";\n"]]
-                          tab (nextLoop);
-                          [braced.[1]] ],
-            lastArrayName,
-            lastDepth
+            tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; index counter arrayName; ";\n"]]
         else
+            tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; (index counter (String.concat "" [arrayName; "__i"; string (counter-1)])); ";\n"]]
+        |> fun nextArrayLine ->
             List.concat [ newln [declLine counter "int"];
                           newln ompline;
                           [braced.[0]];
-                          tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; (index counter (String.concat "" [arrayName; "__i"; string (counter-1)])); ";\n"]]
-                          tab (nextLoop);
+                          nextArrayLine;
+                          tab nextLoop;
                           [braced.[1]] ],
             lastArrayName,
             lastDepth
 
-
+(* N-ary nested_for loop *)
 let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (arg: int) (ompLevels: int list) =
     assert (List.length arrayNames = List.length extents)
     match arrayNames with
