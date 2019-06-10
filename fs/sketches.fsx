@@ -44,13 +44,8 @@ let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (
             tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; index counter arrayName; ";\n"]]
         else
             tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; (index counter (String.concat "" [arrayName; "__i"; string (counter-1)])); ";\n"]]
-        |> fun nextArrayLine ->
-            List.concat [ newln [declLine counter "int"];
-                          newln ompline;
-                          [braced.[0]];
-                          nextArrayLine;
-                          tab nextLoop;
-                          [braced.[1]] ],
+        |> fun x ->
+            List.concat [ newln [declLine counter "int"]; newln ompline; [braced.[0]]; x; tab nextLoop; [braced.[1]] ],
             lastArrayName,
             lastDepth
 
