@@ -51,15 +51,16 @@ protected:
 
     int* dim_order;
 
-    size_t* extents; //< Length of dimensions; A value of -1 signifies a ragged dimension
+    size_t* extents; //< Length of dimensions; no ragged dimensions allowed
 
     int file_ncid;
     int var_ncid;
+    nc_type var_nctype;
     int* dim_ncids;
     string* dim_names;
     int* dim_var_ncids;
     nc_type* dim_var_types;
-    void** dim_var_values;
+    void** dim_var_vals;
 
 public:
     nested_netcdf_base_t(){};
@@ -72,7 +73,8 @@ public:
     static constexpr const int* symmetry = symmetry_groups;
     static constexpr const int rank = rank_t;
 
-    virtual void read() const {};
+    virtual void read() {};
+    virtual void write_init(nested_netcdf_base_t*, const int) const {};
     virtual void write() const {};
     auto get_data() const;
     constexpr int get_rank() const;
@@ -84,10 +86,7 @@ public:
     size_t next_extent() const;
     size_t extent(int) const;
     size_t* get_extents() const;
-
-    bool current_raggedness() const;
-    bool next_raggedness() const;
-    bool raggedness(int) const;
+    void set_extent(int, int);
 
     constexpr int current_symmetry_group() const;
     constexpr int next_symmetry_group() const;
@@ -98,8 +97,19 @@ public:
 
     const int file_id() const;
     const int var_id() const;
+    nc_type   var_type() const;
     int*      dim_ids() const;
     int       dim_id(int) const;
+    string*   get_dim_names() const;
+    string    dim_name(int) const;
+    int*      get_dim_var_ids() const;
+    int       dim_var_id(int) const;
+    nc_type*  get_dim_var_types() const;
+    nc_type   dim_var_type(int) const;
+    void**    get_dim_var_values() const;
+    void*     dim_var_values(int) const;
+
+    void check_dim_completeness() const;
 };
 
 
@@ -123,10 +133,10 @@ public:
     ~nested_netcdf_array_t();
 
     void read();
-    void write();
+    template<typename NITYPE> void write_init(NITYPE* iarray_in, const int forank_in);
+    void write() const;
 
-    const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> operator()(int, int) const; //< alias for 'down', plus a dereference; ragged state
-    const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> operator()(int) const;      //< alias for 'down', plus a dereference; non-ragged state
+    const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> operator()(int) const; //< alias for 'down', plus a dereference; non-ragged state
     DTYPE&                operator[](int);
     const DTYPE&          operator[](int) const;
 
@@ -136,7 +146,6 @@ public:
     nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>* operator/(int);                    //< split along this dimension
 
     const nested_netcdf_array_t<VTYPE, rank_t+1, FNAME, VNAME, symmetry_groups>* up() const;
-    const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* down(int, int) const;
     const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* down(int) const;
     const nested_netcdf_array_t<VTYPE, rank_t,   FNAME, VNAME, symmetry_groups>* next() const;
     const nested_netcdf_array_t<VTYPE, rank_t,   FNAME, VNAME, symmetry_groups>* first() const;
@@ -198,18 +207,8 @@ size_t* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-bool nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::current_raggedness() const {
-    return (this->extents[this->c_depth] == 0) ? true : false;
-}
-
-template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-bool nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::next_raggedness() const {
-    return (this->extents[this->c_depth + 1] == 0) ? true : false;
-}
-
-template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-bool nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::raggedness(int depth_in) const {
-    return (this->extents[depth_in] == 0) ? true : false;
+void nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::set_extent(int depth_in, int extent_in) {
+    this->extents[depth_in] = extent_in;
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
@@ -245,6 +244,11 @@ const int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::va
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+nc_type nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::var_type() const {
+    return this->var_nctype;
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 int* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_ids() const {
     return this->dim_ncids;
 }
@@ -253,21 +257,51 @@ template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[
 int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_id(int depth_in) const {
     return this->dim_ncids[depth_in];
 }
-/*
-auto nc_get_sanity_wrapper(nc_type type_in, void* buffer_in){
-    switch(type_in){
-        case(NC_DOUBLE):
 
-        case(NC_FLOAT):
-        case(NC_INT):
-        case(NC_LONG):
-        case():
-        case():
-        default:
-            exit(-2342);
-    }
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+string* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_names() const {
+    return this->dim_names;
 }
-*/
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+string nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_name(int depth_in) const {
+    return this->dim_names[depth_in];
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+int* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_var_ids() const {
+    return this->dim_var_ncids;
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_var_id(int depth_in) const {
+    return this->dim_var_ncids[depth_in];
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+nc_type* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_var_types() const {
+    return this->dim_var_types;
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+nc_type nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_var_type(int depth_in) const {
+    return this->dim_var_types[depth_in];
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+void* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_var_values(int depth_in) const {
+    return this->dim_var_vals[depth_in];
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+void**     nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_var_values() const {
+    return this->dim_var_vals;
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+void nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::check_dim_completeness() const {
+    return;
+}
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netcdf_array_t(int* dim_order_in){
@@ -284,10 +318,17 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
         }
     }
 
+    this->dim_ncids = new int[rank_t];
+    this->dim_names = new string[rank_t];
+    this->extents = new size_t[rank_t];
+    this->dim_var_ncids = new int[rank_t];
+    this->dim_var_types = new nc_type[rank_t];
+    this->dim_var_vals = new void*[rank_t];
+
     /** Open file and variable */
     int status = nc_create(FNAME, NC_NOCLOBBER, &(this->file_ncid));
     if (status == NC_EEXIST) {
-        // The file already exists; assume read or read/write mode
+        // The file already exists; assume read mode; read/write edge case not implemented because programming is hard
 
         nc_open(FNAME, NC_WRITE|NC_SHARE, &(this->file_ncid));
         nc_inq_varid(this->file_ncid, VNAME, &(this->var_ncid));
@@ -300,12 +341,13 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
             exit(-9001);
         }
 
+        /** Query variable type */
+        nc_inq_vartype(this->file_ncid, this->var_ncid, &(this->var_nctype));
+
         /** Query dimension IDs */
-        this->dim_ncids = new int[rank_t];
         nc_inq_vardimid(this->file_ncid, this->var_ncid, this->dim_ncids);
 
         /** Query dimension names */
-        this->dim_names = new string[rank_t];
         for(int i =0; i < rank_t; i++){
             char* tmp = new char[NC_MAX_NAME+1];
             nc_inq_dimname(this->file_ncid, this->dim_ncids[i], tmp);
@@ -313,41 +355,37 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
         }
 
         /** Query extents */
-        this->extents = new size_t[rank_t];
         for(int i = 0; i < rank_t; i++){
             nc_inq_dimlen(this->file_ncid, this->dim_ncids[i], &(this->extents[i]));
         }
 
         /** Query dimension variable IDs */
-        this->dim_var_ncids = new int[rank_t];
         for(int i =0; i < rank_t; i++){
             nc_inq_varid(this->file_ncid, this->dim_names[i].c_str(), &(this->dim_var_ncids[i]));
         }
 
         /** Query dimension variable types */
-        this->dim_var_types = new nc_type[rank_t];
         for(int i = 0; i < rank_t; i++){
             nc_inq_vartype(this->file_ncid, this->dim_var_ncids[i], &(this->dim_var_types[i]));
         }
 
         /** Query dimension values */
-        this->dim_var_values = new void*[rank_t];
         for(int i = 0; i < rank_t; i++){
             size_t* size = new size_t;
             nc_inq_type(this->file_ncid, this->dim_var_types[i], NULL, size);
-            this->dim_var_values[i] = malloc((*size) * this->extents[i]);
-            nc_get_var(this->file_ncid, this->dim_var_ncids[i], this->dim_var_values[i]);
+            this->dim_var_vals[i] = malloc((*size) * this->extents[i]);
+            nc_get_var(this->file_ncid, this->dim_var_ncids[i], this->dim_var_vals[i]);
         }
-
-        this->c_depth = 0;
-        this->indices = new int[rank_t];
-
-        this->parent = nullptr;
 
     } else {
         // The file does not exist; assume write mode
 
     }
+
+    this->c_depth = 0;
+    this->indices = new int[rank_t];
+
+    this->parent = nullptr;
 
 }
 
@@ -365,11 +403,19 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::operat
     this->dim_ncids = new int[rank_t];
     this->indices = new int[rank_t];
     this->dim_order = new int[rank_t];
+    this->dim_names = new string[rank_t];
+    this->dim_var_ncids = new int[rank_t];
+    this->dim_var_types = new nc_type[rank_t];
+    this->dim_var_vals = new void*[rank_t];
     for(int i = 0; i < rank_t; i++){
         this->extents[i] = array_in.extent(i);
         this->dim_ncids[i] = array_in.dim_id(i);
         this->indices[i] = array_in.get_indices(i);
         this->dim_order[i] = array_in.get_dim_order(i);
+        this->dim_names[i] = array_in.dim_name(i);
+        this->dim_var_ncids[i] = array_in.dim_var_id(i);
+        this->dim_var_types[i] = array_in.dim_var_type(i);
+        this->dim_var_vals[i] = array_in.dim_var_values(i);
     }
 
     this->data = array_in.get_data();
@@ -384,13 +430,18 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
 
     this->file_ncid = parent_in->file_id();
     this->var_ncid = parent_in->var_id();
+    this->var_nctype = parent_in->var_type();
 
     this->c_depth = parent_in->current_depth() + 1;
 
-    /** Shallow-copy extents, raggedness, dimension IDs, and dimension order */
+    /** Shallow-copy extents, dimension IDs, and dimension order */
     this->extents = parent_in->get_extents();
     this->dim_ncids = parent_in->dim_ids();
     this->dim_order = parent_in->get_dim_order();
+    this->dim_names = parent_in->get_dim_names();
+    this->dim_var_ncids = parent_in->get_dim_var_ids();
+    this->dim_var_types = parent_in->get_dim_var_types();
+    this->dim_var_vals = parent_in->get_dim_var_values();
 
     /** Deep-copy indices */
     this->indices = new int[rank_t + this->c_depth];
@@ -414,6 +465,7 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::~nested_net
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read(){
 
+    // *must* do this because NetCDF only accepts 1-D arrays
     if constexpr (rank_t == 1) {
 
         size_t starts[rank_t + this->c_depth];
@@ -439,8 +491,8 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read()
 
     } else {
 
-        for (int i = 0; i < this->current_extent(); i++) {
-            this->down(i).read();
+        for (size_t i = 0; i < this->current_extent(); i++) {
+            this->down(i)->read();
         }
 
     }
@@ -448,8 +500,20 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read()
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write(){
+template<typename NITYPE> void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write_init(NITYPE* iarray_in, const int forank_in){
 
+    for(int i = 0; i < rank_t - forank_in; i++){
+        nc_def_dim(this->file_id(), iarray_in->dim_name(i).c_str(), iarray_in->extent(i), &(this->dim_ids()[i]));
+        nc_def_var(this->file_id(), iarray_in->dim_name(i).c_str(), iarray_in->dim_var_type(i), 1, &(this->dim_ids()[i]), &(this->get_dim_var_ids()[i]));
+        nc_put_var(this->file_id(), this->dim_var_id(i), iarray_in->dim_var_values(i));
+    }
+
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write() const{
+
+    // *must* do this because NetCDF only accepts 1-D arrays
     if constexpr (rank_t == 1) {
 
         size_t starts[rank_t + this->c_depth];
@@ -471,8 +535,8 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write(
 
     } else {
 
-        for (int i = 0; i < this->current_extent(); i++) {
-            this->down(i).write();
+        for (size_t i = 0; i < this->current_extent(); i++) {
+            this->down(i)->write();
         }
 
     }
@@ -491,35 +555,6 @@ const nested_netcdf_array_t<VTYPE, rank_t+1, FNAME, VNAME, symmetry_groups>* nes
     return this->parent;
 }
 
-/** \brief Index into next (ragged) dimension.
- *
- * @param index_in
- * @param extent_in
- * @return
- */
-
-template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::down(int index_in, int extent_in) const {
-
-    if(this->c_depth == rank_t){
-        cout << "Cannot index any further down" << endl;
-        exit(-3);
-    }
-
-    if(!this->current_raggedness()){
-        cout << "This is not a ragged dimension; use '(int)' instead.";
-        exit(-8);
-    }else{
-        this->indices[this->dim_order[this->c_depth]-1] = index_in;
-        this->extents[this->dim_order[this->c_depth+1]-1] = extent_in;
-        nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* out;
-        out = new nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>(this, index_in);
-
-        return out;
-    }
-
-    return nullptr;
-}
 /** \brief Index into next (non-ragged) dimension.
  *
  * @param index_in
@@ -534,15 +569,10 @@ const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* nes
         exit(-3);
     }
 
-    if(this->current_raggedness()){
-        cout << "This is a ragged dimension; use '(int, int)' instead.";
-        exit(-9);
-    }else{
-        this->indices[this->dim_order[this->c_depth]-1] = index_in;
-        nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* out;
-        out = new nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>(this, index_in);
-        return out;
-    }
+    this->indices[this->dim_order[this->c_depth]-1] = index_in;
+    nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* out;
+    out = new nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>(this, index_in);
+    return out;
 
     return nullptr;
 }
@@ -566,12 +596,6 @@ const nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>* neste
     nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>* out;
     out = new nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>(this->parent, 0);
     return out;
-}
-
-
-template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::operator()(int index_in, int extent_in) const {
-    return *(this->down(index_in, extent_in));
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
