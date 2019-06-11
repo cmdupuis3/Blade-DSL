@@ -128,34 +128,26 @@ let rec vStates (arrayNames: string list) (symGroups: string list list) (comGrou
                         if isSym symGroups.[index+1] then SymcomState.Symmetric else SymcomState.Neither
             )
 
-let rec imins (arrayNames: string list) (extents: int list list) (symGroups: int list list) (comGroups: int list) = 
+
+let imins (arrayNames: string list) (extents: int list list) (symGroups: string list list) (comGroups: string list) = 
     assert (List.length arrayNames = List.length extents)
     assert (List.length arrayNames = List.length symGroups)
     assert (List.length arrayNames = List.length comGroups)
 
-    match arrayNames with
-    | [] -> failwith "asdfsdfsfa"
-    | arrHead :: arrTail ->
-        let ranks = rankList extents
-        let indices = indNames2 0 ranks
+    let ranks = rankList extents
+    let indices = indNames2 0 ranks
+    let cimins = comImins comGroups indices
+    let states = vStates arrayNames symGroups comGroups
 
-        let extHead, extTail = List.head extents, List.tail extents
-        let comHead, comTail = List.head comGroups, List.tail comGroups
-        let symHead, symTail = List.head symGroups, List.tail symGroups
-        let rankHead, rankTail = List.head ranks, List.tail ranks
-        let indsHead, indsTail = List.head indices, List.tail indices
-
-        let state : SymcomState = 
-            if comHead = List.head comTail && arrHead = List.head arrTail then
-                if symHead = List.head symTail then SymcomState.Both else SymcomState.Commutative
-            else 
-                if symHead = List.head symTail then SymcomState.Symmetric else SymcomState.Neither
-
-        match state with
-        | SymcomState.Neither     -> List.init rankHead (fun index -> 0)
-        | SymcomState.Symmetric   -> List.init rankHead (fun index -> if index = 0 then 0 else indsHead.[index-1])
-        | SymcomState.Commutative -> List.init rankHead (fun index -> if index = 0 then 0 else indices.[index-1])
-        | SymcomState.Both        -> 
+    List.init (List.length arrayNames) (
+        fun index -> 
+            match states.[index] with
+            | SymcomState.Neither     -> List.init ranks.[index] (fun x -> string 0)
+            | SymcomState.Symmetric   -> symImins symGroups.[index] indices.[index]
+            | SymcomState.Commutative -> cimins.[index]
+            | SymcomState.Both        -> cimins.[index] // can optimize more, just lazy
+            | _                       -> failwith "Invalid symmetry/commutativity state"
+    )
 
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray2"; "iarray3"]
