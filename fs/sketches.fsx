@@ -63,12 +63,12 @@ let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: stri
         thisLoop, thisArrayName :: nextArrayName, thisDepth + nextDepth + 1
 
 
-let rec ranks extents = 
+let rec rankList extents = 
     match extents with
     | [] -> []
-    | head :: tail -> (List.length head) :: ranks tail
+    | head :: tail -> (List.length head) :: rankList tail
 
-let indName (i: int) = [String.concat "" ["__i"; (string i)]]
+let indName (i: int) = String.concat "" ["__i"; (string i)]
 
 let rec indNames min max =
     List.init (max - min) (fun index -> indName (index + min))
@@ -78,8 +78,7 @@ let rec indNames2 min ranks =
     | [] -> []
     | head :: tail -> indNames min (min+head) :: indNames2 (min+head) tail
 
-
-let rec comImins (comGroups: int list) (inames: string list list) =
+let rec comIminsRev (comGroups: string list) (inames: string list list) =
     let inhead, intail = List.head inames, List.tail inames
     match comGroups with
     | []           -> []
@@ -87,8 +86,26 @@ let rec comImins (comGroups: int list) (inames: string list list) =
     | head :: tail -> ( if head = (List.head tail) then 
                             List.init (List.length inhead) (fun index -> (List.head intail).[index])
                         else 
-                            List.init (List.length inhead) (fun index -> string 0) ) :: (comImins tail intail) 
+                            List.init (List.length inhead) (fun index -> string 0) ) :: (comIminsRev tail intail) 
 
+let comImins (comGroups: string list) (inames: string list list) =
+    List.rev (comIminsRev comGroups inames)
+
+let rec isSym symGroup =
+    match symGroup with
+    | [] -> false
+    | [head] -> false
+    | head :: tail -> if head = List.head tail then true else isSym tail
+
+let rec symIminsRev (symGroups: string list) (inames: string list) = 
+    match symGroups with
+    | [] -> []
+    | [head] -> [string 0]
+    | head :: mid :: tail -> (if head = mid then inames.[1] else string 0) :: (symIminsRev (mid :: tail) (List.tail inames))
+
+let symImins (symGroups: string list) (inames: string list) = 
+    List.rev (symIminsRev symGroups inames)
+    
 type SymcomState =
 | Symmetric   = 0
 | Commutative = 1
