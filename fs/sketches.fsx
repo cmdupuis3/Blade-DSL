@@ -63,6 +63,21 @@ let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: stri
         thisLoop, thisArrayName :: nextArrayName, thisDepth + nextDepth + 1
 
 
+let rec ranks extents = 
+    match extents with
+    | [] -> []
+    | head :: tail -> (List.length head) :: ranks tail
+
+let indName (i: int) = [String.concat "" ["__i"; (string i)]]
+
+let rec indNames min max =
+    List.init (max - min) (fun index -> indName (index + min))
+
+let rec indNames2 min ranks =
+    match ranks with
+    | [] -> []
+    | head :: tail -> indNames min (min+head) :: indNames2 (min+head) tail
+    
 
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray2"; "iarray3"]
