@@ -78,18 +78,19 @@ let rec indNames2 min ranks =
     | [] -> []
     | head :: tail -> indNames min (min+head) :: indNames2 (min+head) tail
 
-let rec comIminsRev (comGroups: string list) (inames: string list list) =
+let rec comImins (comGroups: string list) (inames: string list list) =
     let inhead, intail = List.head inames, List.tail inames
     match comGroups with
     | []           -> []
     | [head]       -> [List.init (List.length inhead) (fun index -> string 0)]
-    | head :: tail -> ( if head = (List.head tail) then 
-                            List.init (List.length inhead) (fun index -> (List.head intail).[index])
-                        else 
-                            List.init (List.length inhead) (fun index -> string 0) ) :: (comIminsRev tail intail) 
-
-let comImins (comGroups: string list) (inames: string list list) =
-    List.rev (comIminsRev comGroups inames)
+    | head :: tail -> (List.init (List.length inhead) (fun index -> string 0)) ::
+                      List.init (List.length tail) (
+                          fun index ->
+                              if comGroups.[index+1] = comGroups.[index] then
+                                  List.init (List.length intail.[index]) (fun index -> inhead.[index])
+                              else 
+                                  List.init (List.length intail.[index]) (fun index -> string 0)
+                      )
 
 let rec isSym symGroup =
     match symGroup with
