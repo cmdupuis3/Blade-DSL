@@ -112,6 +112,22 @@ type SymcomState =
 | Both        = 2
 | Neither     = 3
 
+let rec vStates (arrayNames: string list) (symGroups: string list list) (comGroups: string list) = 
+    match arrayNames with 
+    | [] -> []
+    | arrHead :: arrTail ->
+        match arrTail with
+        | [] -> [(if isSym (List.head symGroups) then SymcomState.Symmetric else SymcomState.Neither)]
+        | _  -> 
+            SymcomState.Neither :: 
+            List.init ((List.length arrayNames)-1) (
+                fun index ->
+                    if comGroups.[index+1] = comGroups.[index] && arrayNames.[index+1] = arrayNames.[index] then
+                        if isSym symGroups.[index+1] then SymcomState.Both else SymcomState.Commutative
+                    else 
+                        if isSym symGroups.[index+1] then SymcomState.Symmetric else SymcomState.Neither
+            )
+
 let rec imins (arrayNames: string list) (extents: int list list) (symGroups: int list list) (comGroups: int list) = 
     assert (List.length arrayNames = List.length extents)
     assert (List.length arrayNames = List.length symGroups)
