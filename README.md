@@ -112,7 +112,7 @@ parallelize with OpenMP to the nested iterator declaration like so...
 Also, if your input data is symmetric between some neighboring dimensions, you can declare a symmetry vector for it by
 initializing a native C-array of size equal to the rank of the input array. Assign a unique number for every symmetry
 group. A symmetry group contains only dimensions that are mutually symmetric. If a dimension is not symmetric with any
-other, it is in its own symmetry group. The symmetry group must be passed to the input array as a template parameter,
+other, it is in its own symmetry group. The symmetry vector must be passed to the input array as a template parameter,
 and likewise the closure inputs must have it as well.
 ```cpp
     static constexpr int symmetry[23] = {1,1,1,4,4,4,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
