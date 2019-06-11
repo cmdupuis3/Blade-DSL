@@ -49,11 +49,12 @@ let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (
             lastArrayName,
             lastDepth
 
+
 (* N-ary nested_for loop *)
 let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (arg: int) (ompLevels: int list) =
     assert (List.length arrayNames = List.length extents)
     match arrayNames with
-    | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in loopNestRec
+    | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in unaryLoop
     | [head] -> 
         let lastLoop, lastArrayName, lastDepth = unaryLoop head extents.[0] inner 0 0 ompLevels.[0]
         lastLoop, [lastArrayName], lastDepth
@@ -63,9 +64,10 @@ let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: stri
         thisLoop, thisArrayName :: nextArrayName, thisDepth + nextDepth + 1
 
 
+
 let rec rankList extents = 
     match extents with
-    | [] -> []
+    | []           -> []
     | head :: tail -> (List.length head) :: rankList tail
 
 let indName (i: int) = String.concat "" ["__i"; (string i)]
@@ -75,7 +77,7 @@ let rec indNames min max =
 
 let rec indNames2 min ranks =
     match ranks with
-    | [] -> []
+    | []           -> []
     | head :: tail -> indNames min (min+head) :: indNames2 (min+head) tail
 
 let rec comImins (comGroups: string list) (inames: string list list) =
@@ -94,19 +96,19 @@ let rec comImins (comGroups: string list) (inames: string list list) =
 
 let rec isSym symGroup =
     match symGroup with
-    | [] -> false
-    | [head] -> false
+    | []           -> false
+    | [head]       -> false
     | head :: tail -> if head = List.head tail then true else isSym tail
 
-let rec symIminsRev (symGroups: string list) (inames: string list) = 
-    match symGroups with
-    | [] -> []
-    | [head] -> [string 0]
-    | head :: mid :: tail -> (if head = mid then inames.[1] else string 0) :: (symIminsRev (mid :: tail) (List.tail inames))
 
 let symImins (symGroups: string list) (inames: string list) = 
+    let rec symIminsRev (symGroupsInternal: string list) (inamesInternal: string list) = 
+        match symGroupsInternal with
+        | []                  -> []
+        | [head]              -> [string 0]
+        | head :: mid :: tail -> (if head = mid then inamesInternal.[1] else string 0) :: (symIminsRev (mid :: tail) (List.tail inamesInternal))
     List.rev (symIminsRev symGroups inames)
-    
+
 type SymcomState =
 | Symmetric   = 0
 | Commutative = 1
@@ -129,7 +131,6 @@ let rec vStates (arrayNames: string list) (symGroups: string list list) (comGrou
                         if isSym symGroups.[index+1] then SymcomState.Symmetric else SymcomState.Neither
             )
 
-
 let imins (arrayNames: string list) (extents: int list list) (symGroups: string list list) (comGroups: string list) = 
     assert (List.length arrayNames = List.length extents)
     assert (List.length arrayNames = List.length symGroups)
@@ -151,9 +152,11 @@ let imins (arrayNames: string list) (extents: int list list) (symGroups: string 
     )
 
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
-let iarrays = ["iarray1"; "iarray2"; "iarray3"]
-let iextents = [ [2;3;4]; [5;6;7]; [7;8] ]
+let iarrays = ["iarray1"; "iarray1"; "iarray2"; "iarray3"]
+let iextents = [ [2;3;4]; [5;6;7]; [7;8]; [2;3] ]
 let oarray = "oarray"
+let symm = [ ["1";"2";"3"]; ["1";"2";"3"]; ["1";"1"]; ["1";"2"] ]
+let comm = ["1";"1";"2";"3"]
 
 let p, q, r = unaryLoop iarrays.[0] iextents.[0] (newln inner) 0 3 2
 let x, y, z = naryLoop iarrays iextents (newln inner) 0 [2;1;0]
