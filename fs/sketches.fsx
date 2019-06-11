@@ -77,7 +77,52 @@ let rec indNames2 min ranks =
     match ranks with
     | [] -> []
     | head :: tail -> indNames min (min+head) :: indNames2 (min+head) tail
-    
+
+
+let rec comImins (comGroups: int list) (inames: string list list) =
+    let inhead, intail = List.head inames, List.tail inames
+    match comGroups with
+    | []           -> []
+    | [head]       -> [List.init (List.length inhead) (fun index -> string 0)]
+    | head :: tail -> ( if head = (List.head tail) then 
+                            List.init (List.length inhead) (fun index -> (List.head intail).[index])
+                        else 
+                            List.init (List.length inhead) (fun index -> string 0) ) :: (comImins tail intail) 
+
+type SymcomState =
+| Symmetric   = 0
+| Commutative = 1
+| Both        = 2
+| Neither     = 3
+
+let rec imins (arrayNames: string list) (extents: int list list) (symGroups: int list list) (comGroups: int list) = 
+    assert (List.length arrayNames = List.length extents)
+    assert (List.length arrayNames = List.length symGroups)
+    assert (List.length arrayNames = List.length comGroups)
+
+    match arrayNames with
+    | [] -> failwith "asdfsdfsfa"
+    | arrHead :: arrTail ->
+        let ranks = rankList extents
+        let indices = indNames2 0 ranks
+
+        let extHead, extTail = List.head extents, List.tail extents
+        let comHead, comTail = List.head comGroups, List.tail comGroups
+        let symHead, symTail = List.head symGroups, List.tail symGroups
+        let rankHead, rankTail = List.head ranks, List.tail ranks
+        let indsHead, indsTail = List.head indices, List.tail indices
+
+        let state : SymcomState = 
+            if comHead = List.head comTail && arrHead = List.head arrTail then
+                if symHead = List.head symTail then SymcomState.Both else SymcomState.Commutative
+            else 
+                if symHead = List.head symTail then SymcomState.Symmetric else SymcomState.Neither
+
+        match state with
+        | SymcomState.Neither     -> List.init rankHead (fun index -> 0)
+        | SymcomState.Symmetric   -> List.init rankHead (fun index -> if index = 0 then 0 else indsHead.[index-1])
+        | SymcomState.Commutative -> List.init rankHead (fun index -> if index = 0 then 0 else indices.[index-1])
+        | SymcomState.Both        -> 
 
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray2"; "iarray3"]
