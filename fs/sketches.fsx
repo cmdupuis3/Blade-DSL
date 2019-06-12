@@ -7,64 +7,6 @@ open iterators
 // Define your library scripting code here
 
 
-let loopText iname (imin: int) (imax: int) =
-    String.concat "" ["for("; iname; " = "; (string imin); "; "; iname; " < "; (string imax); "; "; iname; "++)";]
-
-let loopLine (imin: int) (imax: int) (ctr: int) =
-    loopText (String.concat "" ["__i"; (string ctr)]) imin imax
-
-let index (i: int) arrayName =
-    String.concat "" [arrayName; "(__i"; string i; ")"]
-
-let tab x = 
-    x |> List.map (fun y -> String.concat "" ["\t"; y])
-
-let newln x = 
-    x |> List.map (fun y -> String.concat "" [y; "\n"])
-    
-let brace x = 
-    List.append [String.concat " " [x; "{\n"]] ["}\n"]
-
-let ompLine (i: int) =
-    String.concat "" ["#pragma omp parallel for private(__i"; string i; ")"]
-
-let declLine (i: int) itype =
-    String.concat "" [itype; " __i"; string i; ";"]
-
-(* Unary nested_for loop *)
-let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) (counter: int) (ompLevels: int) =
-    match extents with
-    | [] -> (inner, String.concat "" [arrayName; "__i"; string (counter - 1)], depth - 1)
-    | head :: tail ->
-        let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth + 1) (counter + 1) (ompLevels - 1)
-        let braced = brace (loopLine 0 head counter)
-        let ompline = if ompLevels > 0 then [ompLine counter] else []
-        let nextArrayLine indexed = tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; indexed; ";\n"]]
-        if depth = 0 then 
-            tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; index counter arrayName; ";\n"]]
-        else
-            tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; (index counter (String.concat "" [arrayName; "__i"; string (counter-1)])); ";\n"]]
-        |> fun x ->
-            List.concat [ newln [declLine counter "int"]; newln ompline; [braced.[0]]; x; tab nextLoop; [braced.[1]] ],
-            lastArrayName,
-            lastDepth
-
-
-(* N-ary nested_for loop *)
-let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (arg: int) (ompLevels: int list) =
-    assert (List.length arrayNames = List.length extents)
-    match arrayNames with
-    | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in unaryLoop
-    | [head] -> 
-        let lastLoop, lastArrayName, lastDepth = unaryLoop head extents.[0] inner 0 0 ompLevels.[0]
-        lastLoop, [lastArrayName], lastDepth
-    | head :: tail ->
-        let nextLoop, nextArrayName, nextDepth = naryLoop tail extents.[1..] inner (arg + 1) ompLevels.[1..]
-        let thisLoop, thisArrayName, thisDepth = unaryLoop head extents.[0] (nextLoop) 0 (nextDepth + 1) ompLevels.[0]
-        thisLoop, thisArrayName :: nextArrayName, thisDepth + nextDepth + 1
-
-
-
 let rec rankList extents = 
     match extents with
     | []           -> []
@@ -151,12 +93,92 @@ let imins (arrayNames: string list) (extents: int list list) (symGroups: string 
             | _                       -> failwith "Invalid symmetry/commutativity state"
     )
 
+
+
+let loopLine iName iMin arrayName =
+    String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; arrayName; ".current_extent(); "; iName; "++)";]
+
+let index arrayName iName =
+    String.concat "" [arrayName; "("; iName; ")"]
+
+let tab x = 
+    x |> List.map (fun y -> String.concat "" ["\t"; y])
+
+let newln x = 
+    x |> List.map (fun y -> String.concat "" [y; "\n"])
+    
+let brace x = 
+    List.append [String.concat " " [x; "{\n"]] ["}\n"]
+
+let ompLine iName =
+    String.concat "" ["#pragma omp parallel for private("; iName; ")"]
+
+let declLine iType iName =
+    String.concat "" [iType; " "; iName; " = 0;"]
+
+(* Unary nested_for loop *)
+(*
+let rec unaryLoop (arrayName: string) (extents: int list) (inner: string list) (depth: int) (counter: int) (ompLevels: int) =
+    match extents with
+    | [] -> (inner, String.concat "" [arrayName; "__i"; string (counter - 1)], depth - 1)
+    | head :: tail ->
+        let nextLoop, lastArrayName, lastDepth = unaryLoop arrayName tail inner (depth + 1) (counter + 1) (ompLevels - 1)
+        let braced = brace (loopLine 0 head counter)
+        let ompline = if ompLevels > 0 then [ompLine counter] else []
+        let nextArrayLine indexed = tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; indexed; ";\n"]]
+        if depth = 0 then 
+            tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; index counter arrayName; ";\n"]]
+        else
+            tab [String.concat "" ["auto "; arrayName; "__i"; string counter; " = "; (index counter (String.concat "" [arrayName; "__i"; string (counter-1)])); ";\n"]]
+        |> fun x ->
+            List.concat [ newln [declLine counter "int"]; newln ompline; [braced.[0]]; x; tab nextLoop; [braced.[1]] ],
+            lastArrayName,
+            lastDepth
+*)
+
+(* N-ary nested_for loop *)
+(*
+let rec naryLoop (arrayNames: string list) (extents: int list list) (inner: string list) (arg: int) (ompLevels: int list) =
+    assert (List.length arrayNames = List.length extents)
+    match arrayNames with
+    | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in unaryLoop
+    | [head] -> 
+        let lastLoop, lastArrayName, lastDepth = unaryLoop head extents.[0] inner 0 0 ompLevels.[0]
+        lastLoop, [lastArrayName], lastDepth
+    | head :: tail ->
+        let nextLoop, nextArrayName, nextDepth = naryLoop tail extents.[1..] inner (arg + 1) ompLevels.[1..]
+        let thisLoop, thisArrayName, thisDepth = unaryLoop head extents.[0] (nextLoop) 0 (nextDepth + 1) ompLevels.[0]
+        thisLoop, thisArrayName :: nextArrayName, thisDepth + nextDepth + 1
+*)
+
+let rec unaryLoop (arrayName: string) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
+    let indHead, indTail = List.head indNames, List.tail indNames
+    let iminHead, iminTail = List.head iMins, List.tail iMins
+    let sliced = String.concat "" [arrayName; indHead]
+
+    List.init (List.head (rankList [indNames])) (
+        fun i -> 
+            let ompline = if ompLevels > i then [ompLine indNames.[i]] else []
+            let braced = match i with
+                         | 0 -> brace (loopLine indNames.[i] iMins.[i] arrayName)
+                         | _ -> brace (loopLine indNames.[i] iMins.[i] (String.concat "" [arrayName; indNames.[i]]))
+            match i with
+            | 0   -> tab [String.concat "" ["auto "; arrayName; indNames.[i]; " = "; index arrayName indNames.[i]; ";\n"]]
+            | _   -> tab [String.concat "" ["auto "; arrayName; indNames.[i]; " = "; (index (String.concat "" [arrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
+            |> fun x -> fun y -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; x; tab y; [braced.[1]] ]
+    )
+    |> List.rev
+    |> List.fold (fun i elem -> elem i) inner
+
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray1"; "iarray2"; "iarray3"]
 let iextents = [ [2;3;4]; [5;6;7]; [7;8]; [2;3] ]
 let oarray = "oarray"
 let symm = [ ["1";"2";"3"]; ["1";"2";"3"]; ["1";"1"]; ["1";"2"] ]
 let comm = ["1";"1";"2";"3"]
+
+let mins = iminList iarrays symm comm
+let a = unaryLoop iarrays.[0] (indNames2 0 (rankList symm)).[0] mins.[0] (newln inner) 1
 
 let p, q, r = unaryLoop iarrays.[0] iextents.[0] (newln inner) 0 3 2
 let x, y, z = naryLoop iarrays iextents (newln inner) 0 [2;1;0]
