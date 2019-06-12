@@ -1,3 +1,4 @@
+open System.IO
 // Learn more about F# at http://fsharp.org
 // See the 'F# Tutorial' project for more help.
 
@@ -11,7 +12,8 @@ let rec rankList extents =
     | []           -> []
     | head :: tail -> (List.length head) :: rankList tail
 
-let indName (i: int) = String.concat "" ["__i"; (string i)]
+let indName (i: int) = 
+    String.concat "" ["__i"; (string i)]
 
 let rec indNames min max =
     List.init (max - min) (fun index -> indName (index + min))
@@ -23,32 +25,30 @@ let rec indNames2 min ranks =
 
 let rec comImins (comGroups: string list) (inames: string list list) =
     let inhead, intail = List.head inames, List.tail inames
+
+    (List.init (List.length inhead) (fun index -> string 0)) ::
     match comGroups with
-    | []           -> []
-    | [head]       -> [List.init (List.length inhead) (fun index -> string 0)]
-    | head :: tail -> (List.init (List.length inhead) (fun index -> string 0)) ::
-                      List.init (List.length tail) (
-                          fun index ->
-                              if comGroups.[index+1] = comGroups.[index] then
-                                  List.init (List.length intail.[index]) (fun index -> inhead.[index])
-                              else 
-                                  List.init (List.length intail.[index]) (fun index -> string 0)
-                      )
+    | []           -> [] 
+    | [head]       -> []
+    | head :: tail -> 
+        List.init (List.length tail) (
+            fun index ->
+                if comGroups.[index+1] = comGroups.[index] then
+                    List.init (List.length intail.[index]) (fun index -> inhead.[index])
+                else 
+                    List.init (List.length intail.[index]) (fun index -> string 0)
+        )
 
 let rec isSym symGroup =
     match symGroup with
     | []           -> false
     | [head]       -> false
     | head :: tail -> if head = List.head tail then true else isSym tail
-
-
+    
 let symImins (symGroups: string list) (inames: string list) = 
-    let rec symIminsRev (symGroupsInternal: string list) (inamesInternal: string list) = 
-        match symGroupsInternal with
-        | []                  -> []
-        | [head]              -> [string 0]
-        | head :: mid :: tail -> (if head = mid then inamesInternal.[0] else string 0) :: (symIminsRev (mid :: tail) (List.tail inamesInternal))
-    List.rev (symIminsRev symGroups inames)
+    List.init (List.length symGroups) (
+        fun i -> if i = 0 then string 0 else if symGroups.[i] = symGroups.[i-1] then inames.[i-1] else string 0
+    )
 
 type SymcomState =
 | Symmetric   = 0
@@ -60,10 +60,10 @@ let rec vStates (arrayNames: string list) (symGroups: string list list) (comGrou
     match arrayNames with 
     | [] -> []
     | arrHead :: arrTail ->
+        (if isSym (List.head symGroups) then SymcomState.Symmetric else SymcomState.Neither) ::
         match arrTail with
-        | [] -> [(if isSym (List.head symGroups) then SymcomState.Symmetric else SymcomState.Neither)]
+        | [] -> []
         | _  -> 
-            SymcomState.Neither :: 
             List.init ((List.length arrayNames)-1) (
                 fun index ->
                     if comGroups.[index+1] = comGroups.[index] && arrayNames.[index+1] = arrayNames.[index] then
@@ -129,7 +129,7 @@ let unaryLoop (arrayName: string) (indNames: string list) (iMins: string list) (
 
 let rec catLoops (arrayNames: string list) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) = 
     match arrayNames with
-    | [] -> failwith "Empty array names list." // Should be impossible for recursive calls; N-ary nested_for should terminate in unaryLoop
+    | [] -> failwith "Empty array names list."
     | _  ->
         let arrHead, arrTail = List.head arrayNames, List.tail arrayNames
         let indHead, indTail = List.head indNames, List.tail indNames
@@ -137,7 +137,7 @@ let rec catLoops (arrayNames: string list) (indNames: string list list) (iMins: 
         let ompHead, ompTail = List.head ompLevels, List.tail ompLevels
 
         match arrayNames with
-        | [] -> failwith "Impossible match."
+        | [] -> failwith "Impossible match." // Should be impossible for recursive calls; N-ary nested_for should terminate in unaryLoop
         | [head]       -> [(fun i -> unaryLoop arrHead indHead iminHead i ompHead)]
         | head :: tail ->  (fun i -> unaryLoop arrHead indHead iminHead i ompHead) :: catLoops arrTail indTail iminTail inner ompTail
 
@@ -147,20 +147,20 @@ let rec naryLoop (arrayNames: string list) (indNames: string list list) (iMins: 
     assert (List.length arrayNames = List.length ompLevels)
 
     catLoops arrayNames indNames iMins inner ompLevels
-    |> List.rev    
+    |> List.rev
     |> List.fold (fun i elem -> elem i) inner
+
 
 
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray1"; "iarray2"; "iarray3"]
 let iextents = [ [2;3;4]; [5;6;7]; [7;8]; [2;3] ]
 let oarray = "oarray"
-let symm = [ ["1";"2";"3"]; ["1";"2";"3"]; ["1";"1"]; ["1";"2"] ]
+let symm = [ ["1";"1";"3"]; ["1";"1";"3"]; ["1";"1"]; ["1";"2"] ]
 let comm = ["1";"1";"2";"3"]
 
-let mins = iminList iarrays symm comm
 
+let mins = iminList iarrays symm comm
 let ind = 2
 let a = unaryLoop iarrays.[ind] (indNames2 0 (rankList symm)).[ind] mins.[ind] (newln inner) 1
 let b = naryLoop iarrays (indNames2 0 (rankList symm)) mins (newln inner) [1;0;0;0]
-
