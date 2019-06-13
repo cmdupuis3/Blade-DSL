@@ -150,6 +150,15 @@ let rec naryLoop (arrayNames: string list) (indNames: string list list) (iMins: 
     |> List.rev
     |> List.fold (fun i elem -> elem i) inner
 
+let lastArrayNames (arrayNames: string list) (indNames: string list list) =
+    List.init (List.length arrayNames) (
+        fun i ->
+            match indNames.[i] with
+            | [] -> failwith "Empty index names list."
+            | [head] -> head
+            | head :: tail -> List.last indNames.[i]
+            |> fun x -> String.concat "" [arrayNames.[i]; x]
+    )
 
 
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
