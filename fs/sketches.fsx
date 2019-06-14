@@ -1,11 +1,10 @@
+
 open System.IO
-// Learn more about F# at http://fsharp.org
-// See the 'F# Tutorial' project for more help.
+
 
 #load "sketches.fs"
 open iterators
 
-// Define your library scripting code here
 
 let rec rankList extents = 
     match extents with
@@ -26,27 +25,27 @@ let rec indNames2 min ranks =
 let rec comImins (comGroups: string list) (inames: string list list) =
     let inhead, intail = List.head inames, List.tail inames
 
-    (List.init (List.length inhead) (fun index -> string 0)) ::
+    (List.init inhead.Length (fun index -> string 0)) ::
     match comGroups with
     | []           -> [] 
     | [head]       -> []
     | head :: tail -> 
-        List.init (List.length tail) (
+        List.init tail.Length (
             fun index ->
                 if comGroups.[index+1] = comGroups.[index] then
-                    List.init (List.length intail.[index]) (fun index -> inhead.[index])
+                    List.init intail.[index].Length (fun index -> inhead.[index])
                 else 
-                    List.init (List.length intail.[index]) (fun index -> string 0)
+                    List.init intail.[index].Length (fun index -> string 0)
         )
 
 let rec isSym symGroup =
     match symGroup with
     | []           -> false
     | [head]       -> false
-    | head :: tail -> if head = List.head tail then true else isSym tail
+    | head :: tail -> if head = tail.Head then true else isSym tail
     
 let symImins (symGroups: string list) (inames: string list) = 
-    List.init (List.length symGroups) (
+    List.init symGroups.Length (
         fun i -> if i = 0 then string 0 else if symGroups.[i] = symGroups.[i-1] then inames.[i-1] else string 0
     )
 
@@ -60,11 +59,11 @@ let rec vStates (arrayNames: string list) (symGroups: string list list) (comGrou
     match arrayNames with 
     | [] -> []
     | arrHead :: arrTail ->
-        (if isSym (List.head symGroups) then SymcomState.Symmetric else SymcomState.Neither) ::
+        (if isSym symGroups.Head then SymcomState.Symmetric else SymcomState.Neither) ::
         match arrTail with
         | [] -> []
         | _  -> 
-            List.init ((List.length arrayNames)-1) (
+            List.init (arrayNames.Length - 1) (
                 fun index ->
                     if comGroups.[index+1] = comGroups.[index] && arrayNames.[index+1] = arrayNames.[index] then
                         if isSym symGroups.[index+1] then SymcomState.Both else SymcomState.Commutative
@@ -73,15 +72,15 @@ let rec vStates (arrayNames: string list) (symGroups: string list list) (comGrou
             )
 
 let iminList (arrayNames: string list) (symGroups: string list list) (comGroups: string list) = 
-    assert (List.length arrayNames = List.length symGroups)
-    assert (List.length arrayNames = List.length comGroups)
+    assert (arrayNames.Length = symGroups.Length)
+    assert (arrayNames.Length = comGroups.Length)
 
     let ranks = rankList symGroups
     let indexNames = indNames2 0 ranks
     let cimins = comImins comGroups indexNames
     let states = vStates arrayNames symGroups comGroups
 
-    List.init (List.length arrayNames) (
+    List.init arrayNames.Length (
         fun index -> 
             match states.[index] with
             | SymcomState.Neither     -> List.init ranks.[index] (fun x -> string 0)
@@ -113,7 +112,7 @@ let declLine iType iName =
     String.concat "" [iType; " "; iName; " = 0;"]
 
 let unaryLoop (arrayName: string) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
-    List.init (List.head (rankList [indNames])) (
+    List.init (rankList [indNames]).Head (
         fun i -> 
             let ompline = if ompLevels > i then [ompLine indNames.[i]] else []
             let braced = match i with
@@ -131,27 +130,27 @@ let rec catLoops (arrayNames: string list) (indNames: string list list) (iMins: 
     match arrayNames with
     | [] -> failwith "Empty array names list."
     | _  ->
-        let arrHead, arrTail = List.head arrayNames, List.tail arrayNames
-        let indHead, indTail = List.head indNames, List.tail indNames
-        let iminHead, iminTail = List.head iMins, List.tail iMins
-        let ompHead, ompTail = List.head ompLevels, List.tail ompLevels
+        let arrHead,  arrTail  = arrayNames.Head, arrayNames.Tail
+        let indHead,  indTail  = indNames.Head, indNames.Tail
+        let iminHead, iminTail = iMins.Head, iMins.Tail
+        let ompHead,  ompTail  = ompLevels.Head, ompLevels.Tail
 
         match arrayNames with
-        | [] -> failwith "Impossible match." // Should be impossible for recursive calls; N-ary nested_for should terminate in unaryLoop
+        | [] -> failwith "Impossible match."
         | [head]       -> [(fun i -> unaryLoop arrHead indHead iminHead i ompHead)]
         | head :: tail ->  (fun i -> unaryLoop arrHead indHead iminHead i ompHead) :: catLoops arrTail indTail iminTail inner ompTail
 
-let rec naryLoop (arrayNames: string list) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
-    assert (List.length arrayNames = List.length indNames)
-    assert (List.length arrayNames = List.length iMins)
-    assert (List.length arrayNames = List.length ompLevels)
+let naryLoop (arrayNames: string list) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+    assert (arrayNames.Length = indNames.Length)
+    assert (arrayNames.Length = iMins.Length)
+    assert (arrayNames.Length = ompLevels.Length)
 
     catLoops arrayNames indNames iMins inner ompLevels
     |> List.rev
     |> List.fold (fun i elem -> elem i) inner
 
 let lastArrayNames (arrayNames: string list) (indNames: string list list) =
-    List.init (List.length arrayNames) (
+    List.init arrayNames.Length (
         fun i ->
             match indNames.[i] with
             | [] -> failwith "Empty index names list."
