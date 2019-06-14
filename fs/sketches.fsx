@@ -161,19 +161,27 @@ let lastArrayNames (arrayNames: string list) (indNames: string list list) =
 
 
 
-let hasObjectFor (lines: string list) =
-    List.init lines.Length (fun i -> lines.[i].Contains "object_for")
-
-let hasMethodFor (lines: string list) =
-    List.init lines.Length (fun i -> lines.[i].Contains "method_for")
-
 let rec countTokensImpl (line: string) (token: string) (ctr: int) =
     match line.IndexOf token with
     | -1 -> 0
     | i -> 1 + countTokensImpl (line.Substring (token.Length + i)) token i
 
 let countTokens (line: string) (token: string) =
- countTokensImpl line token 0
+    countTokensImpl line token 0
+
+let rec findTokensImpl (line: string) (token: string) (ctr: int) =
+    match line.IndexOf token with
+    | -1 -> []
+    | i -> ctr + i :: findTokensImpl (line.Substring (token.Length + i)) token (token.Length + i + ctr)
+
+let findTokens (line: string) (token: string) =
+    findTokensImpl line token 0
+
+let hasObjectFor (lines: string list) =
+    List.init lines.Length (fun i -> lines.[i].Contains "object_for")
+
+let hasMethodFor (lines: string list) =
+    List.init lines.Length (fun i -> lines.[i].Contains "method_for")
 
 
 
