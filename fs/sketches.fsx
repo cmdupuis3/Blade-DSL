@@ -160,6 +160,23 @@ let lastArrayNames (arrayNames: string list) (indNames: string list list) =
     )
 
 
+
+let hasObjectFor (lines: string list) =
+    List.init lines.Length (fun i -> lines.[i].Contains "object_for")
+
+let hasMethodFor (lines: string list) =
+    List.init lines.Length (fun i -> lines.[i].Contains "method_for")
+
+let rec countTokensImpl (line: string) (token: string) (ctr: int) =
+    match line.IndexOf token with
+    | -1 -> 0
+    | i -> 1 + countTokensImpl (line.Substring (token.Length + i)) token i
+
+let countTokens (line: string) (token: string) =
+ countTokensImpl line token 0
+
+
+
 let inner = ["iarray.read();"; "oarray = iarray;"; "oarray.write();"]
 let iarrays = ["iarray1"; "iarray1"; "iarray2"; "iarray3"]
 let iextents = [ [2;3;4]; [5;6;7]; [7;8]; [2;3] ]
