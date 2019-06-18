@@ -1,8 +1,4 @@
 
-
-open System.IO
-
-
 #load "sketches.fs"
 open iterators
 
@@ -129,26 +125,26 @@ module NestedLoop =
         |> List.rev
         |> List.fold (fun i elem -> elem i) inner
 
-    let rec private catLoops (arrayNames: string list) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) = 
-        match arrayNames with
-        | [] -> failwith "Empty array names list."
-        | _  ->
-            let arrHead,  arrTail  = arrayNames.Head, arrayNames.Tail
-            let indHead,  indTail  = indNames.Head, indNames.Tail
-            let iminHead, iminTail = iMins.Head, iMins.Tail
-            let ompHead,  ompTail  = ompLevels.Head, ompLevels.Tail
-
-            match arrayNames with
-            | [] -> failwith "Impossible match."
-            | [head]       -> [(fun i -> unaryLoop arrHead indHead iminHead i ompHead)]
-            | head :: tail ->  (fun i -> unaryLoop arrHead indHead iminHead i ompHead) :: catLoops arrTail indTail iminTail inner ompTail
-
     let private naryLoop (arrayNames: string list) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
         assert (arrayNames.Length = indNames.Length)
         assert (arrayNames.Length = iMins.Length)
         assert (arrayNames.Length = ompLevels.Length)
 
-        catLoops arrayNames indNames iMins inner ompLevels
+        let rec naryLoop' (arrayNames: string list) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) = 
+            match arrayNames with
+            | [] -> failwith "Empty array names list."
+            | _  ->
+                let arrHead,  arrTail  = arrayNames.Head, arrayNames.Tail
+                let indHead,  indTail  = indNames.Head, indNames.Tail
+                let iminHead, iminTail = iMins.Head, iMins.Tail
+                let ompHead,  ompTail  = ompLevels.Head, ompLevels.Tail
+
+                match arrayNames with
+                | [] -> failwith "Impossible match."
+                | [head]       -> [(fun i -> unaryLoop arrHead indHead iminHead i ompHead)]
+                | head :: tail ->  (fun i -> unaryLoop arrHead indHead iminHead i ompHead) :: naryLoop' arrTail indTail iminTail inner ompTail
+
+        naryLoop' arrayNames indNames iMins inner ompLevels
         |> List.rev
         |> List.fold (fun i elem -> elem i) inner
 
@@ -170,21 +166,19 @@ module NestedLoop =
         )
 
 
-let rec countTokensImpl (line: string) (token: string) (ctr: int) =
-    match line.IndexOf token with
-    | -1 -> 0
-    | i -> 1 + countTokensImpl (line.Substring (token.Length + i)) token i
-
 let countTokens (line: string) (token: string) =
-    countTokensImpl line token 0
+    let rec countTokens' (line: string) (token: string) (ctr: int) =
+        match line.IndexOf token with
+        | -1 -> 0
+        | i -> 1 + countTokens' (line.Substring (token.Length + i)) token i
+    countTokens' line token 0
 
-let rec findTokensImpl (line: string) (token: string) (ctr: int) =
-    match line.IndexOf token with
-    | -1 -> []
-    | i -> ctr + i :: findTokensImpl (line.Substring (token.Length + i)) token (token.Length + i + ctr)
-
-let findTokens (line: string) (token: string) =
-    findTokensImpl line token 0
+let find (line: string) (token: string) =
+    let rec findImpl' (line: string) (token: string) (ctr: int) =
+        match line.IndexOf token with
+        | -1 -> []
+        | i -> ctr + i :: findImpl' (line.Substring (token.Length + i)) token (token.Length + i + ctr)
+    findImpl' line token 0
 
 let hasObjectFor (lines: string list) =
     List.init lines.Length (fun i -> lines.[i].Contains "object_for")
