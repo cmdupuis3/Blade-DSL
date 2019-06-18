@@ -4,37 +4,29 @@ open System.IO
 #load "parser.fs"
 
 
-
-
-
 let code = """
 
 #include "things.hpp"
 #include "stuff.hpp"
 
-#pragma edgi function arity(any) input(iarrays) irank(0) output(oarray) orank(0)
-auto product(){
-
+#pragma edgi function(product) arity(any) input(iarrays) irank(0) output(oarray) orank(0)
+{
     oarray = 1;
     for(int i = 0; i < arity; i++){
         oarray *= iarrays[i];
     }
-
 }
 
-#pragma edgi function arity(3) input(iarrays) irank(0) output(oarray) orank(0)
-auto product3(){
-
+#pragma edgi function(product3) arity(3) input(iarrays) irank(0) output(oarray) orank(0)
+{
     oarray = 1;
-    for(int i = 0; i < iarrays[0].current_extent(); i++){
+    for(int i = 0; i < arity; i++){
         oarray *= iarrays[i];
     }
-
 }
 
-#pragma edgi function input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
-auto sumThenMultiply(){
-
+#pragma edgi function(sumThenMultiply) input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
+{
     // assume iarray1 and iarray2 last extents are same
     for(int i = 0; i < iarray1.current_extent(); i++){
         oarray += iarray1[i] + iarray2[i];
@@ -42,16 +34,13 @@ auto sumThenMultiply(){
 
     oarray *= iarray3;
     //return oarray;
+}
 
-};
-
-#pragma edgi function input(iarray) iranks(0) output(oarray) orank(0)
-auto add10(){
-
+#pragma edgi function(add10) input(iarray) iranks(0) output(oarray) orank(0)
+{
     oarray = iarray + 10;
     //return oarray;
-
-};
+}
 
 int main(){
 
