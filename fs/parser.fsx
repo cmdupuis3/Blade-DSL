@@ -16,10 +16,12 @@ let (|Match|_|) pattern input =
     if m.Success then Some m.Value else None
 
 let toToken = function
+    | Match @"^\n|^\r"               s -> s, Token.NewLine
     | Match @"^\s+"                  s -> s, Token.WhiteSpace
-    | Match @"^\{|^\}|^\(|^\)|^,"    s -> s, Token.Symbol s.[0]
+    | Match @"^\{|^\}|^\(|^\)|^\[|^\]|^,|^\#|^\<|^\>"    s -> s, Token.Symbol s.[0]
     | Match @"^[a-zA-Z][a-zA-Z0-9]*" s -> s, Token.Str s
     | Match @"^\d+"                  s -> s, Token.Int (int s)
+    | Match @".*"                    s -> s, Token.Other (string s)
     | _ -> failwith "Invalid Token"
 
 
@@ -33,28 +35,25 @@ let tokenize (s: string) =
     |> List.choose (function Token.WhiteSpace -> None | t -> Some t)
 
 
-type Syntax =
-    | Block of string
-    | Pragma of InitClause * Clause list
-    | Declaration of Declaration
-    | Assignment of Assignment
-    | Null
-and Type = string
-and Identifier = string
-and Declaration = Type * Identifier
-and Clause =
-    | NullClause of string
-    | StrClause of string * string
-    | IntClause of string * int
-    | StrListClause of string * string list
-    | IntListClause of string * int list
-and InitClause =
-    | NullClause of string
-    | StrClause of string * string
-and Assignment = 
-    | Assign of Identifier * Expression
-    | Construct of Declaration * Expression
-and Expression =
+
+type InitClause =
+    | Null of string
+    | Str of string * string
+
+type Clause =
+    | Null of string
+    | Str of string * string
+    | Int of string * int
+    | StrList of string * string list
+    | IntList of string * int list
+
+type Type = string
+
+type Identifier = string
+
+type Declaration = Type * Identifier
+
+type Expression =
     | MethodLoopInit of string * Identifier list
     | ObjectLoopInit of string * Identifier
     | MethodLoopCall of string * Identifier
@@ -63,9 +62,26 @@ and Expression =
     | Pipe of string * Identifier list
     | Cat  of string * Identifier list
 
+type Assignment = 
+    | Assign of Identifier * Expression
+    | Construct of Declaration * Expression
+
+type Syntax =
+    | Block of string
+    | Pragma of InitClause * Clause list
+    | Declaration of Declaration
+    | Assignment of Assignment
+    | Null
 
 
 
+
+let (|Value|_|) = function
+    | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: Token.Str clause :: Token.Symbol '(' :: Token.Str id :: Token.Symbol ')' :: tail ->
+        Some (Syntax.Pragma (InitClause.Str (clause, id), []))
+    | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: Token.Str clause :: tail ->
+        Some (Syntax.Pragma (InitClause.Null clause, []))
+    | _ -> None
 
 
 let code = """
