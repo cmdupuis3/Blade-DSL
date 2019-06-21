@@ -94,16 +94,26 @@ let rec (|ClausePattern|_|) = function
             Some (Clause.List (head, elements), t)
     | Token.Str head :: tail -> Some (Clause.Null head, tail)
     | _  -> None
-
-
-
-
-let (|Value|_|) = function
-    | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: Token.Str clause :: Token.Symbol '(' :: Token.Str id :: Token.Symbol ')' :: tail ->
-        Some (Syntax.Pragma (InitClause.Str (clause, id), []))
-    | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: Token.Str clause :: tail ->
-        Some (Syntax.Pragma (InitClause.Null clause, []))
+and (|ClausesPattern|_|) = function
+    | ClausePattern (head, tail) ->
+        let rec aux head' = function
+            | ClausePattern (head, tail) -> aux (head :: head') tail
+            | tail -> List.rev head', tail
+        Some(aux [head] tail)
     | _ -> None
+and (|PragmaPattern|_|) = function
+    | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: ClausesPattern (cl, Token.NewLine :: tail) ->
+        Some (Pragma (cl.Head, cl.Tail))
+    | _ -> None
+
+
+
+let parse s =
+    tokenize s |> function 
+    //| ClausesPattern v -> v
+    | PragmaPattern v -> v
+    | _ -> failwith "Failed to parse"
+
 
 
 let code = """
