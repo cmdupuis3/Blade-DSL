@@ -76,6 +76,28 @@ type Syntax =
 
 
 
+let rec toElements s = 
+    match s with
+    | head :: Token.Symbol ',' :: tail -> 
+        let elements, t = toElements tail
+        (head :: elements), t
+    | head :: Token.Symbol ')' :: tail -> [head], tail
+    | _ -> [], []
+
+let rec (|ClausePattern|_|) = function
+    | Token.Str head :: Token.Symbol '(' :: tail -> 
+        let elements, t = toElements tail
+        let last = ClausePattern t
+        if elements.Length = 1 then
+            Some (Clause.Single (head, elements.Head), t)
+        else
+            Some (Clause.List (head, elements), t)
+    | Token.Str head :: tail -> Some (Clause.Null head, tail)
+    | _  -> None
+
+
+
+
 let (|Value|_|) = function
     | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: Token.Str clause :: Token.Symbol '(' :: Token.Str id :: Token.Symbol ')' :: tail ->
         Some (Syntax.Pragma (InitClause.Str (clause, id), []))
