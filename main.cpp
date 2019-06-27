@@ -428,6 +428,63 @@ int speed_test2_omp(){
     return ktime;
 }
 
+int speed_test2_omp(){
+
+    using namespace sample_closures;
+
+    srand(time(NULL)+1);
+
+    int rank = 3;
+    const int len1 = 1000;
+    const int len2 = 1000;
+    const int len3 = 20;
+
+    int* extents = new int[rank];
+    extents[0] = len1;
+    extents[1] = len2;
+    extents[2] = len3;
+
+    float*** in = new float**[len1];
+    for(int i = 0; i < len1; i++){
+        in[i] = new float*[len2];
+        for(int j = 0; j < len2; j++){
+            in[i][j] = new float[len3];
+        }
+    }
+
+    for(int i = 0; i < len1; i++){
+        for(int j = 0; j < len2; j++){
+            for(int k = 0; k < len3; k++){
+                in[i][j][k] = rand() % 10;
+            }
+        }
+    }
+
+    float*** out = new float**[len1];
+    for(int i = 0; i < len1; i++){
+        out[i] = new float*[len2];
+        for(int j = 0; j < len2; j++){
+            out[i][j] = new float[len3];
+        }
+    }
+
+    nested_array_t<float, 3>  nin(extents,  in);
+    nested_array_t<float, 3> nout(extents, out);
+
+    static constexpr const int omp_levels = 1;
+    static constexpr const bool acc_on = true;
+    auto a = method_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels, acc_on>(nin);
+
+    time_t kstart = time(nullptr);
+    a(speed_test<>::function, nout);
+    time_t kend = time(nullptr);
+
+    double ktime = difftime(kend,kstart);
+    cout << "speed test 2 (w/ OpenMP and OpenACC):" << ktime << "s; " << endl;
+
+    return ktime;
+}
+
 /*
 bool test3(){
 
@@ -816,6 +873,73 @@ int speed_test4_omp(){
 
     static constexpr const int omp_levels = 1;
     auto b = method_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels>(nin);
+
+
+    time_t kstart = time(nullptr);
+    b(speed_test<symmetry>::function, nout);
+    time_t kend = time(nullptr);
+
+    double ktime = difftime(kend,kstart);
+    cout << "speed test 4 (w/ OpenMP):" << ktime << "s; " << endl;
+
+    return ktime;
+}
+
+int speed_test4_omp(){
+
+    using namespace sample_closures;
+
+    srand(time(NULL)+4);
+
+    int rank = 3;
+    const int len1 = 1000;
+    const int len2 = 20;
+
+    int* extents = new int[rank];
+    extents[0] = len1;
+    extents[1] = len1;
+    extents[2] = len2;
+
+    float*** in = new float**[len1];
+    for(int i = 0; i < len1; i++){
+        in[i] = new float*[len1];
+        for(int j = 0; j < len1; j++){
+            in[i][j] = new float[len2];
+        }
+    }
+
+    for(int i = 0; i < len1; i++){
+        for(int j = i; j < len1; j++){
+            for(int k = 0; k < len2; k++){
+                in[i][j][k] = rand() % 10;
+            }
+        }
+        /* We don't need this because the symmetry vector tells the method_for loop to never use the lower triangle anyway. */
+        //for(int j = 0; j < i; j++){
+        //    for(int k = 0; k < len2; k++){
+        //        in[i][j][k] = in[j][i][k];
+        //    }
+        //}
+    }
+
+    float*** out = new float**[len1];
+    for(int i = 0; i < len1; i++){
+        out[i] = new float*[len1];
+        for(int j = i; j < len1; j++){
+            out[i][j] = new float[len2];
+        }
+        for(int j = 0; j < i; j++){
+            out[i][j] = out[j][i];
+        }
+    }
+
+    static constexpr int symmetry[3] = {1,1,2};
+    nested_array_t<float, 3, symmetry>  nin(extents,  in);
+    nested_array_t<float, 3>           nout(extents, out);
+
+    static constexpr const int omp_levels = 1;
+    static constexpr const bool acc_on = true;
+    auto b = method_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels, acc_on>(nin);
 
 
     time_t kstart = time(nullptr);
