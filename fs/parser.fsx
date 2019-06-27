@@ -6,10 +6,12 @@ open System.Text.RegularExpressions
 #load "parser.fs"
 
 type Token = 
+    | NewLine
     | WhiteSpace
     | Symbol of char
     | Str of string
     | Int of int
+    | Other of string
 
 let (|Match|_|) pattern input =
     let m = Regex.Match (input, pattern)
