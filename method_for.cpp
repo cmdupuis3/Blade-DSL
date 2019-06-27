@@ -90,7 +90,7 @@ using std::tuple;
  */
 template<typename ITYPE, const int IRANK, const int* ISYM, const int FIRANK,
          typename OTYPE, const int ORANK,                  const int FORANK,
-         const int OMP_LEVELS = 0, const int DEPTH = 0>
+         const int OMP_LEVELS = 0, const bool IN_OMP_REGION, const bool ACC_ON, const int DEPTH = 0>
 constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, const int imin_in = 0){
 
     typedef const void (FTYPE)(nested_array_t<ITYPE, FIRANK, ISYM>, nested_array_t<OTYPE, FORANK>);
@@ -114,35 +114,66 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
             }
 
             auto loop = [func, iarray_in, oarray](int i){
-                // Is this dimension symmetric with the next one?
-                if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
-                    // Are we done stripping off output dimensions?
-                    if constexpr (ORANK == FORANK) {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray);
+                if constexpr (OMP_LEVELS > 0 || IN_OMP_REGION) {
+                    // Is this dimension symmetric with the next one?
+                    if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
+                        // Are we done stripping off output dimensions?
+                        if constexpr (ORANK == FORANK) {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, true, ACC_ON, DEPTH + 1>(iarray_in(i), i)(func, oarray);
+                        } else {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, true, ACC_ON, DEPTH + 1>(iarray_in(i), i)(func, oarray(i));
+                        }
                     } else {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i), i)(func, oarray(i));
-                    }
+                        if constexpr (ORANK == FORANK) {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, true, ACC_ON, DEPTH + 1>(iarray_in(i))(func, oarray);
+                        } else {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, true, ACC_ON, DEPTH + 1>(iarray_in(i))(func, oarray(i));
+                       }
+                   }
                 } else {
-                    if constexpr (ORANK == FORANK) {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray);
+                    // Is this dimension symmetric with the next one?
+                    if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
+                        // Are we done stripping off output dimensions?
+                        if constexpr (ORANK == FORANK) {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, false, ACC_ON, DEPTH + 1>(iarray_in(i), i)(func, oarray);
+                        } else {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, false, ACC_ON, DEPTH + 1>(iarray_in(i), i)(func, oarray(i));
+                        }
                     } else {
-                        method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, DEPTH + 1>(iarray_in(i))(func, oarray(i));
-                    }
+                        if constexpr (ORANK == FORANK) {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK,     FORANK, OMP_LEVELS - 1, false, ACC_ON, DEPTH + 1>(iarray_in(i))(func, oarray);
+                        } else {
+                            method_for_impl<ITYPE, IRANK - 1, ISYM, FIRANK, OTYPE, ORANK - 1, FORANK, OMP_LEVELS - 1, false, ACC_ON, DEPTH + 1>(iarray_in(i))(func, oarray(i));
+                       }
+                   }
                 }
             };
 
-            if constexpr (OMP_LEVELS > 0) {
-                int i = imin_in;
-                #pragma omp parallel for private(i)
-                for (i = imin_in; i < iarray_in.current_extent(); i++) {
-                    loop(i);
+            if constexpr (ACC_ON && IRANK = FIRANK + 1) {
+                if constexpr (OMP_LEVELS > 0) {
+                    //failboat
+                } else { // if constexpr (OMP_LEVELS == 0)
+                    int i = imin_in;     
+                    #pragma acc kernels
+                    for (int i = imin_in; i < iarray_in.current_extent(); i++) {
+                        loop(i);
+                    }
+                    #pragma acc end kernels
                 }
-            } else { // if constexpr (OMP_LEVELS == 0)
-                for (int i = imin_in; i < iarray_in.current_extent(); i++) {
-                    loop(i);
+                     
+            } else {
+                if constexpr (OMP_LEVELS > 0) {
+                    int i = imin_in;
+                    #pragma omp parallel for private(i)
+                    for (i = imin_in; i < iarray_in.current_extent(); i++) {
+                        loop(i);
+                    }
+                } else { // if constexpr (OMP_LEVELS == 0)
+                    for (int i = imin_in; i < iarray_in.current_extent(); i++) {
+                        loop(i);
+                    }
                 }
             }
-
         };
 
     }
@@ -255,18 +286,18 @@ constexpr auto method_for_nc_impl(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IV
  *                  level, it stores a lambda function that simply calls the function on the data. method_for
  *                  loops have a recursive function type that nests with input array rank.
  */
-template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0>
+template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0, const bool ACC_ON = false>
 constexpr auto method_for(NITYPE iarray_in){
     return method_for_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::symmetry,              CLTYPE::input_rank,
                            typename NOTYPE::value_type, NOTYPE::rank,                                CLTYPE::output_rank,
-                           OMP_LEVELS>(iarray_in);
+                           OMP_LEVELS, false, ACC_ON>(iarray_in);
 }
 
-template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0>
+template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0, const bool ACC_ON = false>
 constexpr auto method_for_nc(NITYPE iarray_in){
     return method_for_nc_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::file_name, NITYPE::variable_name, NITYPE::symmetry, CLTYPE::input_rank,
-                              typename NOTYPE::value_type, NOTYPE::rank, NOTYPE::file_name, NOTYPE::variable_name,                   CLTYPE::output_rank,
-                              OMP_LEVELS>(iarray_in);
+                              typename NOTYPE::value_type, NOTYPE::rank, NOTYPE::file_name, NOTYPE::variable_name,,
+                              OMP_LEVELS, false, ACC_ON>(iarray_in);
 }
 
 #endif
