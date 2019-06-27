@@ -52,22 +52,6 @@ namespace sample_closures {
             };
 
     };
-    
-    /** Sample closure that adds ten to the input array (for nested arrays) */
-    template<const int* ISYMMETRY = nullptr>
-    struct add10_nested_acc : closure_base_unary_t<float, 1, float, 1>{
-
-        static constexpr const void(*function)(nested_array_t<float, 1, ISYMMETRY>, nested_array_t<float, 1>) =
-            [](nested_array_t<float, 1, ISYMMETRY> iarray_in, nested_array_t<float, 1> oarray_in) -> const void {
-                #pragma acc kernels
-                int num = iarray_in.current_extent();
-                for(int i = 0; i < num; i++){
-                    oarray_in[i] = iarray_in[i] + 10;
-                }
-                #pragma acc end kernels
-            };
-
-    };
 
     /** Sample closure that adds ten to the input array (for nested arrays) */
     template<const char IFNAME[], const char IVNAME[], const char OFNAME[], const char OVNAME[], const int* ISYMMETRY = nullptr>
