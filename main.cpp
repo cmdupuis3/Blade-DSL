@@ -428,7 +428,7 @@ int speed_test2_omp(){
     return ktime;
 }
 
-int speed_test2_omp(){
+int speed_test2_acc(){
 
     using namespace sample_closures;
 
@@ -885,7 +885,7 @@ int speed_test4_omp(){
     return ktime;
 }
 
-int speed_test4_omp(){
+int speed_test4_acc(){
 
     using namespace sample_closures;
 
