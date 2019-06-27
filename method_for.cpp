@@ -155,7 +155,7 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
                 if constexpr (OMP_LEVELS > 0) {
                     //failboat
                 } else {
-                    int gpu_id = omp_get_thread_num() %% acc_get_num_devices(acc_device_default);
+                    int gpu_id = omp_get_thread_num() % acc_get_num_devices(acc_device_default);
                     acc_set_device_num(gpu_id, acc_device_default);
                     
                     for (int i = imin_in; i < iarray_in.current_extent(); i++) {
