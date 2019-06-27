@@ -52,6 +52,22 @@ namespace sample_closures {
             };
 
     };
+    
+    /** Sample closure that adds ten to the input array (for nested arrays) */
+    template<const int* ISYMMETRY = nullptr>
+    struct add10_nested_acc : closure_base_unary_t<float, 1, float, 1>{
+
+        static constexpr const void(*function)(nested_array_t<float, 1, ISYMMETRY>, nested_array_t<float, 1>) =
+            [](nested_array_t<float, 1, ISYMMETRY> iarray_in, nested_array_t<float, 1> oarray_in) -> const void {
+                #pragma acc kernels
+                int num = iarray_in.current_extent();
+                for(int i = 0; i < num; i++){
+                    oarray_in[i] = iarray_in[i] + 10;
+                }
+                #pragma acc end kernels
+            };
+
+    };
 
     /** Sample closure that adds ten to the input array (for nested arrays) */
     template<const char IFNAME[], const char IVNAME[], const char OFNAME[], const char OVNAME[], const int* ISYMMETRY = nullptr>
@@ -88,6 +104,28 @@ namespace sample_closures {
                 for(int i = 0; i < iarray_in.current_extent(); i++){
                     oarray_in[i] = iarray_in[i];
                 }
+            };
+
+    };
+
+    template<const int* ISYMMETRY = nullptr>
+    struct speed_test_acc : closure_base_unary_t<float, 1, float, 1>{
+
+        static constexpr const void(*function)(nested_array_t<float, 1, ISYMMETRY>, nested_array_t<float, 1>) =
+            [](nested_array_t<float, 1, ISYMMETRY> iarray_in, nested_array_t<float, 1> oarray_in) -> const void {
+                #pragma acc kernels
+                int ct = 0;
+                for(int i = 0; i < 500; i++){
+                    ct += i;
+                }
+                while (ct > 0){
+                    ct--;
+                }
+
+                for(int i = 0; i < iarray_in.current_extent(); i++){
+                    oarray_in[i] = iarray_in[i];
+                }
+                #pragma acc end kernels
             };
 
     };
@@ -476,7 +514,7 @@ int speed_test2_acc(){
     auto a = method_for<decltype(nin), decltype(nout), closure_base_unary_t<float, 1, float, 1>, omp_levels, acc_on>(nin);
 
     time_t kstart = time(nullptr);
-    a(speed_test<>::function, nout);
+    a(speed_test_acc<>::function, nout);
     time_t kend = time(nullptr);
 
     double ktime = difftime(kend,kstart);
@@ -943,7 +981,7 @@ int speed_test4_acc(){
 
 
     time_t kstart = time(nullptr);
-    b(speed_test<symmetry>::function, nout);
+    b(speed_test_acc<symmetry>::function, nout);
     time_t kend = time(nullptr);
 
     double ktime = difftime(kend,kstart);
