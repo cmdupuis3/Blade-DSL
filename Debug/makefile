@@ -46,7 +46,7 @@ all: loops3
 loops3: $(OBJS) $(USER_OBJS)
 	@echo 'Building target: $@'
 	@echo 'Invoking: GCC C++ Linker'
-	g++ -fopenmp -fopenacc -o "loops3" $(OBJS) $(USER_OBJS) $(LIBS)
+	g++ -fopenmp -fopenacc -ta=nvidia:cc70 -o "loops3" $(OBJS) $(USER_OBJS) $(LIBS)
 	@echo 'Finished building target: $@'
 	@echo ' '
 
