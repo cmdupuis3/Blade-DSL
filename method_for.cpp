@@ -22,6 +22,8 @@
 #define METHOD_FOR_CPP
 
 #include <functional>
+#include <omp.h>
+#include <openacc.h>
 #include <tuple>
 #include <type_traits>
 
@@ -152,13 +154,13 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
             if constexpr (ACC_ON && IRANK == FIRANK + 1) {
                 if constexpr (OMP_LEVELS > 0) {
                     //failboat
-                } else { // if constexpr (OMP_LEVELS == 0)
-                    int i = imin_in;     
-                    #pragma acc kernels
+                } else {
+                    int gpu_id = omp_get_thread_num() %% acc_get_num_devices(acc_device_default);
+                    acc_set_device_num(gpu_id, acc_device_default);
+                    
                     for (int i = imin_in; i < iarray_in.current_extent(); i++) {
                         loop(i);
                     }
-                    #pragma acc end kernels
                 }
                      
             } else {
