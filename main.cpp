@@ -1204,12 +1204,14 @@ int main(){
 
 //    speed_test1();
 //    speed_test1_omp();
-//    speed_test2();
-//    speed_test2_omp();
+    speed_test2();
+    speed_test2_omp();
+    speed_test2_acc();
 //    speed_test3();
 //    speed_test3_omp();
-//    speed_test4();
-//    speed_test4_omp();
+    speed_test4();
+    speed_test4_omp();
+    speed_test4_acc();
 
 /*
     static constexpr const char fname[] = "/home/Christopher.Dupuis/EDGI_PCA/vars_a.nc";
