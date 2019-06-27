@@ -60,9 +60,11 @@ namespace sample_closures {
         static constexpr const void(*function)(nested_array_t<float, 1, ISYMMETRY>, nested_array_t<float, 1>) =
             [](nested_array_t<float, 1, ISYMMETRY> iarray_in, nested_array_t<float, 1> oarray_in) -> const void {
                 #pragma acc kernels
-                int num = iarray_in.current_extent();
-                for(int i = 0; i < num; i++){
-                    oarray_in[i] = iarray_in[i] + 10;
+                {
+                    int num = iarray_in.current_extent();
+                    for(int i = 0; i < num; i++){
+                        oarray_in[i] = iarray_in[i] + 10;
+                    }
                 }
                 #pragma acc end kernels
             };
@@ -114,16 +116,18 @@ namespace sample_closures {
         static constexpr const void(*function)(nested_array_t<float, 1, ISYMMETRY>, nested_array_t<float, 1>) =
             [](nested_array_t<float, 1, ISYMMETRY> iarray_in, nested_array_t<float, 1> oarray_in) -> const void {
                 #pragma acc kernels
-                int ct = 0;
-                for(int i = 0; i < 500; i++){
-                    ct += i;
-                }
-                while (ct > 0){
-                    ct--;
-                }
+                {
+                    int ct = 0;
+                    for(int i = 0; i < 500; i++){
+                        ct += i;
+                    }
+                    while (ct > 0){
+                        ct--;
+                    }
 
-                for(int i = 0; i < iarray_in.current_extent(); i++){
-                    oarray_in[i] = iarray_in[i];
+                    for(int i = 0; i < iarray_in.current_extent(); i++){
+                        oarray_in[i] = iarray_in[i];
+                    }
                 }
                 #pragma acc end kernels
             };
