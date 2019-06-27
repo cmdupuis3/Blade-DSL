@@ -180,6 +180,7 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
 
 }
 
+/*
 template<typename ITYPE, const int IRANK, const char IFNAME[], const char IVNAME[], const int* ISYM, const int FIRANK,
          typename OTYPE, const int ORANK, const char OFNAME[], const char OVNAME[],                  const int FORANK,
          const int OMP_LEVELS = 0, const int DEPTH = 0>
@@ -263,7 +264,7 @@ constexpr auto method_for_nc_impl(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IV
     }
 
 }
-
+*/
 
 /** The method_for loop is a grammatical orientation of the nested_for loop that allows you to tie an
  *  iteration pattern to an input array, and later pass it an output array and  a function to evaluate
@@ -292,12 +293,12 @@ constexpr auto method_for(NITYPE iarray_in){
                            typename NOTYPE::value_type, NOTYPE::rank,                                CLTYPE::output_rank,
                            OMP_LEVELS, false, ACC_ON>(iarray_in);
 }
-
+/*
 template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0, const bool ACC_ON = false>
 constexpr auto method_for_nc(NITYPE iarray_in){
     return method_for_nc_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::file_name, NITYPE::variable_name, NITYPE::symmetry, CLTYPE::input_rank,
                               typename NOTYPE::value_type, NOTYPE::rank, NOTYPE::file_name, NOTYPE::variable_name,,
                               OMP_LEVELS, false, ACC_ON>(iarray_in);
 }
-
+*/
 #endif
