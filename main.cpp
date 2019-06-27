@@ -94,7 +94,7 @@ namespace sample_closures {
 
 }
 
-
+/*
 bool test1(){
 
     using namespace sample_closures;
@@ -259,6 +259,7 @@ int speed_test1_omp(){
 
     return ktime;
 }
+*/
 
 bool test2(){
 
@@ -427,7 +428,7 @@ int speed_test2_omp(){
     return ktime;
 }
 
-
+/*
 bool test3(){
 
     using namespace sample_closures;
@@ -625,6 +626,7 @@ int speed_test3_omp(){
 
     return ktime;
 }
+*/
 
 bool test4(){
 
@@ -1022,6 +1024,7 @@ bool test7(){
     return true;
 }
 */
+/*
 bool test8(){
 
     using namespace nested_array_utilities;
@@ -1045,7 +1048,8 @@ bool test8(){
     return true;
 
 }
-
+*/
+/*
 template<typename TUITYPE, const int element = 0>
 constexpr auto gather_symmetry(TUITYPE var){
     if constexpr (element == std::tuple_size<TUITYPE>::value - 1) {
@@ -1062,12 +1066,13 @@ constexpr auto gather_symmetry(TUITYPE var){
         }
     }
 }
+*/
 
 int main(){
 
-    test1();
+    //test1();
     test2();
-    test3();
+    //test3();
     test4();
     //test5();
     //test6();
