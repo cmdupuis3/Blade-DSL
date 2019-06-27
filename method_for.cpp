@@ -149,7 +149,7 @@ constexpr auto method_for_impl(nested_array_t<ITYPE, IRANK, ISYM> iarray_in, con
                 }
             };
 
-            if constexpr (ACC_ON && IRANK = FIRANK + 1) {
+            if constexpr (ACC_ON && IRANK == FIRANK + 1) {
                 if constexpr (OMP_LEVELS > 0) {
                     //failboat
                 } else { // if constexpr (OMP_LEVELS == 0)
