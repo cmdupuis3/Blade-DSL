@@ -37,17 +37,10 @@ let tokenize (s: string) =
     |> List.choose (function Token.WhiteSpace -> None | t -> Some t)
 
 
-
-type InitClause =
-    | Null of string
-    | Str of string * string
-
 type Clause =
     | Null of string
-    | Str of string * string
-    | Int of string * int
-    | StrList of string * string list
-    | IntList of string * int list
+    | Single of string * Token
+    | List of string * Token list
 
 type Type = string
 
@@ -56,26 +49,31 @@ type Identifier = string
 type Declaration = Type * Identifier
 
 type Expression =
-    | MethodLoopInit of string * Identifier list
-    | ObjectLoopInit of string * Identifier
-    | MethodLoopCall of string * Identifier
-    | ObjectLoopCall of string * Identifier list
-    | NestedLoopCall of string * Identifier * Identifier list
-    | Pipe of string * Identifier list
-    | Cat  of string * Identifier list
+    | MethodLoopInit of Identifier list
+    | ObjectLoopInit of Identifier
+    | MethodLoopCall of Identifier
+    | ObjectLoopCall of Identifier list
+    | NestedLoopCall of Identifier * Identifier list
+    | Pipe of Identifier list
+    | Cat  of Identifier list
 
 type Assignment = 
     | Assign of Identifier * Expression
     | Construct of Declaration * Expression
 
+type Scope = string
+type Pragma = Clause * Clause list
+
+type ScopeTree =
+  | Leaf of Token list
+  | Node of ScopeTree // First type is contains all tokens at this scope visible to any internal scopes. Second type is the list of all scopes where the the first is visible.
+
 type Syntax =
-    | Block of string
-    | Pragma of InitClause * Clause list
-    | Declaration of Declaration
-    | Assignment of Assignment
+    | Block of Token list
+    | Pragma of Clause * Clause list
+//    | Declaration of Declaration
+//    | Assignment of Assignment
     | Null
-
-
 
 
 let rec toElements s = 
@@ -106,6 +104,33 @@ and (|ClausesPattern|_|) = function
 and (|PragmaPattern|_|) = function
     | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: ClausesPattern (cl, Token.NewLine :: tail) ->
         Some (Pragma (cl.Head, cl.Tail))
+    | _ -> None
+
+
+let rec (|ScopePattern|_|) = function
+    | Token.Symbol '{' :: tail -> 
+        let rec toScope' t (ctr: int) =
+            match t with
+            | [] -> [], []
+            | head' :: Token.Symbol '}' :: tail' -> 
+                if ctr > 0 then
+                    let h', t' = toScope' tail' (ctr-1)
+                    head' :: Token.Symbol '}' :: h', t'
+                else
+                    [head'], []
+            | head' :: Token.Symbol '{' :: tail' -> 
+                let h', t' = toScope' tail' (ctr+1)
+                head' :: Token.Symbol '{' :: h', t'
+            | head' :: tail' -> 
+                let h', t' = toScope' tail' ctr
+                head' :: h', t'
+            | _ -> failwith "asdfsdf"
+        let scope, t = toScope' tail 0
+        Some (Syntax.Block (scope), (t: Token list))
+    | head :: tail -> 
+        match tail with
+        | ScopePattern(t) -> Some(t)
+        | _ -> None
     | _ -> None
 
 
