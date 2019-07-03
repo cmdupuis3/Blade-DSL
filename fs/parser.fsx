@@ -174,7 +174,6 @@ let (|PragmaPattern|_|) = function
 
 let parse (s: string) =
     let rec parse' = function
-    //| ScopesPattern v -> v
     | PragmaPattern (v,[]) -> [v]
     | PragmaPattern (v, t) -> v :: (parse' t)
     | head :: tail -> parse' tail
@@ -245,3 +244,5 @@ int main(){
 }
 
 """
+
+parse code ;;
