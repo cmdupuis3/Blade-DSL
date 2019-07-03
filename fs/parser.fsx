@@ -1,7 +1,9 @@
 
-
 open System.IO
 open System.Text.RegularExpressions
+
+//#r "FParsec"
+//open FParsec
 
 #load "parser.fs"
 
@@ -20,10 +22,10 @@ let (|Match|_|) pattern input =
 let toToken = function
     | Match @"^\n|^\r"               s -> s, Token.NewLine
     | Match @"^\s+"                  s -> s, Token.WhiteSpace
-    | Match @"^\{|^\}|^\(|^\)|^\[|^\]|^,|^\#|^\<|^\>"    s -> s, Token.Symbol s.[0]
+    | Match @"^\{|^\}|^\(|^\)|^\[|^\]|^,|^\#|^\<|^\>|^;"    s -> s, Token.Symbol s.[0]
     | Match @"^[a-zA-Z][a-zA-Z0-9]*" s -> s, Token.Str s
     | Match @"^\d+"                  s -> s, Token.Int (int s)
-    | Match @".*"                    s -> s, Token.Other (string s)
+    | Match @"."                 s -> s, Token.Other (string s)
     | _ -> failwith "Invalid Token"
 
 
@@ -35,7 +37,6 @@ let tokenize (s: string) =
             token :: tokenize' (index + text.Length) s
     tokenize' 0 s
     |> List.choose (function Token.WhiteSpace -> None | t -> Some t)
-
 
 type Clause =
     | Null of string
@@ -61,50 +62,13 @@ type Assignment =
     | Assign of Identifier * Expression
     | Construct of Declaration * Expression
 
-type Scope = string
-type Pragma = Clause * Clause list
+type Block = Token list
 
-type ScopeTree =
-  | Leaf of Token list
-  | Node of ScopeTree // First type is contains all tokens at this scope visible to any internal scopes. Second type is the list of all scopes where the the first is visible.
-
-type Syntax =
+type PragmaScope =
     | Block of Token list
-    | Pragma of Clause * Clause list
-//    | Declaration of Declaration
-//    | Assignment of Assignment
-    | Null
+    | Line of Token list
 
-
-let rec toElements s = 
-    match s with
-    | head :: Token.Symbol ',' :: tail -> 
-        let elements, t = toElements tail
-        (head :: elements), t
-    | head :: Token.Symbol ')' :: tail -> [head], tail
-    | _ -> [], []
-
-let rec (|ClausePattern|_|) = function
-    | Token.Str head :: Token.Symbol '(' :: tail -> 
-        let elements, t = toElements tail
-        let last = ClausePattern t
-        if elements.Length = 1 then
-            Some (Clause.Single (head, elements.Head), t)
-        else
-            Some (Clause.List (head, elements), t)
-    | Token.Str head :: tail -> Some (Clause.Null head, tail)
-    | _  -> None
-and (|ClausesPattern|_|) = function
-    | ClausePattern (head, tail) ->
-        let rec aux head' = function
-            | ClausePattern (head, tail) -> aux (head :: head') tail
-            | tail -> List.rev head', tail
-        Some(aux [head] tail)
-    | _ -> None
-and (|PragmaPattern|_|) = function
-    | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: ClausesPattern (cl, Token.NewLine :: tail) ->
-        Some (Pragma (cl.Head, cl.Tail))
-    | _ -> None
+type Pragma = Clause * Clause list * PragmaScope
 
 
 let rec (|ScopePattern|_|) = function
@@ -112,6 +76,12 @@ let rec (|ScopePattern|_|) = function
         let rec toScope t (ctr: int) =
             match t with
             | [] -> [], []
+            | Token.Symbol '}' :: Token.NewLine :: tail' -> 
+                if ctr > 0 then
+                    let h', t' = toScope tail' (ctr-1)
+                    Token.Symbol '}' :: Token.NewLine :: h', t'
+                else
+                    [], tail'
             | Token.Symbol '}' :: tail' -> 
                 if ctr > 0 then
                     let h', t' = toScope tail' (ctr-1)
@@ -126,20 +96,80 @@ let rec (|ScopePattern|_|) = function
                 head' :: h', t'
             | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
-        Some (Syntax.Block (scope), (t: Token list))
+        Some (Block (scope), (t: Token list))
     | head :: tail -> 
         match tail with
-        | ScopePattern(t) -> Some(t)
+        | ScopePattern t -> Some t
         | _ -> None
     | _ -> None
 let (|ScopesPattern|_|) = function
-    | ScopePattern(head, tail) ->
+    | ScopePattern (head, tail) ->
         let rec aux head' = function
             | ScopePattern (head, tail) -> aux (head :: head') tail
             | tail -> List.rev head', tail
         Some (aux [head] tail)
     | _ -> None
 
+//match tokenize "asd(8) {fjfj jfjf }\n" with | ScopePattern(s) -> Some(s) |_->None;;
+//let a = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopePattern v -> Some(v) |_-> None ;;
+//let b = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopesPattern v -> Some(v) |_-> None ;;
+
+let rec (|LinePattern|_|) = function
+    | head :: Token.Symbol ';' :: Token.NewLine :: tail | head :: Token.Symbol ';' :: tail ->
+        Some ([head], tail)
+    | head :: tail ->
+        let h, t = 
+            match tail with
+            | LinePattern t -> t
+            | _ -> [], []
+        Some (head :: h, t)
+    | _ -> None
+let (|LinesPattern|_|) = function
+    | LinePattern (head, tail) ->
+        let rec aux head' = function
+            | LinePattern (head, tail) -> aux (head :: head') tail
+            | tail -> List.rev head', tail
+        Some (aux [head] tail)
+    | _ -> None
+
+//match tokenize "asd(8);\n fjfjfj" with | LinePattern(s) -> Some(s) |_->None;;
+//match tokenize "asd(8);\n asdf;\n fjfjfjfj 9;\n" with | LinesPattern(s) -> Some(s) |_->None;;
+
+
+let rec toElements s = 
+    match s with
+    | head :: Token.Symbol ',' :: tail -> 
+        let elements, t = toElements tail
+        (head :: elements), t
+    | head :: Token.Symbol ')' :: tail -> [head], tail
+    | _ -> [], []
+
+let rec (|ClausePattern|_|) = function
+    | Token.NewLine :: tail -> None
+    | Token.Str head :: Token.Symbol '(' :: tail -> 
+        let elements, t = toElements tail
+        if elements.Length = 1 then
+            Some (Clause.Single (head, elements.Head), t)
+        else
+            Some (Clause.List (head, elements), t)
+    | Token.Str head :: tail -> Some (Clause.Null head, tail)
+    | _  -> None
+let (|ClausesPattern|_|) = function
+    | ClausePattern (head, tail) ->
+        let rec aux head' = function
+            | ClausePattern (head, tail) -> aux (head :: head') tail
+            | tail -> List.rev head', tail
+        Some (aux [head] tail)
+    | _ -> None
+let (|PragmaPattern|_|) = function
+    | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: ClausesPattern (cl, Token.NewLine :: tail) ->
+        match tail with
+        | ScopePattern (h, t) -> h, t
+        | LinePattern (h, t) -> PragmaScope.Line h, t
+        | _ -> failwith "fjfjfjpaoixc"
+        ||> fun h -> fun t ->
+            Some (Pragma (cl.Head, cl.Tail, h), t)
+    | _ -> None
 
 
 let parse s =
