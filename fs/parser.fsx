@@ -109,24 +109,23 @@ and (|PragmaPattern|_|) = function
 
 let rec (|ScopePattern|_|) = function
     | Token.Symbol '{' :: tail -> 
-        let rec toScope' t (ctr: int) =
-            printf "%i\n" ctr
+        let rec toScope t (ctr: int) =
             match t with
             | [] -> [], []
             | Token.Symbol '}' :: tail' -> 
                 if ctr > 0 then
-                    let h', t' = toScope' tail' (ctr-1)
+                    let h', t' = toScope tail' (ctr-1)
                     Token.Symbol '}' :: h', t'
                 else
                     [], []
             | Token.Symbol '{' :: tail' -> 
-                let h', t' = toScope' tail' (ctr+1)
+                let h', t' = toScope tail' (ctr+1)
                 Token.Symbol '{' :: h', t'
             | head' :: tail' -> 
-                let h', t' = toScope' tail' ctr
+                let h', t' = toScope tail' ctr
                 head' :: h', t'
             | _ -> failwith "asdfsdf"
-        let scope, t = toScope' tail 0
+        let scope, t = toScope tail 0
         Some (Syntax.Block (scope), (t: Token list))
     | head :: tail -> 
         match tail with
