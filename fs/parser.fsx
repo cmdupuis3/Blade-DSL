@@ -110,17 +110,18 @@ and (|PragmaPattern|_|) = function
 let rec (|ScopePattern|_|) = function
     | Token.Symbol '{' :: tail -> 
         let rec toScope' t (ctr: int) =
+            printf "%i\n" ctr
             match t with
             | [] -> [], []
-            | head' :: Token.Symbol '}' :: tail' -> 
+            | Token.Symbol '}' :: tail' -> 
                 if ctr > 0 then
                     let h', t' = toScope' tail' (ctr-1)
-                    head' :: Token.Symbol '}' :: h', t'
+                    Token.Symbol '}' :: h', t'
                 else
-                    [head'], []
-            | head' :: Token.Symbol '{' :: tail' -> 
+                    [], []
+            | Token.Symbol '{' :: tail' -> 
                 let h', t' = toScope' tail' (ctr+1)
-                head' :: Token.Symbol '{' :: h', t'
+                Token.Symbol '{' :: h', t'
             | head' :: tail' -> 
                 let h', t' = toScope' tail' ctr
                 head' :: h', t'
