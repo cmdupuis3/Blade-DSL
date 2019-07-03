@@ -7,6 +7,7 @@ open System.Text.RegularExpressions
 
 #load "parser.fs"
 
+/// Union of all the relevant token types
 type Token = 
     | NewLine
     | WhiteSpace
@@ -15,64 +16,48 @@ type Token =
     | Int of int
     | Other of string
 
+/// Tokenizer helper pattern for regexes
 let (|Match|_|) pattern input =
     let m = Regex.Match (input, pattern)
     if m.Success then Some m.Value else None
 
+/// Convert string to a token based on a regex pattern
 let toToken = function
     | Match @"^\n|^\r"               s -> s, Token.NewLine
     | Match @"^\s+"                  s -> s, Token.WhiteSpace
     | Match @"^\{|^\}|^\(|^\)|^\[|^\]|^,|^\#|^\<|^\>|^;"    s -> s, Token.Symbol s.[0]
     | Match @"^[a-zA-Z][a-zA-Z0-9]*" s -> s, Token.Str s
     | Match @"^\d+"                  s -> s, Token.Int (int s)
-    | Match @"."                 s -> s, Token.Other (string s)
+    | Match @"."                     s -> s, Token.Other (string s)
     | _ -> failwith "Invalid Token"
 
-
+/// Convert string into a list of parsable tokens
 let tokenize (s: string) =
+    // Convert substrings to tokens, starting at position 'index' in the string. 
     let rec tokenize' index (s: string) =
         if index = s.Length then []
         else
             let text, token = toToken (s.Substring index)
             token :: tokenize' (index + text.Length) s
     tokenize' 0 s
+    // strip out the whitespace tokens; note that since new line characters are distinct, they will remain.
     |> List.choose (function Token.WhiteSpace -> None | t -> Some t)
 
-type Clause =
-    | Null of string
-    | Single of string * Token
-    | List of string * Token list
+/// Pragma clause type; a tuple of the clause name and a list of arguments
+type Clause = string * Token list
 
-type Type = string
-
-type Identifier = string
-
-type Declaration = Type * Identifier
-
-type Expression =
-    | MethodLoopInit of Identifier list
-    | ObjectLoopInit of Identifier
-    | MethodLoopCall of Identifier
-    | ObjectLoopCall of Identifier list
-    | NestedLoopCall of Identifier * Identifier list
-    | Pipe of Identifier list
-    | Cat  of Identifier list
-
-type Assignment = 
-    | Assign of Identifier * Expression
-    | Construct of Declaration * Expression
-
-type Block = Token list
-
+/// Pragma scope type; contains an unparsed list of tokens visible to the pragma
 type PragmaScope =
     | Block of Token list
     | Line of Token list
 
+/// Pragma type; consists of a directive, a list of clauses, and a scope
 type Pragma = Clause * Clause list * PragmaScope
 
-
+/// Pattern for pragma scopes; basically dumps all the tokens inside the pragma scope into a buffer, and returns the tail separately
 let rec (|ScopePattern|_|) = function
-    | Token.Symbol '{' :: tail -> 
+    | Token.Symbol '{' :: tail ->
+        /// Make a list of tokens inside this scope by counting the number of braces (terrible, I know)
         let rec toScope t (ctr: int) =
             match t with
             | [] -> [], []
@@ -96,24 +81,18 @@ let rec (|ScopePattern|_|) = function
                 head' :: h', t'
             | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
-        Some (Block (scope), (t: Token list))
+        Some (PragmaScope.Block (scope), (t: Token list))
     | head :: tail -> 
         match tail with
         | ScopePattern t -> Some t
         | _ -> None
-    | _ -> None
-let (|ScopesPattern|_|) = function
-    | ScopePattern (head, tail) ->
-        let rec aux head' = function
-            | ScopePattern (head, tail) -> aux (head :: head') tail
-            | tail -> List.rev head', tail
-        Some (aux [head] tail)
     | _ -> None
 
 //match tokenize "asd(8) {fjfj jfjf }\n" with | ScopePattern(s) -> Some(s) |_->None;;
 //let a = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopePattern v -> Some(v) |_-> None ;;
 //let b = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopesPattern v -> Some(v) |_-> None ;;
 
+/// Pattern for pragmas applied to individual lines; basically dumps all the tokens inside the pragma scope into a buffer, and returns the tail separately
 let rec (|LinePattern|_|) = function
     | head :: Token.Symbol ';' :: Token.NewLine :: tail | head :: Token.Symbol ';' :: tail ->
         Some ([head], tail)
@@ -124,18 +103,11 @@ let rec (|LinePattern|_|) = function
             | _ -> [], []
         Some (head :: h, t)
     | _ -> None
-let (|LinesPattern|_|) = function
-    | LinePattern (head, tail) ->
-        let rec aux head' = function
-            | LinePattern (head, tail) -> aux (head :: head') tail
-            | tail -> List.rev head', tail
-        Some (aux [head] tail)
-    | _ -> None
 
 //match tokenize "asd(8);\n fjfjfj" with | LinePattern(s) -> Some(s) |_->None;;
 //match tokenize "asd(8);\n asdf;\n fjfjfjfj 9;\n" with | LinesPattern(s) -> Some(s) |_->None;;
 
-
+/// Make a list of clause arguments and return the tail
 let rec toElements s = 
     match s with
     | head :: Token.Symbol ',' :: tail -> 
@@ -144,16 +116,18 @@ let rec toElements s =
     | head :: Token.Symbol ')' :: tail -> [head], tail
     | _ -> [], []
 
+/// Pattern for individual pragma clauses
 let rec (|ClausePattern|_|) = function
     | Token.NewLine :: tail -> None
     | Token.Str head :: Token.Symbol '(' :: tail -> 
         let elements, t = toElements tail
         if elements.Length = 1 then
-            Some (Clause.Single (head, elements.Head), t)
+            Some (Clause (head, elements), t)
         else
-            Some (Clause.List (head, elements), t)
-    | Token.Str head :: tail -> Some (Clause.Null head, tail)
+            Some (Clause (head, elements), t)
+    | Token.Str head :: tail -> Some (Clause (head, []), tail)
     | _  -> None
+/// Pattern for all pragma clauses
 let (|ClausesPattern|_|) = function
     | ClausePattern (head, tail) ->
         let rec aux head' = function
@@ -161,26 +135,45 @@ let (|ClausesPattern|_|) = function
             | tail -> List.rev head', tail
         Some (aux [head] tail)
     | _ -> None
+/// Pattern for pragmas
 let (|PragmaPattern|_|) = function
     | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: ClausesPattern (cl, Token.NewLine :: tail) ->
         match tail with
         | ScopePattern (h, t) -> h, t
         | LinePattern (h, t) -> PragmaScope.Line h, t
-        | _ -> failwith "fjfjfjpaoixc"
+        | _ -> failwith "edgi pragma must occur before a statement or a block."
         ||> fun h -> fun t ->
             Some (Pragma (cl.Head, cl.Tail, h), t)
     | _ -> None
 
-
+/// Parse code for all the pragmas and return a list of them.
 let parse (s: string) =
     let rec parse' = function
     | PragmaPattern (v,[]) -> [v]
     | PragmaPattern (v, t) -> v :: (parse' t)
     | head :: tail -> parse' tail
     | [] -> []
-    | _ -> failwith "Failed to parse"
     parse' (tokenize s)
 
+
+type Type = string
+
+type Identifier = string
+
+type Declaration = Type * Identifier
+
+type Expression =
+    | MethodLoopInit of Identifier list
+    | ObjectLoopInit of Identifier
+    | MethodLoopCall of Identifier
+    | ObjectLoopCall of Identifier list
+    | NestedLoopCall of Identifier * Identifier list
+    | Pipe of Identifier list
+    | Cat  of Identifier list
+
+type Assignment = 
+    | Assign of Identifier * Expression
+    | Construct of Declaration * Expression
 
 
 let code = """
