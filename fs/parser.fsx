@@ -117,7 +117,7 @@ let rec (|ScopePattern|_|) = function
                     let h', t' = toScope tail' (ctr-1)
                     Token.Symbol '}' :: h', t'
                 else
-                    [], []
+                    [], tail'
             | Token.Symbol '{' :: tail' -> 
                 let h', t' = toScope tail' (ctr+1)
                 Token.Symbol '{' :: h', t'
@@ -131,6 +131,13 @@ let rec (|ScopePattern|_|) = function
         match tail with
         | ScopePattern(t) -> Some(t)
         | _ -> None
+    | _ -> None
+let (|ScopesPattern|_|) = function
+    | ScopePattern(head, tail) ->
+        let rec aux head' = function
+            | ScopePattern (head, tail) -> aux (head :: head') tail
+            | tail -> List.rev head', tail
+        Some (aux [head] tail)
     | _ -> None
 
 
