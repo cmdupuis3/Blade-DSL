@@ -172,17 +172,19 @@ let (|PragmaPattern|_|) = function
     | _ -> None
 
 
-let parse s =
-    tokenize s |> function 
-    //| ClausesPattern v -> v
-    | PragmaPattern v -> v
+let parse (s: string) =
+    let rec parse' = function
+    //| ScopesPattern v -> v
+    | PragmaPattern (v,[]) -> [v]
+    | PragmaPattern (v, t) -> v :: (parse' t)
+    | head :: tail -> parse' tail
+    | [] -> []
     | _ -> failwith "Failed to parse"
+    parse' (tokenize s)
 
 
 
-let code = """
-
-#include "things.hpp"
+let code = """#include "things.hpp"
 #include "stuff.hpp"
 
 #pragma edgi function(product) arity(any) input(iarrays) irank(0) output(oarray) orank(0)
