@@ -229,30 +229,60 @@ let (|NetCDFArrayPattern|_|) (symGroups: int list) = function
 
 
 let getArray (clauses: Clause list) (block: BlockScope) =
-    let rec findArrSym (cls: Clause list) = 
-        match cls with
-        | [] -> []
-        | _ ->
-            match cls.Head with
-            | ArraySymmetryPattern s -> s |> List.map (string >> int)
-            | _ -> findArrSym cls.Tail
-    let a = findArrSym clauses
+    let a = clauses |> List.pick (fun x ->
+                                      match x with
+                                      | ArraySymmetryPattern s -> Some (s |> List.map (string >> int))
+                                      | _ -> None
+                                 )
     match block with
     | ArrayPattern a s -> [Some(fst s)]
     | _ -> failwith "Array pragma applied to invalid array declaration."
 
 
+type NestedFunction =
+    { funcName:  string
+      funcArity: int
+      funcIType: string
+      funcIRank: int list
+      funcOType: string
+      funcORank: int
+      funcCom:   int list
+      funcBlock: Token list }
+
+type NestedClosure(iarraysIn: NestedArray list, symGroupsIn: int list list, comGroupsIn: int list, oarraysIn: NestedArray list, functionIn: BlockScope) =
+    member this.Iarrays = iarraysIn
+    member this.SymGroups = symGroupsIn
+    member this.ComGroups = comGroupsIn
+    member this.Oarrays = oarraysIn
+    member this.Function = functionIn
+
+type PragmaObj =
+    | Array of NestedArray
+    | Function of NestedFunction
+
+let sortPragmas (s: Pragma list) =
+    let alist = List.filter (fun x ->
+                                 let directive, clauses, scope = x
+                                 fst directive = "array"
+                            )
+    let flist = List.filter (fun x ->
+                                 let directive, clauses, scope = x
+                                 fst directive = "function"
+                            )
+    alist s, flist s
+
+(*
 let parse (s: Token list) = 
-    let pragmas = parsePragmas s
-    let rec parse' s' =
-        match pragmas with
-        | [] -> []
-        | (pragma, clauses, block) :: tail ->
-            match fst pragma with
-            | "array" -> getArray clauses block
-            | "function" -> []
-            | _ -> failwith "Invalid pragma."
-    parse' s
+    let alist, flist = s |> (parsePragmas >> sortPragmas)
+    let arrays = List.init alist.Length (fun i ->
+                                             let directive, clauses, scope = alist.[i]
+                                             getArray clauses scope
+                                        )
+    let funcs = List.init flist.Length (fun i ->
+                                            let directive, clauses, scope = flist.[i]
+                                            getFunction (snd directive) clauses scope
+                                       )
+*)
 
 
 let code = """
