@@ -49,10 +49,6 @@ type BlockScope =
     | Block of Token list
     | Line of Token list
 
-type Scope = class
-    member this.sub = 9
-end
-
 /// Pragma type; consists of a directive, a list of clauses, and a scope
 type Pragma = Clause * Clause list * BlockScope
 
