@@ -246,6 +246,47 @@ let getArray (clauses: Clause list) (block: BlockScope) =
     | _ -> failwith "Array pragma applied to invalid array declaration."
 
 
+let (|FunctionArityPattern|_|) = function
+    | "arity", [Token.Str "any"] -> None
+    | "arity", [Token.Int arity] -> Some (arity)
+    | _ -> failwith "Invalid or missing arity clause."
+
+let (|FunctionInputPattern|_|) = function
+    | "input", (value: Token list) -> Some (value |> tokenToStr)
+    | _ -> failwith "Invalid or missing input clause."
+
+let (|FunctionOutputPattern|_|) = function
+    | "output", [Token.Str value] -> Some (value)
+    | _ -> failwith "Invalid or missing output clause."
+
+let (|FunctionIRankPattern|_|) (arity: int) = function
+    | "irank", [Token.Int value] -> Some (List.init arity id)
+    | "iranks", (values: Token list) -> Some (values |> tokenToInt)
+    | _ -> failwith "Invalid or missing irank / iranks clause."
+
+let (|FunctionOrankPattern|_|) = function
+    | "orank", [Token.Int value] -> Some (value)
+    | _ -> failwith "Invalid or missing orank clause clause."
+
+let (|FunctionCommutativityPattern|_|) = function
+    | "commutativity", (vals: Token list) -> Some (vals |> tokenToInt)
+    | _ -> failwith "Invalid array clause."
+
+let getFunction (name: string) (clauses: Clause list) (block: BlockScope) =
+
+    let arity  = clauses |> List.pick (fun x -> match x with | FunctionArityPattern s       -> Some(s) | _ -> None)
+    let input  = clauses |> List.pick (fun x -> match x with | FunctionInputPattern s       -> Some(s) | _ -> None)
+    let output = clauses |> List.pick (fun x -> match x with | FunctionOutputPattern s      -> Some(s) | _ -> None)
+    let iranks = clauses |> List.pick (fun x -> match x with | FunctionIRankPattern arity s -> Some(s) | _ -> None)
+    let orank  = clauses |> List.pick (fun x -> match x with | FunctionOrankPattern s       -> Some(s) | _ -> None)
+
+    let hasCom = clauses |> List.exists (fun x -> match x with | FunctionCommutativityPattern s -> true | _ -> false)
+    let com = if hasCom then
+                  clauses |> List.pick (fun x -> match x with | FunctionCommutativityPattern s -> Some (s) | _ -> None)
+              else []
+
+    {funcName = name; funcArity = arity; funcIType = ; funcIRank = iranks; funcOType = ; funcORank = orank; funcCom = com; funcBlock = block}
+
 type NestedFunction =
     { funcName:  string
       funcArity: int
