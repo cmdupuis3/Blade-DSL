@@ -51,14 +51,8 @@ let tokenToStr (s: Token list) =
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
 
-/// Pragma scope type; contains an unparsed list of tokens visible to the pragma
-type BlockScope =
-    | Nested of BlockScope list
-    | Block of Token list
-    | Line of Token list
-
 /// Pragma type; consists of a directive, a list of clauses, and a scope
-type Pragma = Clause * Clause list * BlockScope
+type Pragma = Clause * Clause list * Token list
 
 /// Pattern for pragma scopes; basically dumps all the tokens inside the pragma scope into a buffer, and returns the tail separately
 let rec (|ScopePattern|_|) = function
@@ -87,20 +81,12 @@ let rec (|ScopePattern|_|) = function
                 head' :: h', t'
             | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
-        Some (BlockScope.Block (scope), (t: Token list))
+        Some (scope, (t: Token list))
     | head :: tail -> 
         match tail with
         | ScopePattern t -> Some t
         | _ -> None
     | _ -> None
-
-/// Parse code for all the scopes and return a list of them.
-let rec parseScopes (s: Token list) =
-    let rec parse' = function
-    | ScopePattern (v,t) -> v :: (parse' t)
-    | head :: tail -> parse' tail
-    | [] -> []
-    BlockScope.Nested (parse' s)
 
 //match tokenize "asd(8) {fjfj jfjf }\n" with | ScopePattern(s) -> Some(s) |_->None;;
 //let a = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopePattern v -> Some(v) |_-> None ;;
@@ -154,30 +140,11 @@ let (|PragmaPattern|_|) = function
     | Token.Symbol '#' :: Token.Str "pragma" :: Token.Str "edgi" :: ClausesPattern (cl, Token.NewLine :: tail) ->
         match tail with
         | ScopePattern (h, t) -> h, t
-        | LinePattern (h, t) -> BlockScope.Line h, t
+        | LinePattern (h, t) ->  h, t
         | _ -> failwith "edgi pragma must occur before a statement or a block."
         ||> fun h -> fun t ->
             Some (Pragma (cl.Head, cl.Tail, h), t)
     | _ -> None
-
-
-type Statement =
-    | MethodLoopInit of Token * Token list
-    | ObjectLoopInit of Token * Token
-    | MethodLoopCall of Token * Token
-    | ObjectLoopCall of Token * Token list
-    | NestedLoopCall of Token * Token * Token list
-    | Pipe of Token * Token list
-    | Cat  of Token * Token list
-
-
-let (|StatementPattern|_|) = function
-    | Token.Str loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
-        let elements, t = toElements tail
-        Some (Statement.MethodLoopInit (Token.Str loop, elements), tail)
-    | Token.Str loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: func :: Token.Symbol ')' :: tail ->
-        Some (Statement.ObjectLoopInit (Token.Str loop, func), tail)
-
 
 /// Parse code for all the pragmas and return a list of them.
 let parsePragmas (s: Token list) =
@@ -192,7 +159,7 @@ type NestedArray =
     { arrName: string
       arrType: string
       arrRank: int 
-      arrSym:  int list list}
+      arrSym:  int list list }
 
 type NestedNetCDFArray = 
     { arrName:  string
@@ -202,16 +169,8 @@ type NestedNetCDFArray =
       fileName: string
       varName:  string }
 
-
-type NestedClosure(iarraysIn: NestedArray list, symGroupsIn: int list list, comGroupsIn: int list, oarraysIn: NestedArray list, functionIn: BlockScope) =
-    member this.Iarrays = iarraysIn
-    member this.SymGroups = symGroupsIn
-    member this.ComGroups = comGroupsIn
-    member this.Oarrays = oarraysIn
-    member this.Function = functionIn
-
 let (|ArraySymmetryPattern|_|) = function
-    | "symmetry", (vals: Token list) -> Some (vals)
+    | "symmetry", (vals: Token list) -> Some (vals |> tokenToInt)
     | _ -> failwith "Invalid array clause."
 
 let getSymmetry (rank: int) (symGroups: int list) = 
@@ -224,35 +183,47 @@ let getSymmetry (rank: int) (symGroups: int list) =
             failwith "Symmetry vector length did not match the rank of the array."
 
 let (|ArrayPattern|_|) (symGroups: int list) = function
-    | BlockScope.Line (Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail) ->
+    | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
         Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]}, tail )
-    | BlockScope.Line (Token.Str "promote" :: Token.Symbol '<' :: Token.Str valtype :: Token.Symbol ',' :: Token.Int rank :: Token.Symbol '>' :: Token.Symbol ':' :: Token.Symbol ':' :: Token.Str "type" :: Token.Str name :: Token.Symbol ';' :: tail) ->
+    | Token.Str "promote" :: Token.Symbol '<' :: Token.Str valtype :: Token.Symbol ',' :: Token.Int rank :: Token.Symbol '>' :: Token.Symbol ':' :: Token.Symbol ':' :: Token.Str "type" :: Token.Str name :: Token.Symbol ';' :: tail ->
         Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]}, tail )
     | _ -> None
 
 let (|NetCDFArrayPattern|_|) (symGroups: int list) = function
-    | BlockScope.Line (Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Symbol '<' :: Token.Str fname :: Token.Symbol ',' :: Token.Str vname :: Token.Symbol '>' :: Token.Str name :: Token.Symbol ';' :: tail) ->
+    | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Symbol '<' :: Token.Str fname :: Token.Symbol ',' :: Token.Str vname :: Token.Symbol '>' :: Token.Str name :: Token.Symbol ';' :: tail ->
         Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]; fileName = fname; varName = vname}, tail )
     | _ -> None
 
+//[Str "promote"; Symbol '<'; Str "float"; Symbol ','; Int 4; Symbol '>'; Token.Symbol ':'; Token.Symbol ':'; Token.Str "type"; Str "array1"; Token.Symbol ';'] |> function | ArrayPattern(s) -> Some(s) | _ -> failwith "Array pragma specified on a line that did not declare an array.";;
 
-let getArray (clauses: Clause list) (block: BlockScope) =
+
+let getArray (clauses: Clause list) (block: Token list) =
     let hasSym = clauses |> List.exists (fun x ->
                                              match x with
                                              | ArraySymmetryPattern s -> true
                                              | _ -> false
                                         )
-    let a = if hasSym then
-                clauses |> List.pick (fun x ->
-                                          match x with
-                                          | ArraySymmetryPattern s -> Some (s |> List.map (string >> (fun x -> x.Substring 4) >> int)) // megahack! try to fix for proper Token.Int -> int conversion
-                                          | _ -> None
-                                     )
-            else []
+    let sym = if hasSym then
+                  clauses |> List.pick (fun x ->
+                                            match x with
+                                            | ArraySymmetryPattern s -> Some (s)
+                                            | _ -> None
+                                       )
+              else []
     match block with
-    | ArrayPattern a s -> Some(fst s)
+    | ArrayPattern sym s -> Some(fst s)
     | _ -> failwith "Array pragma applied to invalid array declaration."
 
+
+type NestedFunction =
+    { funcName:  string
+      funcArity: int
+      //funcIType: string
+      funcIRank: int list
+      //funcOType: string
+      funcORank: int
+      funcCom:   int list
+      funcBlock: Token list }
 
 let (|FunctionArityPattern|_|) = function
     | "arity", [Token.Str "any"] -> None
@@ -280,7 +251,7 @@ let (|FunctionCommutativityPattern|_|) = function
     | "commutativity", (vals: Token list) -> Some (vals |> tokenToInt)
     | _ -> failwith "Invalid array clause."
 
-let getFunction (name: string) (clauses: Clause list) (block: BlockScope) =
+let getFunction (name: string) (clauses: Clause list) (block: Token list) =
 
     let arity  = clauses |> List.pick (fun x -> match x with | FunctionArityPattern s       -> Some(s) | _ -> None)
     let input  = clauses |> List.pick (fun x -> match x with | FunctionInputPattern s       -> Some(s) | _ -> None)
@@ -293,19 +264,10 @@ let getFunction (name: string) (clauses: Clause list) (block: BlockScope) =
                   clauses |> List.pick (fun x -> match x with | FunctionCommutativityPattern s -> Some (s) | _ -> None)
               else []
 
-    {funcName = name; funcArity = arity; funcIType = ; funcIRank = iranks; funcOType = ; funcORank = orank; funcCom = com; funcBlock = block}
+    {funcName = name; funcArity = arity; funcIRank = iranks; funcORank = orank; funcCom = com; funcBlock = block}
 
-type NestedFunction =
-    { funcName:  string
-      funcArity: int
-      funcIType: string
-      funcIRank: int list
-      funcOType: string
-      funcORank: int
-      funcCom:   int list
-      funcBlock: Token list }
 
-type NestedClosure(iarraysIn: NestedArray list, symGroupsIn: int list list, comGroupsIn: int list, oarraysIn: NestedArray list, functionIn: BlockScope) =
+type NestedClosure(iarraysIn: NestedArray list, symGroupsIn: int list list, comGroupsIn: int list, oarraysIn: NestedArray list, functionIn: Token list) =
     member this.Iarrays = iarraysIn
     member this.SymGroups = symGroupsIn
     member this.ComGroups = comGroupsIn
@@ -327,8 +289,7 @@ let sortPragmas (s: Pragma list) =
                             )
     alist s, flist s
 
-(*
-let parse (s: Token list) = 
+let parse (s: Token list) =
     let alist, flist = s |> (parsePragmas >> sortPragmas)
     let arrays = List.init alist.Length (fun i ->
                                              let directive, clauses, scope = alist.[i]
@@ -336,10 +297,25 @@ let parse (s: Token list) =
                                         )
     let funcs = List.init flist.Length (fun i ->
                                             let directive, clauses, scope = flist.[i]
-                                            getFunction (snd directive) clauses scope
+                                            getFunction ((snd directive).[0]) clauses scope
                                        )
-*)
 
+type Statement =
+    | MethodLoopInit of Token * Token list
+    | ObjectLoopInit of Token * Token
+    | MethodLoopCall of Token * Token
+    | ObjectLoopCall of Token * Token list
+    | NestedLoopCall of Token * Token * Token list
+    | Pipe of Token * Token list
+    | Cat  of Token * Token list
+
+
+let (|StatementPattern|_|) = function
+    | Token.Str loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
+        let elements, t = toElements tail
+        Some (Statement.MethodLoopInit (Token.Str loop, elements), t)
+    | Token.Str loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: func :: Token.Symbol ')' :: tail ->
+        Some (Statement.ObjectLoopInit (Token.Str loop, func), tail)
 
 let code = """
 
@@ -394,4 +370,3 @@ int main(){
 
     return 0;
 }"""
-
