@@ -40,6 +40,14 @@ let tokenize (s: string) =
     // strip out the whitespace tokens; note that since new line characters are distinct, they will remain.
     |> List.choose (function Token.WhiteSpace -> None | t -> Some t)
 
+/// Megahack to convert tokens to ints. try to fix for proper Token.Int -> int conversion
+let tokenToInt (s: Token list) = 
+    s |> List.map (string >> (fun x -> x.Substring 4) >> int)
+
+/// Megahack to convert tokens to strings. try to fix for proper Token.Str -> string conversion
+let tokenToStr (s: Token list) = 
+    s |> List.map (string >> (fun x -> x.Substring 4))
+
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
 
