@@ -231,11 +231,11 @@ let (|NetCDFArrayPattern|_|) (symGroups: int list) = function
 let getArray (clauses: Clause list) (block: BlockScope) =
     let a = clauses |> List.pick (fun x ->
                                       match x with
-                                      | ArraySymmetryPattern s -> Some (s |> List.map (string >> int))
+                                      | ArraySymmetryPattern s -> Some (s |> List.map (string >> (fun x -> x.Substring 4) >> int)) // megahack! try to fix for proper Token.Int -> int conversion
                                       | _ -> None
                                  )
     match block with
-    | ArrayPattern a s -> [Some(fst s)]
+    | ArrayPattern a s -> Some(fst s)
     | _ -> failwith "Array pragma applied to invalid array declaration."
 
 
@@ -289,7 +289,6 @@ let code = """
 
 #include "things.hpp"
 #include "stuff.hpp"
-
 #pragma edgi function(product) arity(any) input(iarrays) irank(0) output(oarray) orank(0)
 {
     oarray = 1;
@@ -297,7 +296,6 @@ let code = """
         oarray *= iarrays[i];
     }
 }
-
 #pragma edgi function(product3) arity(3) input(iarrays) irank(0) output(oarray) orank(0)
 {
     oarray = 1;
@@ -305,9 +303,8 @@ let code = """
         oarray *= iarrays[i];
     }
 }
-
 #pragma edgi function(sumThenMultiply) input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
-{
+auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
     // assume iarray1 and iarray2 last extents are same
     for(int i = 0; i < iarray1.current_extent(); i++){
         oarray += iarray1[i] + iarray2[i];
@@ -316,21 +313,19 @@ let code = """
     oarray *= iarray3;
     //return oarray;
 }
-
 #pragma edgi function(add10) input(iarray) iranks(0) output(oarray) orank(0)
 {
     oarray = iarray + 10;
     //return oarray;
 }
-
 int main(){
 
     #pragma edgi array symmetry(1, 2, 2, 3)
-    promote<float, 4> array1;
+    promote<float, 4>::type array1;
 
     #pragma edgi array
-    promote<float, 3> array3;
-    
+    promote<float, 3>::type array3;
+
     auto oloop = object_for(sumThenMultiply);
     auto mloop = method_for(array1, array1, array3);
 
@@ -341,10 +336,6 @@ int main(){
 
     auto newfunc = pipe(sumThenMultiply, add10);
 
-
     return 0;
-}
+}"""
 
-"""
-
-parse code ;;
