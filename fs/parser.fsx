@@ -23,7 +23,7 @@ let toToken = function
     | Match @"^\n|^\r"               s -> s, Token.NewLine
     | Match @"^\s+"                  s -> s, Token.WhiteSpace
     | Match @"^\{|^\}|^\(|^\)|^\[|^\]|^,|^\#|^\<|^\>|^;|^:|^~|^\*|^="    s -> s, Token.Symbol s.[0]
-    | Match @"^[a-zA-Z][a-zA-Z0-9]*" s -> s, Token.Str s
+    | Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s -> s, Token.Str s
     | Match @"^\d+"                  s -> s, Token.Int (int s)
     | Match @"."                     s -> s, Token.Other (string s)
     | _ -> failwith "Invalid Token"
