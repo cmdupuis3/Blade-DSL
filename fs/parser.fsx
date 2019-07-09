@@ -229,11 +229,18 @@ let (|NetCDFArrayPattern|_|) (symGroups: int list) = function
 
 
 let getArray (clauses: Clause list) (block: BlockScope) =
-    let a = clauses |> List.pick (fun x ->
-                                      match x with
-                                      | ArraySymmetryPattern s -> Some (s |> List.map (string >> (fun x -> x.Substring 4) >> int)) // megahack! try to fix for proper Token.Int -> int conversion
-                                      | _ -> None
-                                 )
+    let hasSym = clauses |> List.exists (fun x ->
+                                             match x with
+                                             | ArraySymmetryPattern s -> true
+                                             | _ -> false
+                                        )
+    let a = if hasSym then
+                clauses |> List.pick (fun x ->
+                                          match x with
+                                          | ArraySymmetryPattern s -> Some (s |> List.map (string >> (fun x -> x.Substring 4) >> int)) // megahack! try to fix for proper Token.Int -> int conversion
+                                          | _ -> None
+                                     )
+            else []
     match block with
     | ArrayPattern a s -> Some(fst s)
     | _ -> failwith "Array pragma applied to invalid array declaration."
