@@ -218,9 +218,9 @@ let getArray (clauses: Clause list) (block: Token list) =
 type NestedFunction =
     { funcName:  string
       funcArity: int
-      //funcIType: string
+      funcINames: string list
       funcIRank: int list
-      //funcOType: string
+      funcOName: string
       funcORank: int
       funcCom:   int list
       funcBlock: Token list }
@@ -264,14 +264,14 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
                   clauses |> List.pick (fun x -> match x with | FunctionCommutativityPattern s -> Some (s) | _ -> None)
               else []
 
-    {funcName = name; funcArity = arity; funcIRank = iranks; funcORank = orank; funcCom = com; funcBlock = block}
+    {funcName = name; funcArity = arity; funcINames = input; funcIRank = iranks; funcOName = output; funcORank = orank; funcCom = com; funcBlock = block}
 
 
-type NestedClosure(iarraysIn: NestedArray list, symGroupsIn: int list list, comGroupsIn: int list, oarraysIn: NestedArray list, functionIn: Token list) =
+type NestedClosure(iarraysIn: NestedArray list, symGroupsIn: int list list, comGroupsIn: int list, oarrayIn: NestedArray list, functionIn: Token list) =
     member this.Iarrays = iarraysIn
     member this.SymGroups = symGroupsIn
     member this.ComGroups = comGroupsIn
-    member this.Oarrays = oarraysIn
+    member this.Oarray = oarrayIn
     member this.Function = functionIn
 
 type PragmaObj =
@@ -297,8 +297,10 @@ let parse (s: Token list) =
                                         )
     let funcs = List.init flist.Length (fun i ->
                                             let directive, clauses, scope = flist.[i]
-                                            getFunction ((snd directive).[0]) clauses scope
+                                            let name = ([(snd directive).Head] |> tokenToStr).Head
+                                            getFunction name clauses scope
                                        )
+    []
 
 type Statement =
     | MethodLoopInit of Token * Token list
