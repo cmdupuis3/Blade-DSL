@@ -364,6 +364,22 @@ let queryArray (name: string) (arrays: NestedArray list) =
 let queryFunction (name: string) (funcs: NestedFunction list) =
     List.pick (fun (i: NestedFunction) -> if i.funcName = name then Some i else None) funcs
     
+let (|MethodLoopPattern|_|) (arrays: NestedArray list) (functions: NestedFunction list) = function
+    | Token.Str loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
+        let elements, t = toElements tail
+        let iarrays = (tokenToStr elements) |> List.map (fun x -> queryArray x arrays)
+        let rec findCalls s' = 
+            match s' with
+            | Token.Str oarray :: Token.Symbol '=' :: loop :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' -> (func, oarray) :: findCalls tail'
+            | head' :: tail' -> findCalls tail'
+            | [] -> []
+        let oarrays, funcs = 
+            match t with
+            | PostScopePattern t' -> findCalls (fst t')
+            | _ -> []
+            |> fun x -> List.map (fst >> fun y -> queryArray y arrays) x, List.map (snd >> fun y -> queryFunction y functions) x
+        Some (List.init funcs.Length (fun i -> NestedClosure(iarrays, oarrays.[i], funcs.[i])))
+    | _ -> None
 
 let code = """
 
