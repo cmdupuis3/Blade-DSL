@@ -381,6 +381,25 @@ let (|MethodLoopPattern|_|) (arrays: NestedArray list) (functions: NestedFunctio
         Some (List.init funcs.Length (fun i -> NestedClosure(iarrays, oarrays.[i], funcs.[i])))
     | _ -> None
 
+let (|ObjectLoopPattern|_|) (arrays: NestedArray list) (functions: NestedFunction list) = function
+    | Token.Str loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: func :: Token.Symbol ')' :: tail ->
+        let func' = ((tokenToStr [func]) |> List.map (fun x -> queryFunction x functions)).Head
+        let rec findCalls s' = 
+            match s' with
+            | Token.Str oarray :: Token.Symbol '=' :: loop :: Token.Symbol '(' :: tail' ->
+                let iarrays, t = toElements tail
+                (tokenToStr iarrays, oarray) :: findCalls tail'
+            | head' :: tail' -> findCalls tail'
+            | [] -> []
+        let iarrays, oarrays = 
+            match tail with
+            | PostScopePattern t' -> findCalls (fst t')
+            | _ -> []
+            |> fun x -> List.map (fst >> List.map (fun y -> queryArray y arrays)) x, List.map (snd >> fun y -> queryArray y arrays) x
+        Some (List.init oarrays.Length (fun i -> NestedClosure(iarrays.[i], oarrays.[i], func')))
+    | _ -> None
+    
+
 let code = """
 
 #include "things.hpp"
