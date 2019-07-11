@@ -88,6 +88,43 @@ let rec (|ScopePattern|_|) = function
         | _ -> None
     | _ -> None
 
+// Pattern for all code after a certain code block where the code block is in scope
+let rec (|PostScopePattern|_|) = function
+    | Token.Symbol '{' :: tail ->
+        /// Make a list of tokens inside this scope by counting the number of braces (terrible, I know)
+        let rec toScope t (ctr: int) =
+            match t with
+            | [] -> [], []
+            | Token.Symbol '}' :: Token.NewLine :: tail' -> 
+                if ctr > -1 then
+                    let h', t' = toScope tail' (ctr-1)
+                    Token.Symbol '}' :: Token.NewLine :: h', t'
+                else
+                    [], tail'
+            | Token.Symbol '}' :: tail' -> 
+                if ctr > -1 then
+                    let h', t' = toScope tail' (ctr-1)
+                    Token.Symbol '}' :: h', t'
+                else
+                    [], tail'
+            | Token.Symbol '{' :: tail' -> 
+                let h', t' = toScope tail' (ctr+1)
+                Token.Symbol '{' :: h', t'
+            | head' :: tail' -> 
+                let h', t' = toScope tail' ctr
+                head' :: h', t'
+            | _ -> failwith "asdfsdf"
+        let scope, t = toScope tail 0
+        Some (Token.Symbol '{' :: scope, (t: Token list))
+    | head :: tail -> 
+        match tail with
+        | PostScopePattern t -> 
+            match t with
+            | [], [] -> None
+            | _ -> Some (head :: (fst t), snd t)
+        | _ -> None
+    | _ -> None
+
 //match tokenize "asd(8) {fjfj jfjf }\n" with | ScopePattern(s) -> Some(s) |_->None;;
 //let a = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopePattern v -> Some(v) |_-> None ;;
 //let b = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopesPattern v -> Some(v) |_-> None ;;
