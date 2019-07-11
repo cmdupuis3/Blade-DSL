@@ -356,6 +356,15 @@ let (|StatementPattern|_|) = function
     | Token.Str loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: func :: Token.Symbol ')' :: tail ->
         Some (Statement.ObjectLoopInit (Token.Str loop, func), tail)
 
+
+
+let queryArray (name: string) (arrays: NestedArray list) =
+    List.pick (fun (i: NestedArray) -> if i.arrName = name then Some i else None) arrays
+
+let queryFunction (name: string) (funcs: NestedFunction list) =
+    List.pick (fun (i: NestedFunction) -> if i.funcName = name then Some i else None) funcs
+    
+
 let code = """
 
 #include "things.hpp"
