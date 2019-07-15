@@ -46,7 +46,8 @@ let tokenToInt (s: Token list) =
 
 /// Megahack to convert tokens to strings. try to fix for proper Token.Str -> string conversion
 let tokenToStr (s: Token list) = 
-    s |> List.map (string >> (fun x -> x.Substring 4))
+    let unquote (s': string) = s'.Substring(1,s'.Length-2)
+    s |> List.map (string >> (fun x -> x.Substring 4) >> unquote)
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
@@ -233,24 +234,14 @@ let (|NetCDFArrayPattern|_|) (symGroups: int list) = function
 
 //[Str "promote"; Symbol '<'; Str "float"; Symbol ','; Int 4; Symbol '>'; Token.Symbol ':'; Token.Symbol ':'; Token.Str "type"; Str "array1"; Token.Symbol ';'] |> function | ArrayPattern(s) -> Some(s) | _ -> failwith "Array pragma specified on a line that did not declare an array.";;
 
-
 let getArray (clauses: Clause list) (block: Token list) =
-    let hasSym = clauses |> List.exists (fun x ->
-                                             match x with
-                                             | ArraySymmetryPattern s -> true
-                                             | _ -> false
-                                        )
+    let hasSym = clauses |> List.exists (function | ArraySymmetryPattern s -> true | _ -> false)
     let sym = if hasSym then
-                  clauses |> List.pick (fun x ->
-                                            match x with
-                                            | ArraySymmetryPattern s -> Some (s)
-                                            | _ -> None
-                                       )
+                  clauses |> List.pick (function | ArraySymmetryPattern s -> Some (s) | _ -> None)
               else []
     match block with
-    | ArrayPattern sym s -> Some(fst s)
+    | ArrayPattern sym s -> fst s
     | _ -> failwith "Array pragma applied to invalid array declaration."
-
 
 type NestedFunction =
     { funcName:  string
@@ -262,52 +253,24 @@ type NestedFunction =
       funcCom:   int list
       funcBlock: Token list }
 
-let (|FunctionArityPattern|_|) = function
-    | "arity", [Token.Str "any"] -> None
-    | "arity", [Token.Int arity] -> Some (arity)
-    | _ -> failwith "Invalid or missing arity clause."
-
-let (|FunctionInputPattern|_|) = function
-    | "input", (value: Token list) -> Some (value |> tokenToStr)
-    | _ -> failwith "Invalid or missing input clause."
-
-let (|FunctionOutputPattern|_|) = function
-    | "output", [Token.Str value] -> Some (value)
-    | _ -> failwith "Invalid or missing output clause."
-
-let (|FunctionIRankPattern|_|) (arity: int) = function
-    | "irank", [Token.Int value] -> Some (List.init arity id)
-    | "iranks", (values: Token list) -> Some (values |> tokenToInt)
-    | _ -> failwith "Invalid or missing irank / iranks clause."
-
-let (|FunctionOrankPattern|_|) = function
-    | "orank", [Token.Int value] -> Some (value)
-    | _ -> failwith "Invalid or missing orank clause clause."
-
-let (|FunctionCommutativityPattern|_|) = function
-    | "commutativity", (vals: Token list) -> Some (vals |> tokenToInt)
-    | _ -> failwith "Invalid array clause."
-
 let getFunction (name: string) (clauses: Clause list) (block: Token list) =
 
-    let arity  = clauses |> List.pick (fun x -> match x with | FunctionArityPattern s       -> Some(s) | _ -> None)
-    let input  = clauses |> List.pick (fun x -> match x with | FunctionInputPattern s       -> Some(s) | _ -> None)
-    let output = clauses |> List.pick (fun x -> match x with | FunctionOutputPattern s      -> Some(s) | _ -> None)
-    let iranks = clauses |> List.pick (fun x -> match x with | FunctionIRankPattern arity s -> Some(s) | _ -> None)
-    let orank  = clauses |> List.pick (fun x -> match x with | FunctionOrankPattern s       -> Some(s) | _ -> None)
+    let arity  = (clauses |> List.find (fst >> (function | "arity" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
+    let input  = (clauses |> List.find (fst >> (function | "input" -> true | _ -> false))) |> (snd >> tokenToStr)
+    let output = (clauses |> List.find (fst >> (function | "output" -> true | _ -> false))) |> (snd >> tokenToStr >> List.head)
+    let iranks = (clauses |> List.find (fst >> (function | "iranks" -> true | _ -> false))) |> (snd >> tokenToInt)
+    let orank  = (clauses |> List.find (fst >> (function | "orank" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
 
-    let hasCom = clauses |> List.exists (fun x -> match x with | FunctionCommutativityPattern s -> true | _ -> false)
+
+    let hasCom = clauses |> List.exists (fst >> (function | "commutativity" -> true | _ -> false))
     let com = if hasCom then
-                  clauses |> List.pick (fun x -> match x with | FunctionCommutativityPattern s -> Some (s) | _ -> None)
-              else []
+                  (clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt)
+              else List.init arity id
 
     {funcName = name; funcArity = arity; funcINames = input; funcIRank = iranks; funcOName = output; funcORank = orank; funcCom = com; funcBlock = block}
 
-
-type NestedClosure(iarraysIn: NestedArray list, symGroupsIn: int list list, comGroupsIn: int list, oarrayIn: NestedArray list, functionIn: Token list) =
+type NestedClosure(iarraysIn: NestedArray list, oarrayIn: NestedArray, functionIn: NestedFunction) =
     member this.Iarrays = iarraysIn
-    member this.SymGroups = symGroupsIn
-    member this.ComGroups = comGroupsIn
     member this.Oarray = oarrayIn
     member this.Function = functionIn
 
@@ -344,7 +307,7 @@ type Statement =
     | ObjectLoopInit of Token * Token
     | MethodLoopCall of Token * Token
     | ObjectLoopCall of Token * Token list
-    | NestedLoopCall of Token * Token * Token list
+    //| NestedLoopCall of Token * Token * Token list
     | Pipe of Token * Token list
     | Cat  of Token * Token list
 
