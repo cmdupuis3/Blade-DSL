@@ -55,6 +55,17 @@ type Clause = string * Token list
 /// Pragma type; consists of a directive, a list of clauses, and a scope
 type Pragma = Clause * Clause list * Token list
 
+/// Delete the "return" line of a function (needed for function expansion)
+let rec deleteReturnLine = function
+    | Token.Str "return" :: tail ->
+        let rec aux = function
+            | Token.Symbol ';' :: tail' -> Some tail'
+            | head' :: tail'-> aux tail'
+            | _ -> None
+        aux tail
+    | head :: tail -> Some (head :: tail)
+    | _ -> None
+
 /// Pattern for pragma scopes; basically dumps all the tokens inside the pragma scope into a buffer, and returns the tail separately
 let rec (|ScopePattern|_|) = function
     | Token.Symbol '{' :: tail ->
