@@ -278,7 +278,14 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
                   (clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt)
               else List.init arity id
 
-    {funcName = name; funcArity = arity; funcINames = input; funcIRank = iranks; funcOName = output; funcORank = orank; funcCom = com; funcBlock = block}
+    { funcName = name;
+      funcArity = arity;
+      funcINames = input;
+      funcIRank = iranks;
+      funcOName = output;
+      funcORank = orank;
+      funcCom = com;
+      funcBlock = block |> deleteReturnLine |> Option.get }
 
 type NestedClosure(iarraysIn: NestedArray list, oarrayIn: NestedArray, functionIn: NestedFunction) =
     member this.Iarrays = iarraysIn
