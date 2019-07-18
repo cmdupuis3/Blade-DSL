@@ -180,86 +180,78 @@ type ObjectLoop =
       mutable otype: string
     }
 
+/// Pattern for method_for loops and all their calls
 let rec (|MethodLoopPattern|_|) = function
-    | Token.Str loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
+    | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
         let elements, tokens = toElements tail
-        let iarrays = (tokenToStr elements)
+        let iarrays = tokenToStr elements
         let rec findCalls tokens' =
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' when lname = Token.Str loop -> (func, oarray) :: findCalls tail'
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' when lname = loop -> (func, oarray) :: findCalls tail'
             | head' :: tail' -> findCalls tail'
             | [] -> []
         let calls = 
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens')
             | _ -> []
-        Some (({name = loop; init = iarrays; call = calls; iranks = []; orank = -1; itypes = []; otype = ""}: MethodLoop), tokens)
+        Some (({name = (tokenToStr [loop]).Head; init = iarrays; call = calls; iranks = []; orank = -1; itypes = []; otype = ""}: MethodLoop), tokens)
+(*
     | head :: tail ->
         match tail with
         | MethodLoopPattern t -> Some (t)
         | _ -> None
+*)
     | _ -> None
+
+/// Scan code for all the method_for loops and return a list of them.
+let scanMethodLoops (tokens: Token list) =
+    let rec scan = function
+    | MethodLoopPattern (loop,[]) -> [loop]
+    | MethodLoopPattern (loop, tail) -> loop :: (scan tail)
+    | head :: tail -> scan tail
+    | [] -> []
+    scan tokens
 
 //let a = match tokenize code with | MethodLoopPattern(s) -> Some(s) | _ -> None;;
 //let mystr = "auto mloop = method_for(array1, array1, array3); auto ooarray = oloop(array1, array1, array3); auto moarray = mloop(sumThenMultiply);"
 //let b = match tokenize mystr with | MethodLoopPattern(s) -> Some(s) | _ -> None;;
 
-let (|ObjectLoopPattern|_|) (arrays: NestedArray list) (functions: NestedFunction list) = function
-    | Token.Str loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: func :: Token.Symbol ')' :: tail ->
-        let func' = ((tokenToStr [func]) |> List.map (fun x -> queryFunction x functions)).Head
+/// Pattern for object_for loops and all their calls
+let rec (|ObjectLoopPattern|_|) = function
+    | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail ->
         let rec findCalls tokens' = 
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: loop :: Token.Symbol '(' :: tail' ->
-                let iarrays, t = toElements tail
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: tail' when lname = loop ->
+                let iarrays, t = toElements tail'
                 (tokenToStr iarrays, oarray) :: findCalls tail'
             | head' :: tail' -> findCalls tail'
             | [] -> []
-        let iarrays, oarrays = 
+        let calls = 
             match tail with
             | PostScopePattern t' -> findCalls (fst t')
             | _ -> []
-            |> fun x -> List.map (fst >> List.map (fun y -> queryArray y arrays)) x, List.map (snd >> fun y -> queryArray y arrays) x
-        Some (List.init oarrays.Length (fun i -> NestedClosure(iarrays.[i], oarrays.[i], func')))
-    | _ -> None
-
-
-
-
-
-
-
-let loopTemplate (loop: MethodLoop) = 
-
-    let rec toTypes = function
-        | [head] -> Some (String.concat "" [fst head; ","; string (snd head)])
-        | head :: tail -> Some (String.concat "" [fst head; ","; string (snd head); ","; tail |> toTypes |> Option.get])
+        Some (({name = (tokenToStr [loop]).Head; init = string func; call = calls; iranks = []; orank = -1; itypes = []; otype = ""}: ObjectLoop), tail)
+(*
+    | head :: tail ->
+        match tail with
+        | ObjectLoopPattern t -> Some (t)
         | _ -> None
-
-    let types = List.zip (loop.init :: fst loop.call) (loop.iranks :: orank) |> toTypes
-
-
-
-    let types = List.fold (fun elem i -> String.concat "" [elem; i]) "" (decltype loop.init)
-
-
-let loopTemplate (loop: ObjectLoop) = 
-    String.concat "" [
-        """template<decltype"""
-    ]
-
+*)
+    | _ -> None
+    
+/// Scan code for all the method_for loops and return a list of them.
+let scanObjectLoops (tokens: Token list) =
+    let rec scan = function
+    | ObjectLoopPattern (loop,[]) -> [loop]
+    | ObjectLoopPattern (loop, tail) -> loop :: (scan tail)
+    | head :: tail -> scan tail
+    | [] -> []
+    scan tokens
 
 
-
-
-
-
-
-
-
-
-
-
-
+//let a = match tokenize code with | ObjectLoopPattern(s) -> Some(s) | _ -> None;;
+//let mystr = "auto oloop = object_for(sumThenMultiply); auto mloop = method_for(array1, array1, array3); auto ooarray = oloop(array1, array1, array3);"
+//let b = match tokenize mystr with | ObjectLoopPattern(s) -> Some(s) | _ -> None;;
 
 /// Pattern for individual pragma clauses
 let rec (|ClausePattern|_|) = function
@@ -291,8 +283,108 @@ let (|PragmaPattern|_|) = function
             Some (Pragma (cl.Head, cl.Tail, h), t)
     | _ -> None
 
+/// Scan code for all the pragmas and return a list of them.
+let scanPragmas (tokens: Token list) =
+    let rec scan = function
+    | PragmaPattern (pragma,[]) -> [pragma]
+    | PragmaPattern (pragma, tail) -> pragma :: (scan tail)
+    | head :: tail -> scan tail
+    | [] -> []
+    scan tokens
+
+type NestedArray = 
+    { arrName: string
+      arrType: string
+      arrRank: int 
+      arrSym:  int list list }
+
+let (|ArraySymmetryPattern|_|) = function
+    | "symmetry", (vals: Token list) -> Some (vals |> tokenToInt)
+    | _ -> failwith "Invalid array clause."
+
+let getSymmetry (rank: int) (symGroups: int list) = 
+    if symGroups.IsEmpty then 
+        List.init rank id
+    else
+        if symGroups.Length = rank then
+            symGroups
+        else
+            failwith "Symmetry vector length did not match the rank of the array."
+
+let (|ArrayPattern|_|) (symGroups: int list) = function
+    | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
+        Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]}, tail )
+    | Token.Str "promote" :: Token.Symbol '<' :: Token.Str valtype :: Token.Symbol ',' :: Token.Int rank :: Token.Symbol '>' :: Token.Symbol ':' :: Token.Symbol ':' :: Token.Str "type" :: Token.Str name :: Token.Symbol ';' :: tail ->
+        Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]}, tail )
+    | _ -> None
+
+let getArray (clauses: Clause list) (block: Token list) =
+    let hasSym = clauses |> List.exists (function | ArraySymmetryPattern s -> true | _ -> false)
+    let sym = if hasSym then
+                  clauses |> List.pick (function | ArraySymmetryPattern s -> Some (s) | _ -> None)
+              else []
+    match block with
+    | ArrayPattern sym s -> fst s
+    | _ -> failwith "Array pragma applied to invalid array declaration."
+
+type NestedFunction =
+    { funcName:  string
+      funcArity: int
+      funcINames: string list
+      funcIRank: int list
+      funcOName: string
+      funcORank: int
+      funcCom:   int list
+      funcBlock: Token list }
+
+let getFunction (name: string) (clauses: Clause list) (block: Token list) =
+    let arity  = (clauses |> List.find (fst >> (function | "arity" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
+    let input  = (clauses |> List.find (fst >> (function | "input" -> true | _ -> false))) |> (snd >> tokenToStr)
+    let output = (clauses |> List.find (fst >> (function | "output" -> true | _ -> false))) |> (snd >> tokenToStr >> List.head)
+    let iranks = (clauses |> List.find (fst >> (function | "iranks" -> true | _ -> false))) |> (snd >> tokenToInt)
+    let orank  = (clauses |> List.find (fst >> (function | "orank" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
+    let hasCom = clauses |> List.exists (fst >> (function | "commutativity" -> true | _ -> false))
+    let com = if hasCom then
+                  (clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt)
+              else List.init arity id
+    { funcName = name;
+      funcArity = arity;
+      funcINames = input;
+      funcIRank = iranks;
+      funcOName = output;
+      funcORank = orank;
+      funcCom = com;
+      funcBlock = block |> deleteReturnLine |> Option.get }
+
+let sortPragmas (pragmas: Pragma list) =
+    let bin (s: string) = 
+        List.filter (fun x ->
+                        let directive, clauses, scope = x
+                        fst directive = s
+                    ) pragmas
+    bin "array", bin "function"
 
 
+//let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) = 
+
+
+
+
+let lex (tokens: Token list) = 
+    let mloops = scanMethodLoops tokens
+    let oloops = scanObjectLoops tokens
+
+    let alist, flist = tokens |> (scanPragmas >> sortPragmas)
+    let arrays = List.init alist.Length (fun i ->
+                                             let directive, clauses, scope = alist.[i]
+                                             getArray clauses scope
+                                        )
+    let funcs = List.init flist.Length (fun i ->
+                                            let directive, clauses, scope = flist.[i]
+                                            let name = ([(snd directive).Head] |> tokenToStr).Head
+                                            getFunction name clauses scope
+                                       )
+    []
 
 
 
