@@ -158,27 +158,23 @@ let rec toElements s =
     | head :: Token.Symbol ')' :: tail -> [head], tail
     | _ -> [], []
 
-type MethodLoop =
-    { 
-      name: string
-      init: string list // iarrays
-      call: (string * string) list // oarray and func
-      mutable iranks: int list
-      mutable orank: int
-      mutable itypes: string list
-      mutable otype: string
-    }
+type LoopBase () = 
+    let mutable (iranks: int list) = []
+    let mutable (orank: int) = -1
+    let mutable (itypes: string list) = []
+    let mutable (otype: string) = ""
 
-type ObjectLoop =
-    { 
-      name: string
-      init: string  // func
-      call: (string list * string) list // iarrays and oarray
-      mutable iranks: int list
-      mutable orank: int
-      mutable itypes: string list
-      mutable otype: string
-    }
+type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string) list)  =
+    inherit LoopBase()
+    member this.Name = nameIn
+    member this.Init = initIn // iarrays
+    member this.Call = callIn // oarray and func
+
+type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string) list) =
+    inherit LoopBase()
+    member this.Name = nameIn
+    member this.Init = initIn  // func
+    member this.Call = callIn // iarrays and oarray
 
 /// Pattern for method_for loops and all their calls
 let rec (|MethodLoopPattern|_|) = function
@@ -194,7 +190,7 @@ let rec (|MethodLoopPattern|_|) = function
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens')
             | _ -> []
-        Some (({name = (tokenToStr [loop]).Head; init = iarrays; call = calls; iranks = []; orank = -1; itypes = []; otype = ""}: MethodLoop), tokens)
+        Some (MethodLoop((tokenToStr [loop]).Head, iarrays, calls), tokens)
 (*
     | head :: tail ->
         match tail with
@@ -230,7 +226,7 @@ let rec (|ObjectLoopPattern|_|) = function
             match tail with
             | PostScopePattern t' -> findCalls (fst t')
             | _ -> []
-        Some (({name = (tokenToStr [loop]).Head; init = string func; call = calls; iranks = []; orank = -1; itypes = []; otype = ""}: ObjectLoop), tail)
+        Some (ObjectLoop((tokenToStr [loop]).Head, string func, calls), tail)
 (*
     | head :: tail ->
         match tail with
@@ -364,11 +360,18 @@ let sortPragmas (pragmas: Pragma list) =
                     ) pragmas
     bin "array", bin "function"
 
+(*
+let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) = 
+    let send (array: NestedArray) (loop: 'a list)
 
-//let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) = 
 
 
 
+    arrays |> List.map (fun x -> 
+                            []
+                        )
+
+*)
 
 let lex (tokens: Token list) = 
     let mloops = scanMethodLoops tokens
@@ -384,6 +387,11 @@ let lex (tokens: Token list) =
                                             let name = ([(snd directive).Head] |> tokenToStr).Head
                                             getFunction name clauses scope
                                        )
+
+
+
+
+
     []
 
 
