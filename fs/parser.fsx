@@ -158,45 +158,46 @@ let rec toElements s =
     | head :: Token.Symbol ')' :: tail -> [head], tail
     | _ -> [], []
 
+type NestedArray = 
+    { arrName: string
+      arrType: string
+      arrRank: int 
+      arrSym:  int list }
+
+type NestedFunction =
+    { funcName:  string
+      funcArity: int
+      funcINames: string list
+      funcIRank: int list
+      funcOName: string
+      funcORank: int
+      funcCom:   int list
+      funcBlock: Token list }
+
 type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string) list)  =
-    let mutable (iranks: int list) = []
-    let mutable (itypes: string list) = []
-    let mutable (isymms: int list list) = []
-    let mutable (oranks: int list) = []
-    let mutable (otypes: string list) = []
-    let mutable (osymms: int list list) = []
-    let mutable (comms: int list list) = []
+    let mutable (iarrays: NestedArray list) = []
+    let mutable (oarrays: NestedArray list) = []
+    let mutable (func: NestedFunction list) = []
     member this.Name = nameIn
     member this.Init = initIn // iarrays
     member this.Call = callIn // oarray and func
 
-    member this.PushIrank (v: int) = iranks <- List.append iranks [v]
-    member this.PushItype (v: string) = itypes <- List.append itypes [v]
-    member this.PushIsymm (v: int list) = isymms <- List.append isymms [v]
-    member this.PushOrank (v: int) = oranks <- List.append oranks [v]
-    member this.PushOtype (v: string) = otypes <- List.append otypes [v]
-    member this.PushOsymm (v: int list) = osymms <- List.append osymms [v]
-    member this.PushComm (v: int list) = comms <- List.append comms [v]
+    member this.PushIarray (v: NestedArray) = iarrays <- List.append iarrays [v]
+    member this.PushOarray (v: NestedArray) = oarrays <- List.append oarrays [v]
+    member this.PushFunc (v: NestedFunction) = func <- List.append func [v]
 
 type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string) list) =
-    let mutable (iranks: int list list) = []
-    let mutable (itypes: string list list) = []
-    let mutable (isymms: int list list list) = []
-    let mutable (oranks: int list) = []
-    let mutable (otypes: string list) = []
-    let mutable (osymms: int list list) = []
-    let mutable (comm: int list) = []
+    let mutable (iarrays: NestedArray list list) = []
+    let mutable (oarrays: NestedArray list) = []
+    let mutable (func: NestedFunction list) = []
     member this.Name = nameIn
     member this.Init = initIn // func
     member this.Call = callIn // iarrays and oarray
 
-    member this.PushIranks (v: int list) = iranks <- List.append iranks [v]
-    member this.PushItypes (v: string list) = itypes <- List.append itypes [v]
-    member this.PushIsymms (v: int list list) = isymms <- List.append isymms [v]
-    member this.PushOrank (v: int) = oranks <- List.append oranks [v]
-    member this.PushOtype (v: string) = otypes <- List.append otypes [v]
-    member this.PushOsymm (v: int list) = osymms <- List.append osymms [v]
-    member this.SetComm (v: int list) = comm <- v
+    member this.PushIarrays (v: NestedArray list) = iarrays <- List.append iarrays [v]
+    member this.PushOarray (v: NestedArray) = oarrays <- List.append oarrays [v]
+    member this.SetFunc (v: NestedFunction) = func <- [v]
+    member this.GetFunc (v: NestedFunction) = func.Head
 
 /// Pattern for method_for loops and all their calls
 let rec (|MethodLoopPattern|_|) = function
@@ -310,12 +311,6 @@ let scanPragmas (tokens: Token list) =
     | [] -> []
     scan tokens
 
-type NestedArray = 
-    { arrName: string
-      arrType: string
-      arrRank: int 
-      arrSym:  int list }
-
 let (|ArraySymmetryPattern|_|) = function
     | "symmetry", (vals: Token list) -> Some (vals |> tokenToInt)
     | _ -> failwith "Invalid array clause."
@@ -344,16 +339,6 @@ let getArray (clauses: Clause list) (block: Token list) =
     match block with
     | ArrayPattern sym s -> fst s
     | _ -> failwith "Array pragma applied to invalid array declaration."
-
-type NestedFunction =
-    { funcName:  string
-      funcArity: int
-      funcINames: string list
-      funcIRank: int list
-      funcOName: string
-      funcORank: int
-      funcCom:   int list
-      funcBlock: Token list }
 
 let getFunction (name: string) (clauses: Clause list) (block: Token list) =
     let arity  = (clauses |> List.find (fst >> (function | "arity" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
@@ -389,33 +374,34 @@ let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloo
         for j in 0..arrays.Length do
             for k in 0..mloops.[i].Init.Length do
                 if mloops.[i].Init.[k] = arrays.[j].arrName then
-                    mloops.[i].PushIrank arrays.[j].arrRank
-                    mloops.[i].PushItype arrays.[j].arrType
-                    mloops.[i].PushIsymm arrays.[j].arrSym
+                    mloops.[i].PushIarray arrays.[j]
             for k in 0..mloops.[i].Call.Length do
                 if fst mloops.[i].Call.[k] = arrays.[j].arrName then
-                    mloops.[i].PushOrank arrays.[j].arrRank
-                    mloops.[i].PushOtype arrays.[j].arrType
-                    mloops.[i].PushOsymm arrays.[j].arrSym
+                    mloops.[i].PushOarray arrays.[j]
     for i in 0..oloops.Length do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
         for j in 0..arrays.Length do
             for k in 0..oloops.[i].Call.Length do
-                let mutable rtemp = []
-                let mutable ttemp = []
-                let mutable stemp = []
+                let mutable itemp = []
                 for l in 0..(fst oloops.[i].Call.[k]).Length do
                     if (fst oloops.[i].Call.[k]).[l] = arrays.[j].arrName then
-                        rtemp <- List.append rtemp [arrays.[j].arrRank]
-                        ttemp <- List.append ttemp [arrays.[j].arrType]
-                        stemp <- List.append stemp [arrays.[j].arrSym]
-                oloops.[i].PushIranks rtemp
-                oloops.[i].PushItypes ttemp
-                oloops.[i].PushIsymms stemp
+                        itemp <- List.append itemp [arrays.[j]]
+                oloops.[i].PushIarrays itemp
                 if snd oloops.[i].Call.[k] = arrays.[j].arrName then
-                    oloops.[i].PushOrank arrays.[j].arrRank
-                    oloops.[i].PushOtype arrays.[j].arrType
-                    oloops.[i].PushOsymm arrays.[j].arrSym
+                    oloops.[i].PushOarray arrays.[j]
+
+
+/// Message-passing function for sending info about function pragmas to nested loop objects
+let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
+    for i in 0..mloops.Length do
+        // search for function names in funcs list and copy info to loop objects (results must be in order!)
+        for j in 0..funcs.Length do
+            for k in 0..mloops.[i].Init.Length do
+                if mloops.[i].Init.[k] = funcs.[j].funcName then
+                    mloops.[i].PushFunc funcs.[j]
+            for k in 0..mloops.[i].Call.Length do
+                if fst mloops.[i].Call.[k] = funcs.[j].funcName then
+                    mloops.[i].PushFunc funcs.[j]
 
 
 let lex (tokens: Token list) = 
