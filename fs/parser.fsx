@@ -391,7 +391,7 @@ let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloo
                 if mloops.[i].Init.[k] = arrays.[j].arrName then
                     mloops.[i].PushIarray arrays.[j]
             for k in 0..mloops.[i].Call.Length-1 do
-                if fst mloops.[i].Call.[k] = arrays.[j].arrName then
+                if snd mloops.[i].Call.[k] = arrays.[j].arrName then
                     mloops.[i].PushOarray arrays.[j]
     for i in 0..oloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
@@ -411,12 +411,13 @@ let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) 
         // search for function names in funcs list and copy info to loop objects (results must be in order!)
         for j in 0..funcs.Length-1 do
             for k in 0..mloops.[i].Call.Length-1 do
-                if snd mloops.[i].Call.[k] = funcs.[j].funcName then
+                if fst mloops.[i].Call.[k] = funcs.[j].funcName then
                     mloops.[i].PushFunc funcs.[j]
     // search for function names in funcs list and copy info to loop objects (results must be in order!)
-    for j in 0..funcs.Length-1 do
-        if oloops.[j].Init = funcs.[j].funcName then
-            oloops.[j].SetFunc funcs.[j]
+    for i in 0..oloops.Length-1 do
+        for j in 0..funcs.Length-1 do
+            if oloops.[i].Init = funcs.[j].funcName then
+                oloops.[i].SetFunc funcs.[j]
 
 
 let lex (tokens: Token list) = 
@@ -428,14 +429,13 @@ let lex (tokens: Token list) =
                                              let directive, clauses, scope = alist.[i]
                                              getArray clauses scope
                                         )
-(*                                    
     let funcs = List.init flist.Length (fun i ->
                                             let directive, clauses, scope = flist.[i]
                                             let name = ([(snd directive).Head] |> tokenToStr).Head
                                             getFunction name clauses scope
                                        )
-*)
     sendArraysToLoops arrays mloops oloops
+    sendFunctionsToLoops funcs mloops oloops
 
 
 
@@ -447,21 +447,7 @@ let code = """
 
 #include "things.hpp"
 #include "stuff.hpp"
-#pragma edgi function(product) arity(any) input(iarrays) irank(0) output(oarray) orank(0)
-{
-    oarray = 1;
-    for(int i = 0; i < arity; i++){
-        oarray *= iarrays[i];
-    }
-}
-#pragma edgi function(product3) arity(3) input(iarrays) irank(0) output(oarray) orank(0)
-{
-    oarray = 1;
-    for(int i = 0; i < arity; i++){
-        oarray *= iarrays[i];
-    }
-}
-#pragma edgi function(sumThenMultiply) input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
+#pragma edgi function(sumThenMultiply) arity(3) input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
 auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
     // assume iarray1 and iarray2 last extents are same
     for(int i = 0; i < iarray1.current_extent(); i++){
@@ -471,7 +457,7 @@ auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
     oarray *= iarray3;
     //return oarray;
 }
-#pragma edgi function(add10) input(iarray) iranks(0) output(oarray) orank(0)
+#pragma edgi function(add10) arity(1) input(iarray) iranks(0) output(oarray) orank(0)
 {
     oarray = iarray + 10;
     //return oarray;
@@ -483,6 +469,12 @@ int main(){
 
     #pragma edgi array
     promote<float, 3>::type array3;
+
+    #pragma edgi array
+    promote<float, 3>::type ooarray;
+
+    #pragma edgi array
+    promote<float, 3>::type moarray;
 
     auto oloop = object_for(sumThenMultiply);
     auto mloop = method_for(array1, array1, array3);
@@ -496,3 +488,5 @@ int main(){
 
     return 0;
 }"""
+
+let tokens = tokenize code;;
