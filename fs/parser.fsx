@@ -158,23 +158,33 @@ let rec toElements s =
     | head :: Token.Symbol ')' :: tail -> [head], tail
     | _ -> [], []
 
-type LoopBase () = 
-    let mutable (iranks: int list) = []
-    let mutable (orank: int) = -1
-    let mutable (itypes: string list) = []
-    let mutable (otype: string) = ""
-
 type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string) list)  =
-    inherit LoopBase()
+    let mutable (iranks: int list) = []
+    let mutable (itypes: string list) = []
+    let mutable (oranks: int list) = []
+    let mutable (otypes: string list) = []
     member this.Name = nameIn
     member this.Init = initIn // iarrays
     member this.Call = callIn // oarray and func
 
+    member this.PushIrank (v: int) = iranks <- List.append iranks [v]
+    member this.PushItype (v: string) = itypes <- List.append itypes [v]
+    member this.PushOrank (v: int) = oranks <- List.append oranks [v]
+    member this.PushOtype (v: string) = otypes <- List.append otypes [v]
+
 type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string) list) =
-    inherit LoopBase()
+    let mutable (iranks: int list list) = []
+    let mutable (itypes: string list list) = []
+    let mutable (oranks: int list) = []
+    let mutable (otypes: string list) = []
     member this.Name = nameIn
     member this.Init = initIn  // func
     member this.Call = callIn // iarrays and oarray
+
+    member this.PushIranks (v: int list) = iranks <- List.append iranks [v]
+    member this.PushItypes (v: string list) = itypes <- List.append itypes [v]
+    member this.PushOrank (v: int) = oranks <- List.append oranks [v]
+    member this.PushOtype (v: string) = otypes <- List.append otypes [v]
 
 /// Pattern for method_for loops and all their calls
 let rec (|MethodLoopPattern|_|) = function
@@ -360,18 +370,36 @@ let sortPragmas (pragmas: Pragma list) =
                     ) pragmas
     bin "array", bin "function"
 
-(*
+
+/// Message-passing function for sending info about array pragmas to nested loop objects
 let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) = 
-    let send (array: NestedArray) (loop: 'a list)
+    for i in 0..mloops.Length do
+        // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
+        for j in 0..arrays.Length do
+            for k in 0..mloops.[i].Init.Length do
+                if mloops.[i].Init.[k] = arrays.[j].arrName then
+                    mloops.[i].PushIrank arrays.[j].arrRank
+                    mloops.[i].PushItype arrays.[j].arrType
+            for k in 0..mloops.[i].Call.Length do
+                if fst mloops.[i].Call.[k] = arrays.[j].arrName then
+                    mloops.[i].PushOrank arrays.[j].arrRank
+                    mloops.[i].PushOtype arrays.[j].arrType
+    for i in 0..oloops.Length do
+        // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
+        for j in 0..arrays.Length do
+            for k in 0..oloops.[i].Call.Length do
+                let mutable rtemp = []
+                let mutable ttemp = []
+                for l in 0..(fst oloops.[i].Call.[k]).Length do
+                    if (fst oloops.[i].Call.[k]).[l] = arrays.[j].arrName then
+                        rtemp <- List.append rtemp [arrays.[j].arrRank]
+                        ttemp <- List.append ttemp [arrays.[j].arrType]
+                oloops.[i].PushIranks rtemp
+                oloops.[i].PushItypes ttemp
+                if snd oloops.[i].Call.[k] = arrays.[j].arrName then
+                    oloops.[i].PushOrank arrays.[j].arrRank
+                    oloops.[i].PushOtype arrays.[j].arrType
 
-
-
-
-    arrays |> List.map (fun x -> 
-                            []
-                        )
-
-*)
 
 let lex (tokens: Token list) = 
     let mloops = scanMethodLoops tokens
