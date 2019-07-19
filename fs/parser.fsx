@@ -158,12 +158,14 @@ let rec toElements s =
     | head :: Token.Symbol ')' :: tail -> [head], tail
     | _ -> [], []
 
+/// Container for array pragma information
 type NestedArray = 
     { arrName: string
       arrType: string
       arrRank: int 
       arrSym:  int list }
 
+/// Container for function pragma information
 type NestedFunction =
     { funcName:  string
       funcArity: int
@@ -174,30 +176,33 @@ type NestedFunction =
       funcCom:   int list
       funcBlock: Token list }
 
+/// Container for method_for loop information; able to recieve messages about array and function pragmas
 type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string) list)  =
-    let mutable (iarrays: NestedArray list) = []
-    let mutable (oarrays: NestedArray list) = []
-    let mutable (func: NestedFunction list) = []
+    [<DefaultValue>] val mutable public iarrays: NestedArray list
+    [<DefaultValue>] val mutable public oarrays: NestedArray list
+    [<DefaultValue>] val mutable public funcs: NestedFunction list
+    
     member this.Name = nameIn
     member this.Init = initIn // iarrays
     member this.Call = callIn // oarray and func
 
-    member this.PushIarray (v: NestedArray) = iarrays <- List.append iarrays [v]
-    member this.PushOarray (v: NestedArray) = oarrays <- List.append oarrays [v]
-    member this.PushFunc (v: NestedFunction) = func <- List.append func [v]
+    member this.PushIarray (v: NestedArray) = this.iarrays <- List.append this.iarrays [v]
+    member this.PushOarray (v: NestedArray) = this.oarrays <- List.append this.oarrays [v]
+    member this.PushFunc (v: NestedFunction) = this.funcs <- List.append this.funcs [v]
 
+/// Container for object_for loop information; able to recieve messages about array and function pragmas
 type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string) list) =
-    let mutable (iarrays: NestedArray list list) = []
-    let mutable (oarrays: NestedArray list) = []
-    let mutable (func: NestedFunction list) = []
+    [<DefaultValue>] val mutable public iarrays: NestedArray list list
+    [<DefaultValue>] val mutable public oarrays: NestedArray list
+    [<DefaultValue>] val mutable public func: NestedFunction list
     member this.Name = nameIn
     member this.Init = initIn // func
     member this.Call = callIn // iarrays and oarray
 
-    member this.PushIarrays (v: NestedArray list) = iarrays <- List.append iarrays [v]
-    member this.PushOarray (v: NestedArray) = oarrays <- List.append oarrays [v]
-    member this.SetFunc (v: NestedFunction) = func <- [v]
-    member this.GetFunc (v: NestedFunction) = func.Head
+    member this.PushIarrays (v: NestedArray list) = this.iarrays <- List.append this.iarrays [v]
+    member this.PushOarray (v: NestedArray) = this.oarrays <- List.append this.oarrays [v]
+    member this.SetFunc (v: NestedFunction) = this.func <- [v]
+    member this.GetFunc = this.func.Head
 
 /// Pattern for method_for loops and all their calls
 let rec (|MethodLoopPattern|_|) = function
@@ -213,7 +218,11 @@ let rec (|MethodLoopPattern|_|) = function
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens')
             | _ -> []
-        Some (MethodLoop((tokenToStr [loop]).Head, iarrays, calls), tokens)
+        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls)
+        out.iarrays <- []
+        out.oarrays <- []
+        out.funcs <- []
+        Some (out, tokens)
 (*
     | head :: tail ->
         match tail with
@@ -249,7 +258,11 @@ let rec (|ObjectLoopPattern|_|) = function
             match tail with
             | PostScopePattern t' -> findCalls (fst t')
             | _ -> []
-        Some (ObjectLoop((tokenToStr [loop]).Head, string func, calls), tail)
+        let out = ObjectLoop((tokenToStr [loop]).Head, string func, calls)
+        out.iarrays <- []
+        out.oarrays <- []
+        out.func <- []
+        Some (out, tail)
 (*
     | head :: tail ->
         match tail with
@@ -311,6 +324,7 @@ let scanPragmas (tokens: Token list) =
     | [] -> []
     scan tokens
 
+
 let (|ArraySymmetryPattern|_|) = function
     | "symmetry", (vals: Token list) -> Some (vals |> tokenToInt)
     | _ -> failwith "Invalid array clause."
@@ -339,6 +353,7 @@ let getArray (clauses: Clause list) (block: Token list) =
     match block with
     | ArrayPattern sym s -> fst s
     | _ -> failwith "Array pragma applied to invalid array declaration."
+
 
 let getFunction (name: string) (clauses: Clause list) (block: Token list) =
     let arity  = (clauses |> List.find (fst >> (function | "arity" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
@@ -369,39 +384,39 @@ let sortPragmas (pragmas: Pragma list) =
 
 /// Message-passing function for sending info about array pragmas to nested loop objects
 let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) = 
-    for i in 0..mloops.Length do
+    for i in 0..mloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
-        for j in 0..arrays.Length do
-            for k in 0..mloops.[i].Init.Length do
+        for j in 0..arrays.Length-1 do
+            for k in 0..mloops.[i].Init.Length-1 do
                 if mloops.[i].Init.[k] = arrays.[j].arrName then
                     mloops.[i].PushIarray arrays.[j]
-            for k in 0..mloops.[i].Call.Length do
+            for k in 0..mloops.[i].Call.Length-1 do
                 if fst mloops.[i].Call.[k] = arrays.[j].arrName then
                     mloops.[i].PushOarray arrays.[j]
-    for i in 0..oloops.Length do
+    for i in 0..oloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
-        for j in 0..arrays.Length do
-            for k in 0..oloops.[i].Call.Length do
+        for j in 0..arrays.Length-1 do
+            for k in 0..oloops.[i].Call.Length-1 do
                 let mutable itemp = []
-                for l in 0..(fst oloops.[i].Call.[k]).Length do
+                for l in 0..(fst oloops.[i].Call.[k]).Length-1 do
                     if (fst oloops.[i].Call.[k]).[l] = arrays.[j].arrName then
                         itemp <- List.append itemp [arrays.[j]]
                 oloops.[i].PushIarrays itemp
                 if snd oloops.[i].Call.[k] = arrays.[j].arrName then
                     oloops.[i].PushOarray arrays.[j]
 
-
 /// Message-passing function for sending info about function pragmas to nested loop objects
 let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
-    for i in 0..mloops.Length do
+    for i in 0..mloops.Length-1 do
         // search for function names in funcs list and copy info to loop objects (results must be in order!)
-        for j in 0..funcs.Length do
-            for k in 0..mloops.[i].Init.Length do
-                if mloops.[i].Init.[k] = funcs.[j].funcName then
+        for j in 0..funcs.Length-1 do
+            for k in 0..mloops.[i].Call.Length-1 do
+                if snd mloops.[i].Call.[k] = funcs.[j].funcName then
                     mloops.[i].PushFunc funcs.[j]
-            for k in 0..mloops.[i].Call.Length do
-                if fst mloops.[i].Call.[k] = funcs.[j].funcName then
-                    mloops.[i].PushFunc funcs.[j]
+    // search for function names in funcs list and copy info to loop objects (results must be in order!)
+    for j in 0..funcs.Length-1 do
+        if oloops.[j].Init = funcs.[j].funcName then
+            oloops.[j].SetFunc funcs.[j]
 
 
 let lex (tokens: Token list) = 
@@ -413,13 +428,14 @@ let lex (tokens: Token list) =
                                              let directive, clauses, scope = alist.[i]
                                              getArray clauses scope
                                         )
+(*                                    
     let funcs = List.init flist.Length (fun i ->
                                             let directive, clauses, scope = flist.[i]
                                             let name = ([(snd directive).Head] |> tokenToStr).Head
                                             getFunction name clauses scope
                                        )
-
-
+*)
+    sendArraysToLoops arrays mloops oloops
 
 
 
