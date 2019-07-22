@@ -419,6 +419,39 @@ let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) 
             if oloops.[i].Init = funcs.[j].funcName then
                 oloops.[i].SetFunc funcs.[j]
 
+/// Find a loop API call and return the tail
+let rec (|Init|_|) = function
+    | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail -> Some (tail |> toElements |> snd)
+    | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail -> Some (tail)
+    | head :: tail -> 
+        match tail with 
+        | Init(s) -> Some (s)
+        | _ -> None
+    | _ -> None
+
+/// Inserts a comma at the end of each string in the input list, except the last one
+let commas (x: string list) =
+    x
+    |> List.rev
+    |> List.tail
+    |> List.rev
+    |> List.map (fun y -> String.concat "" [y; ", "])
+    |> fun y -> List.append y [List.last x]
+
+let objectLoopTemplate (oloop: ObjectLoop) =
+    let arity = oloop.func.Head.funcArity
+
+    let firank = oloop.func.Head.funcIRank
+    let forank = oloop.func.Head.funcORank
+
+    let numCalls = oloop.Call.Length
+    let irank = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.arrRank))
+    let orank = oloop.oarrays |> List.map (fun x -> x.arrRank)
+    let itype = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.arrType))
+    let otype = oloop.oarrays |> List.map (fun x -> x.arrType)
+
+    String.concat "" ["template<"]
+
 
 let lex (tokens: Token list) = 
     let mloops = scanMethodLoops tokens
