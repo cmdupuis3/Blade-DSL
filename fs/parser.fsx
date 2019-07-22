@@ -2,7 +2,7 @@
 open System.IO
 open System.Text.RegularExpressions
 
-#load "parser.fs"
+//#load "parser.fs"
 
 /// Union of all the relevant token types
 type Token = 
@@ -177,27 +177,32 @@ type NestedFunction =
       funcBlock: Token list }
 
 /// Container for method_for loop information; able to recieve messages about array and function pragmas
-type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string) list)  =
+type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string * int) list, fposition: int, lposition: int)  =
     [<DefaultValue>] val mutable public iarrays: NestedArray list
     [<DefaultValue>] val mutable public oarrays: NestedArray list
     [<DefaultValue>] val mutable public funcs: NestedFunction list
     
     member this.Name = nameIn
     member this.Init = initIn // iarrays
-    member this.Call = callIn // oarray and func
+    member this.Call = callIn // oarray, func, and call position
+    member this.FPosition = fposition // position of the first token of the init pattern
+    member this.LPosition = lposition // position of the last token of the init pattern
 
     member this.PushIarray (v: NestedArray) = this.iarrays <- List.append this.iarrays [v]
     member this.PushOarray (v: NestedArray) = this.oarrays <- List.append this.oarrays [v]
     member this.PushFunc (v: NestedFunction) = this.funcs <- List.append this.funcs [v]
 
 /// Container for object_for loop information; able to recieve messages about array and function pragmas
-type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string) list) =
+type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string * int) list, fposition: int, lposition: int) =
     [<DefaultValue>] val mutable public iarrays: NestedArray list list
     [<DefaultValue>] val mutable public oarrays: NestedArray list
     [<DefaultValue>] val mutable public func: NestedFunction list
+
     member this.Name = nameIn
     member this.Init = initIn // func
-    member this.Call = callIn // iarrays and oarray
+    member this.Call = callIn // iarrays, oarray, and call position
+    member this.FPosition = fposition // position of the first token of the init pattern
+    member this.LPosition = lposition // position of the last token of the init pattern
 
     member this.PushIarrays (v: NestedArray list) = this.iarrays <- List.append this.iarrays [v]
     member this.PushOarray (v: NestedArray) = this.oarrays <- List.append this.oarrays [v]
@@ -205,85 +210,87 @@ type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string
     member this.GetFunc = this.func.Head
 
 /// Pattern for method_for loops and all their calls
-let rec (|MethodLoopPattern|_|) = function
+let rec (|MethodLoopPattern|_|) (position: int) = function
     | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
         let elements, tokens = toElements tail
         let iarrays = tokenToStr elements
-        let rec findCalls tokens' =
+        let rec findCalls tokens' position' =
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' when lname = loop -> (func, oarray) :: findCalls tail'
-            | head' :: tail' -> findCalls tail'
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' when lname = loop -> (func, oarray, position') :: findCalls tail' (position' + 5)
+            | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
+        let lposition = position + 3 + (2*elements.Length)
         let calls = 
             match tokens with
-            | PostScopePattern tokens' -> findCalls (fst tokens')
+            | PostScopePattern tokens' -> findCalls (fst tokens') lposition
             | _ -> []
-        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls)
+        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls, position, lposition)
         out.iarrays <- []
         out.oarrays <- []
         out.funcs <- []
         Some (out, tokens)
-(*
     | head :: tail ->
+        let nextPosition = position + 1
         match tail with
-        | MethodLoopPattern t -> Some (t)
+        | MethodLoopPattern nextPosition t -> Some (t)
         | _ -> None
-*)
     | _ -> None
 
 /// Scan code for all the method_for loops and return a list of them.
 let scanMethodLoops (tokens: Token list) =
-    let rec scan = function
-    | MethodLoopPattern (loop,[]) -> [loop]
-    | MethodLoopPattern (loop, tail) -> loop :: (scan tail)
-    | head :: tail -> scan tail
+    let rec scan (position: int) = function
+    | MethodLoopPattern position (loop,[]) -> [loop]
+    | MethodLoopPattern position (loop, tail) -> loop :: (scan loop.LPosition tail)
+    | head :: tail -> scan (position+1) tail
     | [] -> []
-    scan tokens
+    scan 0 tokens
 
-//let a = match tokenize code with | MethodLoopPattern(s) -> Some(s) | _ -> None;;
+//let a = match tokenize code with | MethodLoopPattern 0 (s) -> Some(s) | _ -> None;;
 //let mystr = "auto mloop = method_for(array1, array1, array3); auto ooarray = oloop(array1, array1, array3); auto moarray = mloop(sumThenMultiply);"
-//let b = match tokenize mystr with | MethodLoopPattern(s) -> Some(s) | _ -> None;;
+//let b = match tokenize mystr with | MethodLoopPattern 0 (s) -> Some(s) | _ -> None;;
 
 /// Pattern for object_for loops and all their calls
-let rec (|ObjectLoopPattern|_|) = function
+let rec (|ObjectLoopPattern|_|) (position: int) = function
     | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail ->
-        let rec findCalls tokens' = 
+        let rec findCalls tokens' position' = 
             match tokens' with
             | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: tail' when lname = loop ->
                 let iarrays, t = toElements tail'
-                (tokenToStr iarrays, oarray) :: findCalls tail'
-            | head' :: tail' -> findCalls tail'
+                (tokenToStr iarrays, oarray, position') :: findCalls tail' (position + 3 + (2*iarrays.Length))
+            | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
+        let lposition = position + 5
         let calls = 
             match tail with
-            | PostScopePattern t' -> findCalls (fst t')
+            | PostScopePattern t' -> findCalls (fst t') lposition
             | _ -> []
-        let out = ObjectLoop((tokenToStr [loop]).Head, string func, calls)
+        let out = ObjectLoop((tokenToStr [loop]).Head, string func, calls, position, lposition)
         out.iarrays <- []
         out.oarrays <- []
         out.func <- []
         Some (out, tail)
 (*
     | head :: tail ->
+        let nextPosition = position + 1
         match tail with
-        | ObjectLoopPattern t -> Some (t)
+        | ObjectLoopPattern nextPosition t -> Some (t)
         | _ -> None
 *)
     | _ -> None
     
 /// Scan code for all the method_for loops and return a list of them.
 let scanObjectLoops (tokens: Token list) =
-    let rec scan = function
-    | ObjectLoopPattern (loop,[]) -> [loop]
-    | ObjectLoopPattern (loop, tail) -> loop :: (scan tail)
-    | head :: tail -> scan tail
+    let rec scan (position: int) = function
+    | ObjectLoopPattern position (loop,[]) -> [loop]
+    | ObjectLoopPattern position (loop, tail) -> loop :: (scan loop.LPosition tail)
+    | head :: tail -> scan (position+1) tail
     | [] -> []
-    scan tokens
+    scan 0 tokens
 
 
-//let a = match tokenize code with | ObjectLoopPattern(s) -> Some(s) | _ -> None;;
+//let a = match tokenize code with | ObjectLoopPattern 0 (s) -> Some(s) | _ -> None;;
 //let mystr = "auto oloop = object_for(sumThenMultiply); auto mloop = method_for(array1, array1, array3); auto ooarray = oloop(array1, array1, array3);"
-//let b = match tokenize mystr with | ObjectLoopPattern(s) -> Some(s) | _ -> None;;
+//let b = match tokenize mystr with | ObjectLoopPattern 0 (s) -> Some(s) | _ -> None;;
 
 /// Pattern for individual pragma clauses
 let rec (|ClausePattern|_|) = function
@@ -381,6 +388,10 @@ let sortPragmas (pragmas: Pragma list) =
                         fst directive = s
                     ) pragmas
     bin "array", bin "function"
+    
+let fst3 (c, _, _) = c
+let snd3 (_, c, _) = c
+let thd3 (_, _, c) = c
 
 /// Message-passing function for sending info about array pragmas to nested loop objects
 let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) = 
@@ -391,47 +402,47 @@ let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloo
                 if mloops.[i].Init.[k] = arrays.[j].arrName then
                     mloops.[i].PushIarray arrays.[j]
             for k in 0..mloops.[i].Call.Length-1 do
-                if snd mloops.[i].Call.[k] = arrays.[j].arrName then
+                if snd3 mloops.[i].Call.[k] = arrays.[j].arrName then
                     mloops.[i].PushOarray arrays.[j]
     for i in 0..oloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
         for j in 0..arrays.Length-1 do
             for k in 0..oloops.[i].Call.Length-1 do
                 let mutable itemp = []
-                for l in 0..(fst oloops.[i].Call.[k]).Length-1 do
-                    if (fst oloops.[i].Call.[k]).[l] = arrays.[j].arrName then
+                for l in 0..(fst3 oloops.[i].Call.[k]).Length-1 do
+                    if (fst3 oloops.[i].Call.[k]).[l] = arrays.[j].arrName then
                         itemp <- List.append itemp [arrays.[j]]
                 oloops.[i].PushIarrays itemp
-                if snd oloops.[i].Call.[k] = arrays.[j].arrName then
+                if snd3 oloops.[i].Call.[k] = arrays.[j].arrName then
                     oloops.[i].PushOarray arrays.[j]
 
 /// Message-passing function for sending info about function pragmas to nested loop objects
 let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
+    // search for function names in funcs list and copy info to loop objects (results must be in order!)
     for i in 0..mloops.Length-1 do
-        // search for function names in funcs list and copy info to loop objects (results must be in order!)
         for j in 0..funcs.Length-1 do
             for k in 0..mloops.[i].Call.Length-1 do
-                if fst mloops.[i].Call.[k] = funcs.[j].funcName then
+                if fst3 mloops.[i].Call.[k] = funcs.[j].funcName then
                     mloops.[i].PushFunc funcs.[j]
-    // search for function names in funcs list and copy info to loop objects (results must be in order!)
     for i in 0..oloops.Length-1 do
         for j in 0..funcs.Length-1 do
             if oloops.[i].Init = funcs.[j].funcName then
                 oloops.[i].SetFunc funcs.[j]
 
+
 /// Find a loop API call and return the tail
 let rec (|Init|_|) = function
     | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail -> Some (tail |> toElements |> snd)
     | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail -> Some (tail)
-    | head :: tail -> 
-        match tail with 
+    | head :: tail ->
+        match tail with
         | Init(s) -> Some (s)
         | _ -> None
     | _ -> None
 
 /// Inserts a comma at the end of each string in the input list, except the last one
 let commas (x: string list) =
-    x
+    x 
     |> List.rev
     |> List.tail
     |> List.rev
@@ -455,14 +466,19 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let tparams = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) []) 
                                   |> List.map (commas >> (fun x -> String.concat "" x))
 
+
     String.concat "" ["template<"]
 
-
 let lex (tokens: Token list) = 
+
+    // Scan for loop API calls and create loop state machines
     let mloops = scanMethodLoops tokens
     let oloops = scanObjectLoops tokens
 
+    // Sort pragma objects into array and function pragmas
     let alist, flist = tokens |> (scanPragmas >> sortPragmas)
+
+    // Retrieve array and function objects from pragma info
     let arrays = List.init alist.Length (fun i ->
                                              let directive, clauses, scope = alist.[i]
                                              getArray clauses scope
@@ -472,9 +488,10 @@ let lex (tokens: Token list) =
                                             let name = ([(snd directive).Head] |> tokenToStr).Head
                                             getFunction name clauses scope
                                        )
+
+    // Pass array and function objects to the loops that call them, if they are visible
     sendArraysToLoops arrays mloops oloops
     sendFunctionsToLoops funcs mloops oloops
-
 
 
     []
