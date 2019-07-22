@@ -450,6 +450,11 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let itype = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.arrType))
     let otype = oloop.oarrays |> List.map (fun x -> x.arrType)
 
+    let ranks = List.append (irank |> List.map (fun x -> x |> List.map string)) [orank |> List.map string]
+    let types = List.append itype [otype]
+    let tparams = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) []) 
+                                  |> List.map (commas >> (fun x -> String.concat "" x))
+
     String.concat "" ["template<"]
 
 
