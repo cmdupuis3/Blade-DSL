@@ -174,6 +174,7 @@ type NestedFunction =
       funcOName: string
       funcORank: int
       funcCom:   int list
+      funcOmpLevels: int
       funcBlock: Token list }
 
 /// Container for method_for loop information; able to recieve messages about array and function pragmas
@@ -368,10 +369,19 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
     let output = (clauses |> List.find (fst >> (function | "output" -> true | _ -> false))) |> (snd >> tokenToStr >> List.head)
     let iranks = (clauses |> List.find (fst >> (function | "iranks" -> true | _ -> false))) |> (snd >> tokenToInt)
     let orank  = (clauses |> List.find (fst >> (function | "orank" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
+
+    let hasOmp = clauses |> List.exists (fst >> (function | "ompLevels" -> true | _ -> false))
+    let ompLevels = 
+        if hasOmp then
+            (clauses |> List.find (fst >> (function | "ompLevels" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
+        else 0
+
     let hasCom = clauses |> List.exists (fst >> (function | "commutativity" -> true | _ -> false))
-    let com = if hasCom then
-                  (clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt)
-              else List.init arity id
+    let com = 
+        if hasCom then
+            (clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt)
+        else List.init arity id
+
     { funcName = name;
       funcArity = arity;
       funcINames = input;
@@ -379,6 +389,7 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
       funcOName = output;
       funcORank = orank;
       funcCom = com;
+      funcOmpLevels = ompLevels;
       funcBlock = block |> deleteReturnLine |> Option.get }
 
 let sortPragmas (pragmas: Pragma list) =
@@ -406,15 +417,16 @@ let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloo
                     mloops.[i].PushOarray arrays.[j]
     for i in 0..oloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
-        for j in 0..arrays.Length-1 do
-            for k in 0..oloops.[i].Call.Length-1 do
-                let mutable itemp = []
-                for l in 0..(fst3 oloops.[i].Call.[k]).Length-1 do
-                    if (fst3 oloops.[i].Call.[k]).[l] = arrays.[j].arrName then
-                        itemp <- List.append itemp [arrays.[j]]
-                oloops.[i].PushIarrays itemp
-                if snd3 oloops.[i].Call.[k] = arrays.[j].arrName then
-                    oloops.[i].PushOarray arrays.[j]
+        for j in 0..oloops.[i].Call.Length-1 do
+            let mutable itemp = []
+            for l in 0..(fst3 oloops.[i].Call.[j]).Length-1 do
+                for k in 0..arrays.Length-1 do
+                    if (fst3 oloops.[i].Call.[j]).[l] = arrays.[k].arrName then
+                        itemp <- List.append itemp [arrays.[k]]
+            oloops.[i].PushIarrays itemp
+            for k in 0..arrays.Length-1 do
+                if snd3 oloops.[i].Call.[j] = arrays.[k].arrName then
+                    oloops.[i].PushOarray arrays.[k]
 
 /// Message-passing function for sending info about function pragmas to nested loop objects
 let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
@@ -473,13 +485,16 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         |> commas
         |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
 
-    let ranks = List.append (irank |> List.map (fun x -> x |> List.map string)) [orank |> List.map string]
-    let types = List.append itype [otype]
+    let ranks = (irank, orank) ||> List.map2 (fun x -> fun y -> List.append (x |> List.map string) [string y])
+    let types = (itype, otype) ||> List.map2 (fun x -> fun y -> List.append (x |> List.map string) [string y])
     let tSpecs = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) []) 
                                  |> List.map (commas >> (fun x -> String.concat "" x))
 
-    let tmain = String.concat "" ["template<"; tTypes; "> void "; "oloop.Name"; "("; argTypes; "){\n\t// Nothing to see here.\n}"]
-    
+    let tmain = String.concat "" ["template<"; tTypes; "> void "; oloop.Name; "("; argTypes; "){\n\t// Nothing to see here.\n}"]
+
+
+
+    String.concat "" ["template<"]
 
 let lex (tokens: Token list) = 
 
