@@ -63,6 +63,18 @@ let rec respace = function
     | head :: tail -> head :: respace tail
     | [] -> []
 
+let rec (|Reconcat|_|) = function
+    | head :: Match @"^\n|^\r" mid :: tail -> Some (String.concat "" (head :: [mid]), tail)
+    | head :: tail -> 
+        let mid, tail' = match tail with Reconcat t -> t | _ -> "", []
+        Some (String.concat "" (head :: [mid]), tail')
+    | [] -> None
+
+let rec reconcat = function
+    | Reconcat (head, tail) -> head :: (reconcat tail)
+    | head :: tail -> [String.concat "" (head :: tail)]
+    | [] -> []
+
 /// Container for array pragma information
 type NestedArray = 
     { arrName: string
@@ -340,14 +352,10 @@ module NestedLoop =
         let Nary' (arrayNames: string list) (symGroups: string list list) (comGroups: string list) (inner: string list) (ompLevels: int list) =
             let ret = naryLoop arrayNames (indNames2 0 (rankList symGroups)) (iminList arrayNames symGroups comGroups) inner ompLevels
             ret, LastArrayNames arrayNames symGroups
-        Nary' (arrays |> List.map (fun x -> x.arrName)) (arrays |> List.map (fun x -> x.arrSym |> List.map string)) (func.funcCom |> List.map string) [(func.funcBlock |> tokenToStr |> respace |> String.concat "")] func.funcOmpLevels
-(*
-let rec reconcat = function
-    | head :: Match @"^\n|^\r" mid :: tail-> String.concat "" (head :: [mid]) :: (reconcat tail)
-    | head :: tail -> 
-        let asdf = reconcat tail
-        String.concat "" (head :: reconcat tail)
-*)
+        Nary' (arrays |> List.map (fun x -> x.arrName)) (arrays |> List.map (fun x -> x.arrSym |> List.map string)) (func.funcCom |> List.map string) (func.funcBlock |> tokenToStr |> respace |> reconcat) func.funcOmpLevels
+
+
+
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
