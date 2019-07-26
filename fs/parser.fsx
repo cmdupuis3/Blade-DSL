@@ -64,7 +64,8 @@ let rec respace = function
     | [] -> []
 
 let rec (|Reconcat|_|) = function
-    | head :: Match @"^\n|^\r" mid :: tail -> Some (String.concat "" (head :: [mid]), tail)
+    | Match @"^\n|^\r" head :: tail -> match tail with Reconcat t -> Some t | _ -> None 
+    | head :: Match @"^\n|^\r" mid :: tail -> Some (head, tail)
     | head :: tail -> 
         let mid, tail' = match tail with Reconcat t -> t | _ -> "", []
         Some (String.concat "" (head :: [mid]), tail')
@@ -342,20 +343,23 @@ module NestedLoop =
                 |> fun x -> String.concat "" [arrayNames.[i]; x]
         )
 
+    /// Autogenerate a unary nested_for loop.
+    /// <param name="array"> An input array class. </param>
+    /// <param name="func"> A function class. </param>
     let Unary (array: NestedArray) (func: NestedFunction) = 
         let Unary' (arrayName: string) (symGroups: string list) (inner: string list) (ompLevels: int) =
             let ret = unaryLoop arrayName (indNames2 0 (rankList [symGroups])).Head (iminList [arrayName] [symGroups] ["1"]).Head inner ompLevels
             ret, LastArrayNames [arrayName] [symGroups]
-        Unary' array.arrName (array.arrSym |> List.map string) (func.funcBlock |> tokenToStr) func.funcOmpLevels.Head
+        Unary' array.arrName (array.arrSym |> List.map string) (func.funcBlock |> tokenToStr |> respace |> reconcat |> newln) func.funcOmpLevels.Head
 
+    /// Autogenerate an N-ary nested_for loop.
+    /// <param name="array"> A list of input array classes. </param>
+    /// <param name="func"> A function class. </param>
     let Nary (arrays: NestedArray list) (func: NestedFunction) = 
         let Nary' (arrayNames: string list) (symGroups: string list list) (comGroups: string list) (inner: string list) (ompLevels: int list) =
             let ret = naryLoop arrayNames (indNames2 0 (rankList symGroups)) (iminList arrayNames symGroups comGroups) inner ompLevels
             ret, LastArrayNames arrayNames symGroups
-        Nary' (arrays |> List.map (fun x -> x.arrName)) (arrays |> List.map (fun x -> x.arrSym |> List.map string)) (func.funcCom |> List.map string) (func.funcBlock |> tokenToStr |> respace |> reconcat) func.funcOmpLevels
-
-
-
+        Nary' (arrays |> List.map (fun x -> x.arrName)) (arrays |> List.map (fun x -> x.arrSym |> List.map string)) (func.funcCom |> List.map string) (func.funcBlock |> tokenToStr |> respace |> reconcat |> newln) func.funcOmpLevels
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
