@@ -333,36 +333,43 @@ module NestedLoop =
         |> List.fold (fun i elem -> elem i) inner
 
     /// Find the final array names for a list of variables; useful when substituting into inner blocks.
-    /// <param name="arrayNames"> Variable names. </param>
-    /// <param name="symGroups"> A list of symmetry vectors. </param>
-    let private lastArrayNames (iarrayNames: string list) (symGroups: int list list) =
-        let indNames = indNames2 0 (rankList symGroups)
-        List.init iarrayNames.Length (
-            fun i ->
-                match symGroups.[i] with
-                | [] -> failwith "Empty index names list."
-                | [head] -> head
-                | head :: tail -> List.last indNames.[i] |> int
-                |> fun x -> String.concat "" [iarrayNames.[i]; string x]
-        )
+    /// <param name="iarrays"> A list of input array classes. </param>
+    /// <param name="oarray"> An output array class. </param>
+    /// <param name="func"> A function class. </param>
+    let private lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
+        let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
+        let inds = indNames2 0 ilevels
+        let lastInds = List.map List.last inds
+        let iNames = 
+            List.init iarrays.Length (
+                fun i ->
+                    if iarrays.[i].Rank = func.IRank.[i] then "" else lastInds.[i]
+                    |> fun x -> String.concat "" [iarrays.[i].Name; x]
+            )
+
+        let rec getOName (inds: string list list) (ctr: int) =
+            if ctr = 0 then (String.concat "" [oarray.Name; inds.[0].[0]]) else getOName (inds.Head.Tail :: inds.Tail) (ctr - 1)
+        let oName = getOName inds (oarray.Rank - func.ORank)
+
+        iNames, oName
 
     /// Autogenerate a unary nested_for loop.
     /// <param name="iarray"> An input array class. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) =
-        let ret = unaryLoop iarray.Name (iarray.Rank - func.IRank.Head) oarray.Name (oarray.Rank - func.ORank) (indNames2 0 [iarray.Rank]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head func.Inner func.OmpLevels.Head
-        ret, lastArrayNames [iarray.Name] [iarray.Symm]
+        let ret = unaryLoop iarray.Name (iarray.Rank - func.IRank.Head) oarray.Name (oarray.Rank - func.ORank) (indNames2 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head func.Inner func.OmpLevels.Head
+        ret, lastArrayNames [iarray] oarray func
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="iarrays"> A list of input array classes. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
-        let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (fun x -> fun y -> x - y)
+        let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
         let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm)) func.Comm
-        let ret = naryLoop (iarrays |> List.map (fun x -> x.Name)) ilevels oarray.Name (oarray.Rank - func.ORank) (indNames2 0 (iarrays |> List.map (fun x -> x.Rank))) imins func.Inner func.OmpLevels
-        ret, lastArrayNames (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm))
+        let ret = naryLoop (iarrays |> List.map (fun x -> x.Name)) ilevels oarray.Name (oarray.Rank - func.ORank) (indNames2 0 ilevels) imins func.Inner func.OmpLevels
+        ret, lastArrayNames iarrays oarray func
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
