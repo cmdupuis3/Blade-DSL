@@ -240,7 +240,7 @@ module NestedLoop =
         assert (arrayNames.Length = symGroups.Length)
         assert (arrayNames.Length = comGroups.Length)
 
-        let ranks = rankList symGroups
+        let ranks = symGroups |> List.map (fun x -> x.Length)
         let indexNames = indNames2 0 ranks
         let cimins = comImins comGroups indexNames
         let states = vStates arrayNames symGroups comGroups
@@ -296,12 +296,12 @@ module NestedLoop =
                              | 0 -> brace (loopLine indNames.[i] iMins.[i] iarrayName)
                              | _ -> brace (loopLine indNames.[i] iMins.[i] (String.concat "" [iarrayName; indNames.[i-1]]))
                 let iline = 
-                    if i = 0 then tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; index iarrayName indNames.[i]; ";\n"]]
-                    else          tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; (index (String.concat "" [iarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
+                    if i = 0 then                     tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; index iarrayName indNames.[i]; ";\n"]]
+                    else                              tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; (index (String.concat "" [iarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
                 let oline = 
-                    if i = 0 then                 tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; index oarrayName indNames.[i]; ";\n"]]
-                    else if i < oarrayLevels then tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; (index (String.concat "" [oarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
-                    else                          []
+                    if i = 0 && i < oarrayLevels then tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; index oarrayName indNames.[i]; ";\n"]]
+                    else if i < oarrayLevels then     tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; (index (String.concat "" [oarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
+                    else                              []
                 fun x -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; iline; oline; tab x; [braced.[1]] ]
         )
         |> List.rev
@@ -359,7 +359,7 @@ module NestedLoop =
     /// <param name="func"> A function class. </param>
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) =
         let ret = unaryLoop iarray.Name (iarray.Rank - func.IRank.Head) oarray.Name (oarray.Rank - func.ORank) (indNames2 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head func.Inner func.OmpLevels.Head
-        ret, lastArrayNames [iarray] oarray func
+        ret//, lastArrayNames [iarray] oarray func
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="iarrays"> A list of input array classes. </param>
@@ -369,7 +369,7 @@ module NestedLoop =
         let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
         let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm)) func.Comm
         let ret = naryLoop (iarrays |> List.map (fun x -> x.Name)) ilevels oarray.Name (oarray.Rank - func.ORank) (indNames2 0 ilevels) imins func.Inner func.OmpLevels
-        ret, lastArrayNames iarrays oarray func
+        ret//, lastArrayNames iarrays oarray func
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
@@ -500,7 +500,7 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
         out.oarrays <- []
         out.funcs <- []
         Some (out, tokens)
-(*
+(* for debugging:
     | head :: tail ->
         let nextPosition = position + 1
         match tail with
@@ -542,7 +542,7 @@ let rec (|ObjectLoopPattern|_|) (position: int) = function
         out.oarrays <- []
         out.func <- []
         Some (out, tail)
-(*
+(* for debugging:
     | head :: tail ->
         let nextPosition = position + 1
         match tail with
@@ -802,6 +802,8 @@ let lex (tokens: Token list) =
 
 
     []
+
+//
 
 
 
