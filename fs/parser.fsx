@@ -93,7 +93,7 @@ type NestedFunction =
       funcORank: int
       funcCom:   int list
       funcOmpLevels: int list
-      funcBlock: Token list }
+      funcBlock: string list }
 
 /// Container for method_for loop information; able to recieve messages about array and function pragmas
 type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string * int) list, fposition: int, lposition: int)  =
@@ -652,7 +652,7 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
       funcORank = orank;
       funcCom = com;
       funcOmpLevels = ompLevels;
-      funcBlock = block |> deleteReturnLine |> Option.get }
+      funcBlock = block |> deleteReturnLine |> Option.get |> tokenToStr |> respace |> reconcat |> newln }
 
 let sortPragmas (pragmas: Pragma list) =
     let bin (s: string) = 
