@@ -350,7 +350,7 @@ module NestedLoop =
         let Unary' (arrayName: string) (symGroups: string list) (inner: string list) (ompLevels: int) =
             let ret = unaryLoop arrayName (indNames2 0 (rankList [symGroups])).Head (iminList [arrayName] [symGroups] ["1"]).Head inner ompLevels
             ret, LastArrayNames [arrayName] [symGroups]
-        Unary' array.arrName (array.arrSym |> List.map string) (func.funcBlock |> tokenToStr |> respace |> reconcat |> newln) func.funcOmpLevels.Head
+        Unary' array.arrName (array.arrSym |> List.map string) func.funcBlock func.funcOmpLevels.Head
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="array"> A list of input array classes. </param>
@@ -359,7 +359,7 @@ module NestedLoop =
         let Nary' (arrayNames: string list) (symGroups: string list list) (comGroups: string list) (inner: string list) (ompLevels: int list) =
             let ret = naryLoop arrayNames (indNames2 0 (rankList symGroups)) (iminList arrayNames symGroups comGroups) inner ompLevels
             ret, LastArrayNames arrayNames symGroups
-        Nary' (arrays |> List.map (fun x -> x.arrName)) (arrays |> List.map (fun x -> x.arrSym |> List.map string)) (func.funcCom |> List.map string) (func.funcBlock |> tokenToStr |> respace |> reconcat |> newln) func.funcOmpLevels
+        Nary' (arrays |> List.map (fun x -> x.arrName)) (arrays |> List.map (fun x -> x.arrSym |> List.map string)) (func.funcCom |> List.map string) func.funcBlock func.funcOmpLevels
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
