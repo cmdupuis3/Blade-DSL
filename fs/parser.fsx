@@ -1,8 +1,9 @@
 
+
 open System.IO
 open System.Text.RegularExpressions
 
-#load "parser.fs"
+//#load "parser.fs"
 
 /// Union of all the relevant token types
 type Token = 
@@ -38,16 +39,342 @@ let tokenize (s: string) =
             token :: tokenize' (index + text.Length) s
     tokenize' 0 s
     // strip out the whitespace tokens; note that since new line characters are distinct, they will remain.
-    |> List.choose (function Token.WhiteSpace -> None | tokens -> Some tokens)
+    |> List.choose (function Token.WhiteSpace -> None | t -> Some t)
 
 /// Megahack to convert tokens to ints. try to fix for proper Token.Int -> int conversion
-let tokenToInt (tokens: Token list) = 
+let tokenToInt (tokens: Token list) =
     tokens |> List.map (string >> (fun x -> x.Substring 4) >> int)
 
 /// Megahack to convert tokens to strings. try to fix for proper Token.Str -> string conversion
-let tokenToStr (tokens: Token list) = 
+let tokenToStr (tokens: Token list) =
     let unquote (tokens': string) = tokens'.Substring(1, tokens'.Length-2)
-    tokens |> List.map (string >> (fun x -> x.Substring 4) >> unquote)
+    tokens |> List.map (
+        function
+        | Token.NewLine -> "\n"
+        | Token.WhiteSpace -> " "
+        | Token.Symbol s -> string s
+        | Token.Str    s -> string s
+        | Token.Int    i -> string i
+        | Token.Other  o -> string o
+    )
+    
+let rec respace = function
+    | Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s1 :: Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
+    | head :: tail -> head :: respace tail
+    | [] -> []
+
+let rec (|Reconcat|_|) = function
+    | Match @"^\n|^\r" head :: tail -> match tail with Reconcat t -> Some t | _ -> None 
+    | head :: Match @"^\n|^\r" mid :: tail -> Some (head, tail)
+    | head :: tail -> 
+        let mid, tail' = match tail with Reconcat t -> t | _ -> "", []
+        Some (String.concat "" (head :: [mid]), tail')
+    | [] -> None
+
+let rec reconcat = function
+    | Reconcat (head, tail) -> head :: (reconcat tail)
+    | head :: tail -> [String.concat "" (head :: tail)]
+    | [] -> []
+
+/// Container for array pragma information
+type NestedArray = 
+    { Name: string
+      Type: string
+      Rank: int 
+      Symm:  int list }
+
+/// Container for function pragma information
+type NestedFunction =
+    { Name:  string
+      Arity: int
+      INames: string list
+      IRank: int list
+      OName: string
+      ORank: int
+      Comm:   int list
+      OmpLevels: int list
+      Inner: string list }
+
+/// Container for method_for loop information; able to recieve messages about array and function pragmas
+type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string * int) list, fposition: int, lposition: int)  =
+    [<DefaultValue>] val mutable public iarrays: NestedArray list
+    [<DefaultValue>] val mutable public oarrays: NestedArray list
+    [<DefaultValue>] val mutable public funcs: NestedFunction list
+    
+    member this.Name = nameIn
+    member this.Init = initIn // iarrays
+    member this.Call = callIn // oarray, func, and call position
+    member this.FPosition = fposition // position of the first token of the init pattern
+    member this.LPosition = lposition // position of the last token of the init pattern
+
+    member this.PushIarray (v: NestedArray) = this.iarrays <- List.append this.iarrays [v]
+    member this.PushOarray (v: NestedArray) = this.oarrays <- List.append this.oarrays [v]
+    member this.PushFunc (v: NestedFunction) = this.funcs <- List.append this.funcs [v]
+
+/// Container for object_for loop information; able to recieve messages about array and function pragmas
+type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string * int) list, fposition: int, lposition: int) =
+    [<DefaultValue>] val mutable public iarrays: NestedArray list list
+    [<DefaultValue>] val mutable public oarrays: NestedArray list
+    [<DefaultValue>] val mutable public func: NestedFunction list
+
+    member this.Name = nameIn
+    member this.Init = initIn // func
+    member this.Call = callIn // iarrays, oarray, and call position
+    member this.FPosition = fposition // position of the first token of the init pattern
+    member this.LPosition = lposition // position of the last token of the init pattern
+
+    member this.PushIarrays (v: NestedArray list) = this.iarrays <- List.append this.iarrays [v]
+    member this.PushOarray (v: NestedArray) = this.oarrays <- List.append this.oarrays [v]
+    member this.SetFunc (v: NestedFunction) = this.func <- [v]
+    member this.GetFunc = this.func.Head
+
+/// Inserts a tab character at the beginning of each string in the input list.
+let tab x =
+    x |> List.map (fun y -> String.concat "" ["\t"; y])
+
+/// Inserts a tab character at the end of each string in the input list.
+let newln x =
+    x |> List.map (fun y -> String.concat "" [y; "\n"])
+    
+/// Creates a two-element list of the input string plus '{', and '}'.
+let brace x =
+    List.append [String.concat " " [x; "{\n"]] ["}\n"]
+
+/// Module containing all the logic for autogenerating nested_for loops of variable arity.
+/// Contains optimizations for symmetry and commutativity.
+module NestedLoop =
+
+    /// Generates a list of new iterator names for multiple variables based on a minumum and the ranks of variables to loop over.
+    /// <param name="min"> First integer to append to "__i". </param>
+    /// <param name="ranks"> List of variable ranks. </param>
+    let rec private indNames min ranks =
+        let rec indNames' min max =
+            List.init (max - min) (fun index -> String.concat "" ["__i"; (string (index + min))])
+        match ranks with
+        | []           -> []
+        | head :: tail -> indNames' min (min+head) :: indNames (min+head) tail
+
+    /// Finds which iterators should serve as a the minimum for a given loop if the variables are commutative; otherwise set the minimum to 0.
+    /// <param name="comGroups"> A commutativity vector. </param>
+    /// <param name="iNames"> Iterator names for all variables. </param>
+    let rec private comImins (comGroups: int list) (iNames: string list list) =
+        let inhead, intail = List.head iNames, List.tail iNames
+
+        (List.init inhead.Length (fun index -> string 0)) ::
+        match comGroups with
+        | []           -> [] 
+        | [head]       -> []
+        | head :: tail -> 
+            List.init tail.Length (
+                fun index ->
+                    if comGroups.[index+1] = comGroups.[index] then
+                        List.init intail.[index].Length (fun index -> inhead.[index])
+                    else 
+                        List.init intail.[index].Length (fun index -> string 0)
+            )
+
+    /// For each dimension, finds whether a dimension is symmetric with the next.
+    /// <param name="symGroup"> A symmetry vector. </param>
+    let rec private isSym symGroups =
+        match symGroups with
+        | []           -> false
+        | [head]       -> false
+        | head :: tail -> if head = tail.Head then true else isSym tail
+        
+    /// Finds which iterators should serve as a the minimum for a given loop if the dimensions are symmetric; otherwise set the minimum to 0.
+    /// <param name="symGroups"> A symmetry vector. </param>
+    /// <param name="iNames"> Iterator names for all variables. </param>
+    let private symImins (symGroups: int list) (iNames: string list) =
+        List.init symGroups.Length (
+            fun i -> if i = 0 then string 0 else if symGroups.[i] = symGroups.[i-1] then iNames.[i-1] else string 0
+        )
+
+    /// Enum for the symmetry/commutativity state of a variable.
+    type private SymcomState =
+    | Symmetric   = 0
+    | Commutative = 1
+    | Both        = 2
+    | Neither     = 3
+
+    /// Finds the states of all the input variables, given symmetry and commutativity vectors.
+    /// <param name="arrayNames"> List of variable names. </param>
+    /// <param name="symGroups"> A list of symmetry vectors. </param>
+    /// <param name="comGroups"> A commutativity vector. </param>
+    let rec private vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
+        match arrayNames with 
+        | [] -> []
+        | arrHead :: arrTail ->
+            (if isSym symGroups.Head then SymcomState.Symmetric else SymcomState.Neither) ::
+            match arrTail with
+            | [] -> []
+            | _  -> 
+                List.init (arrayNames.Length - 1) (
+                    fun index ->
+                        if comGroups.[index+1] = comGroups.[index] && arrayNames.[index+1] = arrayNames.[index] then
+                            if isSym symGroups.[index+1] then SymcomState.Both else SymcomState.Commutative
+                        else 
+                            if isSym symGroups.[index+1] then SymcomState.Symmetric else SymcomState.Neither
+                )
+
+    /// Chooses the correct iterator minimum for all input variables.
+    /// <param name="arrayNames"> List of variable names. </param>
+    /// <param name="symGroups"> A list of symmetry vectors. </param>
+    /// <param name="comGroups"> A commutativity vector. </param>
+    let private iminList (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
+        assert (arrayNames.Length = symGroups.Length)
+        assert (arrayNames.Length = comGroups.Length)
+
+        let ranks = symGroups |> List.map (fun x -> x.Length)
+        let indexNames = indNames 0 ranks
+        let cimins = comImins comGroups indexNames
+        let states = vStates arrayNames symGroups comGroups
+
+        List.init arrayNames.Length (
+            fun index -> 
+                match states.[index] with
+                | SymcomState.Neither     -> List.init ranks.[index] (fun x -> string 0)
+                | SymcomState.Symmetric   -> symImins symGroups.[index] indexNames.[index]
+                | SymcomState.Commutative -> cimins.[index]
+                | SymcomState.Both        -> cimins.[index] // can perhaps optimize more, just lazy
+                | _                       -> failwith "Invalid symmetry/commutativity state"
+        )
+
+    /// Generates a single "for(...)" statement.
+    /// <param name="iName"> Iterator name. </param>
+    /// <param name="iMin"> Iterator minimum name. </param>
+    /// <param name="arrayName"> Previous variable name. </param>
+    let private loopLine iName iMin arrayName =
+        String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; arrayName; ".current_extent(); "; iName; "++)";]
+
+    /// Generates a call to operator().
+    /// <param name="arrayName"> Variable name. </param>
+    /// <param name="iName"> Iterator name. </param>
+    let private index arrayName iName =
+        String.concat "" [arrayName; "("; iName; ")"]
+
+    /// Generates an OpenMP parallelization line. Inserts a "private" clause for the input iterator name.    
+    /// <param name="iName"> Iterator name. </param>
+    let private ompLine iName =
+        String.concat "" ["#pragma omp parallel for private("; iName; ")"]
+
+    /// Generates an iterator declaration line.
+    /// <param name="iType"> Iterator type. </param>
+    /// <param name="iName"> Iterator name. </param>
+    let private declLine iType iName =
+        String.concat "" [iType; " "; iName; " = 0;"]
+
+    /// Autogenerate a unary nested_for loop.
+    /// <param name="arrayName"> Variable name. </param>
+    /// <param name="indNames"> Iterator minimum names. </param>
+    /// <param name="iMins"> Iterator minimum names. </param>
+    /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
+    /// <param name="ompLevels"> Number of OpenMP levels. </param>
+    let private unaryLoop (iarrayName: string) (iarrayLevels: int) (oarrayName: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
+        assert (iarrayLevels = indNames.Length)
+        assert (iarrayLevels = iMins.Length)
+
+        List.init iarrayLevels (
+            fun i -> 
+                let ompline = if ompLevels > i then [ompLine indNames.[i]] else []
+                let braced = match i with
+                             | 0 -> brace (loopLine indNames.[i] iMins.[i] iarrayName)
+                             | _ -> brace (loopLine indNames.[i] iMins.[i] (String.concat "" [iarrayName; indNames.[i-1]]))
+                let iline = 
+                    if i = 0 then                     tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; index iarrayName indNames.[i]; ";\n"]]
+                    else                              tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; (index (String.concat "" [iarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
+                let oline = 
+                    if i = 0 && i < oarrayLevels then tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; index oarrayName indNames.[i]; ";\n"]]
+                    else if i < oarrayLevels then     tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; (index (String.concat "" [oarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
+                    else                              []
+                fun x -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; iline; oline; tab x; [braced.[1]] ]
+        )
+        |> List.rev
+        |> List.fold (fun i elem -> elem i) inner
+
+    /// Autogenerate an N-ary nested_for loop.
+    /// <param name="arrayNames"> Variable names. </param>
+    /// <param name="indNames"> Iterator minimum names. </param>
+    /// <param name="iMins"> Iterator minimum names. </param>
+    /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
+    /// <param name="ompLevels"> Number of OpenMP levels. </param>
+    let private naryLoop (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+        assert (iarrayNames.Length = indNames.Length)
+        assert (iarrayNames.Length = iMins.Length)
+        assert (iarrayNames.Length = ompLevels.Length)
+
+        let rec naryLoop' (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) = 
+            match iarrayNames with
+            | [] -> failwith "Empty array names list."
+            | _  ->
+                match iarrayNames with
+                | [] -> failwith "Impossible match."
+                | [head]       -> [(fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head)]
+                | head :: tail ->  (fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head) :: 
+                                             naryLoop' iarrayNames.Tail iarrayLevels.Tail oarrayName (oarrayLevels - iarrayLevels.Head) indNames.Tail iMins.Tail inner ompLevels.Tail
+
+        naryLoop' iarrayNames iarrayLevels oarrayName oarrayLevels indNames iMins inner ompLevels
+        |> List.rev
+        |> List.fold (fun i elem -> elem i) inner
+
+    /// Find the final array names for a list of variables; useful when substituting into inner blocks.
+    /// <param name="iarrays"> A list of input array classes. </param>
+    /// <param name="oarray"> An output array class. </param>
+    /// <param name="func"> A function class. </param>
+    let lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
+        let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
+        let inds = indNames 0 ilevels
+        let lastInds = List.map List.last inds
+        let iNames = 
+            List.init iarrays.Length (
+                fun i ->
+                    if iarrays.[i].Rank = func.IRank.[i] then "" else lastInds.[i]
+                    |> fun x -> String.concat "" [iarrays.[i].Name; x]
+            )
+
+        let rec getOName (inds: string list list) (ctr: int) =
+            let rec getOName' (inds: string list list) (ctr: int) =
+                if ctr = 0 then 
+                    String.concat "" [oarray.Name; inds.[0].[0]]
+                else 
+                    if inds.Head.Tail.IsEmpty then
+                        getOName' (inds.Tail) (ctr - 1)
+                    else
+                        getOName' (inds.Head.Tail :: inds.Tail) (ctr - 1)
+            if ctr = 0 then oarray.Name else getOName' inds (ctr-1)
+
+        let oName = getOName inds (oarray.Rank - func.ORank)
+        
+        iNames, oName
+
+    /// Autogenerate a unary nested_for loop.
+    /// <param name="iarray"> An input array class. </param>
+    /// <param name="oarray"> An output array class. </param>
+    /// <param name="func"> A function class. </param>
+    let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) =
+        let ret = unaryLoop iarray.Name (iarray.Rank - func.IRank.Head) oarray.Name (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head func.Inner func.OmpLevels.Head
+        ret//, lastArrayNames [iarray] oarray func
+
+    /// Autogenerate an N-ary nested_for loop.
+    /// <param name="iarrays"> A list of input array classes. </param>
+    /// <param name="oarray"> An output array class. </param>
+    /// <param name="func"> A function class. </param>
+    let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
+        let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
+        let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm)) func.Comm
+        let lastINames, lastOName = lastArrayNames iarrays oarray func
+
+        let subINames = List.zip func.INames lastINames
+        let subOName = (oarray.Name, lastOName)
+
+        let rec subInner (subs: (string * string) list) (inner: string list) = 
+            match subs with
+            | []           -> inner
+            | head :: tail -> List.init inner.Length (fun i -> inner.[i].Replace(fst head, snd head)) |> subInner tail
+
+        let subbedInner = func.Inner |> subInner (List.append subINames [subOName])
+
+        let ret = naryLoop (iarrays |> List.map (fun x -> x.Name)) ilevels oarray.Name (oarray.Rank - func.ORank) (indNames 0 ilevels) imins subbedInner func.OmpLevels
+        ret//, lastArrayNames iarrays oarray func
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
@@ -102,7 +429,7 @@ let rec (|ScopePattern|_|) = function
 
 // Pattern for all code after a certain code block where the code block is in scope
 let rec (|PostScopePattern|_|) = function
-    | Token.Symbol '{' :: tail ->
+    | head :: tail ->
         /// Make a list of tokens inside this scope by counting the number of braces (terrible, I know)
         let rec toScope t (ctr: int) =
             match t with
@@ -127,14 +454,7 @@ let rec (|PostScopePattern|_|) = function
                 head' :: h', t'
             | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
-        Some (Token.Symbol '{' :: scope, (t: Token list))
-    | head :: tail -> 
-        match tail with
-        | PostScopePattern t -> 
-            match t with
-            | [], [] -> None
-            | _ -> Some (head :: (fst t), snd t)
-        | _ -> None
+        Some (head :: scope, (t: Token list))
     | _ -> None
 
 //match tokenize "asd(8) {fjfj jfjf }\n" with | ScopePattern(s) -> Some(s) |_->None;;
@@ -156,23 +476,109 @@ let rec (|LinePattern|_|) = function
 //match tokenize "asd(8);\n fjfjfj" with | LinePattern(s) -> Some(s) |_->None;;
 //match tokenize "asd(8);\n asdf;\n fjfjfjfj 9;\n" with | LinesPattern(s) -> Some(s) |_->None;;
 
-/// Make a list of clause arguments and return the tail
-let rec toElements = function
+/// Make a list of arguments from a comma-separated list and return the tail
+let rec toElements s = 
+    match s with
     | head :: Token.Symbol ',' :: tail -> 
         let elements, t = toElements tail
         (head :: elements), t
     | head :: Token.Symbol ')' :: tail -> [head], tail
     | _ -> [], []
 
+/// Pattern for method_for loops and all their calls
+let rec (|MethodLoopPattern|_|) (position: int) = function
+    | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
+        let elements, tokens = toElements tail
+        let iarrays = tokenToStr elements
+        let rec findCalls tokens' position' =
+            match tokens' with
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' when lname = loop -> (func, oarray, position') :: findCalls tail' (position' + 5)
+            | head' :: tail' -> findCalls tail' (position' + 1)
+            | [] -> []
+        let lposition = position + 3 + (2*elements.Length)
+        let calls = 
+            match tokens with
+            | PostScopePattern tokens' -> findCalls (fst tokens') lposition
+            | _ -> []
+        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls, position, lposition)
+        out.iarrays <- []
+        out.oarrays <- []
+        out.funcs <- []
+        Some (out, tokens)
+(* for debugging:
+    | head :: tail ->
+        let nextPosition = position + 1
+        match tail with
+        | MethodLoopPattern nextPosition t -> Some (t)
+        | _ -> None
+*)
+    | _ -> None
+
+/// Scan code for all the method_for loops and return a list of them.
+let scanMethodLoops (tokens: Token list) =
+    let rec scan (position: int) = function
+    | MethodLoopPattern position (loop,[]) -> [loop]
+    | MethodLoopPattern position (loop, tail) -> loop :: (scan loop.LPosition tail)
+    | head :: tail -> scan (position+1) tail
+    | [] -> []
+    scan 0 tokens
+
+//let a = match tokenize code with | MethodLoopPattern 0 (s) -> Some(s) | _ -> None;;
+//let mystr = "auto mloop = method_for(array1, array1, array3); auto ooarray = oloop(array1, array1, array3); auto moarray = mloop(sumThenMultiply);"
+//let b = match tokenize mystr with | MethodLoopPattern 0 (s) -> Some(s) | _ -> None;;
+
+/// Pattern for object_for loops and all their calls
+let rec (|ObjectLoopPattern|_|) (position: int) = function
+    | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail ->
+        let rec findCalls tokens' position' = 
+            match tokens' with
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: tail' when lname = loop ->
+                let iarrays, t = toElements tail'
+                (tokenToStr iarrays, oarray, position') :: findCalls tail' (position + 3 + (2*iarrays.Length))
+            | head' :: tail' -> findCalls tail' (position' + 1)
+            | [] -> []
+        let lposition = position + 5
+        let calls = 
+            match tail with
+            | PostScopePattern t' -> findCalls (fst t') lposition
+            | _ -> []
+        let out = ObjectLoop((tokenToStr [loop]).Head, string func, calls, position, lposition)
+        out.iarrays <- []
+        out.oarrays <- []
+        out.func <- []
+        Some (out, tail)
+(* for debugging:
+    | head :: tail ->
+        let nextPosition = position + 1
+        match tail with
+        | ObjectLoopPattern nextPosition t -> Some (t)
+        | _ -> None
+*)
+    | _ -> None
+    
+/// Scan code for all the method_for loops and return a list of them.
+let scanObjectLoops (tokens: Token list) =
+    let rec scan (position: int) = function
+    | ObjectLoopPattern position (loop,[]) -> [loop]
+    | ObjectLoopPattern position (loop, tail) -> loop :: (scan loop.LPosition tail)
+    | head :: tail -> scan (position+1) tail
+    | [] -> []
+    scan 0 tokens
+
+
+//let a = match tokenize code with | ObjectLoopPattern 0 (s) -> Some(s) | _ -> None;;
+//let mystr = "auto oloop = object_for(sumThenMultiply); auto mloop = method_for(array1, array1, array3); auto ooarray = oloop(array1, array1, array3);"
+//let b = match tokenize mystr with | ObjectLoopPattern 0 (s) -> Some(s) | _ -> None;;
+
 /// Pattern for individual pragma clauses
 let rec (|ClausePattern|_|) = function
     | Token.NewLine :: tail -> None
     | Token.Str head :: Token.Symbol '(' :: tail -> 
-        let elements, tokens = toElements tail
+        let elements, t = toElements tail
         if elements.Length = 1 then
-            Some (Clause (head, elements), tokens)
+            Some (Clause (head, elements), t)
         else
-            Some (Clause (head, elements), tokens)
+            Some (Clause (head, elements), t)
     | Token.Str head :: tail -> Some (Clause (head, []), tail)
     | _  -> None
 /// Pattern for all pragma clauses
@@ -194,28 +600,19 @@ let (|PragmaPattern|_|) = function
             Some (Pragma (cl.Head, cl.Tail, h), t)
     | _ -> None
 
-/// Parse code for all the pragmas and return a list of them.
-let parsePragmas (tokens: Token list) =
-    let rec parse' = function
+/// Scan code for all the pragmas and return a list of them.
+let scanPragmas (tokens: Token list) =
+    let rec scan = function
     | PragmaPattern (pragma,[]) -> [pragma]
-    | PragmaPattern (pragma, tokens') -> pragma :: (parse' tokens')
-    | head :: tail -> parse' tail
+    | PragmaPattern (pragma, tail) -> pragma :: (scan tail)
+    | head :: tail -> scan tail
     | [] -> []
-    parse' tokens
+    scan tokens
 
-type NestedArray = 
-    { arrName: string
-      arrType: string
-      arrRank: int 
-      arrSym:  int list list }
 
-type NestedNetCDFArray = 
-    { arrName:  string
-      arrType:  string
-      arrRank:  int
-      arrSym:   int list list
-      fileName: string
-      varName:  string }
+let (|ArraySymmetryPattern|_|) = function
+    | "symmetry", (vals: Token list) -> Some (vals |> tokenToInt)
+    | _ -> failwith "Invalid array clause."
 
 let getSymmetry (rank: int) (symGroups: int list) = 
     if symGroups.IsEmpty then 
@@ -228,134 +625,172 @@ let getSymmetry (rank: int) (symGroups: int list) =
 
 let (|ArrayPattern|_|) (symGroups: int list) = function
     | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]}, tail )
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = getSymmetry rank symGroups}, tail )
     | Token.Str "promote" :: Token.Symbol '<' :: Token.Str valtype :: Token.Symbol ',' :: Token.Int rank :: Token.Symbol '>' :: Token.Symbol ':' :: Token.Symbol ':' :: Token.Str "type" :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]}, tail )
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = getSymmetry rank symGroups}, tail )
     | _ -> None
-(*
-let (|NetCDFArrayPattern|_|) (symGroups: int list) = function
-    | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Symbol '<' :: Token.Str fname :: Token.Symbol ',' :: Token.Str vname :: Token.Symbol '>' :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {arrName = name; arrType = valtype; arrRank = rank; arrSym = [getSymmetry rank symGroups]; fileName = fname; varName = vname}, tail )
-    | _ -> None
-*)
-
-//[Str "promote"; Symbol '<'; Str "float"; Symbol ','; Int 4; Symbol '>'; Token.Symbol ':'; Token.Symbol ':'; Token.Str "type"; Str "array1"; Token.Symbol ';'] |> function | ArrayPattern(s) -> Some(s) | _ -> failwith "Array pragma specified on a line that did not declare an array.";;
 
 let getArray (clauses: Clause list) (block: Token list) =
-    let hasSym = clauses |> List.exists (fst >> (function | "symmetry" -> true | _ -> false))
+    let hasSym = clauses |> List.exists (function | ArraySymmetryPattern s -> true | _ -> false)
     let sym = if hasSym then
-                  (clauses |> List.find (fst >> (function | "symmetry" -> true | _ -> false))) |> (snd >> tokenToInt)
+                  clauses |> List.pick (function | ArraySymmetryPattern s -> Some (s) | _ -> None)
               else []
     match block with
     | ArrayPattern sym s -> fst s
     | _ -> failwith "Array pragma applied to invalid array declaration."
 
-type NestedFunction =
-    { funcName:  string
-      funcArity: int
-      funcINames: string list
-      funcIRank: int list
-      funcOName: string
-      funcORank: int
-      funcCom:   int list
-      funcBlock: Token list }
 
 let getFunction (name: string) (clauses: Clause list) (block: Token list) =
-
     let arity  = (clauses |> List.find (fst >> (function | "arity" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
     let input  = (clauses |> List.find (fst >> (function | "input" -> true | _ -> false))) |> (snd >> tokenToStr)
     let output = (clauses |> List.find (fst >> (function | "output" -> true | _ -> false))) |> (snd >> tokenToStr >> List.head)
     let iranks = (clauses |> List.find (fst >> (function | "iranks" -> true | _ -> false))) |> (snd >> tokenToInt)
     let orank  = (clauses |> List.find (fst >> (function | "orank" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
 
+    let hasOmp = clauses |> List.exists (fst >> (function | "ompLevels" -> true | _ -> false))
+    let ompLevels = 
+        if hasOmp then
+            (clauses |> List.find (fst >> (function | "ompLevels" -> true | _ -> false))) |> (snd >> tokenToInt)
+        else List.init arity (fun x -> 0)
+
     let hasCom = clauses |> List.exists (fst >> (function | "commutativity" -> true | _ -> false))
-    let com = if hasCom then
-                  (clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt)
-              else List.init arity id
+    let com = 
+        if hasCom then
+            (clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt)
+        else List.init arity id
 
-    { funcName = name; 
-      funcArity = arity;
-      funcINames = input; 
-      funcIRank = iranks; 
-      funcOName = output; 
-      funcORank = orank; 
-      funcCom = com; 
-      funcBlock = block |> deleteReturnLine |> Option.get }
-
-type NestedClosure(iarraysIn: NestedArray list, oarrayIn: NestedArray, functionIn: NestedFunction) =
-    member this.Iarrays = iarraysIn
-    member this.Oarray = oarrayIn
-    member this.Function = functionIn
-
-type PragmaObj =
-    | Array of NestedArray
-    | Function of NestedFunction
+    { Name = name;
+      Arity = arity;
+      INames = input;
+      IRank = iranks;
+      OName = output;
+      ORank = orank;
+      Comm = com;
+      OmpLevels = ompLevels;
+      Inner = block |> deleteReturnLine |> Option.get |> tokenToStr |> respace |> reconcat |> newln }
 
 let sortPragmas (pragmas: Pragma list) =
-    let filter = fun (s: string) ->
+    let bin (s: string) = 
         List.filter (fun x ->
                         let directive, clauses, scope = x
                         fst directive = s
-                    )
-    filter "array" pragmas, filter "function" pragmas
+                    ) pragmas
+    bin "array", bin "function"
 
-(*
-type Statement =
-    | MethodLoopInit of Token * Token list
-    | ObjectLoopInit of Token * Token
-    | MethodLoopCall of Token * Token
-    | ObjectLoopCall of Token * Token list
-    //| NestedLoopCall of Token * Token * Token list
-    | Pipe of Token * Token list
-    | Cat  of Token * Token list
-*)
+let fst3 (c, _, _) = c
+let snd3 (_, c, _) = c
+let thd3 (_, _, c) = c
 
-let queryArray (name: string) (arrays: NestedArray list) =
-    List.pick (fun (i: NestedArray) -> if i.arrName = name then Some i else None) arrays
+/// Message-passing function for sending info about array pragmas to nested loop objects
+let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) = 
+    for i in 0..mloops.Length-1 do
+        // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
+        for j in 0..arrays.Length-1 do
+            for k in 0..mloops.[i].Init.Length-1 do
+                if mloops.[i].Init.[k] = arrays.[j].Name then
+                    mloops.[i].PushIarray arrays.[j]
+            for k in 0..mloops.[i].Call.Length-1 do
+                if snd3 mloops.[i].Call.[k] = arrays.[j].Name then
+                    mloops.[i].PushOarray arrays.[j]
+    for i in 0..oloops.Length-1 do
+        // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
+        for j in 0..oloops.[i].Call.Length-1 do
+            let mutable itemp = []
+            for l in 0..(fst3 oloops.[i].Call.[j]).Length-1 do
+                for k in 0..arrays.Length-1 do
+                    if (fst3 oloops.[i].Call.[j]).[l] = arrays.[k].Name then
+                        itemp <- List.append itemp [arrays.[k]]
+            oloops.[i].PushIarrays itemp
+            for k in 0..arrays.Length-1 do
+                if snd3 oloops.[i].Call.[j] = arrays.[k].Name then
+                    oloops.[i].PushOarray arrays.[k]
 
-let queryFunction (name: string) (funcs: NestedFunction list) =
-    List.pick (fun (i: NestedFunction) -> if i.funcName = name then Some i else None) funcs
+/// Message-passing function for sending info about function pragmas to nested loop objects
+let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
+    // search for function names in funcs list and copy info to loop objects (results must be in order!)
+    for i in 0..mloops.Length-1 do
+        for j in 0..funcs.Length-1 do
+            for k in 0..mloops.[i].Call.Length-1 do
+                if fst3 mloops.[i].Call.[k] = funcs.[j].Name then
+                    mloops.[i].PushFunc funcs.[j]
+    for i in 0..oloops.Length-1 do
+        for j in 0..funcs.Length-1 do
+            if oloops.[i].Init = funcs.[j].Name then
+                oloops.[i].SetFunc funcs.[j]
 
-let (|MethodLoopPattern|_|) (arrays: NestedArray list) (functions: NestedFunction list) = function
-    | Token.Str loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
-        let elements, tokens = toElements tail
-        let iarrays = (tokenToStr elements) |> List.map (fun x -> queryArray x arrays)
-        let rec findCalls tokens' = 
-            match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: loop :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' -> (func, oarray) :: findCalls tail'
-            | head' :: tail' -> findCalls tail'
-            | [] -> []
-        let oarrays, funcs = 
-            match tokens with
-            | PostScopePattern (tokens',_) -> findCalls (tokens')
-            | _ -> []
-            |> fun x -> List.map (fst >> fun y -> queryArray y arrays) x, List.map (snd >> fun y -> queryFunction y functions) x
-        Some (List.init funcs.Length (fun i -> NestedClosure(iarrays, oarrays.[i], funcs.[i])))
+
+/// Find a loop API call and return the tail
+let rec (|Init|_|) = function
+    | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail -> Some (tail |> toElements |> snd)
+    | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail -> Some (tail)
+    | head :: tail ->
+        match tail with
+        | Init(s) -> Some (s)
+        | _ -> None
     | _ -> None
 
-let (|ObjectLoopPattern|_|) (arrays: NestedArray list) (functions: NestedFunction list) = function
-    | Token.Str loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: func :: Token.Symbol ')' :: tail ->
-        let func' = ((tokenToStr [func]) |> List.map (fun x -> queryFunction x functions)).Head
-        let rec findCalls tokens' = 
-            match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: loop :: Token.Symbol '(' :: tail' ->
-                let iarrays, tokens = toElements tail
-                (tokenToStr iarrays, oarray) :: findCalls tail'
-            | head' :: tail' -> findCalls tail'
-            | [] -> []
-        let iarrays, oarrays = 
-            match tail with
-            | PostScopePattern (tokens',_) -> findCalls (tokens')
-            | _ -> []
-            |> fun x -> List.map (fst >> List.map (fun y -> queryArray y arrays)) x, List.map (snd >> fun y -> queryArray y arrays) x
-        Some (List.init oarrays.Length (fun i -> NestedClosure(iarrays.[i], oarrays.[i], func')))
-    | _ -> None
+/// Inserts a comma at the end of each string in the input list, except the last one
+let commas (x: string list) =
+    x 
+    |> List.rev
+    |> List.tail
+    |> List.rev
+    |> List.map (fun y -> String.concat "" [y; ", "])
+    |> fun y -> List.append y [List.last x]
 
-//let a = match (tokenize "l = method_for(dsds);\n l(jjrjr);\n") with | MethodLoopPattern alist flist v -> Some(v) |_-> None ;;
-//let a = match (tokenize "asd(8) {fjfj jfjf { 9 {a b c} 7 8 } }\n asdf {9 8}\n") with | ScopePattern v -> Some(v) |_-> None ;;
+let objectLoopTemplate (oloop: ObjectLoop) =
+    let arity = oloop.func.Head.Arity
 
-let parse (tokens: Token list) =
-    let alist, flist = tokens |> (parsePragmas >> sortPragmas)
+    let firank = oloop.func.Head.IRank
+    let forank = oloop.func.Head.ORank
+
+    let numCalls = oloop.Call.Length
+    let irank = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Rank))
+    let orank = oloop.oarrays |> List.map (fun x -> x.Rank)
+    let itype = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Type))
+    let otype = oloop.oarrays |> List.map (fun x -> x.Type)
+
+    let tTypes = 
+        List.init arity (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1)])
+        |> fun x -> List.append x ["OTYPE, ORANK"]
+        |> commas
+        |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
+
+    let argTypes = 
+        List.init arity (fun i -> String.concat "" ["nested_array<"; "ITYPE"; string (i+1); ", IRANK"; string (i+1); ">"])
+        |> fun x -> List.append x ["nested_array<OTYPE, ORANK>"]
+        |> commas
+        |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
+
+    let tmain = String.concat "" ["template<"; tTypes; "> void "; oloop.Name; "("; argTypes; "){\n\t// Nothing to see here.\n}"]
+
+    let ranks = (irank, orank) ||> List.map2 (fun x -> fun y -> List.append (x |> List.map string) [string y])
+    let types = (itype, otype) ||> List.map2 (fun x -> fun y -> List.append x [y])
+    let tSpecTypes = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) [])
+                                     |> List.map (commas >> (fun x -> String.concat "" x))
+    let tSpecArgs = (types, ranks) ||> List.map2 (fun x -> fun y -> List.init (arity+1) (fun i -> String.concat "" ["nested_array<"; x.[i]; ", "; y.[i]; ">"]))
+
+    let tSpecs = tSpecTypes |> List.map (fun x -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">"])
+
+
+    let inames = List.init oloop.iarrays.Length (fun i -> oloop.iarrays.[i] |> List.map (fun x -> x.Name))
+
+    
+
+
+
+    String.concat "" ["template<"]
+
+let lex (tokens: Token list) = 
+
+    // Scan for loop API calls and create loop state machines
+    let mloops = scanMethodLoops tokens
+    let oloops = scanObjectLoops tokens
+
+    // Sort pragma objects into array and function pragmas
+    let alist, flist = tokens |> (scanPragmas >> sortPragmas)
+
+    // Retrieve array and function objects from pragma info
     let arrays = List.init alist.Length (fun i ->
                                              let directive, clauses, scope = alist.[i]
                                              getArray clauses scope
@@ -365,26 +800,34 @@ let parse (tokens: Token list) =
                                             let name = ([(snd directive).Head] |> tokenToStr).Head
                                             getFunction name clauses scope
                                        )
+
+    // Pass array and function objects to the loops that call them, if they are visible
+    sendArraysToLoops arrays mloops oloops
+    sendFunctionsToLoops funcs mloops oloops
+
+
     []
+
+
 
 let code = """
 
 #include "things.hpp"
 #include "stuff.hpp"
 #pragma edgi function(sumThenMultiply) arity(3) input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
-void sumThenMultiply(nested_array_t<float, 1> oarray, nested_array_t<float,1> iarray1, nested_array_t<float,1> iarray2, nested_array_t<float,0> iarray3) {
+auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
     // assume iarray1 and iarray2 last extents are same
     for(int i = 0; i < iarray1.current_extent(); i++){
         oarray += iarray1[i] + iarray2[i];
     }
 
     oarray *= iarray3;
-    return oarray;
+    //return oarray;
 }
 #pragma edgi function(add10) arity(1) input(iarray) iranks(0) output(oarray) orank(0)
-void sumThenMultiply(nested_array_t<float, 0> oarray, nested_array_t<float, 0> iarray1) {
+{
     oarray = iarray + 10;
-    return oarray;
+    //return oarray;
 }
 int main(){
 
@@ -393,6 +836,12 @@ int main(){
 
     #pragma edgi array
     promote<float, 3>::type array3;
+
+    #pragma edgi array
+    promote<float, 3>::type ooarray;
+
+    #pragma edgi array
+    promote<float, 3>::type moarray;
 
     auto oloop = object_for(sumThenMultiply);
     auto mloop = method_for(array1, array1, array3);
@@ -406,3 +855,5 @@ int main(){
 
     return 0;
 }"""
+
+let tokens = tokenize code;;
