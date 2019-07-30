@@ -144,31 +144,15 @@ let brace x =
 /// Contains optimizations for symmetry and commutativity.
 module NestedLoop =
 
-    /// Finds the ranks corresponding to each extents list.
-    /// <param name="extents"> A list of extents. </param>
-    let rec private rankList extents =
-        match extents with
-        | []           -> []
-        | head :: tail -> (List.length head) :: rankList tail
-
-    /// Generates a new iterator name based on an input number.
-    /// <param name="i"> An integer to append to "__i". </param>
-    let private indName (i: int) =
-        String.concat "" ["__i"; (string i)]
-
-    /// Generates a list of new iterator names based on a range, e.g., "__i3"
-    /// <param name="min"> First integer to append to "__i". </param>
-    /// <param name="max"> Last integer to append to "__i". </param>
-    let rec private indNames min max =
-        List.init (max - min) (fun index -> indName (index + min))
-
     /// Generates a list of new iterator names for multiple variables based on a minumum and the ranks of variables to loop over.
     /// <param name="min"> First integer to append to "__i". </param>
     /// <param name="ranks"> List of variable ranks. </param>
-    let rec private indNames2 min ranks =
+    let rec private indNames min ranks =
+        let rec indNames' min max =
+            List.init (max - min) (fun index -> String.concat "" ["__i"; (string (index + min))])
         match ranks with
         | []           -> []
-        | head :: tail -> indNames min (min+head) :: indNames2 (min+head) tail
+        | head :: tail -> indNames' min (min+head) :: indNames (min+head) tail
 
     /// Finds which iterators should serve as a the minimum for a given loop if the variables are commutative; otherwise set the minimum to 0.
     /// <param name="comGroups"> A commutativity vector. </param>
@@ -241,7 +225,7 @@ module NestedLoop =
         assert (arrayNames.Length = comGroups.Length)
 
         let ranks = symGroups |> List.map (fun x -> x.Length)
-        let indexNames = indNames2 0 ranks
+        let indexNames = indNames 0 ranks
         let cimins = comImins comGroups indexNames
         let states = vStates arrayNames symGroups comGroups
 
@@ -336,9 +320,9 @@ module NestedLoop =
     /// <param name="iarrays"> A list of input array classes. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
-    let private lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
+    let lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
         let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
-        let inds = indNames2 0 ilevels
+        let inds = indNames 0 ilevels
         let lastInds = List.map List.last inds
         let iNames = 
             List.init iarrays.Length (
@@ -348,9 +332,18 @@ module NestedLoop =
             )
 
         let rec getOName (inds: string list list) (ctr: int) =
-            if ctr = 0 then (String.concat "" [oarray.Name; inds.[0].[0]]) else getOName (inds.Head.Tail :: inds.Tail) (ctr - 1)
-        let oName = getOName inds (oarray.Rank - func.ORank)
+            let rec getOName' (inds: string list list) (ctr: int) =
+                if ctr = 0 then 
+                    String.concat "" [oarray.Name; inds.[0].[0]]
+                else 
+                    if inds.Head.Tail.IsEmpty then
+                        getOName' (inds.Tail) (ctr - 1)
+                    else
+                        getOName' (inds.Head.Tail :: inds.Tail) (ctr - 1)
+            if ctr = 0 then oarray.Name else getOName' inds (ctr-1)
 
+        let oName = getOName inds (oarray.Rank - func.ORank)
+        
         iNames, oName
 
     /// Autogenerate a unary nested_for loop.
@@ -358,7 +351,7 @@ module NestedLoop =
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) =
-        let ret = unaryLoop iarray.Name (iarray.Rank - func.IRank.Head) oarray.Name (oarray.Rank - func.ORank) (indNames2 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head func.Inner func.OmpLevels.Head
+        let ret = unaryLoop iarray.Name (iarray.Rank - func.IRank.Head) oarray.Name (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head func.Inner func.OmpLevels.Head
         ret//, lastArrayNames [iarray] oarray func
 
     /// Autogenerate an N-ary nested_for loop.
@@ -368,7 +361,7 @@ module NestedLoop =
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
         let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
         let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm)) func.Comm
-        let ret = naryLoop (iarrays |> List.map (fun x -> x.Name)) ilevels oarray.Name (oarray.Rank - func.ORank) (indNames2 0 ilevels) imins func.Inner func.OmpLevels
+        let ret = naryLoop (iarrays |> List.map (fun x -> x.Name)) ilevels oarray.Name (oarray.Rank - func.ORank) (indNames 0 ilevels) imins func.Inner func.OmpLevels
         ret//, lastArrayNames iarrays oarray func
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
