@@ -755,20 +755,23 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let arity, inames = 
         match oloop.GetFunc.Arity with
-        | Some a -> List.init numCalls (fun i -> a), List.init numCalls (fun x -> oloop.iarrays.Head |> List.map (fun y -> y.Name))
-        | None -> oloop.iarrays |> List.map (fun x -> x.Length), oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Name))
+        | Some a -> // fixed arity => specify all argument names
+            List.init numCalls (fun i -> a), List.init numCalls (fun i -> oloop.GetFunc.INames)
+        | None ->  // variable arity => specify one argument name and template it
+            let arity' = oloop.iarrays |> List.map (fun x -> x.Length)
+            arity', List.init numCalls (fun i -> List.init arity'.[i] (fun j -> String.concat "" [oloop.GetFunc.INames.Head; "_"; string j]))
 
     let onames = oloop.oarrays |> List.map (fun x -> x.Name)
 
-    let templateTypes = 
-        arity |> List.distinct |> List.map (fun i -> 
+    let templateTypes =
+        arity |> List.distinct |> List.map (fun i ->
             List.init i (fun j -> String.concat "" ["ITYPE"; string (j+1); ", IRANK"; string (j+1)])
             |> fun x -> List.append x ["OTYPE, ORANK"]
             |> commas
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         )
 
-    let templateArgTypes = 
+    let templateArgTypes =
         arity |> List.distinct |> List.map (fun i ->
             List.init i (fun j -> String.concat "" ["nested_array<"; "ITYPE"; string (j+1); ", IRANK"; string (j+1); "> "; oloop.GetFunc.INames.[j]])
             |> fun x -> List.append x ["nested_array<OTYPE, ORANK>"; oloop.GetFunc.OName]
