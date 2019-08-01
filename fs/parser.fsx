@@ -748,26 +748,27 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let forank = oloop.GetFunc.ORank
 
     let numCalls = oloop.Call.Length
-    let irank = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Rank))
-    let orank = oloop.oarrays |> List.map (fun x -> x.Rank)
     let itype = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Type))
     let otype = oloop.oarrays |> List.map (fun x -> x.Type)
+    let irank = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Rank))
+    let orank = oloop.oarrays |> List.map (fun x -> x.Rank)
 
-    let arity = 
+    let arity, inames = 
         match oloop.GetFunc.Arity with
-        | Some a -> List.init numCalls (fun i -> a)
-        | None -> oloop.iarrays |> List.map (fun x -> x.Length)
+        | Some a -> List.init numCalls (fun i -> a), List.init numCalls (fun x -> oloop.iarrays.Head |> List.map (fun y -> y.Name))
+        | None -> oloop.iarrays |> List.map (fun x -> x.Length), oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Name))
+
+    let onames = oloop.oarrays |> List.map (fun x -> x.Name)
 
     let templateTypes = 
-        arity |> List.distinct |> List.map (
-            fun i -> 
-                List.init i (fun j -> String.concat "" ["ITYPE"; string (j+1); ", IRANK"; string (j+1)])
-                |> fun x -> List.append x ["OTYPE, ORANK"]
-                |> commas
-                |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
+        arity |> List.distinct |> List.map (fun i -> 
+            List.init i (fun j -> String.concat "" ["ITYPE"; string (j+1); ", IRANK"; string (j+1)])
+            |> fun x -> List.append x ["OTYPE, ORANK"]
+            |> commas
+            |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         )
 
-    let argTypes = 
+    let templateArgTypes = 
         arity |> List.distinct |> List.map (fun i ->
             List.init i (fun j -> String.concat "" ["nested_array<"; "ITYPE"; string (j+1); ", IRANK"; string (j+1); "> "; oloop.GetFunc.INames.[j]])
             |> fun x -> List.append x ["nested_array<OTYPE, ORANK>"; oloop.GetFunc.OName]
@@ -775,22 +776,21 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         )
 
-    let tmain = List.init (arity |> List.distinct |> List.length) (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.Name; "("; argTypes.[i]; "){\n\t// Nothing to see here.\n}"])
-//
-    let ranks = (irank, orank) ||> List.map2 (fun x -> fun y -> List.append (x |> List.map string) [string y])
-    let types = (itype, otype) ||> List.map2 (fun x -> fun y -> List.append x [y])
+    let tmain = List.init (arity |> List.distinct |> List.length) (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
+
+    let ranks = (irank, orank) ||> List.map2 (fun x y -> List.append (x |> List.map string) [string y])
+    let types = (itype, otype) ||> List.map2 (fun x y -> List.append x [y])
+    let names = (inames, onames) ||> List.map2 (fun x y -> List.append x [y])
     let tSpecTypes = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) [])
                                      |> List.map (commas >> (fun x -> String.concat "" x))
-    let tSpecArgs = (types, ranks) ||> List.map2 (fun x -> fun y -> List.init (arity+1) (fun i -> String.concat "" ["nested_array<"; x.[i]; ", "; y.[i]; ">"]))
 
-    let tSpecs = tSpecTypes |> List.map (fun x -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">"])
+    let tSpecArgs = (types, ranks) ||> (fun x y -> List.init (arity.Length) (fun i -> List.init (arity.[i]+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
+                                    |> List.map commas
+                                    |> List.map (List.fold (fun acc elem -> String.concat "" [acc; elem]) "")
 
+    let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
 
-    let inames = List.init oloop.iarrays.Length (fun i -> oloop.iarrays.[i] |> List.map (fun x -> x.Name))
-
-
-
-    String.concat "" ["template<"]
+    []
 
 
 let methodLoopTemplate (mloop: MethodLoop) =
