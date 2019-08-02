@@ -791,8 +791,11 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                                     |> List.map commas
                                     |> List.map (List.fold (fun acc elem -> String.concat "" [acc; elem]) "")
 
-    let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
+    let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc |> fst)
 
+    let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
+                                          |> List.map brace
+                                          |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; z; y.Tail]))
     []
 
 
