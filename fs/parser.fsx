@@ -47,7 +47,6 @@ let tokenToInt (tokens: Token list) =
 
 /// Megahack to convert tokens to strings. try to fix for proper Token.Str -> string conversion
 let tokenToStr (tokens: Token list) =
-    let unquote (tokens': string) = tokens'.Substring(1, tokens'.Length-2)
     tokens |> List.map (
         function
         | Token.NewLine -> "\n"
@@ -359,13 +358,13 @@ module NestedLoop =
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
-        let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
+        let ilevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
         let comm = match func.Comm with | Some comm -> comm | None -> (List.init iarrays.Length id)
         let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm)) comm
         let lastINames, lastOName = lastArrayNames iarrays oarray func
 
         let subINames = List.zip func.INames lastINames
-        let subOName = (oarray.Name, lastOName)
+        let subOName = (func.OName, lastOName)
         let rec subInner (subs: (string * string) list) (inner: string list) = 
             match subs with
             | []           -> inner
