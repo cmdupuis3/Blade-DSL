@@ -288,7 +288,7 @@ module NestedLoop =
                 fun x -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; iline; oline; tab x; [braced.[1]] ]
         )
         |> List.rev
-        |> List.fold (fun i elem -> elem i) inner
+        |> List.fold (fun acc elem -> elem acc) inner
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="arrayNames"> Variable names. </param>
@@ -313,7 +313,7 @@ module NestedLoop =
 
         naryLoop' iarrayNames iarrayLevels oarrayName oarrayLevels indNames iMins inner ompLevels
         |> List.rev
-        |> List.fold (fun i elem -> elem i) inner
+        |> List.fold (fun acc elem -> elem acc) inner
 
     /// Find the final array names for a list of variables; useful when substituting into inner blocks.
     /// <param name="iarrays"> A list of input array classes. </param>
@@ -327,13 +327,13 @@ module NestedLoop =
             List.init iarrays.Length (
                 fun i ->
                     if iarrays.[i].Rank = func.IRank.[i] then "" else lastInds.[i]
-                    |> fun x -> String.concat "" [iarrays.[i].Name; x]
+                    |> fun x -> String.concat "" [func.INames.[i]; x]
             )
 
         let rec getOName (inds: string list list) (ctr: int) =
             let rec getOName' (inds: string list list) (ctr: int) =
                 if ctr = 0 then 
-                    String.concat "" [oarray.Name; inds.[0].[0]]
+                    String.concat "" [func.OName; inds.[0].[0]]
                 else 
                     if inds.Head.Tail.IsEmpty then
                         getOName' (inds.Tail) (ctr - 1)
@@ -344,13 +344,26 @@ module NestedLoop =
         
         iNames, oName
 
+    /// Substitute the first string with the second in a list of strings
+    /// <param name="subs"> A list of substitution pairs; find the first, swap the second in. </param>
+    /// <param name="text"> The text to be substituted. </param>
+    let rec private subInner (subs: (string * string) list) (inner: string list) =
+        match subs with
+        | []           -> inner
+        | head :: tail -> List.init inner.Length (fun i -> inner.[i].Replace(fst head, snd head)) |> subInner tail
+
     /// Autogenerate a unary nested_for loop.
     /// <param name="iarray"> An input array class. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) =
+        let lastINames, lastOName = lastArrayNames [iarray] oarray func
+        let subINames = (func.INames.Head, lastINames.Head)
+        let subOName = (func.OName, lastOName)
+        let subbedInner = func.Inner |> subInner (subINames :: [subOName])
+
         let ompLevels = match func.OmpLevels with | Some omp -> omp.Head | None -> 0
-        let ret = unaryLoop iarray.Name (iarray.Rank - func.IRank.Head) oarray.Name (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head func.Inner ompLevels
+        let ret = unaryLoop func.INames.Head (iarray.Rank - func.IRank.Head) func.OName (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head subbedInner ompLevels
         ret, lastArrayNames [iarray] oarray func
 
     /// Autogenerate an N-ary nested_for loop.
@@ -361,18 +374,14 @@ module NestedLoop =
         let ilevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
         let comm = match func.Comm with | Some comm -> comm | None -> (List.init iarrays.Length id)
         let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm)) comm
-        let lastINames, lastOName = lastArrayNames iarrays oarray func
 
+        let lastINames, lastOName = lastArrayNames iarrays oarray func
         let subINames = List.zip func.INames lastINames
         let subOName = (func.OName, lastOName)
-        let rec subInner (subs: (string * string) list) (inner: string list) = 
-            match subs with
-            | []           -> inner
-            | head :: tail -> List.init inner.Length (fun i -> inner.[i].Replace(fst head, snd head)) |> subInner tail
         let subbedInner = func.Inner |> subInner (List.append subINames [subOName])
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp | None -> (List.init iarrays.Length (fun i -> 0))
-        let ret = naryLoop (iarrays |> List.map (fun x -> x.Name)) ilevels oarray.Name (oarray.Rank - func.ORank) (indNames 0 ilevels) imins subbedInner ompLevels
+        let ret = naryLoop func.INames ilevels func.OName (oarray.Rank - func.ORank) (indNames 0 ilevels) imins subbedInner ompLevels
         ret, lastArrayNames iarrays oarray func
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
@@ -787,8 +796,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                                      |> List.map (commas >> (fun x -> String.concat "" x))
 
     let tSpecArgs = (types, ranks) ||> (fun x y -> List.init (arity.Length) (fun i -> List.init (arity.[i]+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
-                                    |> List.map commas
-                                    |> List.map (List.fold (fun acc elem -> String.concat "" [acc; elem]) "")
+                                    |> List.map (commas >> (List.fold (fun acc elem -> String.concat "" [acc; elem]) ""))
 
     let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc |> fst)
 
