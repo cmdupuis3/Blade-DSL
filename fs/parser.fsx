@@ -80,7 +80,7 @@ type NestedArray =
     { Name: string
       Type: string
       Rank: int 
-      Symm:  int list }
+      Symm:  int list Option}
 
 /// Container for function pragma information
 type NestedFunction =
@@ -357,13 +357,16 @@ module NestedLoop =
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) =
+        let ilevels = iarray.Rank - func.IRank.Head
+        let imins = (iminList [iarray.Name] [iarray.Symm |> function | Some s -> s | None -> (List.init iarray.Rank id)] [1]).Head
+
         let lastINames, lastOName = lastArrayNames [iarray] oarray func
         let subINames = (func.INames.Head, lastINames.Head)
         let subOName = (func.OName, lastOName)
         let subbedInner = func.Inner |> subInner (subINames :: [subOName])
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp.Head | None -> 0
-        let ret = unaryLoop func.INames.Head (iarray.Rank - func.IRank.Head) func.OName (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head (iminList [iarray.Name] [iarray.Symm] [1]).Head subbedInner ompLevels
+        let ret = unaryLoop func.INames.Head ilevels func.OName (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins subbedInner ompLevels
         ret, lastArrayNames [iarray] oarray func
 
     /// Autogenerate an N-ary nested_for loop.
@@ -373,7 +376,7 @@ module NestedLoop =
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
         let ilevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
         let comm = match func.Comm with | Some comm -> comm | None -> (List.init iarrays.Length id)
-        let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm)) comm
+        let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))) comm
 
         let lastINames, lastOName = lastArrayNames iarrays oarray func
         let subINames = List.zip func.INames lastINames
@@ -617,32 +620,18 @@ let scanPragmas (tokens: Token list) =
     | [] -> []
     scan tokens
 
-
-let (|ArraySymmetryPattern|_|) = function
-    | "symmetry", (vals: Token list) -> Some (vals |> tokenToInt)
-    | _ -> failwith "Invalid array clause."
-
-let getSymmetry (rank: int) (symGroups: int list) = 
-    if symGroups.IsEmpty then 
-        List.init rank id
-    else
-        if symGroups.Length = rank then
-            symGroups
-        else
-            failwith "Symmetry vector length did not match the rank of the array."
-
-let (|ArrayPattern|_|) (symGroups: int list) = function
+let (|ArrayPattern|_|) (symGroups: int list Option) = function
     | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = valtype; Rank = rank; Symm = getSymmetry rank symGroups}, tail )
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups}, tail )
     | Token.Str "promote" :: Token.Symbol '<' :: Token.Str valtype :: Token.Symbol ',' :: Token.Int rank :: Token.Symbol '>' :: Token.Symbol ':' :: Token.Symbol ':' :: Token.Str "type" :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = valtype; Rank = rank; Symm = getSymmetry rank symGroups}, tail )
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups}, tail )
     | _ -> None
 
 let getArray (clauses: Clause list) (block: Token list) =
-    let hasSym = clauses |> List.exists (function | ArraySymmetryPattern s -> true | _ -> false)
+    let hasSym = clauses |> List.exists (fst >> (function | "symmetry" -> true | _ -> false))
     let sym = if hasSym then
-                  clauses |> List.pick (function | ArraySymmetryPattern s -> Some (s) | _ -> None)
-              else []
+                  Some ((clauses |> List.find (fst >> (function | "symmetry" -> true | _ -> false))) |> (snd >> tokenToInt))
+              else None
     match block with
     | ArrayPattern sym s -> fst s
     | _ -> failwith "Array pragma applied to invalid array declaration."
@@ -760,6 +749,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let otype = oloop.oarrays |> List.map (fun x -> x.Type)
     let irank = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Rank))
     let orank = oloop.oarrays |> List.map (fun x -> x.Rank)
+    let isymm = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Symm))
+    let osymm = oloop.oarrays |> List.map (fun x -> x.Symm)
 
     let arity, inames = 
         match oloop.GetFunc.Arity with
@@ -773,16 +764,16 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let templateTypes =
         arity |> List.distinct |> List.map (fun i ->
-            List.init i (fun j -> String.concat "" ["ITYPE"; string (j+1); ", IRANK"; string (j+1)])
-            |> fun x -> List.append x ["OTYPE, ORANK"]
+            List.init i (fun j -> String.concat "" ["ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1)])
+            |> fun x -> List.append x ["OTYPE, ORANK, OSYM"]
             |> commas
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         )
 
     let templateArgTypes =
         arity |> List.distinct |> List.map (fun i ->
-            List.init i (fun j -> String.concat "" ["nested_array<"; "ITYPE"; string (j+1); ", IRANK"; string (j+1); "> "; oloop.GetFunc.INames.[j]])
-            |> fun x -> List.append x ["nested_array<OTYPE, ORANK>"; oloop.GetFunc.OName]
+            List.init i (fun j -> String.concat "" ["nested_array<"; "ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1); "> "; oloop.GetFunc.INames.[j]])
+            |> fun x -> List.append x ["nested_array<OTYPE, ORANK, OSYM>"; oloop.GetFunc.OName]
             |> commas
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         )
@@ -791,6 +782,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let ranks = (irank, orank) ||> List.map2 (fun x y -> List.append (x |> List.map string) [string y])
     let types = (itype, otype) ||> List.map2 (fun x y -> List.append x [y])
+    let symms = (isymm, osymm) ||> List.map2 (fun x y -> List.append x [y])
     let names = (inames, onames) ||> List.map2 (fun x y -> List.append x [y])
     let tSpecTypes = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) [])
                                      |> List.map (commas >> (fun x -> String.concat "" x))
@@ -802,12 +794,20 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
                                           |> List.map brace
-                                          |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; z; y.Tail]))
+                                          |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
+
+
+
+
     []
 
 
 let methodLoopTemplate (mloop: MethodLoop) =
-    let arity = mloop.funcs |> List.map (fun x -> x.Arity)
+    let arity = mloop.funcs |> List.map (fun x -> x.Arity) 
+                            |> List.map (function | Some a -> a | None -> failwith "method_for loops must have fixed arity.")
+                            |> fun x -> 
+                                let a = List.distinct x
+                                if a.Length = 1 then a.Head else failwith "method_for loops must have fixed arity."
 
     let firank = mloop.funcs |> List.map (fun x -> x.IRank)
     let forank = mloop.funcs |> List.map (fun x -> x.ORank)
@@ -817,6 +817,9 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let orank = mloop.oarrays |> List.map (fun x -> x.Rank)
     let itype = mloop.iarrays |> List.map (fun x -> x.Type)
     let otype = mloop.oarrays |> List.map (fun x -> x.Type)
+
+    let inames = mloop.funcs |> List.map (fun x -> x.INames)
+    let oname = mloop.funcs |> List.map (fun x -> x.OName)
 
     let argTypes = 
         List.init numCalls (fun i ->
