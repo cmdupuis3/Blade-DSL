@@ -820,7 +820,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     /// Expand the function block for a single variadic function call.
     /// <param name="tokens"> Token stream from a single function block. </param>
     /// <param name="n"> List of variadic input names. </param>
-    let expandVariadic (n: int) = function
+    let expandVariadic (n: int) (tokens: Token list) = 
+        match tokens with
         | TailPattern (h, t) -> 
             match h with
             | HeadPattern oloop.GetFunc.INames.Head (h', t') -> 
@@ -830,9 +831,27 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 |> List.rev
                 |> List.map (List.fold (fun acc elem -> String.concat " " [acc; elem]) "")
                 |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
-                |> fun x -> Some (List.fold (fun acc elem -> String.concat "" [acc; elem]) "" (x :: (t |> tokenToStr)))
-            | _ -> None
-        | _ -> None
+                |> fun x -> List.fold (fun acc elem -> String.concat "" [acc; elem]) "" ((x :: (t |> tokenToStr)) |> respace |> reconcat |> newln)
+            | _ -> h |> tokenToStr |> respace |> reconcat |> newln |> List.head
+        | _ -> tokens |> tokenToStr |> respace |> reconcat |> newln |> List.head
+
+    let tSpecInner = 
+        match oloop.GetFunc.Arity with
+        | Some a -> // fixed arity => specify all argument names
+            List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc |> fst)
+        | None ->
+            let funcs = List.init numCalls (fun i ->
+                { Name = oloop.GetFunc.Name;
+                  Arity = Some(arity.[i]);
+                  INames = inames.[i];
+                  IRank = oloop.GetFunc.IRank;
+                  OName = oloop.GetFunc.OName;
+                  ORank = oloop.GetFunc.ORank;
+                  Comm = oloop.GetFunc.Comm;
+                  OmpLevels = oloop.GetFunc.OmpLevels;
+                  Inner = oloop.GetFunc.Inner |> List.map tokenize |> List.map (expandVariadic i) }
+            )
+            List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] |> fst)
 
 
     let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
