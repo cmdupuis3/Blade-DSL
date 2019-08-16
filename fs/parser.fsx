@@ -807,6 +807,33 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             | _ -> None
         | _ -> None
 
+    let rec (|TailPattern|_|) = function
+        | head :: Token.Str "tail" :: tail -> Some ([head], tail)
+        | head :: tail ->
+            match tail with
+            | TailPattern s -> 
+                let h, t = s
+                Some (head :: h, t)
+            | _ -> None
+        | _ -> None
+
+    /// Expand the function block for a single variadic function call.
+    /// <param name="tokens"> Token stream from a single function block. </param>
+    /// <param name="n"> List of variadic input names. </param>
+    let expandVariadic (n: string list) = function
+        | TailPattern (h, t) -> 
+            match h with
+            | HeadPattern oloop.GetFunc.INames.Head (h', t') -> 
+                List.init arity.[0] (fun i -> List.append (h' |> tokenToStr) (n.[i] :: (t' |> tokenToStr)))
+                |> List.rev
+                |> fun x -> ((x.Head |> String.concat "" |> tokenize |> function | ScopePatternParens s -> Some (s |> fst |> tokenToStr) | _ -> None) |> Option.get) :: x.Tail
+                |> List.rev
+                |> List.map (List.fold (fun acc elem -> String.concat "" [acc; elem]) "")
+                |> List.fold (fun acc elem -> String.concat " " [acc; elem]) ""
+                |> fun x -> Some (List.fold (fun acc elem -> String.concat "" [acc; elem]) "" (x :: (t |> tokenToStr)))
+            | _ -> None
+        | _ -> None
+
 
     let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
                                           |> List.map brace
