@@ -792,6 +792,22 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc |> fst)
 
+    let rec (|HeadPattern|_|) (iname: string) = function
+        | head :: Token.Symbol '=' :: tail -> 
+            let rec pre = function
+                | h' :: Token.Str iname :: t' -> [h'], t'
+                | h' :: t' -> 
+                    let a, b = pre t'
+                    h' :: a, b
+                | _ -> failwith "Input array name not found in variadic function."
+            Some (pre tail)
+        | head :: tail ->
+            match tail with
+            | HeadPattern iname s -> Some (s)
+            | _ -> None
+        | _ -> None
+
+
     let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
                                           |> List.map brace
                                           |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
