@@ -437,6 +437,39 @@ let rec (|ScopePattern|_|) = function
         | ScopePattern t -> Some t
         | _ -> None
     | _ -> None
+    
+let rec (|ScopePatternParens|_|) = function
+    | head :: Token.Symbol '(' :: tail ->
+        /// Make a list of tokens inside this scope by counting the number of braces (terrible, I know)
+        let rec toScope t (ctr: int) =
+            match t with
+            | [] -> [], []
+            | Token.Symbol ')' :: Token.NewLine :: tail' -> 
+                if ctr > 0 then
+                    let h', t' = toScope tail' (ctr-1)
+                    Token.Symbol ')' :: Token.NewLine :: h', t'
+                else
+                    [], tail'
+            | Token.Symbol ')' :: tail' -> 
+                if ctr > 0 then
+                    let h', t' = toScope tail' (ctr-1)
+                    Token.Symbol ')' :: h', t'
+                else
+                    [], tail'
+            | Token.Symbol '(' :: tail' -> 
+                let h', t' = toScope tail' (ctr+1)
+                Token.Symbol '(' :: h', t'
+            | head' :: tail' -> 
+                let h', t' = toScope tail' ctr
+                head' :: h', t'
+            | _ -> failwith "asdfsdf"
+        let scope, t = toScope tail 0
+        Some (head :: Token.Symbol '(' :: (List.append scope [Token.Symbol ')']), (t: Token list))
+    | head :: tail -> 
+        match tail with
+        | ScopePatternParens t -> Some t
+        | _ -> None
+    | _ -> None
 
 // Pattern for all code after a certain code block where the code block is in scope
 let rec (|PostScopePattern|_|) = function
