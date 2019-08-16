@@ -820,16 +820,16 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     /// Expand the function block for a single variadic function call.
     /// <param name="tokens"> Token stream from a single function block. </param>
     /// <param name="n"> List of variadic input names. </param>
-    let expandVariadic (n: string list) = function
+    let expandVariadic (n: int) = function
         | TailPattern (h, t) -> 
             match h with
             | HeadPattern oloop.GetFunc.INames.Head (h', t') -> 
-                List.init arity.[0] (fun i -> List.append (h' |> tokenToStr) (n.[i] :: (t' |> tokenToStr)))
+                List.init arity.[n] (fun i -> List.append (h' |> tokenToStr) (inames.[n].[i] :: (t' |> tokenToStr)))
                 |> List.rev
                 |> fun x -> ((x.Head |> String.concat "" |> tokenize |> function | ScopePatternParens s -> Some (s |> fst |> tokenToStr) | _ -> None) |> Option.get) :: x.Tail
                 |> List.rev
-                |> List.map (List.fold (fun acc elem -> String.concat "" [acc; elem]) "")
-                |> List.fold (fun acc elem -> String.concat " " [acc; elem]) ""
+                |> List.map (List.fold (fun acc elem -> String.concat " " [acc; elem]) "")
+                |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
                 |> fun x -> Some (List.fold (fun acc elem -> String.concat "" [acc; elem]) "" (x :: (t |> tokenToStr)))
             | _ -> None
         | _ -> None
