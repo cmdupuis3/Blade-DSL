@@ -763,22 +763,22 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let onames = oloop.oarrays |> List.map (fun x -> x.Name)
 
     let templateTypes =
-        arity |> List.distinct |> List.map (fun i ->
-            List.init i (fun j -> String.concat "" ["ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1)])
+        arity |> List.map (fun a ->
+            List.init a (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
             |> fun x -> List.append x ["OTYPE, ORANK, OSYM"]
             |> commas
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
-        )
+        ) |> List.distinct
 
     let templateArgTypes =
-        arity |> List.distinct |> List.map (fun i ->
-            List.init i (fun j -> String.concat "" ["nested_array<"; "ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1); "> "; oloop.GetFunc.INames.[j]])
+        (arity, inames) ||> List.map2 (fun a -> fun (names: string list) ->
+            List.init a (fun i -> String.concat "" ["nested_array<ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1); "> "; names.[i]])
             |> fun x -> List.append x ["nested_array<OTYPE, ORANK, OSYM>"; oloop.GetFunc.OName]
             |> commas
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
-        )
+        ) |> List.distinct
 
-    let tmain = List.init (arity |> List.distinct |> List.length) (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
+    let tmain = List.init (arity |> List.length) (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
 
     let ranks = (irank, orank) ||> List.map2 (fun x y -> List.append (x |> List.map string) [string y])
     let types = (itype, otype) ||> List.map2 (fun x y -> List.append x [y])
@@ -878,6 +878,11 @@ auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
 {
     oarray = iarray + 10;
     //return oarray;
+}
+#pragma edgi function(sinThenProduct) arity(any) input(iarray) iranks(0) output(oarray) orank(0)
+{
+    oarray = sin(iarray) * tail;
+    return oarray;
 }
 int main(){
 
