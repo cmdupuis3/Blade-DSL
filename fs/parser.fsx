@@ -397,12 +397,12 @@ type Pragma = Clause * Clause list * Token list
 let rec deleteReturnLine = function
     | Token.Str "return" :: tail ->
         let rec aux = function
-            | Token.Symbol ';' :: tail' -> Some tail'
+            | Token.Symbol ';' :: tail' -> tail'
             | head' :: tail'-> aux tail'
-            | _ -> None
+            | _ -> failwith "derp"
         aux tail
-    | head :: tail -> Some (head :: tail)
-    | _ -> None
+    | head :: tail -> head :: tail
+    | _ -> failwith "No return keyword found on this line."
 
 /// Pattern for pragma scopes; basically dumps all the tokens inside the pragma scope into a buffer, and returns the tail separately
 let rec (|ScopePattern|_|) = function
@@ -437,7 +437,7 @@ let rec (|ScopePattern|_|) = function
         | ScopePattern t -> Some t
         | _ -> None
     | _ -> None
-    
+
 let rec (|ScopePatternParens|_|) = function
     | head :: Token.Symbol '(' :: tail ->
         /// Make a list of tokens inside this scope by counting the number of braces (terrible, I know)
@@ -702,7 +702,7 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
       ORank = orank;
       Comm = com;
       OmpLevels = ompLevels;
-      Inner = block |> deleteReturnLine |> Option.get |> tokenToStr |> respace |> reconcat |> newln }
+      Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln }
 
 let sortPragmas (pragmas: Pragma list) =
     let bin (s: string) = 
@@ -752,7 +752,6 @@ let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) 
         for j in 0..funcs.Length-1 do
             if oloops.[i].Init = funcs.[j].Name then
                 oloops.[i].SetFunc funcs.[j]
-
 
 /// Find a loop API call and return the tail
 let rec (|Init|_|) = function
@@ -823,8 +822,6 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let tSpecArgs = (types, ranks) ||> (fun x y -> List.init (arity.Length) (fun i -> List.init (arity.[i]+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
                                     |> List.map (commas >> (List.fold (fun acc elem -> String.concat "" [acc; elem]) ""))
 
-    let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc |> fst)
-
     let rec (|HeadPattern|_|) (iname: string) = function
         | head :: Token.Symbol '=' :: tail -> 
             let rec pre = function
@@ -833,10 +830,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                     let a, b = pre t'
                     h' :: a, b
                 | _ -> failwith "Input array name not found in variadic function."
-            Some (pre tail)
+            Some (head :: [Token.Symbol '='], pre tail |> fst, pre tail |> snd)
         | head :: tail ->
             match tail with
-            | HeadPattern iname s -> Some (s)
+            | HeadPattern iname s -> Some (head :: (fst3 s), snd3 s, thd3 s)
             | _ -> None
         | _ -> None
 
@@ -857,7 +854,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         match tokens with
         | TailPattern (h, t) -> 
             match h with
-            | HeadPattern oloop.GetFunc.INames.Head (h', t') -> 
+            | HeadPattern oloop.GetFunc.INames.Head (p', h', t') -> 
                 List.init arity.[n] (fun i -> List.append (h' |> tokenToStr) (inames.[n].[i] :: (t' |> tokenToStr)))
                 |> List.rev
                 |> fun x -> ((x.Head |> String.concat "" |> tokenize |> function | ScopePatternParens s -> Some (s |> fst |> tokenToStr) | _ -> None) |> Option.get) :: x.Tail
@@ -865,6 +862,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 |> List.map (List.fold (fun acc elem -> String.concat " " [acc; elem]) "")
                 |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
                 |> fun x -> List.fold (fun acc elem -> String.concat "" [acc; elem]) "" ((x :: (t |> tokenToStr)) |> respace |> reconcat |> newln)
+                |> fun x -> String.concat "" [p' |> tokenToStr |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""; x]
             | _ -> h |> tokenToStr |> respace |> reconcat |> newln |> List.head
         | _ -> tokens |> tokenToStr |> respace |> reconcat |> newln |> List.head
 
@@ -882,10 +880,9 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                   ORank = oloop.GetFunc.ORank;
                   Comm = oloop.GetFunc.Comm;
                   OmpLevels = oloop.GetFunc.OmpLevels;
-                  Inner = oloop.GetFunc.Inner |> List.map tokenize |> List.map (expandVariadic i) }
+                  Inner = oloop.GetFunc.Inner |> List.map tokenize  |> List.map deleteReturnLine |> List.map (expandVariadic i) }
             )
             List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] |> fst)
-
 
     let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
                                           |> List.map brace
@@ -967,12 +964,12 @@ auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
     }
 
     oarray *= iarray3;
-    //return oarray;
+    return oarray;
 }
 #pragma edgi function(add10) arity(1) input(iarray) iranks(0) output(oarray) orank(0)
 {
     oarray = iarray + 10;
-    //return oarray;
+    return oarray;
 }
 #pragma edgi function(sinThenProduct) arity(any) input(iarray) iranks(0) output(oarray) orank(0)
 {
@@ -993,13 +990,20 @@ int main(){
     #pragma edgi array
     promote<float, 3>::type moarray;
 
-    auto oloop = object_for(sumThenMultiply);
-    auto mloop = method_for(array1, array1, array3);
+    #pragma edgi array
+    promote<float, 3>::type voarray;
 
+    auto oloop = object_for(sumThenMultiply);
     auto ooarray = oloop(array1, array1, array3);
+    
+    auto mloop = method_for(array1, array1, array3);
     auto moarray = mloop(sumThenMultiply);
 
-    auto noarray = nested_for(sumThenMultiply, array1, array1, array3);
+    auto oloopv = object_for(sinThenProduct);
+    auto voarray = oloopv(array3, array3);
+
+
+
 
     auto newfunc = pipe(sumThenMultiply, add10);
 
