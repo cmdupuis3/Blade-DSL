@@ -401,7 +401,7 @@ let rec deleteReturnLine = function
             | head' :: tail'-> aux tail'
             | _ -> failwith "derp"
         aux tail
-    | head :: tail -> head :: tail
+    | head :: tail -> head :: deleteReturnLine tail
     | _ -> failwith "No return keyword found on this line."
 
 /// Pattern for pragma scopes; basically dumps all the tokens inside the pragma scope into a buffer, and returns the tail separately
@@ -702,7 +702,7 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
       ORank = orank;
       Comm = com;
       OmpLevels = ompLevels;
-      Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln }
+      Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat }
 
 let sortPragmas (pragmas: Pragma list) =
     let bin (s: string) = 
@@ -880,18 +880,17 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                   ORank = oloop.GetFunc.ORank;
                   Comm = oloop.GetFunc.Comm;
                   OmpLevels = oloop.GetFunc.OmpLevels;
-                  Inner = oloop.GetFunc.Inner |> List.map tokenize  |> List.map deleteReturnLine |> List.map (expandVariadic i) }
+                  Inner = oloop.GetFunc.Inner |> List.map (tokenize >> deleteReturnLine >> (expandVariadic i)) }
             )
             List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] |> fst)
 
-    let tSpecs = (tSpecTypes, tSpecArgs) ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
-                                          |> List.map brace
-                                          |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
-
-
-
-
-    []
+    (tSpecTypes, tSpecArgs) 
+    ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
+    |> List.map brace
+    |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
+    |> List.map (fun x -> x |> List.fold (fun acc elem -> String.concat "" [acc; elem]) "" )
+    |> fun x -> List.concat [tmain; x]
+    |> List.fold (fun acc elem -> String.concat "\n\n" [acc; elem]) ""
 
 
 let methodLoopTemplate (mloop: MethodLoop) =
@@ -946,6 +945,8 @@ let lex (tokens: Token list) =
     // Pass array and function objects to the loops that call them, if they are visible
     sendArraysToLoops arrays mloops oloops
     sendFunctionsToLoops funcs mloops oloops
+
+    
 
 
     []
