@@ -702,7 +702,7 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
       ORank = orank;
       Comm = com;
       OmpLevels = ompLevels;
-      Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat }
+      Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln }
 
 let sortPragmas (pragmas: Pragma list) =
     let bin (s: string) = 
