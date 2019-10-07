@@ -402,7 +402,7 @@ let rec deleteReturnLine = function
             | _ -> failwith "derp"
         aux tail
     | head :: tail -> head :: deleteReturnLine tail
-    | _ -> failwith "No return keyword found on this line."
+    | _ -> []
 
 /// Pattern for pragma scopes; basically dumps all the tokens inside the pragma scope into a buffer, and returns the tail separately
 let rec (|ScopePattern|_|) = function
@@ -792,7 +792,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             let arity' = oloop.iarrays |> List.map (fun x -> x.Length)
             arity', List.init numCalls (fun i -> List.init arity'.[i] (fun j -> String.concat "" [oloop.GetFunc.INames.Head; "_"; string j]))
 
-    let onames = oloop.oarrays |> List.map (fun x -> x.Name)
+    let onames =  List.init numCalls (fun i -> oloop.GetFunc.OName)
 
     let templateTypes =
         arity |> List.map (fun a ->
@@ -810,7 +810,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         ) |> List.distinct
 
-    let tmain = List.init (arity |> List.length) (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
 
     let ranks = (irank, orank) ||> List.map2 (fun x y -> List.append (x |> List.map string) [string y])
     let types = (itype, otype) ||> List.map2 (fun x y -> List.append x [y])
@@ -819,7 +819,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let tSpecTypes = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) [])
                                      |> List.map (commas >> (fun x -> String.concat "" x))
 
-    let tSpecArgs = (types, ranks) ||> (fun x y -> List.init (arity.Length) (fun i -> List.init (arity.[i]+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
+    let tSpecArgs = (types, ranks) ||> (fun x y -> List.init numCalls (fun i -> List.init (arity.[i]+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
                                     |> List.map (commas >> (List.fold (fun acc elem -> String.concat "" [acc; elem]) ""))
 
     let rec (|HeadPattern|_|) (iname: string) = function
@@ -904,15 +904,20 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let forank = mloop.funcs |> List.map (fun x -> x.ORank)
 
     let numCalls = mloop.Call.Length
-    let irank = mloop.iarrays |> List.map (fun x -> x.Rank)
-    let orank = mloop.oarrays |> List.map (fun x -> x.Rank)
     let itype = mloop.iarrays |> List.map (fun x -> x.Type)
     let otype = mloop.oarrays |> List.map (fun x -> x.Type)
+    let irank = mloop.iarrays |> List.map (fun x -> x.Rank)
+    let orank = mloop.oarrays |> List.map (fun x -> x.Rank)
+    let isymm = mloop.iarrays |> List.map (fun x -> x.Symm)
+    let osymm = mloop.oarrays |> List.map (fun x -> x.Symm)
+    let inames = mloop.funcs  |> List.map (fun x -> x.INames)
+    let onames = mloop.funcs  |> List.map (fun x -> x.OName)
 
-    let inames = mloop.funcs |> List.map (fun x -> x.INames)
-    let onames = mloop.oarrays |> List.map (fun x -> x.Name)
-
-
+    let templateTypes =
+        List.init arity (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
+        |> fun x -> List.append x ["OTYPE, ORANK, OSYM"]
+        |> commas
+        |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
 
     let templateArgTypes = 
         List.init numCalls (fun i ->
@@ -920,9 +925,39 @@ let methodLoopTemplate (mloop: MethodLoop) =
             |> commas
             |> fun x -> List.append x [", nested_array<OTYPE, ORANK, OSYM> "; mloop.funcs.[i].OName]
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
-        )
-    []
+        ) |> List.distinct
 
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
+    
+    let ranks = orank |> List.map (fun y -> List.append (irank |> List.map string) [string y])
+    let types = otype |> List.map (fun y -> List.append itype [y])
+    let symms = osymm |> List.map (fun y -> List.append isymm [y])
+    let names = (inames, onames) ||> List.map2 (fun x y -> List.append x [y])
+    let tSpecTypes = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> List.append acc (elem1 :: [elem2])) [])
+                                     |> List.map (commas >> (fun x -> String.concat "" x))
+
+    let tSpecArgs = (types, ranks) ||> (fun x y -> List.init numCalls (fun i -> List.init (arity+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
+                                    |> List.map (commas >> (List.fold (fun acc elem -> String.concat "" [acc; elem]) ""))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    []
 
 let lex (tokens: Token list) =
 
@@ -969,6 +1004,16 @@ auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
     oarray *= iarray3;
     return oarray;
 }
+#pragma edgi function(divideThenSum) arity(3) input(iarray4, iarray5, iarray6) iranks(1, 1, 0) output(oarray) orank(0)
+auto sumThenMultiply = function(iarray4, iarray5, iarray6, oarray){
+    // assume iarray4 and iarray5 last extents are same
+    for(int i = 0; i < iarray4.current_extent(); i++){
+        oarray += iarray4[i] / iarray5[i];
+    }
+
+    oarray += iarray6;
+    return oarray;
+}
 #pragma edgi function(add10) arity(1) input(iarray) iranks(0) output(oarray) orank(0)
 {
     oarray = iarray + 10;
@@ -994,6 +1039,9 @@ int main(){
     promote<float, 3>::type moarray;
 
     #pragma edgi array
+    promote<float, 3>::type moarray2;
+
+    #pragma edgi array
     promote<float, 3>::type voarray;
 
     auto oloop = object_for(sumThenMultiply);
@@ -1001,6 +1049,7 @@ int main(){
     
     auto mloop = method_for(array1, array1, array3);
     auto moarray = mloop(sumThenMultiply);
+    auto moarray2 = mloop(divideThenSum);
 
     auto oloopv = object_for(sinThenProduct);
     auto voarray = oloopv(array3, array3);
