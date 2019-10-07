@@ -803,10 +803,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         ) |> List.distinct
 
     let templateArgTypes =
-        (arity, inames) ||> List.map2 (fun a -> fun (names: string list) ->
+        (arity, inames) ||> List.map2 (fun a (names: string list) ->
             List.init a (fun i -> String.concat "" ["nested_array<ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1); "> "; names.[i]])
-            |> fun x -> List.append x ["nested_array<OTYPE, ORANK, OSYM>"; oloop.GetFunc.OName]
             |> commas
+            |> fun x -> List.append x [", nested_array<OTYPE, ORANK, OSYM> "; oloop.GetFunc.OName]
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         ) |> List.distinct
 
@@ -910,13 +910,15 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let otype = mloop.oarrays |> List.map (fun x -> x.Type)
 
     let inames = mloop.funcs |> List.map (fun x -> x.INames)
-    let oname = mloop.funcs |> List.map (fun x -> x.OName)
+    let onames = mloop.oarrays |> List.map (fun x -> x.Name)
 
-    let argTypes = 
+
+
+    let templateArgTypes = 
         List.init numCalls (fun i ->
-            List.init arity.[i] (fun j -> String.concat "" ["nested_array<"; "ITYPE"; string (j+1); ", IRANK"; string (j+1); "> "; mloop.funcs.[i].INames.[j]])
-            |> fun x -> List.append x ["nested_array<OTYPE, ORANK>"; mloop.funcs.[i].OName]
+            List.init arity (fun j -> String.concat "" ["nested_array<ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1); "> "; mloop.funcs.[i].INames.[j]])
             |> commas
+            |> fun x -> List.append x [", nested_array<OTYPE, ORANK, OSYM> "; mloop.funcs.[i].OName]
             |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
         )
     []
