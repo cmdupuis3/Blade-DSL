@@ -939,25 +939,17 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let tSpecArgs = (types, ranks) ||> (fun x y -> List.init numCalls (fun i -> List.init (arity+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
                                     |> List.map (commas >> (List.fold (fun acc elem -> String.concat "" [acc; elem]) ""))
 
+    let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] |> fst)
+
+    (tSpecTypes, tSpecArgs) 
+    ||> List.map2 (fun x y -> String.concat "" ["template<> void "; mloop.Name; "<"; x; ">("; y; ")"])
+    |> List.map brace
+    |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
+    |> List.map (fun x -> x |> List.fold (fun acc elem -> String.concat "" [acc; elem]) "" )
+    |> fun x -> List.concat [tmain; x]
+    |> List.fold (fun acc elem -> String.concat "\n\n" [acc; elem]) ""
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    []
 
 let lex (tokens: Token list) =
 
