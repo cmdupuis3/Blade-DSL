@@ -772,6 +772,15 @@ let commas (x: string list) =
     |> List.map (fun y -> String.concat "" [y; ", "])
     |> fun y -> List.append y [List.last x]
 
+let symmVec (arrays: NestedArray list) = 
+    arrays
+    |> List.filter (fun x -> x.Symm.IsSome)
+    |> List.map (fun x -> x.Name, x.Symm |> Option.get)
+    |> List.map (fun x ->
+        let name, symm = x
+        String.concat "" ["static constexpr const int["; symm.Length |> string; "] "; name; "_symm = {"; symm |> List.map string |> commas |> List.fold (fun acc elem -> String.concat " " [acc; elem]) "";      "};"]
+    )
+
 let objectLoopTemplate (oloop: ObjectLoop) =
     let firank = oloop.GetFunc.IRank
     let forank = oloop.GetFunc.ORank
