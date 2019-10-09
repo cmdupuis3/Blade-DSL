@@ -948,16 +948,38 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let types = otype |> List.map (fun y -> itype @ [y])
     let symms = osymm |> List.map (fun y -> isymm @ [y])
     let names = (inames, onames) ||> List.map2 (fun x y -> x @ [y])
-    let tSpecTypes = (types, ranks) ||> List.map2 (List.fold2 (fun acc elem1 elem2 -> acc @ (elem1 :: [elem2])) [])
-                                     |> List.map (commas >> (fun x -> String.concat "" x))
 
-    let tSpecArgs = (types, ranks) ||> (fun x y -> List.init numCalls (fun i -> List.init (arity+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
-                                    |> List.map (commas >> stringCollapse "")
+    let tSpecTypes =
+        List.init numCalls (fun i ->
+            List.init (arity+1) (fun j ->
+                [types.[i].[j]; ranks.[i].[j]; symms.[i].[j]]
+                |> commas
+                |> stringCollapse ""
+            ) |> (commas >> stringCollapse "")
+        )
+
+    let tSpecArgs =
+        List.init numCalls (fun i ->
+            List.init (arity+1) (fun j ->
+                (types.[i].[j], ranks.[i].[j], symms.[i].[j])
+                |||> fun x y z ->
+                    if z = "nullptr" then
+                        ["nested_array<"; x; ", "; y; ", nullptr> "; names.[i].[j]]
+                    else
+                        ["nested_array<"; x; ", "; y; ", "; z; "> "; names.[i].[j]]
+                |> stringCollapse ""
+            ) |> (commas >> stringCollapse "")
+        )
+
 
     let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] |> fst)
 
-    (tSpecTypes, tSpecArgs)
-    ||> List.map2 (fun x y -> String.concat "" ["template<> void "; mloop.Name; "<"; x; ">("; y; ")"])
+    List.init numCalls (fun i ->
+            (tSpecTypes.[i], tSpecArgs.[i], mloop.funcs.[i].Name)
+            |||> fun x y z ->
+                ["template<> void "; z; "<"; x; ">("; y; ")"]
+            |> stringCollapse ""
+    )
     |> List.map brace
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
     |> List.map (fun x -> x |> stringCollapse "")
