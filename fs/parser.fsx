@@ -75,6 +75,10 @@ let rec reconcat = function
     | head :: tail -> [String.concat "" (head :: tail)]
     | [] -> []
 
+let stringCollapse (sep: string) =
+    List.reduce (fun acc elem -> String.concat sep [acc; elem])
+
+
 /// Container for array pragma information
 type NestedArray =
     { Name: string
@@ -778,7 +782,7 @@ let symmVecLines (arrays: NestedArray list) =
     |> List.map (fun x -> x.Name, x.Symm |> Option.get)
     |> List.map (fun x ->
         let name, symm = x
-        String.concat "" ["static constexpr const int["; symm.Length |> string; "] "; name; "_symm = {"; symm |> List.map string |> commas |> List.fold (fun acc elem -> String.concat " " [acc; elem]) ""; "};\n"]
+        String.concat "" ["static constexpr const int["; symm.Length |> string; "] "; name; "_symm = {"; symm |> List.map string |> commas |> stringCollapse " "; "};\n"]
     )
 
 let symmVecName (array: NestedArray) =
@@ -810,7 +814,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             List.init a (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
             |> fun x -> x @ ["OTYPE, ORANK, OSYM"]
             |> commas
-            |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
+            |> stringCollapse ""
         ) |> List.distinct
 
     let templateArgTypes =
@@ -818,7 +822,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             List.init a (fun i -> String.concat "" ["nested_array<ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1); "> "; names.[i]])
             |> commas
             |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; oloop.GetFunc.OName]
-            |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
+            |> stringCollapse ""
         ) |> List.distinct
 
     let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
@@ -831,7 +835,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                                      |> List.map (commas >> (fun x -> String.concat "" x))
 
     let tSpecArgs = (types, ranks) ||> (fun x y -> List.init numCalls (fun i -> List.init (arity.[i]+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
-                                    |> List.map (commas >> (List.fold (fun acc elem -> String.concat "" [acc; elem]) ""))
+                                    |> List.map (commas >> stringCollapse "")
 
     let rec (|HeadPattern|_|) (iname: string) = function
         | head :: Token.Symbol '=' :: tail ->
@@ -870,10 +874,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 |> List.rev
                 |> fun x -> ((x.Head |> String.concat "" |> tokenize |> function | ScopePatternParens s -> Some (s |> fst |> tokenToStr) | _ -> None) |> Option.get) :: x.Tail
                 |> List.rev
-                |> List.map (List.fold (fun acc elem -> String.concat " " [acc; elem]) "")
-                |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
-                |> fun x -> List.fold (fun acc elem -> String.concat "" [acc; elem]) "" ((x :: (t |> tokenToStr)) |> respace |> reconcat |> newln)
-                |> fun x -> String.concat "" [p' |> tokenToStr |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""; x]
+                |> List.map (stringCollapse " ")
+                |> stringCollapse ""
+                |> fun x -> stringCollapse "" ((x :: (t |> tokenToStr)) |> respace |> reconcat |> newln)
+                |> fun x -> String.concat "" [p' |> tokenToStr |> stringCollapse ""; x]
             | _ -> h |> tokenToStr |> respace |> reconcat |> newln |> List.head
         | _ -> tokens |> tokenToStr |> respace |> reconcat |> newln |> List.head
 
@@ -899,9 +903,9 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     ||> List.map2 (fun x y -> String.concat "" ["template<> void "; oloop.Name; "<"; x; ">("; y; ")"])
     |> List.map brace
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
-    |> List.map (fun x -> x |> List.fold (fun acc elem -> String.concat "" [acc; elem]) "" )
+    |> List.map (fun x -> x |> stringCollapse "")
     |> fun x -> List.concat [tmain; x]
-    |> List.fold (fun acc elem -> String.concat "\n\n" [acc; elem]) ""
+    |> stringCollapse "\n\n"
 
 
 let methodLoopTemplate (mloop: MethodLoop) =
@@ -928,14 +932,14 @@ let methodLoopTemplate (mloop: MethodLoop) =
         List.init arity (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
         |> fun x -> x @ ["OTYPE, ORANK, OSYM"]
         |> commas
-        |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
+        |> stringCollapse ""
 
     let templateArgTypes =
         List.init numCalls (fun i ->
             List.init arity (fun j -> String.concat "" ["nested_array<ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1); "> "; inames.[i].[j]])
             |> commas
             |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; onames.[i]]
-            |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
+            |> stringCollapse ""
         ) |> List.distinct
 
     let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
@@ -948,7 +952,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
                                      |> List.map (commas >> (fun x -> String.concat "" x))
 
     let tSpecArgs = (types, ranks) ||> (fun x y -> List.init numCalls (fun i -> List.init (arity+1) (fun j -> String.concat "" ["nested_array<"; x.[i].[j]; ", "; y.[i].[j]; "> "; names.[i].[j]])))
-                                    |> List.map (commas >> (List.fold (fun acc elem -> String.concat "" [acc; elem]) ""))
+                                    |> List.map (commas >> stringCollapse "")
 
     let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] |> fst)
 
@@ -956,9 +960,9 @@ let methodLoopTemplate (mloop: MethodLoop) =
     ||> List.map2 (fun x y -> String.concat "" ["template<> void "; mloop.Name; "<"; x; ">("; y; ")"])
     |> List.map brace
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> List.concat [[y.Head]; tab z; y.Tail]))
-    |> List.map (fun x -> x |> List.fold (fun acc elem -> String.concat "" [acc; elem]) "" )
+    |> List.map (fun x -> x |> stringCollapse "")
     |> fun x -> tmain @ x
-    |> List.fold (fun acc elem -> String.concat "\n\n" [acc; elem]) ""
+    |> stringCollapse "\n\n"
 
 let lex (tokens: Token list) =
 
@@ -991,8 +995,10 @@ let lex (tokens: Token list) =
     sendFunctionsToLoops funcs mloops oloops
 
     let templates =
-        List.concat [symmVecs; oloops |> List.map objectLoopTemplate; mloops |> List.map methodLoopTemplate]
-        |> List.reduce (fun x y -> String.concat "" [x; y])
+        List.concat [symmVecs;
+                     oloops |> List.map objectLoopTemplate;
+                     mloops |> List.map methodLoopTemplate]
+        |> stringCollapse ""
 
 
 
