@@ -540,7 +540,7 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
         let iarrays = tokenToStr elements
         let rec findCalls tokens' position' =
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop -> (func, oarray, position'-1) :: findCalls tail' (position' + 7)
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop -> (func, oarray, position') :: findCalls tail' (position' + 7)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 4 + (2*elements.Length)
@@ -582,7 +582,7 @@ let rec (|ObjectLoopPattern|_|) (position: int) = function
             match tokens' with
             | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: tail' when lname = loop ->
                 let iarrays, t = toElements tail'
-                (tokenToStr iarrays, oarray, position'-1) :: findCalls tail' (position + 4 + (2*iarrays.Length))
+                (tokenToStr iarrays, oarray, position') :: findCalls tail' (position + 4 + (2*iarrays.Length))
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 6
