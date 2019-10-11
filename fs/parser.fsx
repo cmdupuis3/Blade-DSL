@@ -540,15 +540,15 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
         let iarrays = tokenToStr elements
         let rec findCalls tokens' position' =
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail' when lname = loop -> (func, oarray, position') :: findCalls tail' (position' + 6)
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop -> (func, oarray, position'-1) :: findCalls tail' (position' + 7)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
-        let lposition = position + 3 + (2*elements.Length)
+        let lposition = position + 4 + (2*elements.Length)
         let calls =
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens') lposition
             | _ -> []
-        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls, position, lposition)
+        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls, position-1, lposition)
         out.iarrays <- []
         out.oarrays <- []
         out.funcs <- []
@@ -566,7 +566,7 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
 let scanMethodLoops (tokens: Token list) =
     let rec scan (position: int) = function
     | MethodLoopPattern position (loop,[]) -> [loop]
-    | MethodLoopPattern position (loop, tail) -> loop :: (scan loop.LPosition tail)
+    | MethodLoopPattern position (loop, tail) -> loop :: (scan (loop.LPosition+1) tail)
     | head :: tail -> scan (position+1) tail
     | [] -> []
     scan 0 tokens
@@ -577,20 +577,20 @@ let scanMethodLoops (tokens: Token list) =
 
 /// Pattern for object_for loops and all their calls
 let rec (|ObjectLoopPattern|_|) (position: int) = function
-    | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: tail ->
+    | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
         let rec findCalls tokens' position' =
             match tokens' with
             | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: tail' when lname = loop ->
                 let iarrays, t = toElements tail'
-                (tokenToStr iarrays, oarray, position') :: findCalls tail' (position + 3 + (2*iarrays.Length))
+                (tokenToStr iarrays, oarray, position'-1) :: findCalls tail' (position + 4 + (2*iarrays.Length))
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
-        let lposition = position + 5
+        let lposition = position + 6
         let calls =
             match tail with
             | PostScopePattern t' -> findCalls (fst t') lposition
             | _ -> []
-        let out = ObjectLoop((tokenToStr [loop]).Head, string func, calls, position, lposition)
+        let out = ObjectLoop((tokenToStr [loop]).Head, string func, calls, position-1, lposition)
         out.iarrays <- []
         out.oarrays <- []
         out.func <- []
@@ -608,7 +608,7 @@ let rec (|ObjectLoopPattern|_|) (position: int) = function
 let scanObjectLoops (tokens: Token list) =
     let rec scan (position: int) = function
     | ObjectLoopPattern position (loop,[]) -> [loop]
-    | ObjectLoopPattern position (loop, tail) -> loop :: (scan loop.LPosition tail)
+    | ObjectLoopPattern position (loop, tail) -> loop :: (scan (loop.LPosition+1) tail)
     | head :: tail -> scan (position+1) tail
     | [] -> []
     scan 0 tokens
