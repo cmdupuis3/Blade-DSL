@@ -161,9 +161,7 @@ constexpr auto method_for_nc_impl(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IV
     if constexpr (IRANK == FIRANK) {
 
         return [iarray_in](FTYPE func, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME> oarray) {
-            iarray_in.read();
             func(iarray_in, oarray);
-            oarray.write();
         };
 
     } else if constexpr (IRANK > FIRANK) {
@@ -217,7 +215,8 @@ constexpr auto method_for_nc_impl(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IV
                 oarray.check_dim_completeness();
 
                 nc_redef(oarray.file_id());
-                nc_def_var(oarray.file_id(), oarray.variable_name, oarray.var_type(), ORANK, oarray.dim_ids(), oarray.var_id()); // generalize type
+                int var_id = oarray.var_id();
+                nc_def_var(oarray.file_id(), oarray.variable_name, oarray.var_type(), ORANK, oarray.dim_ids(), &var_id); // generalize type
                 nc_enddef(oarray.file_id());
 
                 mloop(func, oarray);

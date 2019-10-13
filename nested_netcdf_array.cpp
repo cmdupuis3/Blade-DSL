@@ -134,9 +134,9 @@ public:
 
     void read();
     template<typename NITYPE> void write_init(NITYPE* iarray_in, const int forank_in);
-    void write() const;
+    void write();
 
-    const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> operator()(int) const; //< alias for 'down', plus a dereference; non-ragged state
+    nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> operator()(int) const; //< alias for 'down', plus a dereference; non-ragged state
     DTYPE&                operator[](int);
     const DTYPE&          operator[](int) const;
 
@@ -146,7 +146,7 @@ public:
     nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>* operator/(int);                    //< split along this dimension
 
     const nested_netcdf_array_t<VTYPE, rank_t+1, FNAME, VNAME, symmetry_groups>* up() const;
-    const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* down(int) const;
+    nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* down(int) const;
     const nested_netcdf_array_t<VTYPE, rank_t,   FNAME, VNAME, symmetry_groups>* next() const;
     const nested_netcdf_array_t<VTYPE, rank_t,   FNAME, VNAME, symmetry_groups>* first() const;
 };
@@ -294,7 +294,7 @@ void* nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::dim_va
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-void**     nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_var_values() const {
+void** nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::get_dim_var_values() const {
     return this->dim_var_vals;
 }
 
@@ -511,7 +511,7 @@ template<typename NITYPE> void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write() const{
+void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write() {
 
     // *must* do this because NetCDF only accepts 1-D arrays
     if constexpr (rank_t == 1) {
@@ -562,7 +562,7 @@ const nested_netcdf_array_t<VTYPE, rank_t+1, FNAME, VNAME, symmetry_groups>* nes
  */
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::down(int index_in) const {
+nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::down(int index_in) const {
 
     if(this->c_depth == rank_t){
         cout << "Cannot index any further down" << endl;
@@ -570,11 +570,7 @@ const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* nes
     }
 
     this->indices[this->dim_order[this->c_depth]-1] = index_in;
-    nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>* out;
-    out = new nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>(this, index_in);
-    return out;
-
-    return nullptr;
+    return new nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups>(this, index_in);
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
@@ -599,7 +595,7 @@ const nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>* neste
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
-const nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::operator()(int index_in) const {
+nested_netcdf_array_t<VTYPE, rank_t-1, FNAME, VNAME, symmetry_groups> nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::operator()(int index_in) const {
     return *(this->down(index_in));
 }
 

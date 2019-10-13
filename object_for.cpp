@@ -140,6 +140,88 @@ constexpr auto object_for_impl(std::function<void(nested_array_t<ITYPE, FIRANK, 
 
 }
 
+template<typename ITYPE, const int IRANK, const char IFNAME[], const char IVNAME[], const int* ISYM, const int FIRANK,
+         typename OTYPE, const int ORANK, const char OFNAME[], const char OVNAME[],                  const int FORANK,
+         const int OMP_LEVELS = 0, const int DEPTH = 0>
+
+constexpr auto object_for_nc_impl(std::function<void(nested_netcdf_array_t<ITYPE, FIRANK, IFNAME, IVNAME, ISYM>, nested_netcdf_array_t<OTYPE, FORANK, OFNAME, OVNAME>)> func_in, const int imin_in = 0){
+
+    // Are we done appending loops?
+    if constexpr (IRANK == FIRANK) {
+
+        return [func_in](nested_netcdf_array_t<ITYPE, FIRANK, IFNAME, IVNAME, ISYM> iarray, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME> oarray) {
+        	func_in(iarray, oarray);
+        };
+
+    } else if constexpr (IRANK > FIRANK) {
+
+        auto oloop = [func_in, imin_in](nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IVNAME, ISYM> iarray, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME> oarray) {
+
+            auto loop = [func_in, iarray, oarray](int i){
+                // Is this dimension symmetric with the next one?
+                if constexpr (ISYM && DEPTH < IRANK - FIRANK && ISYM[DEPTH] == ISYM[DEPTH + 1]){
+                    // Are we done stripping off output dimensions?
+                    if constexpr (ORANK == FORANK) {
+                    	object_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK,     OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(func_in, i)(iarray(i), oarray);
+                    } else {
+                    	object_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK - 1, OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(func_in, i)(iarray(i), oarray(i));
+                    }
+                } else {
+                    if constexpr (ORANK == FORANK) {
+                    	object_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK,     OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(func_in)(iarray(i), oarray);
+                    } else {
+                    	object_for_nc_impl<ITYPE, IRANK - 1, IFNAME, IVNAME, ISYM, FIRANK, OTYPE, ORANK - 1, OFNAME, OVNAME, FORANK, OMP_LEVELS - 1, DEPTH + 1>(func_in)(iarray(i), oarray(i));
+                    }
+                }
+            };
+
+            if constexpr (OMP_LEVELS > 0) {
+                size_t i = imin_in;
+                #pragma omp parallel for private(i)
+                for (i = imin_in; i < iarray.current_extent(); i++) {
+                    loop(i);
+                }
+            } else { // if constexpr (OMP_LEVELS == 0)
+                for (size_t i = imin_in; i < iarray.current_extent(); i++) {
+                    loop(i);
+                }
+            }
+
+        };
+
+
+        if constexpr (DEPTH == 0) {
+
+            typedef const void (OWRFTYPE)(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IVNAME, ISYM>, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME>);
+            return [func_in, imin_in, oloop](nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IVNAME, ISYM> iarray, nested_netcdf_array_t<OTYPE, ORANK, OFNAME, OVNAME> oarray, OWRFTYPE owrfunc) {
+
+                for (int i = 0; i < ORANK - FORANK; i++) {
+                    oarray.set_extent(i, iarray.extent(i));
+                }
+
+                oarray.write_init(&iarray, FORANK); // copy all the identical metadata
+                owrfunc(iarray, oarray); // provide user interface for non-identical metadata, with access to both arrays
+                oarray.check_dim_completeness();
+
+                nc_redef(oarray.file_id());
+                int var_id = oarray.var_id();
+                nc_def_var(oarray.file_id(), oarray.variable_name, oarray.var_type(), ORANK, oarray.dim_ids(), &var_id); // generalize type
+                nc_enddef(oarray.file_id());
+
+                oloop(iarray, oarray);
+            };
+
+        } else {
+
+            return oloop;
+
+        }
+
+    }
+
+}
+
+
 /** The object_for loop is a grammatical orientation of the nested_for loop that allows you to tie an
  *  iteration pattern to a function, and later pass it input and output arrays for the function to evaluate.
  *  This is useful for evaluating a function as applied to multiple different input arrays of arbitrary
@@ -166,6 +248,14 @@ constexpr auto object_for(std::function<void(nested_array_t<typename CLTYPE::fit
     return object_for_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::symmetry, CLTYPE::input_rank,
                            typename NOTYPE::value_type, NOTYPE::rank,                   CLTYPE::output_rank,
                            OMP_LEVELS>(func_in);
+}
+
+template<typename NITYPE, typename NOTYPE, typename CLTYPE, const int OMP_LEVELS = 0>
+constexpr auto object_for_nc(std::function<void(nested_netcdf_array_t<typename CLTYPE::fitype, CLTYPE::input_rank,  NITYPE::file_name, NITYPE::variable_name,  NITYPE::symmetry>,
+                                                nested_netcdf_array_t<typename CLTYPE::fotype, CLTYPE::output_rank, NOTYPE::file_name, NOTYPE::variable_name>)> func_in){
+    return object_for_nc_impl<typename NITYPE::value_type, NITYPE::rank, NITYPE::file_name, NITYPE::variable_name, NITYPE::symmetry, CLTYPE::input_rank,
+                              typename NOTYPE::value_type, NOTYPE::rank, NOTYPE::file_name, NOTYPE::variable_name,                   CLTYPE::output_rank,
+                              OMP_LEVELS>(func_in);
 }
 
 #endif

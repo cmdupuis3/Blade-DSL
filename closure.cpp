@@ -32,7 +32,6 @@ using std::vector;
 #include "nested_array.cpp"
 #include "nested_netcdf_array.cpp"
 #include "nested_array_utilities.cpp"
-#include "curry.cpp"
 
 /** Compile-time available container for metadata about functions. */
 template<const int ARITY, typename FITYPE, const int FIRANK, typename FOTYPE, const int FORANK, const int commutativity_groups[ARITY] = nullptr>
