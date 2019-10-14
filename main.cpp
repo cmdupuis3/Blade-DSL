@@ -1095,20 +1095,23 @@ int main(){
 //    speed_test4_omp();
 
 /*
-    static constexpr const char fname[] = "/home/Christopher.Dupuis/EDGI_PCA/vars_a.nc";
+    using namespace sample_closures;
+
+    static constexpr const char fname_in[] = "/home/Christopher.Dupuis/EDGI_PCA/vars_a.nc";
+    static constexpr const char fname_out[] = "/home/Christopher.Dupuis/EDGI_PCA/vars_a_out.nc";
     static constexpr const char vname[] = "SST_a";
 
-    int order[] = {2,1,3};
-    nested_netcdf_array_t<float, 3, fname, vname> block(order);
+    int order[] = {1,2,3};
+    nested_netcdf_array_t<float, 3, fname_in,  vname> block_in(order);
+    nested_netcdf_array_t<float, 3, fname_out, vname> block_out(order);
 
-    auto a = block(40);
-    auto b = a(80);
-    b.read();
 
-    for(int i = 0; i < 5; i++){
-        cout << b[i] << endl;
-    }
+    auto a = method_for_nc<decltype(block_in), decltype(block_out), closure_nc_base_unary_t<float, 1, fname_in, vname, float, 1, fname_out, vname> >(block_in);
+
+    //auto b = a();
+    a(add10_nested_nc<fname_in, vname, fname_out, vname>::function, block_out, add10_nested_nc<fname_in, vname, fname_out, vname>::write_output_dims<3,3>);
+
+    block_out.write();
 */
-
     return 0;
 }
