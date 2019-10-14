@@ -98,7 +98,9 @@ public:
 
     const int file_id() const;
     const int var_id() const;
+    void      set_var_id(const int);
     nc_type   var_type() const;
+    void      set_var_type(const nc_type);
     int*      dim_ids() const;
     int       dim_id(int) const;
     string*   get_dim_names() const;
@@ -246,8 +248,18 @@ const int nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::va
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+void nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::set_var_id(const int var_id_in) {
+    this->var_ncid = var_id_in;
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 nc_type nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::var_type() const {
     return this->var_nctype;
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+void nested_netcdf_base_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::set_var_type(const nc_type type_in) {
+    this->var_nctype = type_in;
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
@@ -503,6 +515,8 @@ void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::read()
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
 template<typename NITYPE> void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::write_init(NITYPE* iarray_in, const int forank_in){
+
+    this->set_var_type(iarray_in->var_type());
 
     for(int i = 0; i < rank_t - forank_in; i++){
         nc_def_dim(this->file_id(), iarray_in->dim_name(i).c_str(), iarray_in->extent(i), &(this->dim_ids()[i]));
