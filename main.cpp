@@ -61,7 +61,7 @@ namespace sample_closures {
             [](nested_netcdf_array_t<float, 1, IFNAME, IVNAME, ISYMMETRY> iarray_in, nested_netcdf_array_t<float, 1, OFNAME, OVNAME> oarray_in) -> const void {
                 
                 iarray_in.read();
-                oarray_in.set_current_extent(iarray_in.current_extent());
+                oarray_in.set_extent(oarray_in.current_depth(), iarray_in.current_extent());
                 oarray_in.allocate();
 
                 int num = iarray_in.current_extent();
