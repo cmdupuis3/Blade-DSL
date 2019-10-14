@@ -217,6 +217,7 @@ constexpr auto method_for_nc_impl(nested_netcdf_array_t<ITYPE, IRANK, IFNAME, IV
                 nc_redef(oarray.file_id());
                 int var_id = oarray.var_id();
                 nc_def_var(oarray.file_id(), oarray.variable_name, oarray.var_type(), ORANK, oarray.dim_ids(), &var_id); // generalize type
+                oarray.set_var_id(var_id);
                 nc_enddef(oarray.file_id());
 
                 mloop(func, oarray);
