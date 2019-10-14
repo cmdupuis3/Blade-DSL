@@ -59,7 +59,10 @@ namespace sample_closures {
 
         static constexpr const void(*function)(nested_netcdf_array_t<float, 1, IFNAME, IVNAME, ISYMMETRY>, nested_netcdf_array_t<float, 1, OFNAME, OVNAME>) =
             [](nested_netcdf_array_t<float, 1, IFNAME, IVNAME, ISYMMETRY> iarray_in, nested_netcdf_array_t<float, 1, OFNAME, OVNAME> oarray_in) -> const void {
+                
                 iarray_in.read();
+                oarray_in.set_current_extent(iarray_in.current_extent());
+                oarray_in.allocate();
 
                 int num = iarray_in.current_extent();
                 for(int i = 0; i < num; i++){
