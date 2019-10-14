@@ -74,6 +74,7 @@ public:
     static constexpr const int rank = rank_t;
 
     virtual void read() {};
+    virtual void allocate() {};
     virtual void write_init(nested_netcdf_base_t*, const int) const {};
     virtual void write() const {};
     auto get_data() const;
@@ -133,6 +134,7 @@ public:
     ~nested_netcdf_array_t();
 
     void read();
+    void allocate();
     template<typename NITYPE> void write_init(NITYPE* iarray_in, const int forank_in);
     void write();
 
@@ -508,6 +510,22 @@ template<typename NITYPE> void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME
         nc_put_var(this->file_id(), this->dim_var_id(i), iarray_in->dim_var_values(i));
     }
 
+}
+
+template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
+void nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::allocate() {
+
+    if constexpr (rank_t > 1) {
+        for (size_t i = 0; i < this->current_extent(); i++) {
+            this->down(i)->allocate();
+        }
+
+    } else if constexpr (rank_t == 1) {
+        this->data = new DTYPE[this->current_extent()];
+
+    } else if constexpr (rank_t == 0) {
+        this->data = new TYPE;
+    }
 }
 
 template<typename VTYPE, const int rank_t, const char FNAME[], const char VNAME[], const int* symmetry_groups>
