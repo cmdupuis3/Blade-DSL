@@ -59,6 +59,7 @@ let tokenToStr (tokens: Token list) =
 
 let rec respace = function
     | Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s1 :: Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
+    | Match @"^return" s1 :: Match @"^[a-zA-Z0-9_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
     | head :: tail -> head :: respace tail
     | [] -> []
 
@@ -657,6 +658,25 @@ let scanPragmas (tokens: Token list) =
     | [] -> []
     scan tokens
 
+
+let sortPragmas (pragmas: Pragma list) =
+    let bin (s: string) =
+        List.filter (fun x ->
+                        let directive, clauses, scope = x
+                        fst directive = s
+                    ) pragmas
+    bin "array", bin "function"
+
+let (|ArrayPragmaPattern|_|) = function
+    | PragmaPattern (pragma, tail) ->
+        if ([pragma] |> sortPragmas |> fst).IsEmpty then None else Some (pragma, tail)
+    | _ -> None
+
+let (|FunctionPragmaPattern|_|) = function
+    | PragmaPattern (pragma, tail) ->
+        if ([pragma] |> sortPragmas |> fst).IsEmpty then Some (pragma, tail) else None
+    | _ -> None
+
 let (|ArrayPattern|_|) (symGroups: int list Option) = function
     | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
         Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups}, tail )
@@ -708,13 +728,6 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
       OmpLevels = ompLevels;
       Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln }
 
-let sortPragmas (pragmas: Pragma list) =
-    let bin (s: string) =
-        List.filter (fun x ->
-                        let directive, clauses, scope = x
-                        fst directive = s
-                    ) pragmas
-    bin "array", bin "function"
 
 let fst3 (c, _, _) = c
 let snd3 (_, c, _) = c
@@ -1002,7 +1015,8 @@ let methodLoopTemplate (mloop: MethodLoop) =
     |> fun x -> tmain @ x
 
 
-//let substitute (tokens: Token list) =
+
+
 
 
 
@@ -1043,7 +1057,39 @@ let lex (tokens: Token list) =
         |> fun x -> symmVecs @ x
         |> stringCollapse "\n\n"
 
-    []
+    let arraySwaps =
+        arrays
+        |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else "")
+        |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";"])
+
+    let rec deleteFunctionPragmas (tokens: Token list) =
+        let rec deleteFrom = function
+        | FunctionPragmaPattern (pragma,[]) -> []
+        | FunctionPragmaPattern (pragma, tail) -> deleteFrom tail
+        | head :: tail -> head :: deleteFrom tail
+        | [] -> []
+        deleteFrom tokens
+
+    let arrayPragmaLookup (pragma: Pragma) =
+        if ([pragma] |> sortPragmas |> fst).IsEmpty then "" else arrayPragmas |> List.findIndex (fun x -> x = pragma) |> (fun i -> arraySwaps.[i])
+
+    /// Swap all pragmas for new code
+    let substitute (tokens: Token list) =
+        let rec substitute' (pre: Token list) = function
+        | ArrayPragmaPattern (pragma, tail) ->
+            (pre |> tokenToStr |> respace |> reconcat |> newln)
+            @ [arrayPragmaLookup pragma]
+            @ (tail |> substitute' [])
+        | FunctionPragmaPattern (pragma, tail) ->
+            (pre |> tokenToStr |> respace |> reconcat |> newln)
+            @ [templates]
+            @ (tail |> deleteFunctionPragmas |> substitute' [])
+        | head :: tail -> substitute' (pre @ [head]) tail
+        | [] -> pre |> tokenToStr |> respace |> reconcat |> newln
+        substitute' [] tokens
+
+    substitute tokens
+    |> stringCollapse ""
 
 
 
@@ -1120,5 +1166,6 @@ int main(){
     return 0;
 }"""
 
-let tokens = tokenize code;;
+code |> tokenize |> lex
+;;
 
