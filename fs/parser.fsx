@@ -1088,6 +1088,30 @@ let lex (tokens: Token list) =
         | [] -> pre |> tokenToStr |> respace |> reconcat |> newln
         substitute' [] tokens
 
+    let oloopCallBounds =
+        let FPositions = oloops |> List.map (fun x -> x.Call |> List.map thd3)
+        let LPositions =
+            FPositions |> List.map (fun x ->
+                x |> List.map (fun y ->
+                    tokens.[y..]
+                    |> List.findIndex (fun z -> z = Token.Symbol ';')
+                    |> (+) y
+                )
+            )
+        (FPositions, LPositions) ||> List.map2 List.zip
+
+    let mloopCallBounds =
+        let FPositions = mloops |> List.map (fun x -> x.Call |> List.map thd3)
+        let LPositions =
+            FPositions |> List.map (fun x ->
+                x |> List.map (fun y ->
+                    tokens.[y..]
+                    |> List.findIndex (fun z -> z = Token.Symbol ';')
+                    |> (+) y
+                )
+            )
+        (FPositions, LPositions) ||> List.map2 List.zip
+
     substitute tokens
     |> stringCollapse ""
 
