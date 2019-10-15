@@ -1098,7 +1098,7 @@ let lex (tokens: Token list) =
                     |> (+) y
                 )
             )
-        (FPositions, LPositions) ||> List.map2 List.zip
+        (FPositions, LPositions) ||> List.map2 (List.map2 (fun x y -> seq{x..y}))
 
     let mloopCallBounds =
         let FPositions = mloops |> List.map (fun x -> x.Call |> List.map thd3)
@@ -1110,9 +1110,22 @@ let lex (tokens: Token list) =
                     |> (+) y
                 )
             )
-        (FPositions, LPositions) ||> List.map2 List.zip
+        (FPositions, LPositions) ||> List.map2 (List.map2 (fun x y -> seq{x..y}))
+
+    // This won't work if template type deduction fails; may need a more sophisticated solution using the tSpec routine in the templating functions
+    let oloopCallSwaps =
+        let names = oloops |> List.map (fun x -> x.Init)
+        let args = oloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> (fst3 x.Call.[i]) @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
+        (names, args) ||> List.map2 (fun x y -> y |> List.map (fun z -> String.concat "" [x; "("; z; ");"]))
+
+    let mloopCallSwaps =
+        let names = mloops |> List.map (fun x -> x.Call |> List.map fst3)
+        let args = mloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> x.Init @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
+        (names, args) ||> List.map2 (List.map2 (fun x y -> String.concat "" [x; "("; y; ");"]))
 
     substitute tokens
+    |> List.filter (fun x -> not (x.Contains "object_for"))
+    |> List.filter (fun x -> not (x.Contains "method_for"))
     |> stringCollapse ""
 
 
