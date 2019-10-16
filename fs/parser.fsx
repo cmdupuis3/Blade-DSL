@@ -827,7 +827,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             |> fun x -> x @ ["OTYPE, ORANK, OSYM"]
             |> withCommas
             |> stringCollapse ""
-        ) |> List.distinct
+        )
 
     let templateArgTypes =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
@@ -835,10 +835,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             |> withCommas
             |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; oloop.GetFunc.OName]
             |> stringCollapse ""
-        ) |> List.distinct
+        )
 
     let aritySuffix = List.init numCalls (fun i -> if oloop.GetFunc.Arity.IsNone then String.concat "" ["_arity"; string arity.[i]] else "")
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]]; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]]; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
 
     let ranks = (irank, orank) ||> List.map2 (fun x y -> (x |> List.map string) @ [string y])
     let types = (itype, otype) ||> List.map2 (fun x y -> x @ [y])
@@ -937,6 +937,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
     |> List.map (fun x -> x |> stringCollapse "")
     |> fun x -> tmain @ x
+    |> List.distinct
 
 
 let methodLoopTemplate (mloop: MethodLoop) =
@@ -961,7 +962,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let templateTypes =
         List.init arity (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
-        |> fun x -> x @ ["OTYPE, ORANK, OSYM"]
+        |> (@) ["OTYPE, ORANK, OSYM"]
         |> withCommas
         |> stringCollapse ""
 
@@ -971,9 +972,9 @@ let methodLoopTemplate (mloop: MethodLoop) =
             |> withCommas
             |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; onames.[i]]
             |> stringCollapse ""
-        ) |> List.distinct
+        )
 
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
 
     let ranks = orank |> List.map (fun y -> (irank |> List.map string) @ [string y])
     let types = otype |> List.map (fun y -> itype @ [y])
@@ -1013,7 +1014,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
     |> List.map (fun x -> x |> stringCollapse "")
     |> fun x -> tmain @ x
-
+    |> List.distinct
 
 
 
