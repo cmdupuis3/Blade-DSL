@@ -1135,9 +1135,7 @@ let lex (tokens: Token list) =
         >> deleteLoopLines
         >> stringCollapse "")
 
-
-
-
+(*
 let code = """
 
 #include "things.hpp"
@@ -1214,5 +1212,5 @@ int main(){
     return 0;
 }"""
 
-let tokens = code |> tokenize
-
+code |> tokenize |> lex;;
+*)
