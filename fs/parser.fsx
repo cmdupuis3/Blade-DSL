@@ -1124,12 +1124,15 @@ let lex (tokens: Token list) =
             else
                 head :: swap (position+1) bounds tail
 
+    let loopNames = (oloops |> List.map (fun x -> x.Name)) @ (mloops |> List.map (fun x -> x.Name))
+    let deleteLoopLines = loopNames |> List.map (fun x -> List.filter (fun (y:string) -> not (y.Contains x))) |> List.reduce (>>)
 
     tokens
     |> (swap 0 callBounds
         >> substitute
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
+        >> deleteLoopLines
         >> stringCollapse "")
 
 
