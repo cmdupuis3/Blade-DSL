@@ -1021,11 +1021,12 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
 
 
+
 let lex (tokens: Token list) =
 
     // Scan for loop API calls and create loop state machines
-    let mloops = scanMethodLoops tokens
-    let oloops = scanObjectLoops tokens
+    let mloops = scanMethodLoops tokens //mloops |> List.map (fun x -> x.Call) |> List.reduce (@) |> List.map thd3 |> List.map (fun x -> tokens.[x])
+    let oloops = scanObjectLoops tokens //oloops |> List.map (fun x -> x.Call) |> List.reduce (@) |> List.map thd3 |> List.map (fun x -> tokens.[x])
 
     // Sort pragma objects into array and function pragmas
     let arrayPragmas, functionPragmas = tokens |> (scanPragmas >> sortPragmas)
@@ -1053,14 +1054,14 @@ let lex (tokens: Token list) =
 
     let templates =
         (oloops |> List.map objectLoopTemplate) @ (mloops |> List.map methodLoopTemplate)
-        |> List.reduce (fun acc elem -> acc @ elem)
+        |> List.reduce (@)
         |> List.distinct
         |> fun x -> symmVecs @ x
         |> stringCollapse "\n\n"
 
     let arraySwaps =
         arrays
-        |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else "")
+        |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else ", nullptr")
         |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";"])
 
     let rec deleteFunctionPragmas (tokens: Token list) =
@@ -1072,7 +1073,7 @@ let lex (tokens: Token list) =
         deleteFrom tokens
 
     let arrayPragmaLookup (pragma: Pragma) =
-        if ([pragma] |> sortPragmas |> fst).IsEmpty then "" else arrayPragmas |> List.findIndex (fun x -> x = pragma) |> (fun i -> arraySwaps.[i])
+        arrayPragmas |> List.findIndex (fun x -> x = pragma) |> (fun i -> arraySwaps.[i])
 
     /// Swap all pragmas for new code
     let substitute (tokens: Token list) =
@@ -1089,45 +1090,47 @@ let lex (tokens: Token list) =
         | [] -> pre |> tokenToStr |> respace |> reconcat |> newln
         substitute' [] tokens
 
-    let oloopCallBounds =
-        let FPositions = oloops |> List.map (fun x -> x.Call |> List.map thd3)
-        let LPositions =
-            FPositions |> List.map (fun x ->
-                x |> List.map (fun y ->
-                    tokens.[y..]
-                    |> List.findIndex (fun z -> z = Token.Symbol ';')
-                    |> (+) y
-                )
-            )
-        (FPositions, LPositions) ||> List.map2 (List.map2 (fun x y -> seq{x..y}))
+    let FPositions = (oloops |> List.map (fun x -> x.Call |> List.map thd3)) @ (mloops |> List.map (fun x -> x.Call |> List.map thd3)) |> List.reduce (@)
+    let LPositions =
+        FPositions |> List.map (fun y ->
+            tokens.[y..]
+            |> List.findIndex (fun z -> z = Token.Symbol ';')
+            |> (+) y
+        )
+    let callBounds = (FPositions, LPositions) ||> List.map2 (fun f l -> seq{f..l})
+    //let a = callBounds |> List.map (fun x -> x |> Seq.toList |> List.map (fun y -> tokens.[y]))
 
-    let mloopCallBounds =
-        let FPositions = mloops |> List.map (fun x -> x.Call |> List.map thd3)
-        let LPositions =
-            FPositions |> List.map (fun x ->
-                x |> List.map (fun y ->
-                    tokens.[y..]
-                    |> List.findIndex (fun z -> z = Token.Symbol ';')
-                    |> (+) y
-                )
-            )
-        (FPositions, LPositions) ||> List.map2 (List.map2 (fun x y -> seq{x..y}))
-
-    // This won't work if template type deduction fails; may need a more sophisticated solution using the tSpec routine in the templating functions
+    // This won't work if template type deduction fails; may need a more sophisticated solution using the tSpec routines in the templating functions
     let oloopCallSwaps =
         let names = oloops |> List.map (fun x -> x.Init)
         let args = oloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> (fst3 x.Call.[i]) @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
-        (names, args) ||> List.map2 (fun x y -> y |> List.map (fun z -> String.concat "" [x; "("; z; ");"]))
+        (names, args) ||> List.map2 (fun x y -> y |> List.map (fun z -> String.concat "" [x; "("; z; ");\n"]))
 
     let mloopCallSwaps =
         let names = mloops |> List.map (fun x -> x.Call |> List.map fst3)
         let args = mloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> x.Init @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
-        (names, args) ||> List.map2 (List.map2 (fun x y -> String.concat "" [x; "("; y; ");"]))
+        (names, args) ||> List.map2 (List.map2 (fun x y -> String.concat "" [x; "("; y; ");\n"]))
 
-    substitute tokens
-    |> List.filter (fun x -> not (x.Contains "object_for"))
-    |> List.filter (fun x -> not (x.Contains "method_for"))
-    |> stringCollapse ""
+    let callSwaps = (oloopCallSwaps @ mloopCallSwaps) |> List.reduce (@) |> List.map tokenize
+
+    let rec swap (position: int) (bounds: seq<int> list) (tokens: Token list) : Token list =
+        match tokens with
+        | [] -> []
+        | head :: tail ->
+            if FPositions |> List.contains position then
+                let i = FPositions |> List.findIndex (fun x -> x = position)
+                let mask = Seq.concat [seq{0 .. (i-1)}; seq{(i+1) .. (bounds.Length)}] |> Seq.toList
+                callSwaps.[i] @ swap (position+1) (List.init (bounds.Length - 1) (fun i -> bounds.[mask.[i]])) tail
+            else
+                head :: swap (position+1) bounds tail
+
+
+    tokens
+    |> (swap 0 callBounds
+        >> substitute
+        >> List.filter (fun x -> not (x.Contains "object_for"))
+        >> List.filter (fun x -> not (x.Contains "method_for"))
+        >> stringCollapse "")
 
 
 
@@ -1197,6 +1200,10 @@ int main(){
     auto voarray = oloopv(array3, array3);
 
 
+    auto ooarray = oloop(array1, array1, array3);
+    auto moarray = mloop(sumThenMultiply);
+    auto moarray2 = mloop(divideThenSum);
+    auto voarray = oloopv(array3, array3);
 
 
     auto newfunc = pipe(sumThenMultiply, add10);
@@ -1204,6 +1211,5 @@ int main(){
     return 0;
 }"""
 
-code |> tokenize |> lex
-;;
+let tokens = code |> tokenize
 
