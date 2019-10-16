@@ -541,7 +541,7 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
         let iarrays = tokenToStr elements
         let rec findCalls tokens' position' =
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop -> (func, oarray, position') :: findCalls tail' (position' + 7)
+            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop -> (func, oarray, position'-1) :: findCalls tail' (position' + 7)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 4 + (2*elements.Length)
@@ -583,7 +583,7 @@ let rec (|ObjectLoopPattern|_|) (position: int) = function
             match tokens' with
             | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: tail' when lname = loop ->
                 let iarrays, t = toElements tail'
-                (tokenToStr iarrays, oarray, position') :: findCalls tail' (position + 4 + (2*iarrays.Length))
+                (tokenToStr iarrays, oarray, position') :: findCalls t (position' + 4 + (2*iarrays.Length))
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 6
@@ -827,7 +827,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             |> fun x -> x @ ["OTYPE, ORANK, OSYM"]
             |> withCommas
             |> stringCollapse ""
-        ) |> List.distinct
+        )
 
     let templateArgTypes =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
@@ -835,10 +835,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             |> withCommas
             |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; oloop.GetFunc.OName]
             |> stringCollapse ""
-        ) |> List.distinct
+        )
 
     let aritySuffix = List.init numCalls (fun i -> if oloop.GetFunc.Arity.IsNone then String.concat "" ["_arity"; string arity.[i]] else "")
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]]; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]]; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
 
     let ranks = (irank, orank) ||> List.map2 (fun x y -> (x |> List.map string) @ [string y])
     let types = (itype, otype) ||> List.map2 (fun x y -> x @ [y])
@@ -937,6 +937,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
     |> List.map (fun x -> x |> stringCollapse "")
     |> fun x -> tmain @ x
+    |> List.distinct
 
 
 let methodLoopTemplate (mloop: MethodLoop) =
@@ -961,7 +962,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let templateTypes =
         List.init arity (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
-        |> fun x -> x @ ["OTYPE, ORANK, OSYM"]
+        |> (@) ["OTYPE, ORANK, OSYM"]
         |> withCommas
         |> stringCollapse ""
 
@@ -971,9 +972,9 @@ let methodLoopTemplate (mloop: MethodLoop) =
             |> withCommas
             |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; onames.[i]]
             |> stringCollapse ""
-        ) |> List.distinct
+        )
 
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"]) |> List.distinct
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
 
     let ranks = orank |> List.map (fun y -> (irank |> List.map string) @ [string y])
     let types = otype |> List.map (fun y -> itype @ [y])
@@ -1013,6 +1014,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
     |> List.map (fun x -> x |> stringCollapse "")
     |> fun x -> tmain @ x
+    |> List.distinct
 
 
 
@@ -1023,8 +1025,8 @@ let methodLoopTemplate (mloop: MethodLoop) =
 let lex (tokens: Token list) =
 
     // Scan for loop API calls and create loop state machines
-    let mloops = scanMethodLoops tokens
-    let oloops = scanObjectLoops tokens
+    let mloops = scanMethodLoops tokens //mloops |> List.map (fun x -> x.Call) |> List.reduce (@) |> List.map thd3 |> List.map (fun x -> tokens.[x])
+    let oloops = scanObjectLoops tokens //oloops |> List.map (fun x -> x.Call) |> List.reduce (@) |> List.map thd3 |> List.map (fun x -> tokens.[x])
 
     // Sort pragma objects into array and function pragmas
     let arrayPragmas, functionPragmas = tokens |> (scanPragmas >> sortPragmas)
@@ -1052,14 +1054,14 @@ let lex (tokens: Token list) =
 
     let templates =
         (oloops |> List.map objectLoopTemplate) @ (mloops |> List.map methodLoopTemplate)
-        |> List.reduce (fun acc elem -> acc @ elem)
+        |> List.reduce (@)
         |> List.distinct
         |> fun x -> symmVecs @ x
         |> stringCollapse "\n\n"
 
     let arraySwaps =
         arrays
-        |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else "")
+        |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else ", nullptr")
         |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";"])
 
     let rec deleteFunctionPragmas (tokens: Token list) =
@@ -1071,7 +1073,7 @@ let lex (tokens: Token list) =
         deleteFrom tokens
 
     let arrayPragmaLookup (pragma: Pragma) =
-        if ([pragma] |> sortPragmas |> fst).IsEmpty then "" else arrayPragmas |> List.findIndex (fun x -> x = pragma) |> (fun i -> arraySwaps.[i])
+        arrayPragmas |> List.findIndex (fun x -> x = pragma) |> (fun i -> arraySwaps.[i])
 
     /// Swap all pragmas for new code
     let substitute (tokens: Token list) =
@@ -1088,8 +1090,50 @@ let lex (tokens: Token list) =
         | [] -> pre |> tokenToStr |> respace |> reconcat |> newln
         substitute' [] tokens
 
-    substitute tokens
-    |> stringCollapse ""
+    let FPositions = (oloops |> List.map (fun x -> x.Call |> List.map thd3)) @ (mloops |> List.map (fun x -> x.Call |> List.map thd3)) |> List.reduce (@)
+    let LPositions =
+        FPositions |> List.map (fun y ->
+            tokens.[y..]
+            |> List.findIndex (fun z -> z = Token.Symbol ';')
+            |> (+) y
+        )
+    let callBounds = (FPositions, LPositions) ||> List.map2 (fun f l -> seq{f..l})
+    //let a = callBounds |> List.map (fun x -> x |> Seq.toList |> List.map (fun y -> tokens.[y]))
+
+    // This won't work if template type deduction fails; may need a more sophisticated solution using the tSpec routines in the templating functions
+    let oloopCallSwaps =
+        let names = oloops |> List.map (fun x -> x.Init)
+        let args = oloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> (fst3 x.Call.[i]) @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
+        (names, args) ||> List.map2 (fun x y -> y |> List.map (fun z -> String.concat "" [x; "("; z; ");\n"]))
+
+    let mloopCallSwaps =
+        let names = mloops |> List.map (fun x -> x.Call |> List.map fst3)
+        let args = mloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> x.Init @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
+        (names, args) ||> List.map2 (List.map2 (fun x y -> String.concat "" [x; "("; y; ");\n"]))
+
+    let callSwaps = (oloopCallSwaps @ mloopCallSwaps) |> List.reduce (@) |> List.map tokenize
+
+    let rec swap (position: int) (bounds: seq<int> list) (tokens: Token list) : Token list =
+        match tokens with
+        | [] -> []
+        | head :: tail ->
+            if FPositions |> List.contains position then
+                let i = FPositions |> List.findIndex (fun x -> x = position)
+                let mask = Seq.concat [seq{0 .. (i-1)}; seq{(i+1) .. (bounds.Length)}] |> Seq.toList
+                callSwaps.[i] @ swap (position+1) (List.init (bounds.Length - 1) (fun i -> bounds.[mask.[i]])) tail
+            else
+                head :: swap (position+1) bounds tail
+
+    let loopNames = (oloops |> List.map (fun x -> x.Name)) @ (mloops |> List.map (fun x -> x.Name))
+    let deleteLoopLines = loopNames |> List.map (fun x -> List.filter (fun (y:string) -> not (y.Contains x))) |> List.reduce (>>)
+
+    tokens
+    |> (swap 0 callBounds
+        >> substitute
+        >> List.filter (fun x -> not (x.Contains "object_for"))
+        >> List.filter (fun x -> not (x.Contains "method_for"))
+        >> deleteLoopLines
+        >> stringCollapse "")
 
 
 [<EntryPoint>]
@@ -1102,3 +1146,83 @@ let main args =
     |> fun x -> File.WriteAllText (oFileName, x)
 
     0
+
+(*
+let code = """
+
+#include "things.hpp"
+#include "stuff.hpp"
+#pragma edgi function(sumThenMultiply) arity(3) input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
+auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
+    // assume iarray1 and iarray2 last extents are same
+    for(int i = 0; i < iarray1.current_extent(); i++){
+        oarray += iarray1[i] + iarray2[i];
+    }
+
+    oarray *= iarray3;
+    return oarray;
+}
+#pragma edgi function(divideThenSum) arity(3) input(iarray4, iarray5, iarray6) iranks(1, 1, 0) output(oarray) orank(0)
+auto sumThenMultiply = function(iarray4, iarray5, iarray6, oarray){
+    // assume iarray4 and iarray5 last extents are same
+    for(int i = 0; i < iarray4.current_extent(); i++){
+        oarray += iarray4[i] / iarray5[i];
+    }
+
+    oarray += iarray6;
+    return oarray;
+}
+#pragma edgi function(add10) arity(1) input(iarray) iranks(0) output(oarray) orank(0)
+{
+    oarray = iarray + 10;
+    return oarray;
+}
+#pragma edgi function(sinThenProduct) arity(any) input(iarray) iranks(0) output(oarray) orank(0)
+{
+    oarray = sin(iarray) * tail;
+    return oarray;
+}
+int main(){
+
+    #pragma edgi array symmetry(1, 2, 2, 3)
+    promote<float, 4>::type array1;
+
+    #pragma edgi array
+    promote<float, 3>::type array3;
+
+    #pragma edgi array
+    promote<float, 3>::type ooarray;
+
+    #pragma edgi array
+    promote<float, 3>::type moarray;
+
+    #pragma edgi array
+    promote<float, 3>::type moarray2;
+
+    #pragma edgi array
+    promote<float, 3>::type voarray;
+
+    auto oloop = object_for(sumThenMultiply);
+    auto ooarray = oloop(array1, array1, array3);
+
+    auto mloop = method_for(array1, array1, array3);
+    auto moarray = mloop(sumThenMultiply);
+    auto moarray2 = mloop(divideThenSum);
+
+    auto oloopv = object_for(sinThenProduct);
+    auto voarray = oloopv(array3, array3);
+
+
+    auto ooarray = oloop(array1, array1, array3);
+    auto moarray = mloop(sumThenMultiply);
+    auto moarray2 = mloop(divideThenSum);
+    auto voarray = oloopv(array3, array3);
+
+
+    auto newfunc = pipe(sumThenMultiply, add10);
+
+    return 0;
+}"""
+
+code |> tokenize |> lex;;
+*)
