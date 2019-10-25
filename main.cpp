@@ -55,11 +55,10 @@ namespace sample_closures {
 
     /** Sample closure that adds ten to the input array (for nested arrays) */
     template<const char IFNAME[], const char IVNAME[], const char OFNAME[], const char OVNAME[], const int* ISYMMETRY = nullptr>
-    struct add10_nested_nc : closure_base_unary_t<float, 1, float, 1>{
+    struct add10_nested_nc : closure_nc_base_unary_t<float, 1, IFNAME, IVNAME, float, 1, OFNAME, OVNAME>{
 
         static constexpr const void(*function)(nested_netcdf_array_t<float, 1, IFNAME, IVNAME, ISYMMETRY>, nested_netcdf_array_t<float, 1, OFNAME, OVNAME>) =
             [](nested_netcdf_array_t<float, 1, IFNAME, IVNAME, ISYMMETRY> iarray_in, nested_netcdf_array_t<float, 1, OFNAME, OVNAME> oarray_in) -> const void {
-                
                 iarray_in.read();
                 oarray_in.set_extent(oarray_in.current_depth(), iarray_in.current_extent());
                 oarray_in.allocate();
@@ -69,9 +68,17 @@ namespace sample_closures {
                     oarray_in[i] = iarray_in[i] + 10;
                 }
 
-                oarray_in.write();
             };
             
+        /** This function is where the remaining output dimensions must be written. */
+        template<const int IRANK, const int ORANK>
+        static constexpr const void(*write_output_dims)(nested_netcdf_array_t<float, IRANK, IFNAME, IVNAME>, nested_netcdf_array_t<float, ORANK, OFNAME, OVNAME>) =
+            [](nested_netcdf_array_t<float, IRANK, IFNAME, IVNAME> iarray_in, nested_netcdf_array_t<float, ORANK, OFNAME, OVNAME> oarray_in) -> const void {
+                nc_def_dim(oarray_in.file_id(), iarray_in.dim_name(IRANK-1).c_str(), iarray_in.extent(IRANK-1), &(oarray_in.dim_ids()[IRANK-1]));
+                nc_def_var(oarray_in.file_id(), iarray_in.dim_name(IRANK-1).c_str(), iarray_in.dim_var_type(IRANK-1), 1, &(oarray_in.dim_ids()[IRANK-1]), &(oarray_in.get_dim_var_ids()[IRANK-1]));
+                nc_put_var(oarray_in.file_id(), oarray_in.dim_var_id(IRANK-1), iarray_in.dim_var_values(IRANK-1));
+        };
+
         /** This function is where the remaining output dimensions must be written. */
         template<const int IRANK, const int ORANK>
         static constexpr const void(*write_output_dims)(nested_netcdf_array_t<float, IRANK, IFNAME, IVNAME>, nested_netcdf_array_t<float, ORANK, OFNAME, OVNAME>) =
@@ -1107,6 +1114,11 @@ int main(){
 
 
     auto a = method_for_nc<decltype(block_in), decltype(block_out), closure_nc_base_unary_t<float, 1, fname_in, vname, float, 1, fname_out, vname> >(block_in);
+
+    //auto b = a();
+    a(add10_nested_nc<fname_in, vname, fname_out, vname>::function, block_out, add10_nested_nc<fname_in, vname, fname_out, vname>::write_output_dims<3,3>);
+
+    block_out.write();
 
     //auto b = a();
     a(add10_nested_nc<fname_in, vname, fname_out, vname>::function, block_out, add10_nested_nc<fname_in, vname, fname_out, vname>::write_output_dims<3,3>);

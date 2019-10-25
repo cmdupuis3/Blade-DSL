@@ -393,6 +393,7 @@ nested_netcdf_array_t<VTYPE, rank_t, FNAME, VNAME, symmetry_groups>::nested_netc
 
     } else {
         // The file does not exist; assume write mode
+        nc_create(FNAME, NC_WRITE|NC_SHARE, &(this->file_ncid));
 
     }
 
