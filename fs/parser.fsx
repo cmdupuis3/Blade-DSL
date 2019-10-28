@@ -60,6 +60,7 @@ let tokenToStr (tokens: Token list) =
 let rec respace = function
     | Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s1 :: Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
     | Match @"^return" s1 :: Match @"^[a-zA-Z0-9_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
+    | Match @"^\#" s1 :: Match @"^include" s2 :: tail -> s1 :: s2 :: " " :: respace tail
     | head :: tail -> head :: respace tail
     | [] -> []
 
@@ -280,9 +281,10 @@ module NestedLoop =
         List.init iarrayLevels (
             fun i ->
                 let ompline = if ompLevels > i then [ompLine indNames.[i]] else []
-                let braced = match i with
-                             | 0 -> brace (loopLine indNames.[i] iMins.[i] iarrayName)
-                             | _ -> brace (loopLine indNames.[i] iMins.[i] (String.concat "" [iarrayName; indNames.[i-1]]))
+                let braced =
+                    match i with
+                    | 0 -> brace (loopLine indNames.[i] iMins.[i] iarrayName)
+                    | _ -> brace (loopLine indNames.[i] iMins.[i] (String.concat "" [iarrayName; indNames.[i-1]]))
                 let iline =
                     if i = 0 then                     tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; index iarrayName indNames.[i]; ";\n"]]
                     else                              tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; (index (String.concat "" [iarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
@@ -309,12 +311,9 @@ module NestedLoop =
         let rec naryLoop' (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
             match iarrayNames with
             | [] -> failwith "Empty array names list."
-            | _  ->
-                match iarrayNames with
-                | [] -> failwith "Impossible match."
-                | [head]       -> [(fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head)]
-                | head :: tail ->  (fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head) ::
-                                             naryLoop' iarrayNames.Tail iarrayLevels.Tail oarrayName (oarrayLevels - iarrayLevels.Head) indNames.Tail iMins.Tail inner ompLevels.Tail
+            | [head]       -> [(fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head)]
+            | head :: tail ->  (fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head) ::
+                                         naryLoop' iarrayNames.Tail iarrayLevels.Tail oarrayName (oarrayLevels - iarrayLevels.Head) indNames.Tail iMins.Tail inner ompLevels.Tail
 
         naryLoop' iarrayNames iarrayLevels oarrayName oarrayLevels indNames iMins inner ompLevels
         |> List.rev
@@ -804,11 +803,11 @@ let symmVecName (array: NestedArray) =
 let objectLoopTemplate (oloop: ObjectLoop) =
 
     let numCalls = oloop.Call.Length
-    let itype = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Type))
+    let itype = oloop.iarrays |> List.map (List.map (fun y -> y.Type))
     let otype = oloop.oarrays |> List.map (fun x -> x.Type)
-    let irank = oloop.iarrays |> List.map (fun x -> x |> List.map (fun y -> y.Rank))
+    let irank = oloop.iarrays |> List.map (List.map (fun y -> y.Rank))
     let orank = oloop.oarrays |> List.map (fun x -> x.Rank)
-    let isymm = oloop.iarrays |> List.map (fun x -> x |> List.map symmVecName)
+    let isymm = oloop.iarrays |> List.map (List.map symmVecName)
     let osymm = oloop.oarrays |> List.map symmVecName
 
     let arity, inames =
@@ -907,8 +906,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 |> stringCollapse ""
                 |> fun x -> stringCollapse "" ((x :: (t |> tokenToStr)) |> respace |> reconcat |> newln)
                 |> fun x -> String.concat "" [p' |> tokenToStr |> stringCollapse ""; x]
-            | _ -> h |> tokenToStr |> respace |> reconcat |> newln |> List.head
-        | _ -> tokens |> tokenToStr |> respace |> reconcat |> newln |> List.head
+            | _ -> h |> (tokenToStr >> respace >> reconcat >> newln >> List.head)
+        | _ -> tokens |> (tokenToStr >> respace >> reconcat >> newln >> List.head)
 
     let tSpecInner =
         match oloop.GetFunc.Arity with
@@ -1062,7 +1061,7 @@ let lex (tokens: Token list) =
     let arraySwaps =
         arrays
         |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else ", nullptr")
-        |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";"])
+        |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";\n"])
 
     let rec deleteFunctionPragmas (tokens: Token list) =
         let rec deleteFrom = function
@@ -1133,6 +1132,7 @@ let lex (tokens: Token list) =
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
         >> deleteLoopLines
+        >> (@) ["#include \"nested_array.hpp\"\n"]
         >> stringCollapse "")
 
 
