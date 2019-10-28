@@ -79,15 +79,6 @@ namespace sample_closures {
                 nc_put_var(oarray_in.file_id(), oarray_in.dim_var_id(IRANK-1), iarray_in.dim_var_values(IRANK-1));
         };
 
-        /** This function is where the remaining output dimensions must be written. */
-        template<const int IRANK, const int ORANK>
-        static constexpr const void(*write_output_dims)(nested_netcdf_array_t<float, IRANK, IFNAME, IVNAME>, nested_netcdf_array_t<float, ORANK, OFNAME, OVNAME>) =
-            [](nested_netcdf_array_t<float, IRANK, IFNAME, IVNAME> iarray_in, nested_netcdf_array_t<float, ORANK, OFNAME, OVNAME> oarray_in) -> const void {
-                nc_def_dim(oarray_in.file_id(), iarray_in.dim_name(IRANK-1).c_str(), iarray_in.extent(IRANK-1), &(oarray_in.dim_ids()[IRANK-1]));
-                nc_def_var(oarray_in.file_id(), iarray_in.dim_name(IRANK-1).c_str(), iarray_in.dim_var_type(IRANK-1), 1, &(oarray_in.dim_ids()[IRANK-1]), &(oarray_in.get_dim_var_ids()[IRANK-1]));
-                nc_put_var(oarray_in.file_id(), oarray_in.dim_var_id(IRANK-1), iarray_in.dim_var_values(IRANK-1));
-        };
-
     };
 
     template<const int* ISYMMETRY = nullptr>
