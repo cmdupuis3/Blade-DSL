@@ -75,34 +75,46 @@ namespace nested_array_utilities {
     /** Recursively allocate an array, with dimensionality deduced from TYPE, according to arrays
      *  of index minima and maxima. Minima default to zero in every dimension.
      */
-    template<typename TYPE, const int MAX[], const int MIN[] = nullptr, const int depth = 0>
-    constexpr auto allocate(){
+    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
+    constexpr TYPE allocate(const int lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        if constexpr (MIN) {
-
-            TYPE array = new DTYPE[MAX[depth] - MIN[depth]];
-            if constexpr (std::is_pointer<DTYPE>::value) {
-                for (int i = 0; i < MAX[depth] - MIN[depth]; i++) {
-                    array[i] = allocate<DTYPE, MAX, MIN, depth+1>();
+        TYPE array = new DTYPE[EXTENTS[DEPTH]];
+        if constexpr (get_rank<TYPE>() > 1) {
+            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
+                if constexpr (SYMM && DEPTH+1 < get_rank<TYPE>() && SYMM[DEPTH] == SYMM[DEPTH+1]) {
+                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>(i);
+                    //cout << DEPTH << " hurr" << endl;
+                } else {
+                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>();
+                    //cout << DEPTH << " durr" << endl;
                 }
             }
-            return array;
+        }
+        return array;
 
-        } else {
+    }
 
-            TYPE array = new DTYPE[MAX[depth]];
-            if constexpr (std::is_pointer<DTYPE>::value) {
-                for (int i = 0; i < MAX[depth]; i++) {
-                    array[i] = allocate<DTYPE, MAX, nullptr, depth+1>();
+    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
+    constexpr void fold(TYPE array) {
+
+        typedef typename remove_pointer<TYPE>::type DTYPE;
+
+        if constexpr (SYMM && DEPTH+1 < get_rank<TYPE>()) {
+            for (int i = 0; i < EXTENTS[DEPTH]; i++) {
+                if constexpr (SYMM[DEPTH] == SYMM[DEPTH+1]) {
+                    for (int j = 0; j < i; j++) {
+                        array[i][j] = array[j][i];
+                    }
                 }
+                fold<DTYPE, EXTENTS, SYMM, DEPTH+1>(array[i]);
             }
-            return array;
-
         }
 
     }
+
+
 
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
     template<typename TYPE, const int MAX[], const int MIN[] = nullptr, const int depth = 0>
