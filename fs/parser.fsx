@@ -1132,7 +1132,7 @@ let lex (tokens: Token list) =
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
         >> deleteLoopLines
-        >> (@) ["#include \"nested_array.hpp\"\n"]
+        >> (@) ["#include \"nested_array.cpp\"\n"]
         >> stringCollapse "")
 
 
@@ -1162,7 +1162,7 @@ auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
     oarray *= iarray3;
     return oarray;
 }
-#pragma edgi function(divideThenSum) arity(3) input(iarray4, iarray5, iarray6) iranks(1, 1, 0) output(oarray) orank(0)
+#pragma edgi function(divideThenSum) arity(3) input(iarray4, iarray5, iarray6) iranks(1, 1, 0) output(oarray) orank(0) ompLevels(1,1,0)
 auto sumThenMultiply = function(iarray4, iarray5, iarray6, oarray){
     // assume iarray4 and iarray5 last extents are same
     for(int i = 0; i < iarray4.current_extent(); i++){
