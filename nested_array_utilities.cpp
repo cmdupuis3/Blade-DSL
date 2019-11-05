@@ -114,39 +114,21 @@ namespace nested_array_utilities {
 
     }
 
-
-
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
-    template<typename TYPE, const int MAX[], const int MIN[] = nullptr, const int depth = 0>
-    constexpr auto fill_random(TYPE array_in, int mod_in){
+    template<typename TYPE, const int MAX[], const int DEPTH = 0>
+    constexpr auto fill_random(TYPE array_in, int mod_in) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
-        if constexpr (depth == 0) srand(time(NULL));
+        if constexpr (DEPTH == 0) srand(time(NULL));
 
-        if constexpr (MIN) {
-
-            if constexpr (std::is_pointer<DTYPE>::value) {
-                for (int i = 0; i < MAX[depth] - MIN[depth]; i++) {
-                    fill_random<DTYPE, MAX, MIN, depth+1>(array_in[i], mod_in);
-                }
-            } else {
-                for (int i = 0; i < MAX[depth] - MIN[depth]; i++) {
-                    array_in[i] = rand() % mod_in;
-                }
+        if constexpr (std::is_pointer<DTYPE>::value) {
+            for (int i = 0; i < MAX[DEPTH]; i++) {
+                fill_random<DTYPE, MAX, DEPTH+1>(array_in[i], mod_in);
             }
-
         } else {
-
-            if constexpr (std::is_pointer<DTYPE>::value) {
-                for (int i = 0; i < MAX[depth]; i++) {
-                    fill_random<DTYPE, MAX, nullptr, depth+1>(array_in[i], mod_in);
-                }
-            } else {
-                for (int i = 0; i < MAX[depth]; i++) {
-                    array_in[i] = rand() % mod_in;
-                }
+            for (int i = 0; i < MAX[DEPTH]; i++) {
+                array_in[i] = rand() % mod_in;
             }
-
         }
 
     }
