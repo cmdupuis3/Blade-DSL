@@ -27,6 +27,7 @@
 
 using std::add_pointer;
 using std::remove_pointer;
+using std::is_pointer;
 
 
 // Helper functions (must be constexpr)
@@ -85,10 +86,8 @@ namespace nested_array_utilities {
             for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
                 if constexpr (SYMM && DEPTH+1 < get_rank<TYPE>() && SYMM[DEPTH] == SYMM[DEPTH+1]) {
                     array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>(i);
-                    //cout << DEPTH << " hurr" << endl;
                 } else {
                     array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>();
-                    //cout << DEPTH << " durr" << endl;
                 }
             }
         }
