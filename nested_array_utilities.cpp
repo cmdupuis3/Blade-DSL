@@ -118,7 +118,6 @@ namespace nested_array_utilities {
     constexpr auto fill_random(TYPE array_in, int mod_in) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
-        if constexpr (DEPTH == 0) srand(time(NULL));
 
         if constexpr (std::is_pointer<DTYPE>::value) {
             for (int i = 0; i < MAX[DEPTH]; i++) {
