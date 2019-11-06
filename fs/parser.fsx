@@ -152,7 +152,7 @@ module NestedLoop =
     /// Generates a list of new iterator names for multiple variables based on a minumum and the ranks of variables to loop over.
     /// <param name="min"> First integer to append to "__i". </param>
     /// <param name="ranks"> List of variable ranks. </param>
-    let rec private indNames min ranks =
+    let rec   indNames min ranks =
         let rec indNames' min max =
             List.init (max - min) (fun index -> String.concat "" ["__i"; (string (index + min))])
         match ranks with
@@ -162,7 +162,7 @@ module NestedLoop =
     /// Finds which iterators should serve as a the minimum for a given loop if the variables are commutative; otherwise set the minimum to 0.
     /// <param name="comGroups"> A commutativity vector. </param>
     /// <param name="iNames"> Iterator names for all variables. </param>
-    let rec private comImins (comGroups: int list) (iNames: string list list) =
+    let rec   comImins (comGroups: int list) (iNames: string list list) =
         let inhead, intail = List.head iNames, List.tail iNames
 
         (List.init inhead.Length (fun index -> string 0)) ::
@@ -180,7 +180,7 @@ module NestedLoop =
 
     /// For each dimension, finds whether a dimension is symmetric with the next.
     /// <param name="symGroup"> A symmetry vector. </param>
-    let rec private isSym symGroups =
+    let rec   isSym symGroups =
         match symGroups with
         | []           -> false
         | [head]       -> false
@@ -189,13 +189,13 @@ module NestedLoop =
     /// Finds which iterators should serve as a the minimum for a given loop if the dimensions are symmetric; otherwise set the minimum to 0.
     /// <param name="symGroups"> A symmetry vector. </param>
     /// <param name="iNames"> Iterator names for all variables. </param>
-    let private symImins (symGroups: int list) (iNames: string list) =
+    let   symImins (symGroups: int list) (iNames: string list) =
         List.init symGroups.Length (
             fun i -> if i = 0 then string 0 else if symGroups.[i] = symGroups.[i-1] then iNames.[i-1] else string 0
         )
 
     /// Enum for the symmetry/commutativity state of a variable.
-    type private SymcomState =
+    type   SymcomState =
     | Symmetric   = 0
     | Commutative = 1
     | Both        = 2
@@ -205,7 +205,7 @@ module NestedLoop =
     /// <param name="arrayNames"> List of variable names. </param>
     /// <param name="symGroups"> A list of symmetry vectors. </param>
     /// <param name="comGroups"> A commutativity vector. </param>
-    let rec private vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
+    let rec   vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
         match arrayNames with
         | [] -> []
         | arrHead :: arrTail ->
@@ -225,7 +225,7 @@ module NestedLoop =
     /// <param name="arrayNames"> List of variable names. </param>
     /// <param name="symGroups"> A list of symmetry vectors. </param>
     /// <param name="comGroups"> A commutativity vector. </param>
-    let private iminList (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
+    let   iminList (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
         assert (arrayNames.Length = symGroups.Length)
         assert (arrayNames.Length = comGroups.Length)
 
@@ -248,24 +248,24 @@ module NestedLoop =
     /// <param name="iName"> Iterator name. </param>
     /// <param name="iMin"> Iterator minimum name. </param>
     /// <param name="arrayName"> Previous variable name. </param>
-    let private loopLine iName iMin arrayName =
+    let   loopLine iName iMin arrayName =
         String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; arrayName; ".current_extent(); "; iName; "++)";]
 
     /// Generates a call to operator().
     /// <param name="arrayName"> Variable name. </param>
     /// <param name="iName"> Iterator name. </param>
-    let private index arrayName iName =
+    let   index arrayName iName =
         String.concat "" [arrayName; "("; iName; ")"]
 
-    /// Generates an OpenMP parallelization line. Inserts a "private" clause for the input iterator name.
+    /// Generates an OpenMP parallelization line. Inserts a " " clause for the input iterator name.
     /// <param name="iName"> Iterator name. </param>
-    let private ompLine iName =
-        String.concat "" ["#pragma omp parallel for private("; iName; ")"]
+    let   ompLine iName =
+        String.concat "" ["#pragma omp parallel for  ("; iName; ")"]
 
     /// Generates an iterator declaration line.
     /// <param name="iType"> Iterator type. </param>
     /// <param name="iName"> Iterator name. </param>
-    let private declLine iType iName =
+    let   declLine iType iName =
         String.concat "" [iType; " "; iName; " = 0;"]
 
     /// Autogenerate a unary nested_for loop.
@@ -274,7 +274,7 @@ module NestedLoop =
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let private unaryLoop (iarrayName: string) (iarrayLevels: int) (oarrayName: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
+    let   unaryLoop (iarrayName: string) (iarrayLevels: int) (oarrayName: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
         assert (iarrayLevels = indNames.Length)
         assert (iarrayLevels = iMins.Length)
 
@@ -303,7 +303,7 @@ module NestedLoop =
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let private naryLoop (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+    let   naryLoop (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
         assert (iarrayNames.Length = indNames.Length)
         assert (iarrayNames.Length = iMins.Length)
         assert (iarrayNames.Length = ompLevels.Length)
@@ -323,7 +323,7 @@ module NestedLoop =
     /// <param name="iarrays"> A list of input array classes. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
-    let private lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
+    let   lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
         let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
         let inds = indNames 0 ilevels
         let lastInds = List.map List.last inds
@@ -351,7 +351,7 @@ module NestedLoop =
     /// Substitute the first string with the second in a list of strings
     /// <param name="subs"> A list of substitution pairs; find the first, swap the second in. </param>
     /// <param name="text"> The text to be substituted. </param>
-    let rec private subInner (subs: (string * string) list) (inner: string list) =
+    let rec   subInner (subs: (string * string) list) (inner: string list) =
         match subs with
         | []           -> inner
         | head :: tail -> List.init inner.Length (fun i -> inner.[i].Replace(fst head, snd head)) |> subInner tail
@@ -794,7 +794,7 @@ let symmVecLines (arrays: NestedArray list) =
     |> List.map (fun x -> x.Name, x.Symm |> Option.get)
     |> List.map (fun x ->
         let name, symm = x
-        String.concat "" ["static constexpr const int["; symm.Length |> string; "] "; name; "_symm = {"; symm |> List.map string |> withCommas |> stringCollapse " "; "};\n"]
+        String.concat "" ["static constexpr const int "; name; "_symm["; symm.Length |> string; "] = {"; symm |> List.map string |> withCommas |> stringCollapse " "; "};\n"]
     )
 
 let symmVecName (array: NestedArray) =
@@ -822,17 +822,17 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let templateTypes =
         arity |> List.map (fun a ->
-            List.init a (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
-            |> fun x -> x @ ["OTYPE, ORANK, OSYM"]
+            List.init a (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1); ", const int* ISYM"; string (i+1)])
+            |> fun x -> x @ ["typename OTYPE, const int ORANK, const int* OSYM"]
             |> withCommas
             |> stringCollapse ""
         )
 
     let templateArgTypes =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
-            List.init a (fun i -> String.concat "" ["nested_array<ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1); "> "; names.[i]])
+            List.init a (fun i -> String.concat "" ["nested_array_t<ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1); "> "; names.[i]])
             |> withCommas
-            |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; oloop.GetFunc.OName]
+            |> fun x -> x @ [", nested_array_t<OTYPE, ORANK, OSYM> "; oloop.GetFunc.OName]
             |> stringCollapse ""
         )
 
@@ -858,9 +858,9 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 (types.[i].[j], ranks.[i].[j], symms.[i].[j])
                 |||> fun x y z ->
                     if z = "nullptr" then
-                        ["nested_array<"; x; ", "; y; ", nullptr> "; names.[i].[j]]
+                        ["nested_array_t<"; x; ", "; y; ", nullptr> "; names.[i].[j]]
                     else
-                        ["nested_array<"; x; ", "; y; ", "; z; "> "; names.[i].[j]]
+                        ["nested_array_t<"; x; ", "; y; ", "; z; "> "; names.[i].[j]]
                 |> stringCollapse ""
             ) |> (withCommas >> stringCollapse "")
         )
@@ -967,9 +967,9 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let templateArgTypes =
         List.init numCalls (fun i ->
-            List.init arity (fun j -> String.concat "" ["nested_array<ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1); "> "; inames.[i].[j]])
+            List.init arity (fun j -> String.concat "" ["nested_array_t<ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1); "> "; inames.[i].[j]])
             |> withCommas
-            |> fun x -> x @ [", nested_array<OTYPE, ORANK, OSYM> "; onames.[i]]
+            |> fun x -> x @ [", nested_array_t<OTYPE, ORANK, OSYM> "; onames.[i]]
             |> stringCollapse ""
         )
 
@@ -994,9 +994,9 @@ let methodLoopTemplate (mloop: MethodLoop) =
                 (types.[i].[j], ranks.[i].[j], symms.[i].[j])
                 |||> fun x y z ->
                     if z = "nullptr" then
-                        ["nested_array<"; x; ", "; y; ", nullptr> "; names.[i].[j]]
+                        ["nested_array_t<"; x; ", "; y; ", nullptr> "; names.[i].[j]]
                     else
-                        ["nested_array<"; x; ", "; y; ", "; z; "> "; names.[i].[j]]
+                        ["nested_array_t<"; x; ", "; y; ", "; z; "> "; names.[i].[j]]
                 |> stringCollapse ""
             ) |> (withCommas >> stringCollapse "")
         )
@@ -1061,7 +1061,7 @@ let lex (tokens: Token list) =
     let arraySwaps =
         arrays
         |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else ", nullptr")
-        |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";\n"])
+        |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array_t<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";\n"])
 
     let rec deleteFunctionPragmas (tokens: Token list) =
         let rec deleteFrom = function
@@ -1146,6 +1146,12 @@ let main args =
     |> fun x -> File.WriteAllText (oFileName, x)
 
     0
+
+//let tokens = File.ReadAllText iFileName |> tokenize;;
+//let args = [|"/home/Christopher.Dupuis/agu2019proj/main.edgi"; "/home/Christopher.Dupuis/agu2019proj/main.cpp"|];;
+//main [|"/home/Christopher.Dupuis/agu2019proj/main.edgi"; "/home/Christopher.Dupuis/agu2019proj/main.cpp"|];;
+
+
 
 (*
 let code = """
