@@ -99,7 +99,7 @@ protected:
 
 public:
     nested_array_t();
-    nested_array_t(int*, TYPE, int index = 0);
+    nested_array_t(const int*, TYPE, int index = 0);
     nested_array_t(const nested_array_t<VTYPE, rank_t+1, symmetry_groups>*, int index = 0); //< Downward traversal pointer-type constructor; not for public consumption
     ~nested_array_t();
 
@@ -200,7 +200,7 @@ nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(){
 }
 
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
-nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(int* extents_in, TYPE data_in, int index_in){
+nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(const int* extents_in, TYPE data_in, int index_in){
 
     this->data = data_in;
 
@@ -272,12 +272,12 @@ const nested_array_t<VTYPE, rank_t+1, symmetry_groups>* nested_array_t<VTYPE, ra
  */
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 const nested_array_t<VTYPE, rank_t-1, symmetry_groups>* nested_array_t<VTYPE, rank_t, symmetry_groups>::down(int index_in, int extent_in) const {
-
+/*
     if(this->c_depth == rank_t){
         cout << "Cannot index any further down" << endl;
         exit(-3);
     }
-
+*/
     if(!this->current_raggedness()){
         cout << "This is not a ragged dimension; use '(int)' instead.";
         exit(-8);
@@ -296,12 +296,12 @@ const nested_array_t<VTYPE, rank_t-1, symmetry_groups>* nested_array_t<VTYPE, ra
  */
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 const nested_array_t<VTYPE, rank_t-1, symmetry_groups>* nested_array_t<VTYPE, rank_t, symmetry_groups>::down(int index_in) const {
-
+/*
     if(this->c_depth == rank_t){
         cout << "Cannot index any further down" << endl;
         exit(-3);
     }
-
+*/
     if(this->current_raggedness()){
         cout << "This is a ragged dimension; use '(int, int)' instead.";
         exit(-9);
