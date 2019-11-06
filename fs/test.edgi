@@ -1,0 +1,66 @@
+
+#include <cmath>
+#include <iostream>
+using std::cout;
+using std::endl;
+
+#include "nested_array_utilities.cpp"
+
+
+#pragma edgi function(func) arity(3) input(in1, in2, in3) iranks(0,0,0) output(out) orank(0) ompLevels(1,1,0)
+{
+    out = (in1 + sin(in2)) * in3;
+}
+
+
+static constexpr const int extents[4] = {5,5,5,5};
+
+
+int main() {
+
+
+    #pragma edgi array symmetry(1,1,1,1)
+    float~4 a1;
+
+    #pragma edgi array
+    float~4 a2;
+
+    #pragma edgi array
+    float~4 a3;
+
+    #pragma edgi array
+    float~4 res;
+
+    typedef promote<float, 4>::type float4;
+
+    float4 a1_vals = allocate<float4, extents, a1_symm>();
+    float4 a2_vals = allocate<float4, extents, nullptr>();
+    float4 a3_vals = allocate<float4, extents, nullptr>();
+    fold<float4, extents, a1_symm>(a1_vals);
+
+    fill_random<float4, extents>(a1_vals, 10);
+    fill_random<float4, extents>(a2_vals, 10);
+    fill_random<float4, extents>(a3_vals, 10);
+
+    a1  = nested_array_t<float, 4, a1_symm>(extents, a1_vals);
+    a2  = nested_array_t<float, 4, nullptr>(extents, a2_vals);
+    a3  = nested_array_t<float, 4, nullptr>(extents, a3_vals);
+    res = nested_array_t<float, 4, nullptr>(extents, allocate<float4, extents, nullptr>());
+
+
+    auto oloop = object_for(func);
+    auto res = oloop(a1, a2, a3);
+
+    for (int i = 0; i < 5; i++){
+        for (int j = 0; j < 5; j++){
+            for (int k = 0; k < 5; k++){
+                cout << a1[i][j][k][0] << " ";
+            }
+            cout << endl;
+        }
+        cout << endl << endl;
+    }
+
+    return 0;
+}
+
