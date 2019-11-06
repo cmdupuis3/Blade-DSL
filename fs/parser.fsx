@@ -436,6 +436,7 @@ let rec (|ScopePattern|_|) = function
             | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
         Some (scope, (t: Token list))
+    | Token.Symbol ';' :: tail -> None
     | head :: tail ->
         match tail with
         | ScopePattern t -> Some t
@@ -469,6 +470,7 @@ let rec (|ScopePatternParens|_|) = function
             | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
         Some (head :: Token.Symbol '(' :: (scope @ [Token.Symbol ')']), (t: Token list))
+    | Token.Symbol ';' :: tail -> None
     | head :: tail ->
         match tail with
         | ScopePatternParens t -> Some t
