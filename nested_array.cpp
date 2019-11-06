@@ -58,6 +58,8 @@ public:
     static constexpr const int* symmetry = symmetry_groups;
     static constexpr const int rank = rank_t;
 
+    operator TYPE(){ return this->data; };
+
     auto get_data() const;
     constexpr int get_rank() const;
     int current_depth() const;
