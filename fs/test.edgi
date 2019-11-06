@@ -17,7 +17,7 @@ static constexpr const int extents[4] = {5,5,5,5};
 
 
 int main() {
-
+	srand(time(NULL));
 
     #pragma edgi array symmetry(1,1,1,1)
     float~4 a1;
@@ -55,6 +55,18 @@ int main() {
         for (int j = 0; j < 5; j++){
             for (int k = 0; k < 5; k++){
                 cout << a1[i][j][k][0] << " ";
+            }
+            cout << "   ";
+            for (int k = 0; k < 5; k++){
+                cout << a2[i][j][k][0] << " ";
+            }
+            cout << "   ";
+            for (int k = 0; k < 5; k++){
+                cout << a3[i][j][k][0] << " ";
+            }
+            cout << "   ";
+            for (int k = 0; k < 5; k++){
+                cout << res[i][j][k][0] << " ";
             }
             cout << endl;
         }
