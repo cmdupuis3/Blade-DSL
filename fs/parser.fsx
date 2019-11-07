@@ -152,7 +152,7 @@ module NestedLoop =
     /// Generates a list of new iterator names for multiple variables based on a minumum and the ranks of variables to loop over.
     /// <param name="min"> First integer to append to "__i". </param>
     /// <param name="ranks"> List of variable ranks. </param>
-    let rec   indNames min ranks =
+    let rec private indNames min ranks =
         let rec indNames' min max =
             List.init (max - min) (fun index -> String.concat "" ["__i"; (string (index + min))])
         match ranks with
@@ -162,7 +162,7 @@ module NestedLoop =
     /// Finds which iterators should serve as a the minimum for a given loop if the variables are commutative; otherwise set the minimum to 0.
     /// <param name="comGroups"> A commutativity vector. </param>
     /// <param name="iNames"> Iterator names for all variables. </param>
-    let rec   comImins (comGroups: int list) (iNames: string list list) =
+    let rec private comImins (comGroups: int list) (iNames: string list list) =
         let inhead, intail = List.head iNames, List.tail iNames
 
         (List.init inhead.Length (fun index -> string 0)) ::
@@ -180,7 +180,7 @@ module NestedLoop =
 
     /// For each dimension, finds whether a dimension is symmetric with the next.
     /// <param name="symGroup"> A symmetry vector. </param>
-    let rec   isSym symGroups =
+    let rec private isSym symGroups =
         match symGroups with
         | []           -> false
         | [head]       -> false
@@ -189,13 +189,13 @@ module NestedLoop =
     /// Finds which iterators should serve as a the minimum for a given loop if the dimensions are symmetric; otherwise set the minimum to 0.
     /// <param name="symGroups"> A symmetry vector. </param>
     /// <param name="iNames"> Iterator names for all variables. </param>
-    let   symImins (symGroups: int list) (iNames: string list) =
+    let private symImins (symGroups: int list) (iNames: string list) =
         List.init symGroups.Length (
             fun i -> if i = 0 then string 0 else if symGroups.[i] = symGroups.[i-1] then iNames.[i-1] else string 0
         )
 
     /// Enum for the symmetry/commutativity state of a variable.
-    type   SymcomState =
+    type private SymcomState =
     | Symmetric   = 0
     | Commutative = 1
     | Both        = 2
@@ -205,7 +205,7 @@ module NestedLoop =
     /// <param name="arrayNames"> List of variable names. </param>
     /// <param name="symGroups"> A list of symmetry vectors. </param>
     /// <param name="comGroups"> A commutativity vector. </param>
-    let rec   vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
+    let rec private vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
         match arrayNames with
         | [] -> []
         | arrHead :: arrTail ->
@@ -225,7 +225,7 @@ module NestedLoop =
     /// <param name="arrayNames"> List of variable names. </param>
     /// <param name="symGroups"> A list of symmetry vectors. </param>
     /// <param name="comGroups"> A commutativity vector. </param>
-    let   iminList (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
+    let private iminList (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
         assert (arrayNames.Length = symGroups.Length)
         assert (arrayNames.Length = comGroups.Length)
 
@@ -248,24 +248,24 @@ module NestedLoop =
     /// <param name="iName"> Iterator name. </param>
     /// <param name="iMin"> Iterator minimum name. </param>
     /// <param name="arrayName"> Previous variable name. </param>
-    let   loopLine iName iMin arrayName =
+    let private loopLine iName iMin arrayName =
         String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; arrayName; ".current_extent(); "; iName; "++)";]
 
     /// Generates a call to operator().
     /// <param name="arrayName"> Variable name. </param>
     /// <param name="iName"> Iterator name. </param>
-    let   index arrayName iName =
+    let private index arrayName iName =
         String.concat "" [arrayName; "("; iName; ")"]
 
     /// Generates an OpenMP parallelization line. Inserts a " " clause for the input iterator name.
     /// <param name="iName"> Iterator name. </param>
-    let   ompLine iName =
-        String.concat "" ["#pragma omp parallel for  ("; iName; ")"]
+    let private ompLine iName =
+        String.concat "" ["#pragma omp parallel for private("; iName; ")"]
 
     /// Generates an iterator declaration line.
     /// <param name="iType"> Iterator type. </param>
     /// <param name="iName"> Iterator name. </param>
-    let   declLine iType iName =
+    let private declLine iType iName =
         String.concat "" [iType; " "; iName; " = 0;"]
 
     /// Autogenerate a unary nested_for loop.
@@ -274,7 +274,7 @@ module NestedLoop =
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let   unaryLoop (iarrayName: string) (iarrayLevels: int) (oarrayName: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
+    let private unaryLoop (iarrayName: string) (iarrayLevels: int) (oarrayName: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
         assert (iarrayLevels = indNames.Length)
         assert (iarrayLevels = iMins.Length)
 
@@ -303,7 +303,7 @@ module NestedLoop =
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let   naryLoop (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+    let private naryLoop (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
         assert (iarrayNames.Length = indNames.Length)
         assert (iarrayNames.Length = iMins.Length)
         assert (iarrayNames.Length = ompLevels.Length)
@@ -323,7 +323,7 @@ module NestedLoop =
     /// <param name="iarrays"> A list of input array classes. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
-    let   lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
+    let private lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
         let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
         let inds = indNames 0 ilevels
         let lastInds = List.map List.last inds
@@ -351,7 +351,7 @@ module NestedLoop =
     /// Substitute the first string with the second in a list of strings
     /// <param name="subs"> A list of substitution pairs; find the first, swap the second in. </param>
     /// <param name="text"> The text to be substituted. </param>
-    let rec   subInner (subs: (string * string) list) (inner: string list) =
+    let rec private subInner (subs: (string * string) list) (inner: string list) =
         match subs with
         | []           -> inner
         | head :: tail -> List.init inner.Length (fun i -> inner.[i].Replace(fst head, snd head)) |> subInner tail
