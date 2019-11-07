@@ -73,28 +73,6 @@ namespace nested_array_utilities {
 
     };
 
-    /** Recursively allocate an array, with dimensionality deduced from TYPE, according to arrays
-     *  of index minima and maxima. Minima default to zero in every dimension.
-     */
-    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
-    constexpr TYPE allocate(const int lastIndex = 0) {
-
-        typedef typename remove_pointer<TYPE>::type DTYPE;
-
-        TYPE array = new DTYPE[EXTENTS[DEPTH]];
-        if constexpr (get_rank<TYPE>() > 1) {
-            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
-                if constexpr (SYMM && DEPTH+1 < get_rank<TYPE>() && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>(i);
-                } else {
-                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>();
-                }
-            }
-        }
-        return array;
-
-    }
-
     template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
     constexpr void fold(TYPE array) {
 
@@ -110,6 +88,35 @@ namespace nested_array_utilities {
                 fold<DTYPE, EXTENTS, SYMM, DEPTH+1>(array[i]);
             }
         }
+
+    }
+
+    /** Recursively allocate an array, with dimensionality deduced from TYPE, according to arrays
+     *  of index minima and maxima. Minima default to zero in every dimension.
+     */
+    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
+    constexpr TYPE allocate(const int lastIndex = 0) {
+
+        typedef typename remove_pointer<TYPE>::type DTYPE;
+
+        TYPE array = new DTYPE[EXTENTS[DEPTH]];
+        if constexpr (get_rank<TYPE>() > 1) {
+            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
+                if constexpr (SYMM && DEPTH+1 < get_rank<TYPE>() && SYMM[DEPTH] == SYMM[DEPTH+1]) {
+                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>(i);
+                    //cout << DEPTH << " hurr" << endl;
+                } else {
+                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>();
+                    //cout << DEPTH << " durr" << endl;
+                }
+            }
+        }
+
+        if constexpr (DEPTH == 0 && SYMM) {
+            fold<TYPE, EXTENTS, SYMM>(array);
+        }
+
+        return array;
 
     }
 
