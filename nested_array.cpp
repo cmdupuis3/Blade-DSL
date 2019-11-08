@@ -208,9 +208,11 @@ nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(const int* extent
     this->index = index_in;
 
     /** Deep-copy extents */
-    this->extents = new int[rank_t];
-    for(int i = 0; i < rank_t; i++){
-        this->extents[i] = extents_in[i];
+    if constexpr (rank_t > 0) {
+        this->extents = new int[rank_t];
+        for(int i = 0; i < rank_t; i++){
+            this->extents[i] = extents_in[i];
+        }
     }
 
     this->parent = nullptr;
@@ -220,15 +222,20 @@ nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(const int* extent
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 void nested_array_t<VTYPE, rank_t, symmetry_groups>::operator=(nested_array_t<VTYPE, rank_t, symmetry_groups> array_in){
 
-    this->data = array_in.get_data();
+    this->data = new DTYPE[array_in.extent(0)];
+    for(int i = 0; i < array_in.extent(0); i++){
+        this->data[i] = array_in.get_data()[i];
+    }
 
     this->c_depth = array_in.current_depth();
     this->index = array_in.get_index();
 
     /** Deep-copy extents */
-    this->extents = new int[rank_t];
-    for(int i = 0; i < rank_t; i++){
-        this->extents[i] = array_in.extent(i);
+    if constexpr (rank_t > 0) {
+        this->extents = new int[rank_t];
+        for(int i = 0; i < rank_t; i++){
+            this->extents[i] = array_in.extent(i);
+        }
     }
 
     this->parent = nullptr;
@@ -237,7 +244,14 @@ void nested_array_t<VTYPE, rank_t, symmetry_groups>::operator=(nested_array_t<VT
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(const nested_array_t<VTYPE, rank_t+1, symmetry_groups>* parent_in, int index_in){
 
-    this->data = parent_in->get_data()[index_in];
+    if constexpr (rank_t > 0) {
+        this->data = new DTYPE[parent_in->extent(1)];
+        for(int i = 0; i < parent_in->extent(1); i++){
+            this->data[i] = parent_in->get_data()[index_in][i];
+        }
+    } else {
+        this->data = parent_in->get_data()[index_in];
+    }
 
     this->c_depth = parent_in->current_depth() + 1;
     this->index = index_in;
@@ -250,7 +264,16 @@ nested_array_t<VTYPE, rank_t, symmetry_groups>::nested_array_t(const nested_arra
 
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
 nested_array_t<VTYPE, rank_t, symmetry_groups>::~nested_array_t(){
-
+    if (this->parent) {
+        //cout << this->parent->get_data()[this->index] << endl;
+        if constexpr (rank_t > 0) {
+            for(int i = 0; i < this->parent->extent(0); i++){
+                this->parent->get_data()[this->index][i] = this->data[i];
+            }
+        } else {
+            this->parent->get_data()[this->index] = this->data;
+        }
+    }
 }
 
 template<typename VTYPE, const int rank_t, const int* symmetry_groups>
