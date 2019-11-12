@@ -1133,7 +1133,7 @@ let parse (tokens: Token list) =
                     ) |> (withCommas >> stringCollapse "")
                 )
 
-            List.init oloops.[i].Call.Length (fun j -> String.concat "" [name; "<"; tSpecTypes.[i]; ">"; "("; args.[i]; ");\n"])
+            List.init oloops.[i].Call.Length (fun j -> String.concat "" ["\n"; name; "<"; tSpecTypes.[i]; ">"; "("; args.[i]; ");\n"])
         )
 
     let mloopCallSwaps =
@@ -1162,7 +1162,7 @@ let parse (tokens: Token list) =
                     ) |> (withCommas >> stringCollapse "")
                 )
 
-            List.init mloops.[i].Call.Length (fun j -> String.concat "" [names.[i]; "<"; tSpecTypes.[i]; ">"; "("; args.[i]; ");\n"])
+            List.init mloops.[i].Call.Length (fun j -> String.concat "" ["\n"; names.[i]; "<"; tSpecTypes.[i]; ">"; "("; args.[i]; ");\n"])
         )
 
     let callSwaps = (oloopCallSwaps @ mloopCallSwaps) |> List.reduce (@) |> List.map tokenize
