@@ -255,7 +255,7 @@ module NestedLoop =
     /// <param name="arrayName"> Variable name. </param>
     /// <param name="iName"> Iterator name. </param>
     let private index arrayName iName =
-        String.concat "" [arrayName; "("; iName; ")"]
+        String.concat "" [arrayName; "["; iName; "]"]
 
     /// Generates an OpenMP parallelization line. Inserts a " " clause for the input iterator name.
     /// <param name="iName"> Iterator name. </param>
@@ -269,12 +269,17 @@ module NestedLoop =
         String.concat "" [iType; " "; iName; " = 0;"]
 
     /// Autogenerate a unary nested_for loop.
-    /// <param name="arrayName"> Variable name. </param>
+    /// <param name="iarrayName"> Input variable name. </param>
+    /// <param name="oarrayName"> Output variable name. </param>
+    /// <param name="iarrayType"> Input variable value type. </param>
+    /// <param name="oarrayType"> Output variable value type. </param>
+    /// <param name="iarrayLevels"> Number of input array dimensions to iterate over. </param>
+    /// <param name="oarrayLevels"> Number of output array dimensions to iterate over. </param>
     /// <param name="indNames"> Iterator minimum names. </param>
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let private unaryLoop (iarrayName: string) (iarrayLevels: int) (oarrayName: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
+    let private unaryLoop (iarrayName: string) (iarrayType: string) (iarrayLevels: int) (oarrayName: string) (oarrayType: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
         assert (iarrayLevels = indNames.Length)
         assert (iarrayLevels = iMins.Length)
 
@@ -286,11 +291,13 @@ module NestedLoop =
                     | 0 -> brace (loopLine indNames.[i] iMins.[i] iarrayName)
                     | _ -> brace (loopLine indNames.[i] iMins.[i] (String.concat "" [iarrayName; indNames.[i-1]]))
                 let iline =
-                    if i = 0 then                     tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; index iarrayName indNames.[i]; ";\n"]]
-                    else                              tab [String.concat "" ["auto "; iarrayName; indNames.[i]; " = "; (index (String.concat "" [iarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
+                    let pre = String.concat "" ["promote<"; iarrayType; ", "; string (iarrayLevels-i-1); ">::type "; iarrayName; indNames.[i]; " = "]
+                    if i = 0 then                     tab [String.concat "" [pre; index iarrayName indNames.[i]; ";\n"]]
+                    else                              tab [String.concat "" [pre; (index (String.concat "" [iarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
                 let oline =
-                    if i = 0 && i < oarrayLevels then tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; index oarrayName indNames.[i]; ";\n"]]
-                    else if i < oarrayLevels then     tab [String.concat "" ["auto "; oarrayName; indNames.[i]; " = "; (index (String.concat "" [oarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
+                    let pre = String.concat "" ["promote<"; oarrayType; ", "; string (oarrayLevels-i-1);  ">::type "; oarrayName; indNames.[i]; " = "]
+                    if i = 0 && i < oarrayLevels then tab [String.concat "" [pre; index oarrayName indNames.[i]; ";\n"]]
+                    else if i < oarrayLevels then     tab [String.concat "" [pre; (index (String.concat "" [oarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
                     else                              []
                 fun x -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; iline; oline; tab x; [braced.[1]] ]
         )
@@ -298,24 +305,29 @@ module NestedLoop =
         |> List.fold (fun acc elem -> elem acc) inner
 
     /// Autogenerate an N-ary nested_for loop.
-    /// <param name="arrayNames"> Variable names. </param>
+    /// <param name="iarrayNames"> Input variable names. </param>
+    /// <param name="oarrayName"> Output variable name. </param>
+    /// <param name="iarrayTypes"> Input variable value types. </param>
+    /// <param name="oarrayType"> Output variable value type. </param>
+    /// <param name="iarrayLevels"> Number of input array dimensions to iterate over for each input array. </param>
+    /// <param name="oarrayLevels"> Number of output array dimensions to iterate over. </param>
     /// <param name="indNames"> Iterator minimum names. </param>
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let private naryLoop (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+    let private naryLoop (iarrayNames: string list) (iarrayTypes: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayType: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
         assert (iarrayNames.Length = indNames.Length)
         assert (iarrayNames.Length = iMins.Length)
         assert (iarrayNames.Length = ompLevels.Length)
 
-        let rec naryLoop' (iarrayNames: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+        let rec naryLoop' (iarrayNames: string list) (iarrayTypes: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayType: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
             match iarrayNames with
             | [] -> failwith "Empty array names list."
-            | [head]       -> [(fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head)]
-            | head :: tail ->  (fun i -> unaryLoop iarrayNames.Head iarrayLevels.Head oarrayName oarrayLevels indNames.Head iMins.Head i ompLevels.Head) ::
-                                         naryLoop' iarrayNames.Tail iarrayLevels.Tail oarrayName (oarrayLevels - iarrayLevels.Head) indNames.Tail iMins.Tail inner ompLevels.Tail
+            | [head]       -> [(fun i -> unaryLoop iarrayNames.Head iarrayTypes.Head iarrayLevels.Head oarrayName oarrayType oarrayLevels indNames.Head iMins.Head i ompLevels.Head)]
+            | head :: tail ->  (fun i -> unaryLoop iarrayNames.Head iarrayTypes.Head iarrayLevels.Head oarrayName oarrayType oarrayLevels indNames.Head iMins.Head i ompLevels.Head) ::
+                                         naryLoop' iarrayNames.Tail iarrayTypes.Tail iarrayLevels.Tail oarrayName oarrayType (oarrayLevels - iarrayLevels.Head) indNames.Tail iMins.Tail inner ompLevels.Tail
 
-        naryLoop' iarrayNames iarrayLevels oarrayName oarrayLevels indNames iMins inner ompLevels
+        naryLoop' iarrayNames iarrayTypes iarrayLevels oarrayName oarrayType oarrayLevels indNames iMins inner ompLevels
         |> List.rev
         |> List.fold (fun acc elem -> elem acc) inner
 
@@ -370,7 +382,7 @@ module NestedLoop =
         let subbedInner = func.Inner |> subInner (subINames :: [subOName])
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp.Head | None -> 0
-        let ret = unaryLoop func.INames.Head ilevels func.OName (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins subbedInner ompLevels
+        let ret = unaryLoop func.INames.Head iarray.Type ilevels func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins subbedInner ompLevels
         ret, lastArrayNames [iarray] oarray func
 
     /// Autogenerate an N-ary nested_for loop.
@@ -388,7 +400,7 @@ module NestedLoop =
         let subbedInner = func.Inner |> subInner (subINames @ [subOName])
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp | None -> (List.init iarrays.Length (fun i -> 0))
-        let ret = naryLoop func.INames ilevels func.OName (oarray.Rank - func.ORank) (indNames 0 ilevels) imins subbedInner ompLevels
+        let ret = naryLoop func.INames (iarrays |> List.map (fun x -> x.Type)) ilevels func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 ilevels) imins subbedInner ompLevels
         ret, lastArrayNames iarrays oarray func
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
@@ -824,17 +836,17 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let templateTypes =
         arity |> List.map (fun a ->
-            List.init a (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1); ", const int* ISYM"; string (i+1)])
-            |> fun x -> x @ ["typename OTYPE, const int ORANK, const int* OSYM"]
+            List.init a (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1)])
+            |> fun x -> x @ ["typename OTYPE, const int ORANK"]
             |> withCommas
             |> stringCollapse ""
         )
 
     let templateArgTypes =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
-            List.init a (fun i -> String.concat "" ["nested_array_t<ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1); "> "; names.[i]])
+            List.init a (fun i -> String.concat "" ["promote<ITYPE"; string (i+1); ", IRANK"; string (i+1); ">::type "; names.[i]])
             |> withCommas
-            |> fun x -> x @ [", nested_array_t<OTYPE, ORANK, OSYM> "; oloop.GetFunc.OName]
+            |> fun x -> x @ [", promote<OTYPE, ORANK>::type "; oloop.GetFunc.OName]
             |> stringCollapse ""
         )
 
@@ -857,12 +869,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let tSpecArgs =
         List.init numCalls (fun i ->
             List.init (arity.[i]+1) (fun j ->
-                (types.[i].[j], ranks.[i].[j], symms.[i].[j])
-                |||> fun x y z ->
-                    if z = "nullptr" then
-                        ["nested_array_t<"; x; ", "; y; ", nullptr> "; names.[i].[j]]
-                    else
-                        ["nested_array_t<"; x; ", "; y; ", "; z; "> "; names.[i].[j]]
+                (types.[i].[j], ranks.[i].[j])
+                ||> fun x y -> ["promote<"; x; ", "; y; ">::type "; names.[i].[j]]
                 |> stringCollapse ""
             ) |> (withCommas >> stringCollapse "")
         )
@@ -962,16 +970,16 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let onames = mloop.funcs  |> List.map (fun x -> x.OName)
 
     let templateTypes =
-        List.init arity (fun i -> String.concat "" ["ITYPE"; string (i+1); ", IRANK"; string (i+1); ", ISYM"; string (i+1)])
-        |> (@) ["OTYPE, ORANK, OSYM"]
+        List.init arity (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1)])
+        |> (@) ["typename OTYPE, const int ORANK"]
         |> withCommas
         |> stringCollapse ""
 
     let templateArgTypes =
         List.init numCalls (fun i ->
-            List.init arity (fun j -> String.concat "" ["nested_array_t<ITYPE"; string (j+1); ", IRANK"; string (j+1); ", ISYM"; string (j+1); "> "; inames.[i].[j]])
+            List.init arity (fun j -> String.concat "" ["promote<ITYPE"; string (j+1); ", IRANK"; string (j+1); ">::type "; inames.[i].[j]])
             |> withCommas
-            |> fun x -> x @ [", nested_array_t<OTYPE, ORANK, OSYM> "; onames.[i]]
+            |> fun x -> x @ [", promote<OTYPE, ORANK>::type "; onames.[i]]
             |> stringCollapse ""
         )
 
@@ -993,12 +1001,8 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let tSpecArgs =
         List.init numCalls (fun i ->
             List.init (arity+1) (fun j ->
-                (types.[i].[j], ranks.[i].[j], symms.[i].[j])
-                |||> fun x y z ->
-                    if z = "nullptr" then
-                        ["nested_array_t<"; x; ", "; y; ", nullptr> "; names.[i].[j]]
-                    else
-                        ["nested_array_t<"; x; ", "; y; ", "; z; "> "; names.[i].[j]]
+                (types.[i].[j], ranks.[i].[j])
+                ||> fun x y -> ["promote<"; x; ", "; y; ">::type "; names.[i].[j]]
                 |> stringCollapse ""
             ) |> (withCommas >> stringCollapse "")
         )
@@ -1061,9 +1065,7 @@ let lex (tokens: Token list) =
         |> stringCollapse "\n\n"
 
     let arraySwaps =
-        arrays
-        |> List.map (fun x -> if x.Symm.IsSome then String.concat "" [", "; x.Name; "_symm"] else ", nullptr")
-        |> fun x -> List.init arrays.Length (fun i -> String.concat "" ["nested_array_t<"; arrays.[i].Type; ", "; string arrays.[i].Rank; x.[i]; "> "; arrays.[i].Name; ";\n"])
+        List.init arrays.Length (fun i -> String.concat "" ["promote<"; arrays.[i].Type; ", "; string arrays.[i].Rank; ">::type "; arrays.[i].Name; ";\n"])
 
     let rec deleteFunctionPragmas (tokens: Token list) =
         let rec deleteFrom = function
@@ -1101,16 +1103,66 @@ let lex (tokens: Token list) =
     let callBounds = (FPositions, LPositions) ||> List.map2 (fun f l -> seq{f..l})
     //let a = callBounds |> List.map (fun x -> x |> Seq.toList |> List.map (fun y -> tokens.[y]))
 
-    // This won't work if template type deduction fails; may need a more sophisticated solution using the tSpec routines in the templating functions
     let oloopCallSwaps =
-        let names = oloops |> List.map (fun x -> x.Init)
-        let args = oloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> (fst3 x.Call.[i]) @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
-        (names, args) ||> List.map2 (fun x y -> y |> List.map (fun z -> String.concat "" [x; "("; z; ");\n"]))
+        List.init oloops.Length (fun i ->
+            let name = oloops.[i].Init
+            let args = List.init oloops.[i].Call.Length (fun j -> (fst3 oloops.[i].Call.[j]) @ [snd3 oloops.[i].Call.[j]]) |> List.map withCommas |> List.map (stringCollapse "")
+
+            let arity =
+                match oloops.[i].GetFunc.Arity with
+                | Some a -> List.init oloops.[i].Call.Length (fun i -> a)
+                | None   -> oloops.[i].iarrays |> List.map (fun x -> x.Length)
+
+            let itype = oloops.[i].iarrays |> List.map (List.map (fun y -> y.Type))
+            let otype = oloops.[i].oarrays |> List.map (fun x -> x.Type)
+            let irank = oloops.[i].iarrays |> List.map (List.map (fun y -> y.Rank))
+            let orank = oloops.[i].oarrays |> List.map (fun x -> x.Rank)
+            let isymm = oloops.[i].iarrays |> List.map (List.map symmVecName)
+            let osymm = oloops.[i].oarrays |> List.map symmVecName
+
+            let ranks = (irank, orank) ||> List.map2 (fun x y -> (x |> List.map string) @ [string y])
+            let types = (itype, otype) ||> List.map2 (fun x y -> x @ [y])
+            let symms = (isymm, osymm) ||> List.map2 (fun x y -> x @ [y])
+
+            let tSpecTypes =
+                List.init oloops.[i].Call.Length (fun i ->
+                    List.init (arity.[i]+1) (fun j ->
+                        [types.[i].[j]; ranks.[i].[j]; symms.[i].[j]]
+                        |> (withCommas >> stringCollapse "")
+                    ) |> (withCommas >> stringCollapse "")
+                )
+
+            List.init oloops.[i].Call.Length (fun j -> String.concat "" [name; "<"; tSpecTypes.[i]; ">"; "("; args.[i]; ");\n"])
+        )
 
     let mloopCallSwaps =
-        let names = mloops |> List.map (fun x -> x.Call |> List.map fst3)
-        let args = mloops |> List.map (fun x -> (List.init x.Call.Length (fun i -> x.Init @ [snd3 x.Call.[i]])) |> List.map withCommas |> List.map (stringCollapse ""))
-        (names, args) ||> List.map2 (List.map2 (fun x y -> String.concat "" [x; "("; y; ");\n"]))
+        List.init mloops.Length (fun i ->
+            let names = mloops.[i].Call |> List.map fst3
+            let args = List.init mloops.[i].Call.Length (fun i -> mloops.[i].Init @ [snd3 mloops.[i].Call.[i]]) |> List.map withCommas |> List.map (stringCollapse "")
+
+            let arity = mloops.[i].funcs.[1].Arity |> Option.get // hack
+
+            let itype = mloops.[i].iarrays |> List.map (fun x -> x.Type)
+            let otype = mloops.[i].oarrays |> List.map (fun x -> x.Type)
+            let irank = mloops.[i].iarrays |> List.map (fun x -> x.Rank)
+            let orank = mloops.[i].oarrays |> List.map (fun x -> x.Rank)
+            let isymm = mloops.[i].iarrays |> List.map symmVecName
+            let osymm = mloops.[i].oarrays |> List.map symmVecName
+
+            let ranks = orank |> List.map (fun y -> (irank |> List.map string) @ [string y])
+            let types = otype |> List.map (fun y -> itype @ [y])
+            let symms = osymm |> List.map (fun y -> isymm @ [y])
+
+            let tSpecTypes =
+                List.init mloops.[i].Call.Length (fun i ->
+                    List.init (arity+1) (fun j ->
+                        [types.[i].[j]; ranks.[i].[j]; symms.[i].[j]]
+                        |> (withCommas >> stringCollapse "")
+                    ) |> (withCommas >> stringCollapse "")
+                )
+
+            List.init mloops.[i].Call.Length (fun j -> String.concat "" [names.[i]; "("; args.[i]; ");\n"])
+        )
 
     let callSwaps = (oloopCallSwaps @ mloopCallSwaps) |> List.reduce (@) |> List.map tokenize
 
