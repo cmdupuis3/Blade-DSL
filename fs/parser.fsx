@@ -550,14 +550,17 @@ let rec toElements s =
 /// Pattern for method_for loops and all their calls
 let rec (|MethodLoopPattern|_|) (position: int) = function
     | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
-        let elements, tokens = toElements tail
-        let iarrays = tokenToStr elements
+        let args, tokens = toElements tail
+        let nArgs = args.Length / 2
+        let iarrays, exts = args |> tokenToStr |> List.splitAt nArgs
+
         let rec findCalls tokens' position' =
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop -> (func, oarray, position'-1) :: findCalls tail' (position' + 7)
+            | lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ',' :: Token.Str oarray :: Token.Symbol ',' :: Token.Str exto :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
+                (func, oarray, position') :: findCalls tail' (position' + 8)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
-        let lposition = position + 4 + (2*elements.Length)
+        let lposition = position + 4 + (2*args.Length)
         let calls =
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens') lposition
@@ -594,9 +597,12 @@ let rec (|ObjectLoopPattern|_|) (position: int) = function
     | loop :: Token.Symbol '=' :: Token.Str "object_for" :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
         let rec findCalls tokens' position' =
             match tokens' with
-            | Token.Str oarray :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: tail' when lname = loop ->
-                let iarrays, t = toElements tail'
-                (tokenToStr iarrays, oarray, position') :: findCalls t (position' + 4 + (2*iarrays.Length))
+            | lname :: Token.Symbol '(' :: tail' when lname = loop ->
+                let args, t = toElements tail'
+                let nArgs = args.Length / 2
+                let arrs, exts = args |> tokenToStr |> List.splitAt nArgs
+                let iarrays, oarray = arrs |> List.rev |> fun x -> (x |> (List.tail >> List.rev), x |> List.head)
+                (iarrays, oarray, position') :: findCalls t (position' + 2 + (2*args.Length))
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 6
@@ -1022,12 +1028,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
     |> List.distinct
 
 
-
-
-
-
-
-let lex (tokens: Token list) =
+let parse (tokens: Token list) =
 
     // Scan for loop API calls and create loop state machines
     let mloops = scanMethodLoops tokens //mloops |> List.map (fun x -> x.Call) |> List.reduce (@) |> List.map thd3 |> List.map (fun x -> tokens.[x])
@@ -1138,7 +1139,7 @@ let lex (tokens: Token list) =
     let mloopCallSwaps =
         List.init mloops.Length (fun i ->
             let names = mloops.[i].Call |> List.map fst3
-            let args = List.init mloops.[i].Call.Length (fun i -> mloops.[i].Init @ [snd3 mloops.[i].Call.[i]]) |> List.map withCommas |> List.map (stringCollapse "")
+            let args = List.init mloops.[i].Call.Length (fun j -> mloops.[i].Init @ [snd3 mloops.[i].Call.[j]]) |> List.map withCommas |> List.map (stringCollapse "")
 
             let arity = mloops.[i].funcs.[1].Arity |> Option.get // hack
 
@@ -1161,7 +1162,7 @@ let lex (tokens: Token list) =
                     ) |> (withCommas >> stringCollapse "")
                 )
 
-            List.init mloops.[i].Call.Length (fun j -> String.concat "" [names.[i]; "("; args.[i]; ");\n"])
+            List.init mloops.[i].Call.Length (fun j -> String.concat "" [names.[i]; "<"; tSpecTypes.[i]; ">"; "("; args.[i]; ");\n"])
         )
 
     let callSwaps = (oloopCallSwaps @ mloopCallSwaps) |> List.reduce (@) |> List.map tokenize
@@ -1196,7 +1197,7 @@ let main args =
 
     File.ReadAllText iFileName
     |> tokenize
-    |> lex
+    |> parse
     |> fun x -> File.WriteAllText (oFileName, x)
 
     0
@@ -1263,26 +1264,24 @@ int main(){
     promote<float, 3>::type voarray;
 
     auto oloop = object_for(sumThenMultiply);
-    auto ooarray = oloop(array1, array1, array3);
+    oloop(array1, array1, array3, ooarray, a, b, c, d);
 
-    auto mloop = method_for(array1, array1, array3);
-    auto moarray = mloop(sumThenMultiply);
-    auto moarray2 = mloop(divideThenSum);
+    auto mloop = method_for(array1, array1, array3, a, b, c);
+    mloop(sumThenMultiply, moarray, e);
+    mloop(divideThenSum, moarray2, f);
 
     auto oloopv = object_for(sinThenProduct);
-    auto voarray = oloopv(array3, array3);
+    oloopv(array3, array3, voarray, g, h, i);
 
 
-    auto ooarray = oloop(array1, array1, array3);
-    auto moarray = mloop(sumThenMultiply);
-    auto moarray2 = mloop(divideThenSum);
-    auto voarray = oloopv(array3, array3);
-
-
-    auto newfunc = pipe(sumThenMultiply, add10);
+    oloop(array1, array1, array3, ooarray, a, b, c, d);
+    mloop(sumThenMultiply, moarray, e);
+    mloop(divideThenSum, moarray2, f);
+    oloopv(array3, array3, voarray, g, h, i);
 
     return 0;
 }"""
 
-code |> tokenize |> lex;;
+let tokens = code |> tokenize
+tokens |> parse;;
 *)
