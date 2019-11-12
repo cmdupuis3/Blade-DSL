@@ -19,7 +19,7 @@ static constexpr const int extents[4] = {5,5,5,5};
 int main() {
 	srand(time(NULL));
 
-    #pragma edgi array symmetry(1,1,1,1)
+    #pragma edgi array symmetry(1,1,1,2)
     float~4 a1;
 
     #pragma edgi array
@@ -28,25 +28,19 @@ int main() {
     #pragma edgi array
     float~4 a3;
 
-    #pragma edgi array
+    #pragma edgi array symmetry(1,1,1,2)
     float~4 res;
 
     typedef promote<float, 4>::type float4;
 
-    float4 a1_vals = allocate<float4, extents, a1_symm>();
-    float4 a2_vals = allocate<float4, extents, nullptr>();
-    float4 a3_vals = allocate<float4, extents, nullptr>();
-    fold<float4, extents, a1_symm>(a1_vals);
+    a1  = allocate<float4, extents, a1_symm>();
+    a2  = allocate<float4, extents, nullptr>();
+    a3  = allocate<float4, extents, nullptr>();
+    res = allocate<float4, extents, a1_symm>();
 
     fill_random<float4, extents>(a1_vals, 10);
     fill_random<float4, extents>(a2_vals, 10);
     fill_random<float4, extents>(a3_vals, 10);
-
-    a1  = nested_array_t<float, 4, a1_symm>(extents, a1_vals);
-    a2  = nested_array_t<float, 4, nullptr>(extents, a2_vals);
-    a3  = nested_array_t<float, 4, nullptr>(extents, a3_vals);
-    res = nested_array_t<float, 4, nullptr>(extents, allocate<float4, extents, nullptr>());
-
 
     auto oloop = object_for(func);
     auto res = oloop(a1, a2, a3);
