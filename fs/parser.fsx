@@ -840,29 +840,33 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let onames =  List.init numCalls (fun i -> oloop.GetFunc.OName)
 
+    let ranks = (irank, orank) ||> List.map2 (fun x y -> (x |> List.map string) @ [string y])
+    let types = (itype, otype) ||> List.map2 (fun x y -> x @ [y])
+    let symms = (isymm, osymm) ||> List.map2 (fun x y -> x @ [y])
+    let names = (inames, onames) ||> List.map2 (fun x y -> x @ [y])
+
     let templateTypes =
         arity |> List.map (fun a ->
-            List.init a (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1)])
-            |> fun x -> x @ ["typename OTYPE, const int ORANK"]
+            List.init a (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1); ", const int* ISYM"; string (i+1)])
+            |> fun x -> x @ ["typename OTYPE, const int ORANK, const int* OSYM"]
             |> withCommas
             |> stringCollapse ""
         )
 
     let templateArgTypes =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
-            List.init a (fun i -> String.concat "" ["promote<ITYPE"; string (i+1); ", IRANK"; string (i+1); ">::type "; names.[i]])
-            |> withCommas
-            |> fun x -> x @ [", promote<OTYPE, ORANK>::type "; oloop.GetFunc.OName]
+            (List.init a (fun i -> String.concat "" ["\n\ttypename promote<ITYPE"; string (i+1); ", IRANK"; string (i+1); ">::type "; names.[i]])
+            |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; oloop.GetFunc.OName; ", "]]
+            |> withCommas)
+            @ (List.init a (fun i -> String.concat "" ["\n\tconst int "; names.[i]; "_extents[IRANK"; string (i+1); "]"])
+            |> fun x -> x @ [String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"]]
+            |> withCommas)
             |> stringCollapse ""
         )
 
     let aritySuffix = List.init numCalls (fun i -> if oloop.GetFunc.Arity.IsNone then String.concat "" ["_arity"; string arity.[i]] else "")
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]]; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; aritySuffix.[i]; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
 
-    let ranks = (irank, orank) ||> List.map2 (fun x y -> (x |> List.map string) @ [string y])
-    let types = (itype, otype) ||> List.map2 (fun x y -> x @ [y])
-    let symms = (isymm, osymm) ||> List.map2 (fun x y -> x @ [y])
-    let names = (inames, onames) ||> List.map2 (fun x y -> x @ [y])
 
     let tSpecTypes =
         List.init numCalls (fun i ->
@@ -876,7 +880,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         List.init numCalls (fun i ->
             List.init (arity.[i]+1) (fun j ->
                 (types.[i].[j], ranks.[i].[j])
-                ||> fun x y -> ["promote<"; x; ", "; y; ">::type "; names.[i].[j]]
+                ||> fun x y -> ["\n\ttypename promote<"; x; ", "; y; ">::type "; names.[i].[j]]
                 |> stringCollapse ""
             ) |> (withCommas >> stringCollapse "")
         )
@@ -975,26 +979,30 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let inames = mloop.funcs  |> List.map (fun x -> x.INames)
     let onames = mloop.funcs  |> List.map (fun x -> x.OName)
 
+    let ranks = orank |> List.map (fun y -> (irank |> List.map string) @ [string y])
+    let types = otype |> List.map (fun y -> itype @ [y])
+    let symms = osymm |> List.map (fun y -> isymm @ [y])
+    let names = (inames, onames) ||> List.map2 (fun x y -> x @ [y])
+
     let templateTypes =
-        List.init arity (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1)])
-        |> (@) ["typename OTYPE, const int ORANK"]
+        List.init arity (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1); ", const int* ISYM"; string (i+1)])
+        |> (@) ["typename OTYPE, const int ORANK, const int* OSYM"]
         |> withCommas
         |> stringCollapse ""
 
     let templateArgTypes =
         List.init numCalls (fun i ->
-            List.init arity (fun j -> String.concat "" ["promote<ITYPE"; string (j+1); ", IRANK"; string (j+1); ">::type "; inames.[i].[j]])
-            |> withCommas
-            |> fun x -> x @ [", promote<OTYPE, ORANK>::type "; onames.[i]]
+            (List.init arity (fun j -> String.concat "" ["\n\ttypename promote<ITYPE"; string (j+1); ", IRANK"; string (j+1); ">::type "; inames.[i].[j]])
+            |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; onames.[i]]]
+            |> withCommas)
+            @ (List.init arity (fun j -> String.concat "" ["\n\tconst int "; inames.[i].[j]; "_extents[IRANK"; string (j+1); "]"])
+            |> fun x -> x @ [String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"]]
+            |> withCommas)
             |> stringCollapse ""
         )
 
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
-
-    let ranks = orank |> List.map (fun y -> (irank |> List.map string) @ [string y])
-    let types = otype |> List.map (fun y -> itype @ [y])
-    let symms = osymm |> List.map (fun y -> isymm @ [y])
-    let names = (inames, onames) ||> List.map2 (fun x y -> x @ [y])
+    let aritySuffix = if mloop.funcs.[0].Arity.IsNone then String.concat "" ["_arity"; string arity] else ""
+    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; aritySuffix; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
 
     let tSpecTypes =
         List.init numCalls (fun i ->
@@ -1008,7 +1016,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
         List.init numCalls (fun i ->
             List.init (arity+1) (fun j ->
                 (types.[i].[j], ranks.[i].[j])
-                ||> fun x y -> ["promote<"; x; ", "; y; ">::type "; names.[i].[j]]
+                ||> fun x y -> ["\n\ttypename promote<"; x; ", "; y; ">::type "; names.[i].[j]]
                 |> stringCollapse ""
             ) |> (withCommas >> stringCollapse "")
         )
@@ -1187,7 +1195,7 @@ let parse (tokens: Token list) =
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
         >> deleteLoopLines
-        >> (@) ["#include \"nested_array.cpp\"\n"]
+        //>> (@) ["#include \"nested_array.cpp\"\n"]
         >> stringCollapse "")
 
 
