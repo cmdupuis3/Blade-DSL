@@ -856,11 +856,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let templateArgTypes =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
             (List.init a (fun i -> String.concat "" ["\n\ttypename promote<ITYPE"; string (i+1); ", IRANK"; string (i+1); ">::type "; names.[i]])
-            |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; oloop.GetFunc.OName; ", "]]
-            |> withCommas)
+            |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; oloop.GetFunc.OName]])
             @ (List.init a (fun i -> String.concat "" ["\n\tconst int "; names.[i]; "_extents[IRANK"; string (i+1); "]"])
-            |> fun x -> x @ [String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"]]
-            |> withCommas)
+            |> fun x -> x @ [String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"]])
+            |> withCommas
             |> stringCollapse ""
         )
 
@@ -878,11 +877,13 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let tSpecArgs =
         List.init numCalls (fun i ->
-            List.init (arity.[i]+1) (fun j ->
-                (types.[i].[j], ranks.[i].[j])
-                ||> fun x y -> ["\n\ttypename promote<"; x; ", "; y; ">::type "; names.[i].[j]]
-                |> stringCollapse ""
-            ) |> (withCommas >> stringCollapse "")
+            (List.init (arity.[i]+1) (fun j ->
+                String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]]
+            ))
+            @ (List.init (arity.[i]+1) (fun j ->
+                String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"]
+            ))
+            |> (withCommas >> stringCollapse "")
         )
 
     let rec (|HeadPattern|_|) (iname: string) = function
@@ -986,18 +987,17 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let templateTypes =
         List.init arity (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1); ", const int* ISYM"; string (i+1)])
-        |> (@) ["typename OTYPE, const int ORANK, const int* OSYM"]
+        |> fun x -> x @ ["typename OTYPE, const int ORANK, const int* OSYM"]
         |> withCommas
         |> stringCollapse ""
 
     let templateArgTypes =
         List.init numCalls (fun i ->
             (List.init arity (fun j -> String.concat "" ["\n\ttypename promote<ITYPE"; string (j+1); ", IRANK"; string (j+1); ">::type "; inames.[i].[j]])
-            |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; onames.[i]]]
-            |> withCommas)
+            |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; onames.[i]]])
             @ (List.init arity (fun j -> String.concat "" ["\n\tconst int "; inames.[i].[j]; "_extents[IRANK"; string (j+1); "]"])
-            |> fun x -> x @ [String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"]]
-            |> withCommas)
+            |> fun x -> x @ [String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"]])
+            |> withCommas
             |> stringCollapse ""
         )
 
@@ -1014,11 +1014,13 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let tSpecArgs =
         List.init numCalls (fun i ->
-            List.init (arity+1) (fun j ->
-                (types.[i].[j], ranks.[i].[j])
-                ||> fun x y -> ["\n\ttypename promote<"; x; ", "; y; ">::type "; names.[i].[j]]
-                |> stringCollapse ""
-            ) |> (withCommas >> stringCollapse "")
+            (List.init (arity+1) (fun j ->
+                String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]]
+            ))
+            @ (List.init (arity+1) (fun j ->
+                String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"]
+            ))
+            |> (withCommas >> stringCollapse "")
         )
 
     let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] |> fst)
