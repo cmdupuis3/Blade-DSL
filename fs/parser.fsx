@@ -557,7 +557,7 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
         let rec findCalls tokens' position' =
             match tokens' with
             | lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ',' :: Token.Str oarray :: Token.Symbol ',' :: Token.Str exto :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
-                (func, oarray, position') :: findCalls tail' (position' + 8)
+                (func, oarray, position'-1) :: findCalls tail' (position' + 9)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 4 + (2*args.Length)
