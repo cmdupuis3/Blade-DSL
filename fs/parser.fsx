@@ -101,14 +101,14 @@ type NestedFunction =
       Inner: string list }
 
 /// Container for method_for loop information; able to recieve messages about array and function pragmas
-type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string * int) list, fposition: int, lposition: int)  =
+type MethodLoop (nameIn: string, initIn: string list * string list, callIn: (string * string * string * int) list, fposition: int, lposition: int)  =
     [<DefaultValue>] val mutable public iarrays: NestedArray list
     [<DefaultValue>] val mutable public oarrays: NestedArray list
     [<DefaultValue>] val mutable public funcs: NestedFunction list
 
     member this.Name = nameIn
-    member this.Init = initIn // iarrays
-    member this.Call = callIn // oarray, func, and call position
+    member this.Init = initIn // iarrays and their extents
+    member this.Call = callIn // func, oarray, its extents, and call position
     member this.FPosition = fposition // position of the first token of the init pattern
     member this.LPosition = lposition // position of the last token of the init pattern
 
@@ -117,14 +117,14 @@ type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string *
     member this.PushFunc (v: NestedFunction) = this.funcs <- this.funcs @ [v]
 
 /// Container for object_for loop information; able to recieve messages about array and function pragmas
-type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list) * string * int) list, fposition: int, lposition: int) =
+type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list * string list) * (string * string) * int) list, fposition: int, lposition: int) =
     [<DefaultValue>] val mutable public iarrays: NestedArray list list
     [<DefaultValue>] val mutable public oarrays: NestedArray list
     [<DefaultValue>] val mutable public func: NestedFunction list
 
     member this.Name = nameIn
     member this.Init = initIn // func
-    member this.Call = callIn // iarrays, oarray, and call position
+    member this.Call = callIn // iarrays and their extents, oarray and its extents, and call position
     member this.FPosition = fposition // position of the first token of the init pattern
     member this.LPosition = lposition // position of the last token of the init pattern
 
@@ -294,12 +294,7 @@ module NestedLoop =
                     let pre = String.concat "" ["promote<"; iarrayType; ", "; string (iarrayLevels-i-1); ">::type "; iarrayName; indNames.[i]; " = "]
                     if i = 0 then                     tab [String.concat "" [pre; index iarrayName indNames.[i]; ";\n"]]
                     else                              tab [String.concat "" [pre; (index (String.concat "" [iarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
-                let oline =
-                    let pre = String.concat "" ["promote<"; oarrayType; ", "; string (oarrayLevels-i-1);  ">::type "; oarrayName; indNames.[i]; " = "]
-                    if i = 0 && i < oarrayLevels then tab [String.concat "" [pre; index oarrayName indNames.[i]; ";\n"]]
-                    else if i < oarrayLevels then     tab [String.concat "" [pre; (index (String.concat "" [oarrayName; indNames.[i-1]]) indNames.[i]); ";\n"]]
-                    else                              []
-                fun x -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; iline; oline; tab x; [braced.[1]] ]
+                fun x -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; iline; tab x; [braced.[1]] ]
         )
         |> List.rev
         |> List.fold (fun acc elem -> elem acc) inner
@@ -553,11 +548,10 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
         let args, tokens = toElements tail
         let nArgs = args.Length / 2
         let iarrays, exts = args |> tokenToStr |> List.splitAt nArgs
-
         let rec findCalls tokens' position' =
             match tokens' with
             | lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ',' :: Token.Str oarray :: Token.Symbol ',' :: Token.Str exto :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
-                (func, oarray, position'-1) :: findCalls tail' (position' + 9)
+                (func, oarray, exto, position'-1) :: findCalls tail' (position' + 9)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 4 + (2*args.Length)
@@ -565,7 +559,7 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens') lposition
             | _ -> []
-        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls, position-1, lposition)
+        let out = MethodLoop((tokenToStr [loop]).Head, (iarrays, exts), calls, position-1, lposition)
         out.iarrays <- []
         out.oarrays <- []
         out.funcs <- []
@@ -602,7 +596,8 @@ let rec (|ObjectLoopPattern|_|) (position: int) = function
                 let nArgs = args.Length / 2
                 let arrs, exts = args |> tokenToStr |> List.splitAt nArgs
                 let iarrays, oarray = arrs |> List.rev |> fun x -> (x |> (List.tail >> List.rev), x |> List.head)
-                (iarrays, oarray, position') :: findCalls t (position' + 2 + (2*args.Length))
+                let exti, exto = arrs |> List.rev |> fun x -> (x |> (List.tail >> List.rev), x |> List.head)
+                ((iarrays, exti), (oarray, exto), position') :: findCalls t (position' + 2 + (2*args.Length))
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 6
@@ -751,29 +746,33 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
 let fst3 (c, _, _) = c
 let snd3 (_, c, _) = c
 let thd3 (_, _, c) = c
+let fst4 (c, _, _, _) = c
+let snd4 (_, c, _, _) = c
+let thd4 (_, _, c, _) = c
+let fth4 (_, _, _, c) = c
 
 /// Message-passing function for sending info about array pragmas to nested loop objects
 let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
     for i in 0..mloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
         for j in 0..arrays.Length-1 do
-            for k in 0..mloops.[i].Init.Length-1 do
-                if mloops.[i].Init.[k] = arrays.[j].Name then
+            for k in 0..(fst mloops.[i].Init).Length-1 do
+                if (fst mloops.[i].Init).[k] = arrays.[j].Name then
                     mloops.[i].PushIarray arrays.[j]
             for k in 0..mloops.[i].Call.Length-1 do
-                if snd3 mloops.[i].Call.[k] = arrays.[j].Name then
+                if snd4 mloops.[i].Call.[k] = arrays.[j].Name then
                     mloops.[i].PushOarray arrays.[j]
     for i in 0..oloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
         for j in 0..oloops.[i].Call.Length-1 do
             let mutable itemp = []
-            for l in 0..(fst3 oloops.[i].Call.[j]).Length-1 do
+            for l in 0..(oloops.[i].Call.[j] |> fst3 |> fst).Length-1 do
                 for k in 0..arrays.Length-1 do
-                    if (fst3 oloops.[i].Call.[j]).[l] = arrays.[k].Name then
+                    if (oloops.[i].Call.[j] |> fst3 |> fst).[l] = arrays.[k].Name then
                         itemp <- itemp @ [arrays.[k]]
             oloops.[i].PushIarrays itemp
             for k in 0..arrays.Length-1 do
-                if snd3 oloops.[i].Call.[j] = arrays.[k].Name then
+                if (oloops.[i].Call.[j] |> snd3 |> fst) = arrays.[k].Name then
                     oloops.[i].PushOarray arrays.[k]
 
 /// Message-passing function for sending info about function pragmas to nested loop objects
@@ -782,7 +781,7 @@ let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) 
     for i in 0..mloops.Length-1 do
         for j in 0..funcs.Length-1 do
             for k in 0..mloops.[i].Call.Length-1 do
-                if fst3 mloops.[i].Call.[k] = funcs.[j].Name then
+                if fst4 mloops.[i].Call.[k] = funcs.[j].Name then
                     mloops.[i].PushFunc funcs.[j]
     for i in 0..oloops.Length-1 do
         for j in 0..funcs.Length-1 do
@@ -1104,7 +1103,7 @@ let parse (tokens: Token list) =
         | [] -> pre |> tokenToStr |> respace |> reconcat |> newln
         substitute' [] tokens
 
-    let FPositions = (oloops |> List.map (fun x -> x.Call |> List.map thd3)) @ (mloops |> List.map (fun x -> x.Call |> List.map thd3)) |> List.reduce (@)
+    let FPositions = (oloops |> List.map (fun x -> x.Call |> List.map thd3)) @ (mloops |> List.map (fun x -> x.Call |> List.map fth4)) |> List.reduce (@)
     let LPositions =
         FPositions |> List.map (fun y ->
             tokens.[y..]
@@ -1117,7 +1116,7 @@ let parse (tokens: Token list) =
     let oloopCallSwaps =
         List.init oloops.Length (fun i ->
             let name = oloops.[i].Init
-            let args = List.init oloops.[i].Call.Length (fun j -> (fst3 oloops.[i].Call.[j]) @ [snd3 oloops.[i].Call.[j]]) |> List.map withCommas |> List.map (stringCollapse "")
+            let args = List.init oloops.[i].Call.Length (fun j -> (oloops.[i].Call.[j] |> fst3 |> fst) @ [oloops.[i].Call.[j] |> snd3 |> fst]) |> List.map withCommas |> List.map (stringCollapse "")
 
             let arity =
                 match oloops.[i].GetFunc.Arity with
@@ -1148,8 +1147,8 @@ let parse (tokens: Token list) =
 
     let mloopCallSwaps =
         List.init mloops.Length (fun i ->
-            let names = mloops.[i].Call |> List.map fst3
-            let args = List.init mloops.[i].Call.Length (fun j -> mloops.[i].Init @ [snd3 mloops.[i].Call.[j]]) |> List.map withCommas |> List.map (stringCollapse "")
+            let names = mloops.[i].Call |> List.map fst4
+            let args = List.init mloops.[i].Call.Length (fun j -> fst mloops.[i].Init @ [snd4 mloops.[i].Call.[j]]) |> List.map withCommas |> List.map (stringCollapse "")
 
             let arity = mloops.[i].funcs.[1].Arity |> Option.get // hack
 
