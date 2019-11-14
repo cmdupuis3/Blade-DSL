@@ -341,17 +341,12 @@ module NestedLoop =
                     |> fun x -> String.concat "" [func.INames.[i]; x]
             )
 
-        let rec getOName (inds: string list list) (ctr: int) =
-            let rec getOName' (inds: string list list) (ctr: int) =
-                if ctr = 0 then
-                    String.concat "" [func.OName; inds.[0].[0]]
-                else
-                    if inds.Head.Tail.IsEmpty then
-                        getOName' (inds.Tail) (ctr - 1)
-                    else
-                        getOName' (inds.Head.Tail :: inds.Tail) (ctr - 1)
-            if ctr = 0 then oarray.Name else getOName' inds (ctr-1)
-        let oName = getOName inds (oarray.Rank - func.ORank)
+        let oName =
+            seq{1..(oarray.Rank - func.ORank)}
+            |> Seq.toList
+            |> List.map (fun x y -> String.concat "" [y; "[__i"; string (x-1); "]"])
+            |> List.reduce (>>)
+            |> fun x -> x func.OName
 
         iNames, oName
 
