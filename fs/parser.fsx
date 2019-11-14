@@ -247,9 +247,10 @@ module NestedLoop =
     /// Generates a single "for(...)" statement.
     /// <param name="iName"> Iterator name. </param>
     /// <param name="iMin"> Iterator minimum name. </param>
-    /// <param name="arrayName"> Previous variable name. </param>
-    let private loopLine iName iMin arrayName =
-        String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; arrayName; ".current_extent(); "; iName; "++)";]
+    /// <param name="extentName"> Extent vector name. </param>
+    /// <param name="extentIndex"> Element of extent vector to use as iterator maximum. </param>
+    let private loopLine iName iMin extentName extentIndex =
+        String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; extentName; "["; extentIndex; "]; "; iName; "++)";]
 
     /// Generates a call to operator().
     /// <param name="arrayName"> Variable name. </param>
@@ -275,21 +276,22 @@ module NestedLoop =
     /// <param name="oarrayType"> Output variable value type. </param>
     /// <param name="iarrayLevels"> Number of input array dimensions to iterate over. </param>
     /// <param name="oarrayLevels"> Number of output array dimensions to iterate over. </param>
+    /// <param name="iExtents"> An extent vector names corresponding to iarray. </param>
+    /// <param name="oExtents"> An extent vector names corresponding to oarray. </param>
     /// <param name="indNames"> Iterator minimum names. </param>
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let private unaryLoop (iarrayName: string) (iarrayType: string) (iarrayLevels: int) (oarrayName: string) (oarrayType: string) (oarrayLevels: int) (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
+    let private unaryLoop (iarrayName: string) (iarrayType: string) (iarrayLevels: int) (iExtents: string)
+                          (oarrayName: string) (oarrayType: string) (oarrayLevels: int)
+                          (indNames: string list) (iMins: string list) (inner: string list) (ompLevels: int) =
         assert (iarrayLevels = indNames.Length)
         assert (iarrayLevels = iMins.Length)
 
         List.init iarrayLevels (
             fun i ->
                 let ompline = if ompLevels > i then [ompLine indNames.[i]] else []
-                let braced =
-                    match i with
-                    | 0 -> brace (loopLine indNames.[i] iMins.[i] iarrayName)
-                    | _ -> brace (loopLine indNames.[i] iMins.[i] (String.concat "" [iarrayName; indNames.[i-1]]))
+                let braced = brace (loopLine indNames.[i] iMins.[i] iExtents (string i))
                 let iline =
                     let pre = String.concat "" ["promote<"; iarrayType; ", "; string (iarrayLevels-i-1); ">::type "; iarrayName; indNames.[i]; " = "]
                     if i = 0 then                     tab [String.concat "" [pre; index iarrayName indNames.[i]; ";\n"]]
@@ -297,7 +299,7 @@ module NestedLoop =
                 fun x -> List.concat [ newln [declLine "int" indNames.[i]]; newln ompline; [braced.[0]]; iline; tab x; [braced.[1]] ]
         )
         |> List.rev
-        |> List.fold (fun acc elem -> elem acc) inner
+        |> List.fold (|>) inner
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="iarrayNames"> Input variable names. </param>
@@ -306,25 +308,31 @@ module NestedLoop =
     /// <param name="oarrayType"> Output variable value type. </param>
     /// <param name="iarrayLevels"> Number of input array dimensions to iterate over for each input array. </param>
     /// <param name="oarrayLevels"> Number of output array dimensions to iterate over. </param>
+    /// <param name="iExtents"> A list of extent vector names corresponding to iarrays. </param>
+    /// <param name="oExtents"> An extent vector name corresponding to oarray. </param>
     /// <param name="indNames"> Iterator minimum names. </param>
     /// <param name="iMins"> Iterator minimum names. </param>
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
-    let private naryLoop (iarrayNames: string list) (iarrayTypes: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayType: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+    let private naryLoop (iarrayNames: string list) (iarrayTypes: string list) (iarrayLevels: int list) (iExtents: string list)
+                         (oarrayName: string)       (oarrayType: string)       (oarrayLevels: int)
+                         (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
         assert (iarrayNames.Length = indNames.Length)
         assert (iarrayNames.Length = iMins.Length)
         assert (iarrayNames.Length = ompLevels.Length)
 
-        let rec naryLoop' (iarrayNames: string list) (iarrayTypes: string list) (iarrayLevels: int list) (oarrayName: string) (oarrayType: string) (oarrayLevels: int) (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
+        let rec naryLoop' (iarrayNames: string list) (iarrayTypes: string list) (iarrayLevels: int list) (iExtents: string list)
+                          (oarrayName: string)       (oarrayType: string)       (oarrayLevels: int)
+                          (indNames: string list list) (iMins: string list list) (inner: string list) (ompLevels: int list) =
             match iarrayNames with
             | [] -> failwith "Empty array names list."
-            | [head]       -> [(fun i -> unaryLoop iarrayNames.Head iarrayTypes.Head iarrayLevels.Head oarrayName oarrayType oarrayLevels indNames.Head iMins.Head i ompLevels.Head)]
-            | head :: tail ->  (fun i -> unaryLoop iarrayNames.Head iarrayTypes.Head iarrayLevels.Head oarrayName oarrayType oarrayLevels indNames.Head iMins.Head i ompLevels.Head) ::
-                                         naryLoop' iarrayNames.Tail iarrayTypes.Tail iarrayLevels.Tail oarrayName oarrayType (oarrayLevels - iarrayLevels.Head) indNames.Tail iMins.Tail inner ompLevels.Tail
+            | [head]       -> [(fun i -> unaryLoop iarrayNames.Head iarrayTypes.Head iarrayLevels.Head iExtents.Head oarrayName oarrayType oarrayLevels indNames.Head iMins.Head i ompLevels.Head)]
+            | head :: tail ->  (fun i -> unaryLoop iarrayNames.Head iarrayTypes.Head iarrayLevels.Head iExtents.Head oarrayName oarrayType oarrayLevels indNames.Head iMins.Head i ompLevels.Head) ::
+                                         naryLoop' iarrayNames.Tail iarrayTypes.Tail iarrayLevels.Tail iExtents.Tail oarrayName oarrayType (oarrayLevels - iarrayLevels.Head) indNames.Tail iMins.Tail inner ompLevels.Tail
 
-        naryLoop' iarrayNames iarrayTypes iarrayLevels oarrayName oarrayType oarrayLevels indNames iMins inner ompLevels
+        naryLoop' iarrayNames iarrayTypes iarrayLevels iExtents oarrayName oarrayType oarrayLevels indNames iMins inner ompLevels
         |> List.rev
-        |> List.fold (fun acc elem -> elem acc) inner
+        |> List.fold (|>) inner
 
     /// Find the final array names for a list of variables; useful when substituting into inner blocks.
     /// <param name="iarrays"> A list of input array classes. </param>
@@ -342,8 +350,7 @@ module NestedLoop =
             )
 
         let oName =
-            seq{1..(oarray.Rank - func.ORank)}
-            |> Seq.toList
+            [1..(oarray.Rank - func.ORank)]
             |> List.map (fun x y -> String.concat "" [y; "[__i"; string (x-1); "]"])
             |> List.reduce (>>)
             |> fun x -> x func.OName
@@ -372,7 +379,8 @@ module NestedLoop =
         let subbedInner = func.Inner |> subInner (subINames :: [subOName])
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp.Head | None -> 0
-        let ret = unaryLoop func.INames.Head iarray.Type ilevels func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins subbedInner ompLevels
+        let iExtents = String.concat "" [func.INames.Head; "_extents"]
+        let ret = unaryLoop func.INames.Head iarray.Type ilevels iExtents func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins subbedInner ompLevels
         ret, lastArrayNames [iarray] oarray func
 
     /// Autogenerate an N-ary nested_for loop.
@@ -390,7 +398,8 @@ module NestedLoop =
         let subbedInner = func.Inner |> subInner (subINames @ [subOName])
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp | None -> (List.init iarrays.Length (fun i -> 0))
-        let ret = naryLoop func.INames (iarrays |> List.map (fun x -> x.Type)) ilevels func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 ilevels) imins subbedInner ompLevels
+        let iExtents = func.INames |> List.map (fun x -> String.concat "" [x; "_extents"])
+        let ret = naryLoop func.INames (iarrays |> List.map (fun x -> x.Type)) ilevels iExtents func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 ilevels) imins subbedInner ompLevels
         ret, lastArrayNames iarrays oarray func
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
