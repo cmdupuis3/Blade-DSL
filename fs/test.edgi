@@ -5,11 +5,12 @@ using std::cout;
 using std::endl;
 
 #include "nested_array_utilities.cpp"
+using namespace nested_array_utilities;
 
 
 #pragma edgi function(func) arity(3) input(in1, in2, in3) iranks(0,0,0) output(out) orank(0) ompLevels(1,1,0)
 {
-    out = (in1 + sin(in2)) * in3;
+    out = (in1 + in2) * in3;
 }
 
 
@@ -36,14 +37,15 @@ int main() {
     a1  = allocate<float4, extents, a1_symm>();
     a2  = allocate<float4, extents, nullptr>();
     a3  = allocate<float4, extents, nullptr>();
-    res = allocate<float4, extents, a1_symm>();
+    res = allocate<float4, extents, res_symm>();
 
-    fill_random<float4, extents>(a1_vals, 10);
-    fill_random<float4, extents>(a2_vals, 10);
-    fill_random<float4, extents>(a3_vals, 10);
+    fill_random<float4, extents>(a1, 10);
+    fill_random<float4, extents>(a2, 10);
+    fill_random<float4, extents>(a3, 10);
 
     auto oloop = object_for(func);
-    auto res = oloop(a1, a2, a3);
+    oloop(a1, a2, a3, res, extents, extents, extents, extents);
+
 
     for (int i = 0; i < 5; i++){
         for (int j = 0; j < 5; j++){
