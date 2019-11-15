@@ -1,0 +1,72 @@
+
+#include <cmath>
+#include <iostream>
+using std::cout;
+using std::endl;
+
+#include "nested_array_utilities.cpp"
+using namespace nested_array_utilities;
+
+#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) orank(0) ompLevels(1,1)
+{
+    int len = 5;
+    float mean1 = 0;
+    float mean2 = 0;
+    for (int i = 0; i < len; i++) {
+        mean1 += in1[i];
+    }
+    mean1 /= len;
+
+    for (int j = 0; j < len; j++) {
+        mean2 += in2[j];
+    }
+    mean2 /= len;
+
+    for (int i = 0; i < len; i++) {
+        for (int j = 0; j < len; j++) {
+            out += (in1[i] - mean1) * (in2[j] - mean2);
+        }
+    }
+    out /= len;
+}
+
+static constexpr const int extents2[2] = {5,5};
+
+int main() {
+	srand(time(NULL));
+
+    #pragma edgi array
+    float~2 a1;
+
+    #pragma edgi array
+    float~2 a2;
+
+    #pragma edgi array
+    float~2 res;
+
+    typedef promote<float, 2>::type float2;
+
+    a1  = allocate<float2, extents2, nullptr>();
+    a2  = allocate<float2, extents2, nullptr>();
+    res = allocate<float2, extents2, nullptr>();
+
+    fill_random<float2, extents2>(a1, 10);
+    fill_random<float2, extents2>(a2, 10);
+
+    time_t start = time(nullptr);
+    auto oloop = object_for(covariance);
+    oloop(a1, a2, res, extents2, extents2, extents2);
+    time_t end = time(nullptr);
+
+    cout << difftime(end,start) << endl << endl;
+
+    for (int k = 0; k < 5; k++){
+        for (int l = 0; l < 5; l++){
+            cout << res[k][l] << " ";
+        }
+        cout << endl;
+    }
+
+    return 0;
+}
+
