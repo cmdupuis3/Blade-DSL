@@ -7,7 +7,9 @@ using std::endl;
 #include "nested_array_utilities.cpp"
 using namespace nested_array_utilities;
 
-#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) orank(0) ompLevels(1,1)
+#define OMP_NUM_THREADS 48
+
+#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) orank(0) ompLevels(1,0)
 {
     int len = 5;
     float mean1 = 0;
@@ -30,43 +32,47 @@ using namespace nested_array_utilities;
     out /= len;
 }
 
-static constexpr const int extents2[2] = {5,5};
+static constexpr const int extents3[3] = {400,400,400};
+static constexpr const int extents4[4] = {400,400,400,400};
 
 int main() {
-	srand(time(NULL));
+
+    time_t start;
+
+    #pragma edgi array symmetry(1,1,3)
+    float~3 a1;
 
     #pragma edgi array
-    float~2 a1;
+    float~3 a2;
 
     #pragma edgi array
-    float~2 a2;
+    float~4 res;
 
-    #pragma edgi array
-    float~2 res;
+    typedef promote<float, 3>::type float3;
+    typedef promote<float, 4>::type float4;
 
-    typedef promote<float, 2>::type float2;
+    time(&start);
+    a1  = allocate<float3, extents3, nullptr>();
+    a2  = allocate<float3, extents3, nullptr>();
+    res = allocate<float4, extents4, nullptr>();
+    cout << "Allocation took " << (time(NULL) - start) << "s" << endl << endl;
 
-    a1  = allocate<float2, extents2, nullptr>();
-    a2  = allocate<float2, extents2, nullptr>();
-    res = allocate<float2, extents2, nullptr>();
+    fill_random<float3, extents3>(a1, 10);
+    fill_random<float3, extents3>(a2, 10);
 
-    fill_random<float2, extents2>(a1, 10);
-    fill_random<float2, extents2>(a2, 10);
-
-    time_t start = time(nullptr);
+    time(&start);
     auto oloop = object_for(covariance);
-    oloop(a1, a2, res, extents2, extents2, extents2);
-    time_t end = time(nullptr);
+    oloop(a1, a2, res, extents3, extents3, extents4);
 
-    cout << difftime(end,start) << endl << endl;
-
+    cout << "Calculation took " << (time(NULL) - start) << "s" << endl << endl;
+/*
     for (int k = 0; k < 5; k++){
         for (int l = 0; l < 5; l++){
-            cout << res[k][l] << " ";
+            cout << res[k][l] << "\t";
         }
         cout << endl;
     }
-
+*/
     return 0;
 }
 
