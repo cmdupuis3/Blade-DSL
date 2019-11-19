@@ -119,17 +119,21 @@ namespace nested_array_utilities {
     }
 
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
-    template<typename TYPE, const int MAX[], const int DEPTH = 0>
-    constexpr auto fill_random(TYPE array_in, int mod_in) {
+    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
+    constexpr auto fill_random(TYPE array_in, int mod_in, int lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (std::is_pointer<DTYPE>::value) {
-            for (int i = 0; i < MAX[DEPTH]; i++) {
-                fill_random<DTYPE, MAX, DEPTH+1>(array_in[i], mod_in);
+            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
+                if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
+                    fill_random<DTYPE, EXTENTS, SYMM, DEPTH+1>(array_in[i], mod_in, i);
+                } else {
+                    fill_random<DTYPE, EXTENTS, SYMM, DEPTH+1>(array_in[i], mod_in);
+                }
             }
         } else {
-            for (int i = 0; i < MAX[DEPTH]; i++) {
+            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
                 array_in[i] = rand() % mod_in;
             }
         }
