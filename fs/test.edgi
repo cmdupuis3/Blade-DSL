@@ -35,11 +35,11 @@ int main() {
     typedef promote<float, 4>::type float4;
 
     a1  = allocate<float4, extents, a1_symm>();
-    a2  = allocate<float4, extents, nullptr>();
-    a3  = allocate<float4, extents, nullptr>();
+    a2  = allocate<float4, extents>();
+    a3  = allocate<float4, extents>();
     res = allocate<float4, extents, res_symm>();
 
-    fill_random<float4, extents>(a1, 10);
+    fill_random<float4, extents, a1_symm>(a1, 10);
     fill_random<float4, extents>(a2, 10);
     fill_random<float4, extents>(a3, 10);
 
