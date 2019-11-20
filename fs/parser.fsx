@@ -360,10 +360,20 @@ module NestedLoop =
     /// Substitute the first string with the second in a list of strings
     /// <param name="subs"> A list of substitution pairs; find the first, swap the second in. </param>
     /// <param name="text"> The text to be substituted. </param>
-    let rec private subInner (subs: (string * string) list) (inner: string list) =
-        match subs with
-        | []           -> inner
-        | head :: tail -> List.init inner.Length (fun i -> inner.[i].Replace(fst head, snd head)) |> subInner tail
+    let private subInner (subs: (string * string) list) (inner: string list) =
+        let rec subInner' (subs: (string * string) list) (str: string) =
+            match subs with
+            | []           -> str
+            | head :: tail ->
+                let rec sub (str': string) =
+                    if str'.Contains (fst head) then
+                        let index = str'.IndexOf (fst head)
+                        let pre = str'.[0..(index-1)]
+                        let post = str'.[(index+(fst head).Length)..]
+                        String.concat "" [sub pre; snd head; sub post]
+                    else subInner' tail str'
+                sub str
+        inner |> List.map (subInner' subs)
 
     /// Autogenerate a unary nested_for loop.
     /// <param name="iarray"> An input array class. </param>
@@ -376,7 +386,7 @@ module NestedLoop =
         let lastINames, lastOName = lastArrayNames [iarray] oarray func
         let subINames = (func.INames.Head, lastINames.Head)
         let subOName = (func.OName, lastOName)
-        let subbedInner = func.Inner |> subInner (subINames :: [subOName])
+        let subbedInner = func.Inner |> subInner (subINames :: [subOName] |> List.rev)
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp.Head | None -> 0
         let iExtents = String.concat "" [func.INames.Head; "_extents"]
@@ -395,7 +405,7 @@ module NestedLoop =
         let lastINames, lastOName = lastArrayNames iarrays oarray func
         let subINames = List.zip func.INames lastINames
         let subOName = (func.OName, lastOName)
-        let subbedInner = func.Inner |> subInner (subINames @ [subOName])
+        let subbedInner = func.Inner |> subInner (subINames @ [subOName] |> List.rev)
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp | None -> (List.init iarrays.Length (fun i -> 0))
         let iExtents = func.INames |> List.map (fun x -> String.concat "" [x; "_extents"])
