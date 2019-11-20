@@ -1,0 +1,102 @@
+
+#include <cmath>
+#include <ctime>
+#include <iostream>
+using std::cout;
+using std::endl;
+
+#include "nested_array_utilities.cpp"
+using namespace nested_array_utilities;
+
+#define OMP_NUM_THREADS 48
+
+#pragma edgi function(add10) arity(10) input(in1,in2,in3,in4,in5,in6,in7,in8,in9,in10) iranks(0,0,0,0,0,0,0,0,0,0) output(out) orank(0) ompLevels(1,0,0,0,0,0,0,0,0,0) commutativity(1,2,3,4,5,6,7,8,9,10)
+{
+    out = in1 + in2 + in3 + in4 + in5 + in6 + in7 + in8 + in9 + in10;
+}
+
+
+static constexpr const int extents1[1] = {10};
+static constexpr const int extents10[10] = {10,10,10,10,10,10,10,10,10,10};
+
+int main() {
+
+    clock_t start;
+
+    #pragma edgi array
+    float~1 a1;
+
+    #pragma edgi array
+    float~1 a2;
+
+    #pragma edgi array
+    float~1 a3;
+
+    #pragma edgi array
+    float~1 a4;
+
+    #pragma edgi array
+    float~1 a5;
+
+    #pragma edgi array
+    float~1 a6;
+
+    #pragma edgi array
+    float~1 a7;
+
+    #pragma edgi array
+    float~1 a8;
+
+    #pragma edgi array
+    float~1 a9;
+
+    #pragma edgi array
+    float~1 a10;
+
+    #pragma edgi array
+    float~10 res;
+
+    typedef promote<float, 1>::type float1;
+    typedef promote<float, 10>::type float10;
+
+    start = clock();
+    a1  = allocate<float1, extents1>();
+    a2  = allocate<float1, extents1>();
+    a3  = allocate<float1, extents1>();
+    a4  = allocate<float1, extents1>();
+    a5  = allocate<float1, extents1>();
+    a6  = allocate<float1, extents1>();
+    a7  = allocate<float1, extents1>();
+    a8  = allocate<float1, extents1>();
+    a9  = allocate<float1, extents1>();
+    a10  = allocate<float1, extents1>();
+    res = allocate<float10, extents10>();
+    cout << "Allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+
+    fill_random<float1, extents1>(a1, 10);
+    fill_random<float1, extents1>(a2, 10);
+    fill_random<float1, extents1>(a3, 10);
+    fill_random<float1, extents1>(a4, 10);
+    fill_random<float1, extents1>(a5, 10);
+    fill_random<float1, extents1>(a6, 10);
+    fill_random<float1, extents1>(a7, 10);
+    fill_random<float1, extents1>(a8, 10);
+    fill_random<float1, extents1>(a9, 10);
+    fill_random<float1, extents1>(a10, 10);
+
+    start = clock();
+    auto oloop = object_for(add10);
+    oloop(a1, a1, a1, a4, a5, a6, a7, a8, a9, a10, res, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents10);
+
+    cout << "Calculation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+/*
+    for (int k = 0; k < 5; k++){
+        for (int l = 0; l < 5; l++){
+            cout << res[k][l] << "\t";
+        }
+        cout << endl;
+    }
+*/
+    return 0;
+}
+
