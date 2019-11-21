@@ -196,10 +196,10 @@ module NestedLoop =
 
     /// Enum for the symmetry/commutativity state of a variable.
     type private SymcomState =
-    | Symmetric   = 0
-    | Commutative = 1
-    | Both        = 2
-    | Neither     = 3
+    | Symmetric
+    | Commutative
+    | Both
+    | Neither
 
     /// Finds the states of all the input variables, given symmetry and commutativity vectors.
     /// <param name="arrayNames"> List of variable names. </param>
@@ -241,7 +241,6 @@ module NestedLoop =
                 | SymcomState.Symmetric   -> symImins symGroups.[index] indexNames.[index]
                 | SymcomState.Commutative -> cimins.[index]
                 | SymcomState.Both        -> cimins.[index] // can perhaps optimize more, just lazy
-                | _                       -> failwith "Invalid symmetry/commutativity state"
         )
 
     /// Generates a single "for(...)" statement.
@@ -283,7 +282,6 @@ module NestedLoop =
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
     let private unaryLoop (iarrayName: string)    (iarrayType: string) (iarrayLevels: int) (iRank: int) (iExtents: string)
-                          (oarrayName: string)    (oarrayType: string) (oarrayLevels: int)
                           (indNames: string list) (iMins: string list) (ompLevels: int) =
         assert (iarrayLevels = indNames.Length)
         assert (iarrayLevels = iMins.Length)
@@ -313,17 +311,27 @@ module NestedLoop =
     /// <param name="inner"> "Inner" block, i.e., code to place inside all the loops. </param>
     /// <param name="ompLevels"> Number of OpenMP levels. </param>
     let private naryLoop (iarrayNames: string list)   (iarrayTypes: string list) (iarrayLevels: int list) (iRanks: int list) (iExtents: string list)
-                         (oarrayName: string)         (oarrayType: string)       (oarrayLevels: int)
-                         (indNames: string list list) (iMins: string list list)  (ompLevels: int list) =
+                         (indNames: string list list) (iMins: string list list)  (ompLevels: int list) (states: SymcomState list) =
         assert (iarrayNames.Length = indNames.Length)
         assert (iarrayNames.Length = iMins.Length)
         assert (iarrayNames.Length = ompLevels.Length)
 
-        List.init iarrayLevels.Length (fun j ->
-            let oLevels = if j = 0 then oarrayLevels else (oarrayLevels - iarrayLevels.[j-1])
-            unaryLoop iarrayNames.[j] iarrayTypes.[j] iarrayLevels.[j] iRanks.[j] iExtents.[j] oarrayName oarrayType oLevels indNames.[j] iMins.[j] ompLevels.[j]
-        )
-        |> List.rev
+        let uloops = List.init states.Length (fun j -> unaryLoop iarrayNames.[j] iarrayTypes.[j] iarrayLevels.[j] iRanks.[j] iExtents.[j] indNames.[j] iMins.[j] ompLevels.[j])
+
+        let rec naryLoop' (states: SymcomState list) (uloops: (string list -> string list) list list)  =
+            match states with
+            | [] -> []
+            | [head] -> [uloops.Head]
+            | head :: tail ->
+                match head with
+                | (SymcomState.Neither     | SymcomState.Symmetric) -> uloops.Head :: naryLoop' tail uloops.Tail
+                | (SymcomState.Commutative | SymcomState.Both)      ->
+                    let nloops = naryLoop' tail uloops.Tail
+                    ((uloops.Head, nloops.Head) ||> List.map2 (>>)) :: nloops.Tail
+
+        naryLoop' (List.rev states) (List.rev uloops)
+
+
 
     /// Find the final array names for a list of variables; useful when substituting into inner blocks.
     /// <param name="iarrays"> A list of input array classes. </param>
@@ -377,12 +385,12 @@ module NestedLoop =
         let lastINames, lastOName = lastArrayNames [iarray] oarray func
         let subINames = (func.INames.Head, lastINames.Head)
         let subOName = (func.OName, lastOName)
-        let subbedInner = func.Inner |> subInner (subINames :: [subOName] |> List.rev)
+        let subbedInner = subInner (subINames :: [subOName] |> List.rev) func.Inner
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp.Head | None -> 0
         let iExtents = String.concat "" [func.INames.Head; "_extents"]
         let ret =
-            unaryLoop func.INames.Head iarray.Type ilevels func.IRank.Head iExtents func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins ompLevels
+            unaryLoop func.INames.Head iarray.Type ilevels func.IRank.Head iExtents (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins ompLevels
             |> List.fold (|>) subbedInner
         ret, lastArrayNames [iarray] oarray func
 
@@ -393,19 +401,23 @@ module NestedLoop =
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
         let ilevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
         let comm = match func.Comm with | Some comm -> comm | None -> (List.init iarrays.Length id)
-        let imins = iminList (iarrays |> List.map (fun x -> x.Name)) (iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))) comm
+        let imins, states =
+            ((iarrays |> List.map (fun x -> x.Name)),
+             (iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))),
+             comm)
+            |||> (fun x y z -> (iminList x y z, vStates x y z))
 
         let lastINames, lastOName = lastArrayNames iarrays oarray func
         let subINames = List.zip func.INames lastINames
         let subOName = (func.OName, lastOName)
-        let subbedInner = func.Inner |> subInner (subINames @ [subOName] |> List.rev)
+        let subbedInner = subInner (subINames @ [subOName] |> List.rev) func.Inner
 
         let ompLevels = match func.OmpLevels with | Some omp -> omp | None -> (List.init iarrays.Length (fun i -> 0))
         let iExtents = func.INames |> List.map (fun x -> String.concat "" [x; "_extents"])
         let ret =
-            naryLoop func.INames (iarrays |> List.map (fun x -> x.Type)) ilevels func.IRank iExtents func.OName oarray.Type (oarray.Rank - func.ORank) (indNames 0 ilevels) imins ompLevels
+            naryLoop func.INames (iarrays |> List.map (fun x -> x.Type)) ilevels func.IRank iExtents (indNames 0 ilevels) imins ompLevels states
             |> List.fold (List.fold (|>)) subbedInner
-        ret, lastArrayNames iarrays oarray func
+        ret, lastINames @ [lastOName]
 
 /// Pragma clause type; a tuple of the clause name and a list of arguments
 type Clause = string * Token list
@@ -1211,7 +1223,6 @@ let parse (tokens: Token list) =
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
         >> deleteLoopLines
-        //>> (@) ["#include \"nested_array.cpp\"\n"]
         >> stringCollapse "")
 
 
