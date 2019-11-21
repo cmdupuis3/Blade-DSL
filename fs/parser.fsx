@@ -297,6 +297,19 @@ module NestedLoop =
         )
         |> List.rev
 
+    /// Rearrange a table of functions to fold the same way the loops will
+    let rec private swap (states: SymcomState list) (acc: int) (items: (int -> 'a -> 'a) list list) =
+        match states with
+        | [] -> []
+        | [head] -> [List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc))]
+        | head :: tail ->
+            match head with
+            | (SymcomState.Neither | SymcomState.Symmetric) ->
+                (List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc))) :: swap tail (acc + items.Head.Length) items.Tail
+            | (SymcomState.Commutative | SymcomState.Both)  ->
+                let sub = swap tail (acc + items.Head.Length) items.Tail
+                ((List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc)), sub.Head) ||> List.map2 (>>)) :: sub.Tail
+
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="iarrayNames"> Input variable names. </param>
     /// <param name="oarrayName"> Output variable name. </param>
@@ -316,43 +329,46 @@ module NestedLoop =
         assert (iarrayNames.Length = iMins.Length)
         assert (iarrayNames.Length = ompLevels.Length)
 
-        let uloops = List.init states.Length (fun j -> unaryLoop iarrayNames.[j] iarrayTypes.[j] iarrayLevels.[j] iRanks.[j] iExtents.[j] indNames.[j] iMins.[j] ompLevels.[j])
-
-        let rec naryLoop' (states: SymcomState list) (uloops: (string list -> string list) list list)  =
-            match states with
-            | [] -> []
-            | [head] -> [uloops.Head]
-            | head :: tail ->
-                match head with
-                | (SymcomState.Neither     | SymcomState.Symmetric) -> uloops.Head :: naryLoop' tail uloops.Tail
-                | (SymcomState.Commutative | SymcomState.Both)      ->
-                    let nloops = naryLoop' tail uloops.Tail
-                    ((uloops.Head, nloops.Head) ||> List.map2 (>>)) :: nloops.Tail
-
-        naryLoop' (List.rev states) (List.rev uloops)
-
-
+        List.init states.Length (fun j ->
+            unaryLoop iarrayNames.[j] iarrayTypes.[j] iarrayLevels.[j] iRanks.[j] iExtents.[j] indNames.[j] iMins.[j] ompLevels.[j]
+            |> List.map (fun y (acc: int) -> y)
+        )
+        |> List.rev
+        |> swap (List.rev states) 0
 
     /// Find the final array names for a list of variables; useful when substituting into inner blocks.
     /// <param name="iarrays"> A list of input array classes. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
-    let private lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
+    let private lastArrayNames (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) (states: SymcomState list) =
         let ilevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
         let inds = indNames 0 ilevels
         let lastInds = List.map List.last inds
         let iNames =
-            List.init iarrays.Length (
-                fun i ->
-                    if iarrays.[i].Rank = func.IRank.[i] then "" else lastInds.[i]
-                    |> fun x -> String.concat "" [func.INames.[i]; x]
+            List.init iarrays.Length (fun i ->
+                if iarrays.[i].Rank = func.IRank.[i] then "" else lastInds.[i]
+                |> fun x -> String.concat "" [func.INames.[i]; x]
             )
 
+
+        let durr = fun (acc: int) x -> String.concat "" [x;"[__i"; string acc; "]"]
+
+
         let oName =
-            [1..(oarray.Rank - func.ORank)]
-            |> List.map (fun x y -> String.concat "" [y; "[__i"; string (x-1); "]"])
+            List.init states.Length (fun i ->
+                if (iarrays.[i].Rank = func.IRank.[i]) then
+                    [fun (acc: int) x ->  String.concat "" [x; ""]]
+                else if (iarrays.[i].Rank - func.IRank.[i]) = (oarray.Rank - func.ORank) then
+                    [fun (acc: int) x ->  String.concat "" [x; ""]]
+                else if (iarrays.[i].Rank - func.IRank.[i]) > (oarray.Rank - func.ORank) then
+                    List.init (iarrays.[i].Rank - func.IRank.[i]) (fun i acc -> durr acc)
+                else
+                    List.init (iarrays.[i].Rank - func.IRank.[i]) (fun i acc -> durr acc)
+            )
+            |> swap states 0
+            |> List.map (List.reduce (>>))
             |> List.reduce (>>)
-            |> fun x -> x func.OName
+            |> fun x -> x ""
 
         iNames, oName
 
@@ -381,8 +397,9 @@ module NestedLoop =
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) =
         let ilevels = iarray.Rank - func.IRank.Head
         let imins = (iminList [iarray.Name] [iarray.Symm |> function | Some s -> s | None -> (List.init iarray.Rank id)] [1]).Head
+        let state = (vStates [iarray.Name] [iarray.Symm |> function | Some s -> s | None -> (List.init iarray.Rank id)] [1]).Head
 
-        let lastINames, lastOName = lastArrayNames [iarray] oarray func
+        let lastINames, lastOName = lastArrayNames [iarray] oarray func [state]
         let subINames = (func.INames.Head, lastINames.Head)
         let subOName = (func.OName, lastOName)
         let subbedInner = subInner (subINames :: [subOName] |> List.rev) func.Inner
@@ -392,7 +409,7 @@ module NestedLoop =
         let ret =
             unaryLoop func.INames.Head iarray.Type ilevels func.IRank.Head iExtents (indNames 0 [iarray.Rank - func.IRank.Head]).Head imins ompLevels
             |> List.fold (|>) subbedInner
-        ret, lastArrayNames [iarray] oarray func
+        ret, lastINames @ [lastOName]
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="iarrays"> A list of input array classes. </param>
@@ -407,7 +424,7 @@ module NestedLoop =
              comm)
             |||> (fun x y z -> (iminList x y z, vStates x y z))
 
-        let lastINames, lastOName = lastArrayNames iarrays oarray func
+        let lastINames, lastOName = lastArrayNames iarrays oarray func states
         let subINames = List.zip func.INames lastINames
         let subOName = (func.OName, lastOName)
         let subbedInner = subInner (subINames @ [subOName] |> List.rev) func.Inner
@@ -965,9 +982,9 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] |> fst)
 
     List.init numCalls (fun i ->
-            (tSpecTypes.[i], tSpecArgs.[i], String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]])
-            |||> fun x y z -> ["template<> void "; z; "<"; x; ">("; y; ")"]
-            |> stringCollapse ""
+        (tSpecTypes.[i], tSpecArgs.[i], String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]])
+        |||> fun x y z -> ["template<> void "; z; "<"; x; ">("; y; ")"]
+        |> stringCollapse ""
     )
     |> List.map brace
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
@@ -977,11 +994,13 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
 
 let methodLoopTemplate (mloop: MethodLoop) =
-    let arity = mloop.funcs |> List.map (fun x -> x.Arity)
-                            |> List.map (function | Some a -> a | None -> failwith "method_for loops must have fixed arity.")
-                            |> fun x ->
-                                let a = List.distinct x
-                                if a.Length = 1 then a.Head else failwith "method_for loops must have fixed arity."
+    let arity =
+        mloop.funcs
+        |> List.map (fun x -> x.Arity)
+        |> List.map (function | Some a -> a | None -> failwith "method_for loops must have fixed arity.")
+        |> fun x ->
+            let a = List.distinct x
+            if a.Length = 1 then a.Head else failwith "method_for loops must have fixed arity."
 
     let firank = mloop.funcs |> List.map (fun x -> x.IRank)
     let forank = mloop.funcs |> List.map (fun x -> x.ORank)
@@ -1137,8 +1156,7 @@ let parse (tokens: Token list) =
                 List.init oloops.[i].Call.Length (fun j ->
                       (oloops.[i].Call.[j] |> fst3 |> fst) @ [oloops.[i].Call.[j] |> snd3 |> fst]
                     @ (oloops.[i].Call.[j] |> fst3 |> snd) @ [oloops.[i].Call.[j] |> snd3 |> snd])
-                |> List.map withCommas
-                |> List.map (stringCollapse "")
+                |> List.map (withCommas >> (stringCollapse ""))
 
             let arity =
                 match oloops.[i].GetFunc.Arity with
@@ -1174,8 +1192,7 @@ let parse (tokens: Token list) =
                 List.init mloops.[i].Call.Length (fun j ->
                       fst mloops.[i].Init @ [mloops.[i].Call.[j] |> snd3 |> fst]
                     @ snd mloops.[i].Init @ [mloops.[i].Call.[j] |> snd3 |> snd])
-                |> List.map withCommas
-                |> List.map (stringCollapse "")
+                |> List.map (withCommas >> (stringCollapse ""))
 
             let arity = mloops.[i].funcs.[1].Arity |> Option.get // hack
 
