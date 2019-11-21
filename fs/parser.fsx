@@ -163,20 +163,12 @@ module NestedLoop =
     /// <param name="comGroups"> A commutativity vector. </param>
     /// <param name="iNames"> Iterator names for all variables. </param>
     let rec private comImins (comGroups: int list) (iNames: string list list) =
-        let inhead, intail = List.head iNames, List.tail iNames
-
-        (List.init inhead.Length (fun index -> string 0)) ::
-        match comGroups with
-        | []           -> []
-        | [head]       -> []
-        | head :: tail ->
-            List.init tail.Length (
-                fun index ->
-                    if comGroups.[index+1] = comGroups.[index] then
-                        List.init intail.[index].Length (fun index -> inhead.[index])
-                    else
-                        List.init intail.[index].Length (fun index -> string 0)
-            )
+        List.init comGroups.Length (fun i ->
+            if i = 0 || (comGroups.[i] <> comGroups.[i-1]) then
+                List.init iNames.[i].Length (fun j -> string 0)
+            else
+                iNames.[i-1]
+        )
 
     /// For each dimension, finds whether a dimension is symmetric with the next.
     /// <param name="symGroup"> A symmetry vector. </param>
