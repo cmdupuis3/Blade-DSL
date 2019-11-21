@@ -224,15 +224,15 @@ module NestedLoop =
         let ranks = symGroups |> List.map (fun x -> x.Length)
         let indexNames = indNames 0 ranks
         let cimins = comImins comGroups indexNames
+        let simins = List.init symGroups.Length (fun i -> symImins symGroups.[i] indexNames.[i])
         let states = vStates arrayNames symGroups comGroups
 
-        List.init arrayNames.Length (
-            fun index ->
-                match states.[index] with
-                | SymcomState.Neither     -> List.init ranks.[index] (fun x -> string 0)
-                | SymcomState.Symmetric   -> symImins symGroups.[index] indexNames.[index]
-                | SymcomState.Commutative -> cimins.[index]
-                | SymcomState.Both        -> cimins.[index] // can perhaps optimize more, just lazy
+        List.init arrayNames.Length (fun i ->
+            match states.[i] with
+            | SymcomState.Neither     -> List.init ranks.[i] (fun x -> string 0)
+            | SymcomState.Symmetric   -> simins.[i]
+            | SymcomState.Commutative -> cimins.[i]
+            | SymcomState.Both        -> cimins.[i].Head :: simins.[i].Tail // can perhaps optimize more, just lazy
         )
 
     /// Generates a single "for(...)" statement.
