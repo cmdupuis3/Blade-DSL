@@ -298,17 +298,19 @@ module NestedLoop =
         |> List.rev
 
     /// Rearrange a table of functions to fold the same way the loops will
-    let rec private swap (states: SymcomState list) (acc: int) (items: (int -> 'a -> 'a) list list) =
-        match states with
-        | [] -> []
-        | [head] -> [List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc))]
-        | head :: tail ->
-            match head with
-            | (SymcomState.Neither | SymcomState.Symmetric) ->
-                (List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc))) :: swap tail (acc + items.Head.Length) items.Tail
-            | (SymcomState.Commutative | SymcomState.Both)  ->
-                let sub = swap tail (acc + items.Head.Length) items.Tail
-                ((List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc)), sub.Head) ||> List.map2 (>>)) :: sub.Tail
+    let private swap (states: SymcomState list) (acc: int) (items: (int -> 'a -> 'a) list list) =
+        let rec swap' (states: SymcomState list) (acc: int) (items: (int -> 'a -> 'a) list list) =
+            match states with
+            | [] -> []
+            | [head] -> [List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc))]
+            | head :: tail ->
+                match head with
+                | (SymcomState.Neither | SymcomState.Symmetric) ->
+                    (List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc))) :: swap' tail (acc + items.Head.Length) items.Tail
+                | (SymcomState.Commutative | SymcomState.Both)  ->
+                    let sub = swap' tail (acc + items.Head.Length) items.Tail
+                    ((List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc)), sub.Head) ||> List.map2 (>>)) :: sub.Tail
+        swap' (List.rev states) acc (List.rev items)
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="iarrayNames"> Input variable names. </param>
@@ -333,8 +335,7 @@ module NestedLoop =
             unaryLoop iarrayNames.[j] iarrayTypes.[j] iarrayLevels.[j] iRanks.[j] iExtents.[j] indNames.[j] iMins.[j] ompLevels.[j]
             |> List.map (fun y (acc: int) -> y)
         )
-        |> List.rev
-        |> swap (List.rev states) 0
+        |> swap states 0
 
     /// Find the final array names for a list of variables; useful when substituting into inner blocks.
     /// <param name="iarrays"> A list of input array classes. </param>
@@ -368,7 +369,7 @@ module NestedLoop =
             |> swap states 0
             |> List.map (List.reduce (>>))
             |> List.reduce (>>)
-            |> fun x -> x ""
+            |> fun x -> x func.OName
 
         iNames, oName
 
