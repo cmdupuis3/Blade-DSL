@@ -967,10 +967,20 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             | _ -> h |> (tokenToStr >> respace >> reconcat >> newln >> List.head)
         | _ -> tokens |> (tokenToStr >> respace >> reconcat >> newln >> List.head)
 
+    let nOmp =
+        if oloop.GetFunc.OmpLevels.IsNone then 0 else
+            oloop.GetFunc.OmpLevels
+            |> Option.get
+            |> List.filter (fun x -> x > 0)
+            |> List.length
+
     let tSpecInner =
         match oloop.GetFunc.Arity with
         | Some a -> // fixed arity => specify all argument names
-            List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc |> fst)
+            List.init numCalls (fun i ->
+                String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc |> fst)
+            )
         | None ->
             let funcs = List.init numCalls (fun i ->
                 { Name = String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]];
@@ -983,7 +993,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                   OmpLevels = oloop.GetFunc.OmpLevels;
                   Inner = oloop.GetFunc.Inner |> List.map (tokenize >> deleteReturnLine >> (expandVariadic i)) }
             )
-            List.init numCalls (fun i -> NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] |> fst)
+            List.init numCalls (fun i ->
+                String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] |> fst)
+            )
 
     List.init numCalls (fun i ->
         (tSpecTypes.[i], tSpecArgs.[i], String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]])
@@ -1062,13 +1075,23 @@ let methodLoopTemplate (mloop: MethodLoop) =
             |> (withCommas >> stringCollapse "")
         )
 
-    let tSpecInner = List.init numCalls (fun i -> NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] |> fst)
+    let tSpecInner =
+        List.init numCalls (fun i ->
+            let nOmp =
+                if mloop.funcs.[i].OmpLevels.IsNone then 0 else
+                    mloop.funcs.[i].OmpLevels
+                    |> Option.get
+                    |> List.filter (fun x -> x > 0)
+                    |> List.length
+            String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
+            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] |> fst)
+        )
 
     List.init numCalls (fun i ->
-            (tSpecTypes.[i], tSpecArgs.[i], mloop.funcs.[i].Name)
-            |||> fun x y z ->
-                ["template<> void "; z; "<"; x; ">("; y; ")"]
-            |> stringCollapse ""
+        (tSpecTypes.[i], tSpecArgs.[i], mloop.funcs.[i].Name)
+        |||> fun x y z ->
+            ["template<> void "; z; "<"; x; ">("; y; ")"]
+        |> stringCollapse ""
     )
     |> List.map brace
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
@@ -1080,8 +1103,8 @@ let methodLoopTemplate (mloop: MethodLoop) =
 let parse (tokens: Token list) =
 
     // Scan for loop API calls and create loop state machines
-    let mloops = scanMethodLoops tokens //mloops |> List.map (fun x -> x.Call) |> List.reduce (@) |> List.map thd3 |> List.map (fun x -> tokens.[x])
-    let oloops = scanObjectLoops tokens //oloops |> List.map (fun x -> x.Call) |> List.reduce (@) |> List.map thd3 |> List.map (fun x -> tokens.[x])
+    let mloops = scanMethodLoops tokens
+    let oloops = scanObjectLoops tokens
 
     // Sort pragma objects into array and function pragmas
     let arrayPragmas, functionPragmas = tokens |> (scanPragmas >> sortPragmas)
@@ -1151,7 +1174,6 @@ let parse (tokens: Token list) =
             |> (+) y
         )
     let callBounds = (FPositions, LPositions) ||> List.map2 (fun f l -> seq{f..l})
-    //let a = callBounds |> List.map (fun x -> x |> Seq.toList |> List.map (fun y -> tokens.[y]))
 
     let oloopCallSwaps =
         List.init oloops.Length (fun i ->
@@ -1241,6 +1263,7 @@ let parse (tokens: Token list) =
     tokens
     |> (swap 0 callBounds
         >> substitute
+        >> (fun x -> "#include <omp.h>\n" :: x)
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
         >> deleteLoopLines
