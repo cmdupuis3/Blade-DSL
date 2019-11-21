@@ -297,8 +297,11 @@ module NestedLoop =
         )
         |> List.rev
 
-    /// Rearrange a table of functions to fold the same way the loops will
-    let private swap (states: SymcomState list) (acc: int) (items: (int -> 'a -> 'a) list list) =
+    /// Rearrange a table of functions ("items") to fold differently for commutative functions
+    /// <param name="states"> List of symmetry/commutativity states for each unary nested iterator. </param>
+    /// <param name="items"> Table of functions to reorganize; takes a counter and an input and returns an output of the same type as the input </param>
+    let private swap (states: SymcomState list) (items: (int -> 'a -> 'a) list list) =
+        /// <param name="acc"> A counter threaded through all functions. </param>
         let rec swap' (states: SymcomState list) (acc: int) (items: (int -> 'a -> 'a) list list) =
             match states with
             | [] -> []
@@ -310,7 +313,7 @@ module NestedLoop =
                 | (SymcomState.Commutative | SymcomState.Both)  ->
                     let sub = swap' tail (acc + items.Head.Length) items.Tail
                     ((List.init (items.Head.Length) (fun i -> items.Head.[i] (i + acc)), sub.Head) ||> List.map2 (>>)) :: sub.Tail
-        swap' (List.rev states) acc (List.rev items)
+        swap' (List.rev states) 0 (List.rev items)
 
     /// Autogenerate an N-ary nested_for loop.
     /// <param name="iarrayNames"> Input variable names. </param>
@@ -335,7 +338,7 @@ module NestedLoop =
             unaryLoop iarrayNames.[j] iarrayTypes.[j] iarrayLevels.[j] iRanks.[j] iExtents.[j] indNames.[j] iMins.[j] ompLevels.[j]
             |> List.map (fun y (acc: int) -> y)
         )
-        |> swap states 0
+        |> swap states
 
     /// Find the final array names for a list of variables; useful when substituting into inner blocks.
     /// <param name="iarrays"> A list of input array classes. </param>
@@ -366,7 +369,7 @@ module NestedLoop =
                 else
                     List.init (iarrays.[i].Rank - func.IRank.[i]) (fun i acc -> durr acc)
             )
-            |> swap states 0
+            |> swap states
             |> List.map (List.reduce (>>))
             |> List.reduce (>>)
             |> fun x -> x func.OName
