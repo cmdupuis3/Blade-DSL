@@ -474,7 +474,6 @@ let rec (|ScopePattern|_|) = function
             | head' :: tail' ->
                 let h', t' = toScope tail' ctr
                 head' :: h', t'
-            | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
         Some (scope, (t: Token list))
     | Token.Symbol ';' :: tail -> None
@@ -508,7 +507,6 @@ let rec (|ScopePatternParens|_|) = function
             | head' :: tail' ->
                 let h', t' = toScope tail' ctr
                 head' :: h', t'
-            | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
         Some (head :: Token.Symbol '(' :: (scope @ [Token.Symbol ')']), (t: Token list))
     | Token.Symbol ';' :: tail -> None
@@ -543,7 +541,6 @@ let rec (|PostScopePattern|_|) = function
             | head' :: tail' ->
                 let h', t' = toScope tail' ctr
                 head' :: h', t'
-            | _ -> failwith "asdfsdf"
         let scope, t = toScope tail 0
         Some (head :: scope, (t: Token list))
     | _ -> None
