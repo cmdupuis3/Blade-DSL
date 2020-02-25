@@ -73,12 +73,12 @@ namespace nested_array_utilities {
 
     };
 
-    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
+    template<typename TYPE, const int EXTENTS[], const int SYMM[], const int DEPTH = 0>
     constexpr void fold(TYPE array) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        if constexpr (SYMM && DEPTH+1 < get_rank<TYPE>()) {
+        if constexpr (get_rank<TYPE>() > 1) {
             for (int i = 0; i < EXTENTS[DEPTH]; i++) {
                 if constexpr (SYMM[DEPTH] == SYMM[DEPTH+1]) {
                     for (int j = 0; j < i; j++) {
@@ -102,7 +102,7 @@ namespace nested_array_utilities {
         TYPE array = new DTYPE[EXTENTS[DEPTH]];
         if constexpr (get_rank<TYPE>() > 1) {
             for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
-                if constexpr (SYMM && DEPTH+1 < get_rank<TYPE>() && SYMM[DEPTH] == SYMM[DEPTH+1]) {
+                if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
                     array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>(i);
                 } else {
                     array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>();
