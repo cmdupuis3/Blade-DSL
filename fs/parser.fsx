@@ -1,4 +1,29 @@
 
+open System.Runtime.InteropServices
+
+[<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
+extern int get_num_dims([<MarshalAs(UnmanagedType.LPStr)>] string fileName, [<MarshalAs(UnmanagedType.LPStr)>] string varName)
+
+[<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
+extern int get_var_type([<MarshalAs(UnmanagedType.LPStr)>] string fileName, [<MarshalAs(UnmanagedType.LPStr)>] string varName)
+
+let getNCnumDims fileName variableName = get_num_dims(fileName, variableName)
+
+let getNCtype fileName variableName =
+    match get_var_type(fileName, variableName) with
+    | 1 | 2 -> "char"
+    | 3 -> "short"
+    | 4 -> "int"
+    | 5 -> "float"
+    | 6 -> "double"
+    | 7 -> "uchar"
+    | 8 -> "ushort"
+    | 9 -> "uint"
+    | 10 -> "int64"
+    | 11 -> "uint64"
+    | 12 -> "char*" // ?
+    | _ -> failwith "This NetCDF type is currently unsupported."
+
 
 /// Container for array pragma information
 type NestedArray =
