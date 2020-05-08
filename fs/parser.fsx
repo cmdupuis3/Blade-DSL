@@ -1,4 +1,5 @@
 
+
 open System.Runtime.InteropServices
 
 [<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
@@ -24,6 +25,20 @@ let getNCtype fileName variableName =
     | 12 -> "char*" // ?
     | _ -> failwith "This NetCDF type is currently unsupported."
 
+(*
+
+let file = @"/home/username/Data/indonesia/hqp_block11.nc"
+let var = @"hqp"
+
+get_num_dims(file, var)
+get_var_type(file, var)
+
+getNCnumDims file var
+getNCtype file var
+
+*)
+
+
 
 /// Container for array pragma information
 type NestedArray =
@@ -31,7 +46,8 @@ type NestedArray =
         Name: string
         Type: string
         Rank: int
-        Symm:  int list Option
+        Symm: int list Option
+        ncFile: (string * string) Option
     }
 
 /// Container for function pragma information
@@ -43,8 +59,8 @@ type NestedFunction =
         IRank: int list
         OName: string
         ORank: int
-        Comm:   int list Option
-        ParallelismLevels: int list Option list
+        Comm:  int list Option
+        ParallelismLevels: int list
         Inner: string list
     }
 
@@ -58,17 +74,146 @@ type Loop =
         iExtents: string
         indNames: string list
         iMins: string list
-        parLevels: int list
+        parLevels: int
     }
 
-type LoopTextGenerator =
-    {
-        IteratorName: int -> int -> string
-        Index: string -> string -> string
-        ParallelismLines: (string -> string list) list
-        LoopText: Loop -> int -> string list -> string list -> string list
-        Zero: string
-    }
+/// Inserts a tab character at the beginning of each string in the input list.
+let tab x =
+    x |> List.map (fun y -> String.concat "" ["\t"; y])
+
+/// Inserts a tab character at the end of each string in the input list.
+let newln (x: string list) =
+    x |> List.map (fun y -> String.concat "" [y; "\n"])
+
+/// Creates a two-element list of the input string plus '{', and '}'.
+let brace x =
+    [String.concat " " [x; "{\n"]] @ ["}\n"]
+
+/// Generate all text for a single nested loop (language agnostic).
+/// <param name="outerNested"> A list of functions for generating nested lines outside the loop line, based on a template. </param>
+/// <param name="innerNested"> A list of functions for generating nested lines inside the loop line, based on a template. </param>
+/// <param name="loopLine"> A template for the for-loop expression. </param>
+/// <param name="scope"> A template for the scope enclosed by the for-loop, e.g., "{ (inner) }". </param>
+/// <param name="loop"> Loop object constructed by NestedLoop.Unary or NestedLoop.Nary. </param>
+/// <param name="i"> Current N-ary loop index; this is threaded through all loops. </param>
+/// <param name="j"> Current unary loop index; this resets for every new nested loop. </param>
+/// <param name="inner"> Inner block of text i.e. the actual algorithm. </param>
+let loopBuilder outerNested outerDistributed loopLine (scope: string -> string list) innerNested innerDistributed loop i j inner =
+    let nestedText      = List.map (fun x -> [x loop i]   |> newln |> List.head)
+    let distributedText = List.map (fun x -> [x loop i j] |> newln |> List.head)
+    let outerText = (outerNested |> nestedText) @ (outerDistributed |> distributedText)
+    let innerText = (innerNested |> nestedText) @ (innerDistributed |> distributedText)
+
+    let scoped = scope (loopLine loop.indNames.[i] loop.iMins.[i] loop.iExtents (string i))
+    List.concat [outerText; [scoped.[0]]; innerText; tab inner; [scoped.[1]]]
+
+
+let cppIteratorNameGenerator min index =
+    String.concat "" ["__i"; (string (index + min))]
+
+/// Generates a single "for(...)" statement.
+/// <param name="iName"> Iterator name. </param>
+/// <param name="iMin"> Iterator minimum name. </param>
+/// <param name="extentName"> Extent vector name. </param>
+/// <param name="extentIndex"> Element of extent vector to use as iterator maximum. </param>
+let cppLoopLine iName iMin extentName extentIndex =
+    String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; extentName; "["; extentIndex; "]; "; iName; "++)";]
+
+/// Generates a call to operator().
+/// <param name="arrayName"> Variable name. </param>
+/// <param name="iName"> Iterator name. </param>
+let cppIndex arrayName iName =
+    String.concat "" [arrayName; "["; iName; "]"]
+
+/// Generates an iterator declaration line.
+/// <param name="iType"> Iterator type. </param>
+/// <param name="iName"> Iterator name. </param>
+let cppIteratorDeclLine iType iName =
+    String.concat "" [iType; " "; iName; " = 0;"]
+
+/// Generate a C++ array declaration.
+let cppArrayDeclLine loop j =
+    let pre = String.concat "" ["promote<"; loop.iarrayType; ", "; string (loop.iarrayLevels-j+loop.iRank-1); ">::type "; loop.iarrayName; loop.indNames.[j]; " = "]
+
+    match j with
+    | 0 -> cppIndex loop.iarrayName loop.indNames.[j]
+    | _ -> cppIndex (String.concat "" [loop.iarrayName; loop.indNames.[j-1]]) loop.indNames.[j]
+    |> fun x -> tab [String.concat "" [pre; x; ";"]]
+    |> List.head
+
+/// Generates an OpenMP parallelization line. Inserts a " " clause for the input iterator name.
+let cppOmpLine loop i j =
+    if loop.parLevels > j then
+        String.concat "" ["#pragma omp parallel for private("; cppIndex loop.iarrayName loop.indNames.[j]; ")"]
+    else ""
+
+let cppNestedNCstart loop j =
+    String.concat "" ["start["; string j; "] = "; loop.indNames.[j]; ";"]
+
+type pushText<'T> =
+    abstract member PushOuterNested: (Loop -> int -> string) -> 'T
+    abstract member PushOuterDistributed: (Loop -> int -> int -> string) -> 'T
+    abstract member PushInnerNested: (Loop -> int -> string) -> 'T
+    abstract member PushInnerDistributed: (Loop -> int -> int -> string) -> 'T
+
+[<AbstractClass>]
+type LoopTextBase() =
+    abstract member IteratorName: int -> int -> string
+    abstract member Index: string -> string -> string
+    abstract member Zero: string
+    abstract member Text: Loop -> int -> int -> string list -> string list
+
+type LoopTextGenerator (outerNested: (Loop -> int -> string) list,
+                        outerDistributed: (Loop -> int -> int -> string) list,
+                        innerNested: (Loop -> int -> string) list,
+                        innerDistributed: (Loop -> int -> int -> string) list) =
+    inherit  LoopTextBase()
+    let mutable OuterNested      = outerNested
+    let mutable OuterDistributed = outerDistributed
+    let mutable InnerNested      = innerNested
+    let mutable InnerDistributed = innerDistributed
+    new() as this = LoopTextGenerator([], [], [], [])
+
+    override this.IteratorName i j = ""
+    override this.Index a b = ""
+    override this.Zero = string 0
+    override this.Text loop i j a = [""]
+
+    interface pushText<LoopTextGenerator> with
+        override this.PushOuterNested newOuterNested =
+            LoopTextGenerator(OuterNested @ [newOuterNested], OuterDistributed, InnerNested, InnerDistributed)
+        override this.PushOuterDistributed newOuterDistributed =
+            LoopTextGenerator(OuterNested, OuterDistributed @ [newOuterDistributed], InnerNested, InnerDistributed)
+        override this.PushInnerNested newInnerNested =
+            LoopTextGenerator(OuterNested, OuterDistributed, InnerNested @ [newInnerNested], InnerDistributed)
+        override this.PushInnerDistributed newInnerDistributed =
+            LoopTextGenerator(OuterNested, OuterDistributed, InnerNested, InnerDistributed @ [newInnerDistributed])
+
+
+type CppLoopTextGenerator (outerNested, outerDistributed, innerNested, innerDistributed) =
+    inherit LoopTextGenerator(outerNested, outerDistributed, innerNested, innerDistributed)
+    let mutable OuterNested      = outerNested
+    let mutable OuterDistributed = outerDistributed
+    let mutable InnerNested      = innerNested
+    let mutable InnerDistributed = innerDistributed
+    new() as this = CppLoopTextGenerator([], [], [], [])
+
+    override this.IteratorName min index = cppIteratorNameGenerator min index
+    override this.Index arrayName iName = cppIndex arrayName iName
+    override this.Zero = string 0
+    override this.Text loop i j inner = loopBuilder OuterNested OuterDistributed cppLoopLine brace InnerNested InnerDistributed loop i j inner
+
+    interface pushText<CppLoopTextGenerator> with
+        override this.PushOuterNested newOuterNested =
+            CppLoopTextGenerator(OuterNested @ [newOuterNested], OuterDistributed, InnerNested, InnerDistributed)
+        override this.PushOuterDistributed newOuterDistributed =
+            CppLoopTextGenerator(OuterNested, OuterDistributed @ [newOuterDistributed], InnerNested, InnerDistributed)
+        override this.PushInnerNested newInnerNested =
+            CppLoopTextGenerator(OuterNested, OuterDistributed, InnerNested @ [newInnerNested], InnerDistributed)
+        override this.PushInnerDistributed newInnerDistributed =
+            CppLoopTextGenerator(OuterNested, OuterDistributed, InnerNested, InnerDistributed @ [newInnerDistributed])
+
+(********************************************************************************)
 
 module NestedLoop =
     /// Union for the symmetry/commutativity state of a variable.
@@ -134,29 +279,14 @@ module NestedLoop =
         swap' (List.rev states) 0 (List.rev items)
 
     /// Autogenerate a unary nested_for loop.
-    let private unaryLoop (loop: Loop) (textGenerator: LoopTextGenerator) =
-        let rec parLines' levels acc =
-            match levels with
-            | [] -> []
-            | head :: tail ->
-                if head > 0 then
-                    textGenerator.ParallelismLines.[acc] :: (parLines' ((head-1) :: tail) acc)
-                else if head = 0 then
-                    parLines' tail (acc+1)
-                else
-                    failwith "derp"
-        let parLines = parLines' loop.parLevels 0
-
-        List.init loop.iarrayLevels (fun i ->
-            let parLine = if i < parLines.Length then parLines.[i] loop.indNames.[i] else []
-            fun inner -> textGenerator.LoopText loop i parLine inner
-        )
+    let private unaryLoop (loop: Loop) (textGenerator: LoopTextGenerator) (i: int) =
+        List.init loop.iarrayLevels (fun j inner-> textGenerator.Text loop i j inner)
         |> List.rev
 
     /// Autogenerate an N-ary nested_for loop.
     let private naryLoop (loops: Loop list) (states: SymcomState list list) (textGenerator: LoopTextGenerator) =
-        List.init states.Length (fun j ->
-            unaryLoop loops.[j] textGenerator
+        List.init states.Length (fun i ->
+            unaryLoop loops.[i] textGenerator i
             |> List.map (fun y (acc: int) -> y)
         )
         |> swap states
@@ -185,11 +315,12 @@ module NestedLoop =
     /// <param name="func"> A function class. </param>
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) (textGenerator: LoopTextGenerator) =
         let ilevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
-        let comm = func.Comm |> function | Some comm -> comm | None -> (List.init iarrays.Length id)
 
-        let iNames = iarrays |> List.map (fun x -> x.Name)
-        let iSymms = iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))
-        let states = vStates iNames iSymms comm
+        let states =
+            let comm = func.Comm |> function | Some comm -> comm | None -> (List.init iarrays.Length id)
+            let iNames = iarrays |> List.map (fun x -> x.Name)
+            let iSymms = iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))
+            vStates iNames iSymms comm
 
         /// Generates a list of new iterator names for multiple variables based on a minumum and the ranks of variables to loop over.
         /// <param name="min"> First integer to append to "__i". </param>
@@ -236,16 +367,6 @@ module NestedLoop =
         let subOName = (func.OName, lastOName)
         let subbedInner = subInner (subINames @ [subOName] |> List.rev) func.Inner
 
-        // from https://stackoverflow.com/questions/3016139/help-me-to-explain-the-f-matrix-transpose-function
-        let rec transpose = function
-            | (_::_)::_ as m -> List.map List.head m :: transpose (List.map List.tail m)
-            | _ -> []
-
-        let parallelismLevels =
-            func.ParallelismLevels
-            |> List.map (function | Some x -> x | None -> (List.init iarrays.Length (fun i -> 0)))
-            |> transpose
-
         let iExtents = func.INames |> List.map (fun x -> String.concat "" [x; "_extents"])
 
         let loops = List.init (iarrays.Length) (fun i ->
@@ -257,7 +378,7 @@ module NestedLoop =
                 iExtents = iExtents.[i];
                 indNames = indexNames.[i];
                 iMins = imins.[i];
-                parLevels = parallelismLevels.[i]
+                parLevels = func.ParallelismLevels.[i]
             }
         )
 
@@ -270,77 +391,71 @@ module NestedLoop =
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) (textGenerator: LoopTextGenerator) =
         Nary [iarray] oarray func textGenerator
 
+    /// Autogenerate an N-ary nested_for loop
+    /// <param name="iarrays"> A list of input array classes. </param>
+    /// <param name="oarray"> An output array class. </param>
+    /// <param name="func"> A function class. </param>
+    let ncGet (array: NestedArray) (textGenerator: LoopTextGenerator) =
+        let ncFileName, ncVarName = array.ncFile |> Option.get |> fun x -> fst x, snd x
 
-(********************************************************************************)
+        let indexNames = List.init (array.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
 
+        let iSymms = array.Symm |> function | Some s -> s | None -> (List.init array.Rank id)
+        let states = vStates [array.Name] [iSymms] [0]
+        /// Chooses the correct iterator minimum for all input variables.
+        let imins =
+            let iMaps = iminMap states
+            List.init array.Rank (fun j ->
+                if iMaps.Head.[j] = (0, j) then textGenerator.Zero else indexNames.[snd iMaps.Head.[j]]
+            )
 
-/// Inserts a tab character at the beginning of each string in the input list.
-let tab x =
-    x |> List.map (fun y -> String.concat "" ["\t"; y])
+        /// Last input array intermediate names to be subbed into the inner block
+        let lastIName = String.concat "" [array.Name; indexNames |> List.rev |> List.head]
 
-/// Inserts a tab character at the end of each string in the input list.
-let newln x =
-    x |> List.map (fun y -> String.concat "" [y; "\n"])
+        /// nc_open call
+        let ncInit = String.concat "" [
+            "int "; array.Name; "_file_ncid;\n";
+            "nc_open("; ncFileName; ", NC_NOWRITE, &"; array.Name; "_file_ncid);\n";
+            "int "; array.Name; "_var_ncid;\n";
+            "nc_inq_varid("; array.Name; "_file_ncid, "; ncVarName; ", &"; array.Name; "_var_ncid;\n";
+            "int* ";    array.Name; "_dim_ncids = new int[";  string array.Rank; "];\n";
+            "size_t* "; array.Name; "_extents = new size_t["; string array.Rank; "];\n";
+            "size_t* "; array.Name; "_starts = new size_t[";  string array.Rank; "];\n";
+            "size_t* "; array.Name; "_counts = new size_t[";  string array.Rank; "];\n";
+            "for(int q = 0; q < "; string array.Rank; "; q++){\n";
+            "\t"; "nc_inq_dimid(";  array.Name; "_file_ncid, "; array.Name; "_var_ncid, &(";     array.Name; "_dim_ncids[q]));\n";
+            "\t"; "nc_inq_dimlen("; array.Name; "_file_ncid, "; array.Name; "_dim_ncids[q], &("; array.Name; "_extents[q]));\n";
+            "\t"; array.Name; "_starts[q] = 0;\n";
+            "\t"; array.Name; "_counts[q] = 1;\n";
+            "}\n";
+            array.Name; "_counts["; string array.Rank; "] = "; array.Name; "_extents["; string array.Rank; "];\n";
+        ]
 
-/// Creates a two-element list of the input string plus '{', and '}'.
-let brace x =
-    [String.concat " " [x; "{\n"]] @ ["}\n"]
+        let textGenerator = (textGenerator :> pushText<LoopTextGenerator>).PushInnerNested (fun loop i ->
+            String.concat "" [array.Name; "_starts["; string i; "] = "; loop.indNames.[i]; ";\n"]
+        )
 
-let cppIteratorNameGenerator min index =
-    String.concat "" ["__i"; (string (index + min))]
+        let inner = String.concat "" [
+            "nc_get_vara_"; array.Type; "("; array.Name; "_file_ncid, "; array.Name; "_var_ncid, "; array.Name; "_starts, "; array.Name; "_counts, "; array.Name; ");\n"
+        ]
 
-/// Generates a single "for(...)" statement.
-/// <param name="iName"> Iterator name. </param>
-/// <param name="iMin"> Iterator minimum name. </param>
-/// <param name="extentName"> Extent vector name. </param>
-/// <param name="extentIndex"> Element of extent vector to use as iterator maximum. </param>
-let cppLoopLine iName iMin extentName extentIndex =
-    String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; extentName; "["; extentIndex; "]; "; iName; "++)";]
+        let loop =
+            {
+                iarrayName = array.Name;
+                iarrayType = array.Type;
+                iarrayLevels = array.Rank-1;
+                iRank = array.Rank;
+                iExtents = String.concat "" [array.Name; "_extents"];
+                indNames = indexNames;
+                iMins = imins;
+                parLevels = 0;
+            }
 
-/// Generates a call to operator().
-/// <param name="arrayName"> Variable name. </param>
-/// <param name="iName"> Iterator name. </param>
-let cppIndex arrayName iName =
-    String.concat "" [arrayName; "["; iName; "]"]
-
-/// Generates an OpenMP parallelization line. Inserts a " " clause for the input iterator name.
-/// <param name="iName"> Iterator name. </param>
-let cppOmpLine iName =
-    [String.concat "" ["#pragma omp parallel for private("; iName; ")"]]
-
-/// Generates an iterator declaration line.
-/// <param name="iType"> Iterator type. </param>
-/// <param name="iName"> Iterator name. </param>
-let cppIteratorDeclLine iType iName =
-    String.concat "" [iType; " "; iName; " = 0;"]
-
-/// Main code meat
-let cppArrayDeclLine loop i inner =
-    let braced = brace (cppLoopLine loop.indNames.[i] loop.iMins.[i] loop.iExtents (string i))
-    let pre = String.concat "" ["promote<"; loop.iarrayType; ", "; string (loop.iarrayLevels-i+loop.iRank-1); ">::type "; loop.iarrayName; loop.indNames.[i]; " = "]
-
-    match i with
-    | 0 -> cppIndex loop.iarrayName loop.indNames.[i]
-    | _ -> cppIndex (String.concat "" [loop.iarrayName; loop.indNames.[i-1]]) loop.indNames.[i]
-    |> fun x -> tab [String.concat "" [pre; x; ";\n"]]
-    |> fun iline -> List.concat [[braced.[0]]; iline; tab inner; [braced.[1]]]
-
-/// Generate all text for a single nested loop.
-/// <param name="loop"> Loop object constructed by NestedLoop.Unary or NestedLoop.Nary. </param>
-/// <param name="i"> Current loop index. </param>
-/// <param name="parLine"> Callback hook for the correct parallel loop line function for this iteration. </param>
-/// <param name="inner"> Inner block of text i.e. the actual algorithm. </param>
-let cppLoopText loop i parLine inner =
-    List.concat [ newln [cppIteratorDeclLine "int" loop.indNames.[i]]; newln parLine; cppArrayDeclLine loop i inner ]
-
-let cppGenerator =
-    {
-        IteratorName = cppIteratorNameGenerator;
-        Index = cppIndex;
-        ParallelismLines = [cppOmpLine];
-        LoopText = cppLoopText;
-        Zero = string 0
-    }
+        let ret =
+            (unaryLoop loop textGenerator 0
+            |> List.fold (|>) [inner])
+            @ [String.concat "" ["nc_close("; array.Name; "_file_ncid);\n"]]
+        ret
 
 
 (********************************************************************************)
@@ -736,10 +851,12 @@ let (|FunctionPragmaPattern|_|) = function
     | _ -> None
 
 let (|ArrayPattern|_|) (symGroups: int list Option) = function
-    | Token.Str valtype :: Token.Symbol '~' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups}, tail )
+    | Token.Str "edgi_nc_t" :: Token.Str name :: Token.Symbol '(' :: Token.Str fileName :: Token.Symbol ',' :: Token.Str varName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
+        Some ( {Name = name; Type = getNCtype fileName varName; Rank = getNCnumDims fileName varName; Symm = symGroups; ncFile = Some (fileName, varName)}, tail)
+    | Token.Str valtype :: Token.Symbol '^' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; ncFile = None}, tail )
     | Token.Str "promote" :: Token.Symbol '<' :: Token.Str valtype :: Token.Symbol ',' :: Token.Int rank :: Token.Symbol '>' :: Token.Symbol ':' :: Token.Symbol ':' :: Token.Str "type" :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups}, tail )
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; ncFile = None}, tail )
     | _ -> None
 
 let getArray (clauses: Clause list) (block: Token list) =
@@ -767,8 +884,9 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
     let hasOmp = clauses |> List.exists (fst >> (function | "ompLevels" -> true | _ -> false))
     let ompLevels =
         if hasOmp then
-            Some ((clauses |> List.find (fst >> (function | "ompLevels" -> true | _ -> false))) |> (snd >> tokenToInt))
-        else None
+            (clauses |> List.find (fst >> (function | "ompLevels" -> true | _ -> false))) |> (snd >> tokenToInt)
+        else
+            List.init iranks.Length (fun i -> 0)
 
     let hasCom = clauses |> List.exists (fst >> (function | "commutativity" -> true | _ -> false))
     let com =
@@ -783,7 +901,7 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
       OName = output;
       ORank = orank;
       Comm = com;
-      ParallelismLevels = [ompLevels];
+      ParallelismLevels = ompLevels;
       Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln }
 
 
@@ -970,9 +1088,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         | _ -> tokens |> (tokenToStr >> respace >> reconcat >> newln >> List.head)
 
     let nOmp =
-        if oloop.GetFunc.ParallelismLevels.[0].IsNone then 0 else
-            oloop.GetFunc.ParallelismLevels.[0]
-            |> Option.get
+        if (oloop.GetFunc.ParallelismLevels |> List.sum = 0) then 0 else
+            oloop.GetFunc.ParallelismLevels
             |> List.filter (fun x -> x > 0)
             |> List.length
 
@@ -981,23 +1098,25 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         | Some a -> // fixed arity => specify all argument names
             List.init numCalls (fun i ->
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc cppGenerator |> fst)
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc (new CppLoopTextGenerator()) |> fst)
             )
         | None ->
             let funcs = List.init numCalls (fun i ->
-                { Name = String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]];
-                  Arity = Some(arity.[i]);
-                  INames = inames.[i];
-                  IRank = List.init arity.[i] (fun j -> oloop.GetFunc.IRank.Head);
-                  OName = oloop.GetFunc.OName;
-                  ORank = oloop.GetFunc.ORank;
-                  Comm = oloop.GetFunc.Comm;
-                  ParallelismLevels = oloop.GetFunc.ParallelismLevels;
-                  Inner = oloop.GetFunc.Inner |> List.map (tokenize >> deleteReturnLine >> (expandVariadic i)) }
+                {
+                    Name = String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]];
+                    Arity = Some(arity.[i]);
+                    INames = inames.[i];
+                    IRank = List.init arity.[i] (fun j -> oloop.GetFunc.IRank.Head);
+                    OName = oloop.GetFunc.OName;
+                    ORank = oloop.GetFunc.ORank;
+                    Comm = oloop.GetFunc.Comm;
+                    ParallelismLevels = oloop.GetFunc.ParallelismLevels;
+                    Inner = oloop.GetFunc.Inner |> List.map (tokenize >> deleteReturnLine >> (expandVariadic i))
+                }
             )
             List.init numCalls (fun i ->
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] cppGenerator |> fst)
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] (new CppLoopTextGenerator()) |> fst)
             )
 
     List.init numCalls (fun i ->
@@ -1080,13 +1199,12 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let tSpecInner =
         List.init numCalls (fun i ->
             let nOmp =
-                if mloop.funcs.[i].ParallelismLevels.[0].IsNone then 0 else
-                    mloop.funcs.[i].ParallelismLevels.[0]
-                    |> Option.get
+                if (mloop.funcs.[i].ParallelismLevels |> List.sum = 0) then 0 else
+                    mloop.funcs.[i].ParallelismLevels
                     |> List.filter (fun x -> x > 0)
                     |> List.length
             String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] cppGenerator |> fst)
+            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] (new CppLoopTextGenerator()) |> fst)
         )
 
     List.init numCalls (fun i ->
@@ -1286,7 +1404,8 @@ let main args =
 //let args = [|"/home/Christopher.Dupuis/agu2019proj/covariance.edgi"; "/home/Christopher.Dupuis/agu2019proj/covariance.cpp"|];;
 //main [|"/home/Christopher.Dupuis/agu2019proj/covariance.edgi"; "/home/Christopher.Dupuis/agu2019proj/covariance.cpp"|];;
 
-
+//let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"|];;
+//main [|"/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"|];;
 
 
 (*
