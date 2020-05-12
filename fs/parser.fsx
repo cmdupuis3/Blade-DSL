@@ -98,14 +98,15 @@ let brace x =
 /// <param name="i"> Current N-ary loop index; this is threaded through all loops. </param>
 /// <param name="j"> Current unary loop index; this resets for every new nested loop. </param>
 /// <param name="inner"> Inner block of text i.e. the actual algorithm. </param>
-let loopBuilder outerNested outerDistributed loopLine (scope: string -> string list) innerNested innerDistributed loop i j inner =
-    let nestedText      = List.map (fun x -> [x loop i]   |> newln |> List.head)
-    let distributedText = List.map (fun x -> [x loop i j] |> newln |> List.head)
+let loopBuilder iteratorDeclLine outerNested outerDistributed loopLine (scope: string -> string list) innerNested innerDistributed loop i j inner =
+    let nestedText      = List.map (fun x -> [x loop j]   |> newln |> List.head)
+    let distributedText = List.map (fun x -> [x loop j i] |> newln |> List.head)
     let outerText = (outerNested |> nestedText) @ (outerDistributed |> distributedText)
     let innerText = (innerNested |> nestedText) @ (innerDistributed |> distributedText)
 
-    let scoped = scope (loopLine loop.indNames.[i] loop.iMins.[i] loop.iExtents (string i))
-    List.concat [outerText; [scoped.[0]]; innerText; tab inner; [scoped.[1]]]
+    let iteratorDecl = iteratorDeclLine "int" loop.indNames.[j]
+    let scoped = scope (loopLine loop.indNames.[j] loop.iMins.[j] loop.iExtents (string j))
+    List.concat [newln [iteratorDecl]; outerText; [scoped.Head]; innerText; tab inner; [scoped.Tail.Head]]
 
 
 let cppIteratorNameGenerator min index =
@@ -138,13 +139,12 @@ let cppArrayDeclLine loop j =
     match j with
     | 0 -> cppIndex loop.iarrayName loop.indNames.[j]
     | _ -> cppIndex (String.concat "" [loop.iarrayName; loop.indNames.[j-1]]) loop.indNames.[j]
-    |> fun x -> tab [String.concat "" [pre; x; ";"]]
-    |> List.head
+    |> fun x -> String.concat "" [pre; x; ";"]
 
 /// Generates an OpenMP parallelization line. Inserts a " " clause for the input iterator name.
-let cppOmpLine loop i j =
+let cppOmpLine loop j i =
     if loop.parLevels > j then
-        String.concat "" ["#pragma omp parallel for private("; cppIndex loop.iarrayName loop.indNames.[j]; ")"]
+        String.concat "" ["#pragma omp parallel for private("; loop.indNames.[j]; ")"]
     else ""
 
 let cppNestedNCstart loop j =
@@ -172,7 +172,7 @@ type LoopTextGenerator (outerNested: (Loop -> int -> string) list,
     let mutable OuterDistributed = outerDistributed
     let mutable InnerNested      = innerNested
     let mutable InnerDistributed = innerDistributed
-    new() as this = LoopTextGenerator([], [], [], [])
+    new() = LoopTextGenerator([], [], [], [])
 
     override this.IteratorName i j = ""
     override this.Index a b = ""
@@ -196,12 +196,12 @@ type CppLoopTextGenerator (outerNested, outerDistributed, innerNested, innerDist
     let mutable OuterDistributed = outerDistributed
     let mutable InnerNested      = innerNested
     let mutable InnerDistributed = innerDistributed
-    new() as this = CppLoopTextGenerator([], [], [], [])
+    new() = CppLoopTextGenerator([], [], [], [])
 
     override this.IteratorName min index = cppIteratorNameGenerator min index
     override this.Index arrayName iName = cppIndex arrayName iName
     override this.Zero = string 0
-    override this.Text loop i j inner = loopBuilder OuterNested OuterDistributed cppLoopLine brace InnerNested InnerDistributed loop i j inner
+    override this.Text loop i j inner = loopBuilder cppIteratorDeclLine OuterNested OuterDistributed cppLoopLine brace InnerNested InnerDistributed loop i j inner
 
     interface pushText<CppLoopTextGenerator> with
         override this.PushOuterNested newOuterNested =
@@ -453,7 +453,7 @@ module NestedLoop =
 
         let ret =
             (unaryLoop loop textGenerator 0
-            |> List.fold (|>) [inner])
+             |> List.fold (|>) [inner])
             @ [String.concat "" ["nc_close("; array.Name; "_file_ncid);\n"]]
         ret
 
@@ -1087,18 +1087,13 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             | _ -> h |> (tokenToStr >> respace >> reconcat >> newln >> List.head)
         | _ -> tokens |> (tokenToStr >> respace >> reconcat >> newln >> List.head)
 
-    let nOmp =
-        if (oloop.GetFunc.ParallelismLevels |> List.sum = 0) then 0 else
-            oloop.GetFunc.ParallelismLevels
-            |> List.filter (fun x -> x > 0)
-            |> List.length
-
     let tSpecInner =
+        let nOmp = oloop.GetFunc.ParallelismLevels |> List.sum
         match oloop.GetFunc.Arity with
         | Some a -> // fixed arity => specify all argument names
             List.init numCalls (fun i ->
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc (new CppLoopTextGenerator()) |> fst)
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc (new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])) |> fst)
             )
         | None ->
             let funcs = List.init numCalls (fun i ->
@@ -1116,7 +1111,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             )
             List.init numCalls (fun i ->
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] (new CppLoopTextGenerator()) |> fst)
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] (new CppLoopTextGenerator([cppArrayDeclLine],[cppOmpLine],[],[])) |> fst)
             )
 
     List.init numCalls (fun i ->
@@ -1198,13 +1193,9 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let tSpecInner =
         List.init numCalls (fun i ->
-            let nOmp =
-                if (mloop.funcs.[i].ParallelismLevels |> List.sum = 0) then 0 else
-                    mloop.funcs.[i].ParallelismLevels
-                    |> List.filter (fun x -> x > 0)
-                    |> List.length
+            let nOmp = mloop.funcs.[i].ParallelismLevels |> List.sum
             String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] (new CppLoopTextGenerator()) |> fst)
+            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] (new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine], [], [])) |> fst)
         )
 
     List.init numCalls (fun i ->
@@ -1406,6 +1397,12 @@ let main args =
 
 //let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"|];;
 //main [|"/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"|];;
+
+//let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/10D.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10D.cpp"|];;
+//main [|"/home/username/Downloads/EDGI_nested_iterators/fs/10D.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10D.cpp"|];;
+
+//let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"|];;
+//main [|"/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"|];;
 
 
 (*
