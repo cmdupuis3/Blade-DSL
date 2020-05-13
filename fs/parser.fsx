@@ -39,6 +39,13 @@ getNCtype file var
 *)
 
 
+// Hack alert
+let unquote (s: string) =
+    s.[1..(s.Length-2)]
+
+let quote (s: string) =
+    String.concat "" ["\""; s; "\""]
+
 
 /// Container for array pragma information
 type NestedArray =
@@ -413,22 +420,22 @@ module NestedLoop =
         let lastIName = String.concat "" [array.Name; indexNames |> List.rev |> List.head]
 
         /// nc_open call
-        let ncInit = String.concat "" [
-            "int "; array.Name; "_file_ncid;\n";
-            "nc_open("; ncFileName; ", NC_NOWRITE, &"; array.Name; "_file_ncid);\n";
-            "int "; array.Name; "_var_ncid;\n";
-            "nc_inq_varid("; array.Name; "_file_ncid, "; ncVarName; ", &"; array.Name; "_var_ncid;\n";
-            "int* ";    array.Name; "_dim_ncids = new int[";  string array.Rank; "];\n";
-            "size_t* "; array.Name; "_extents = new size_t["; string array.Rank; "];\n";
-            "size_t* "; array.Name; "_starts = new size_t[";  string array.Rank; "];\n";
-            "size_t* "; array.Name; "_counts = new size_t[";  string array.Rank; "];\n";
-            "for(int q = 0; q < "; string array.Rank; "; q++){\n";
-            "\t"; "nc_inq_dimid(";  array.Name; "_file_ncid, "; array.Name; "_var_ncid, &(";     array.Name; "_dim_ncids[q]));\n";
-            "\t"; "nc_inq_dimlen("; array.Name; "_file_ncid, "; array.Name; "_dim_ncids[q], &("; array.Name; "_extents[q]));\n";
-            "\t"; array.Name; "_starts[q] = 0;\n";
-            "\t"; array.Name; "_counts[q] = 1;\n";
-            "}\n";
-            array.Name; "_counts["; string array.Rank; "] = "; array.Name; "_extents["; string array.Rank; "];\n";
+        let ncInit = [
+            String.concat "" ["int "; array.Name; "_file_ncid;"]
+            String.concat "" ["nc_open("; quote ncFileName; ", NC_NOWRITE, &"; array.Name; "_file_ncid);"]
+            String.concat "" ["int "; array.Name; "_var_ncid;";]
+            String.concat "" ["nc_inq_varid("; array.Name; "_file_ncid, "; quote ncVarName; ", &"; array.Name; "_var_ncid);"]
+            String.concat "" ["int* ";    array.Name; "_dim_ncids = new int[";  string array.Rank; "];"]
+            String.concat "" ["size_t* "; array.Name; "_extents = new size_t["; string array.Rank; "];"]
+            String.concat "" ["size_t* "; array.Name; "_starts = new size_t[";  string array.Rank; "];"]
+            String.concat "" ["size_t* "; array.Name; "_counts = new size_t[";  string array.Rank; "];"]
+            String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
+            String.concat "" ["\t"; "nc_inq_dimid(";  array.Name; "_file_ncid, "; array.Name; "_var_ncid, &(";     array.Name; "_dim_ncids[q]));"]
+            String.concat "" ["\t"; "nc_inq_dimlen("; array.Name; "_file_ncid, "; array.Name; "_dim_ncids[q], &("; array.Name; "_extents[q]));"]
+            String.concat "" ["\t"; array.Name; "_starts[q] = 0;"]
+            String.concat "" ["\t"; array.Name; "_counts[q] = 1;"]
+            String.concat "" ["}"]
+            String.concat "" [array.Name; "_counts["; string (array.Rank-1); "] = "; array.Name; "_extents["; string array.Rank; "];"]
         ]
 
         let textGenerator = (textGenerator :> pushText<LoopTextGenerator>).PushInnerNested (fun loop i ->
@@ -452,8 +459,9 @@ module NestedLoop =
             }
 
         let ret =
-            (unaryLoop loop textGenerator 0
-             |> List.fold (|>) [inner])
+            newln ncInit
+            @ (unaryLoop loop textGenerator 0
+               |> List.fold (|>) [inner])
             @ [String.concat "" ["nc_close("; array.Name; "_file_ncid);\n"]]
         ret
 
@@ -480,13 +488,6 @@ type Token =
 let (|Match|_|) pattern input =
     let m = Regex.Match (input, pattern)
     if m.Success then Some m.Value else None
-
-// Hack alert
-let unquote (s: string) =
-    s.[1..(s.Length-2)]
-
-let quote (s: string) =
-    String.concat "" ["\""; s; "\""]
 
 /// Convert string to a token based on a regex pattern
 let toToken = function
