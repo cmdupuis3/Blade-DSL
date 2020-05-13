@@ -395,7 +395,7 @@ module NestedLoop =
     /// <param name="iarrays"> A list of input array classes. </param>
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
-    let ncGet (array: NestedArray) (textGenerator: LoopTextGenerator) =
+    let ncGet (textGenerator: LoopTextGenerator) (array: NestedArray) =
         let ncFileName, ncVarName = array.ncFile |> Option.get |> fun x -> fst x, snd x
 
         let indexNames = List.init (array.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
@@ -473,12 +473,20 @@ type Token =
     | Symbol of char
     | Str of string
     | Int of int
+    | Quote of string
     | Other of string
 
 /// Tokenizer helper pattern for regexes
 let (|Match|_|) pattern input =
     let m = Regex.Match (input, pattern)
     if m.Success then Some m.Value else None
+
+// Hack alert
+let unquote (s: string) =
+    s.[1..(s.Length-2)]
+
+let quote (s: string) =
+    String.concat "" ["\""; s; "\""]
 
 /// Convert string to a token based on a regex pattern
 let toToken = function
@@ -487,6 +495,8 @@ let toToken = function
     | Match @"^\{|^\}|^\(|^\)|^\[|^\]|^,|^\#|^\<|^\>|^;|^:|^\^|^\*|^=" s -> s, Token.Symbol s.[0]
     | Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s -> s, Token.Str s
     | Match @"^\d+"                    s -> s, Token.Int (int s)
+    | Match  "^\"[^\"]+\""             s -> s, Token.Quote (unquote s)
+    | Match  "^\'[^\']+\""             s -> s, Token.Quote (unquote s)
     | Match @"."                       s -> s, Token.Other (string s)
     | _ -> failwith "Invalid Token"
 
@@ -515,6 +525,7 @@ let tokenToStr (tokens: Token list) =
         | Token.Symbol s -> string s
         | Token.Str    s -> string s
         | Token.Int    i -> string i
+        | Token.Quote  q -> quote (string q)
         | Token.Other  o -> string o
     )
 
@@ -522,6 +533,7 @@ let rec respace = function
     | Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s1 :: Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
     | Match @"^return" s1 :: Match @"^[a-zA-Z0-9_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
     | Match @"^\#" s1 :: Match @"^include" s2 :: tail -> s1 :: s2 :: " " :: respace tail
+    | Match @"^\#" s1 :: Match @"^define" s2 :: s3 :: s4 :: tail -> s1 :: s2 :: " " :: s3 :: " " :: s4 :: respace tail
     | head :: tail -> head :: respace tail
     | [] -> []
 
@@ -851,7 +863,7 @@ let (|FunctionPragmaPattern|_|) = function
     | _ -> None
 
 let (|ArrayPattern|_|) (symGroups: int list Option) = function
-    | Token.Str "edgi_nc_t" :: Token.Str name :: Token.Symbol '(' :: Token.Str fileName :: Token.Symbol ',' :: Token.Str varName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
+    | Token.Str "edgi_nc_t" :: Token.Str name :: Token.Symbol '(' :: Token.Quote fileName :: Token.Symbol ',' :: Token.Quote varName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
         Some ( {Name = name; Type = getNCtype fileName varName; Rank = getNCnumDims fileName varName; Symm = symGroups; ncFile = Some (fileName, varName)}, tail)
     | Token.Str valtype :: Token.Symbol '^' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
         Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; ncFile = None}, tail )
@@ -1092,8 +1104,13 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         match oloop.GetFunc.Arity with
         | Some a -> // fixed arity => specify all argument names
             List.init numCalls (fun i ->
+                let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc (new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])) |> fst)
+                (oloop.iarrays.[i]
+                 |> List.filter (fun x -> x.ncFile.IsSome)
+                 |> List.map (NestedLoop.ncGet textGenerator)
+                 |> List.reduce (@)) @
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc textGenerator |> fst)
             )
         | None ->
             let funcs = List.init numCalls (fun i ->
@@ -1110,8 +1127,13 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 }
             )
             List.init numCalls (fun i ->
+                let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] (new CppLoopTextGenerator([cppArrayDeclLine],[cppOmpLine],[],[])) |> fst)
+                (oloop.iarrays.[i]
+                 |> List.filter (fun x -> x.ncFile.IsSome)
+                 |> List.map (NestedLoop.ncGet textGenerator)
+                 |> List.reduce (@)) @
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] textGenerator |> fst)
             )
 
     List.init numCalls (fun i ->
@@ -1194,8 +1216,13 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let tSpecInner =
         List.init numCalls (fun i ->
             let nOmp = mloop.funcs.[i].ParallelismLevels |> List.sum
+            let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
             String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] (new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine], [], [])) |> fst)
+            (mloop.iarrays
+             |> List.filter (fun x -> x.ncFile.IsSome)
+             |> List.map (NestedLoop.ncGet textGenerator)
+             |> List.reduce (@)) @
+            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] textGenerator |> fst)
         )
 
     List.init numCalls (fun i ->
