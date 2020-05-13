@@ -10,7 +10,7 @@ using namespace nested_array_utilities;
 
 #define OMP_NUM_THREADS 48
 
-#pragma edgi function(add10) arity(10) input(in1,in2,in3,in4,in5,in6,in7,in8,in9,in10) iranks(0,0,0,0,0,0,0,0,0,0) output(out) orank(0) ompLevels(1,0,0,0,0,0,0,0,0,0) commutativity(1,2,3,4,5,6,7,8,9,10)
+#pragma edgi function(add10) arity(10) input(in1,in2,in3,in4,in5,in6,in7,in8,in9,in10) iranks(0,0,0,0,0,0,0,0,0,0) output(out) orank(0) ompLevels(1,0,1,0,0,0,0,0,0,0) commutativity(1,1,1,4,5,6,7,8,9,10)
 {
     out = in1 + in2 + in3 + in4 + in5 + in6 + in7 + in8 + in9 + in10;
 }
@@ -22,56 +22,45 @@ static constexpr const int extents10[10] = {10,10,10,10,10,10,10,10,10,10};
 int main() {
 
     clock_t start;
+    start = clock();
 
     #pragma edgi array
-    float~1 a1;
+    float^1 a1(extents1);
 
     #pragma edgi array
-    float~1 a2;
+    float^1 a2(extents1);
 
     #pragma edgi array
-    float~1 a3;
+    float^1 a3(extents1);
 
     #pragma edgi array
-    float~1 a4;
+    float^1 a4(extents1);
 
     #pragma edgi array
-    float~1 a5;
+    float^1 a5(extents1);
 
     #pragma edgi array
-    float~1 a6;
+    float^1 a6(extents1);
 
     #pragma edgi array
-    float~1 a7;
+    float^1 a7(extents1);
 
     #pragma edgi array
-    float~1 a8;
+    float^1 a8(extents1);
 
     #pragma edgi array
-    float~1 a9;
+    float^1 a9(extents1);
 
     #pragma edgi array
-    float~1 a10;
+    float^1 a10(extents1);
 
     #pragma edgi array
-    float~10 res;
+    float^10 res(extents10);
+
+    cout << "Allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
 
     typedef promote<float, 1>::type float1;
     typedef promote<float, 10>::type float10;
-
-    start = clock();
-    a1  = allocate<float1, extents1>();
-    a2  = allocate<float1, extents1>();
-    a3  = allocate<float1, extents1>();
-    a4  = allocate<float1, extents1>();
-    a5  = allocate<float1, extents1>();
-    a6  = allocate<float1, extents1>();
-    a7  = allocate<float1, extents1>();
-    a8  = allocate<float1, extents1>();
-    a9  = allocate<float1, extents1>();
-    a10  = allocate<float1, extents1>();
-    res = allocate<float10, extents10>();
-    cout << "Allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
 
     fill_random<float1, extents1>(a1, 10);
     fill_random<float1, extents1>(a2, 10);
@@ -86,7 +75,7 @@ int main() {
 
     start = clock();
     auto oloop = object_for(add10);
-    oloop(a1, a1, a1, a4, a5, a6, a7, a8, a9, a10, res, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents1, extents10);
+    oloop(a1, a1, a1, a4, a5, a6, a7, a8, a9, a10, res);
 
     cout << "Calculation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
 /*

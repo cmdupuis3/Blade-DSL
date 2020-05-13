@@ -10,7 +10,7 @@ using namespace nested_array_utilities;
 
 #define OMP_NUM_THREADS 48
 
-#pragma edgi function(add10) arity(1) input(in1) iranks(0) output(out) orank(0) ompLevels(1)
+#pragma edgi function(add10) arity(1) input(in1) iranks(0) output(out) orank(0) ompLevels(2)
 {
     out = in1 + 10;
 }
@@ -21,25 +21,23 @@ static constexpr const int extents10[10] = {10,10,10,10,10,10,10,10,10,10};
 int main() {
 
     clock_t start;
+    start = clock();
 
-    #pragma edgi array symmetry(1,2,3,4,5,6,7,8,9,10)
-    float~10 a1;
+    #pragma edgi array symmetry(1,1,1,4,5,6,7,8,9,10)
+    float^10 a1(extents10);
 
-    #pragma edgi array symmetry(1,2,3,4,5,6,7,8,9,10)
-    float~10 res;
+    #pragma edgi array symmetry(1,1,1,4,5,6,7,8,9,10)
+    float^10 res(extents10);
+
+    cout << "Allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
 
     typedef promote<float, 10>::type float10;
-
-    start = clock();
-    a1  = allocate<float10, extents10, a1_symm>();
-    res = allocate<float10, extents10, res_symm>();
-    cout << "Allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
 
     fill_random<float10, extents10, a1_symm>(a1, 10);
 
     start = clock();
     auto oloop = object_for(add10);
-    oloop(a1, res, extents10, extents10);
+    oloop(a1, res);
 
     cout << "Calculation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
 /*

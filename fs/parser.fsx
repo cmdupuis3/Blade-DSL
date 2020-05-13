@@ -132,7 +132,7 @@ let loopBuilder iteratorDeclLine outerNested outerDistributed loopLine (scope: s
 
     let iteratorDecl = iteratorDeclLine "int" loop.indNames.[j]
     let scoped = scope (loopLine loop.indNames.[j] loop.iMins.[j] loop.iExtents (string j))
-    List.concat [newln [iteratorDecl]; outerText; [scoped.Head]; innerText; tab inner; [scoped.Tail.Head]]
+    List.concat [newln [iteratorDecl]; outerText; [scoped.Head]; tab innerText; tab inner; [scoped.Tail.Head]]
 
 
 let cppIteratorNameGenerator min index =
@@ -465,7 +465,7 @@ module NestedLoop =
         )
 
         let inner = String.concat "" [
-            "nc_get_vara_"; array.Type; "("; array.Name; "_file_ncid, "; array.Name; "_var_ncid, "; array.Name; "_starts, "; array.Name; "_counts, "; array.Name; ");\n"
+            "nc_get_vara_"; array.Type; "("; array.Name; "_file_ncid, "; array.Name; "_var_ncid, "; array.Name; "_starts, "; array.Name; "_counts, "; lastIName; ");\n"
         ]
 
         let loop =
@@ -1122,12 +1122,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         match oloop.GetFunc.Arity with
         | Some a -> // fixed arity => specify all argument names
             List.init numCalls (fun i ->
-                let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
+                let textGenerator = CppLoopTextGenerator([], [cppOmpLine],[cppArrayDeclLine],[])
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (oloop.iarrays.[i]
-                 |> List.filter (fun x -> x.Info |> function | NetCDF _ -> true | _ -> false)
-                 |> List.map (NestedLoop.ncGet textGenerator)
-                 |> List.reduce (@)) @
                 (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc textGenerator |> fst)
             )
         | None ->
@@ -1145,12 +1141,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 }
             )
             List.init numCalls (fun i ->
-                let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
+                let textGenerator = CppLoopTextGenerator([], [cppOmpLine],[cppArrayDeclLine],[])
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (oloop.iarrays.[i]
-                 |> List.filter (fun x -> x.Info |> function | NetCDF _ -> true | _ -> false)
-                 |> List.map (NestedLoop.ncGet textGenerator)
-                 |> List.reduce (@)) @
                 (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] textGenerator |> fst)
             )
 
@@ -1234,12 +1226,8 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let tSpecInner =
         List.init numCalls (fun i ->
             let nOmp = mloop.funcs.[i].ParallelismLevels |> List.sum
-            let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
+            let textGenerator = CppLoopTextGenerator([], [cppOmpLine],[cppArrayDeclLine],[])
             String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-            (mloop.iarrays
-                 |> List.filter (fun x -> x.Info |> function | NetCDF _ -> true | _ -> false)
-             |> List.map (NestedLoop.ncGet textGenerator)
-             |> List.reduce (@)) @
             (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] textGenerator |> fst)
         )
 
@@ -1294,7 +1282,14 @@ let parse (tokens: Token list) =
         |> stringCollapse "\n\n"
 
     let arraySwaps =
-        List.init arrays.Length (fun i -> String.concat "" ["promote<"; arrays.[i].Type; ", "; string arrays.[i].Rank; ">::type "; arrays.[i].Name; ";\n"])
+        arrays |> List.map (fun array ->
+            String.concat "" ["promote<"; array.Type; ", "; string array.Rank; ">::type "; array.Name; ";\n"]
+            :: String.concat "" [array.Name; " = allocate<"; array.Type; ", "; string array.Rank; ", "; symmVecName array; ">();\n"]
+            :: match array.Info with
+                | Array _ -> [""]
+                | NetCDF _ -> array |> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[]))
+                |> stringCollapse ""
+        )
 
     let rec deleteFunctionPragmas (tokens: Token list) =
         let rec deleteFrom = function
@@ -1531,4 +1526,5 @@ int main(){
 let tokens = code |> tokenize
 tokens |> parse;;
 *)
+
 
