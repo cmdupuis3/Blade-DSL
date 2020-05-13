@@ -158,10 +158,10 @@ let cppNestedNCstart loop j =
     String.concat "" ["start["; string j; "] = "; loop.indNames.[j]; ";"]
 
 type pushText<'T> =
-    abstract member PushOuterNested: (Loop -> int -> string) -> 'T
-    abstract member PushOuterDistributed: (Loop -> int -> int -> string) -> 'T
-    abstract member PushInnerNested: (Loop -> int -> string) -> 'T
-    abstract member PushInnerDistributed: (Loop -> int -> int -> string) -> 'T
+    abstract member PushOuterNested: (Loop -> int -> string) -> unit
+    abstract member PushOuterDistributed: (Loop -> int -> int -> string) -> unit
+    abstract member PushInnerNested: (Loop -> int -> string) -> unit
+    abstract member PushInnerDistributed: (Loop -> int -> int -> string) -> unit
 
 [<AbstractClass>]
 type LoopTextBase() =
@@ -188,13 +188,13 @@ type LoopTextGenerator (outerNested: (Loop -> int -> string) list,
 
     interface pushText<LoopTextGenerator> with
         override this.PushOuterNested newOuterNested =
-            LoopTextGenerator(OuterNested @ [newOuterNested], OuterDistributed, InnerNested, InnerDistributed)
+            OuterNested <- OuterNested @ [newOuterNested]
         override this.PushOuterDistributed newOuterDistributed =
-            LoopTextGenerator(OuterNested, OuterDistributed @ [newOuterDistributed], InnerNested, InnerDistributed)
+            OuterDistributed <- OuterDistributed @ [newOuterDistributed]
         override this.PushInnerNested newInnerNested =
-            LoopTextGenerator(OuterNested, OuterDistributed, InnerNested @ [newInnerNested], InnerDistributed)
+            InnerNested <- InnerNested @ [newInnerNested]
         override this.PushInnerDistributed newInnerDistributed =
-            LoopTextGenerator(OuterNested, OuterDistributed, InnerNested, InnerDistributed @ [newInnerDistributed])
+            InnerDistributed <- InnerDistributed @ [newInnerDistributed]
 
 
 type CppLoopTextGenerator (outerNested, outerDistributed, innerNested, innerDistributed) =
@@ -212,13 +212,13 @@ type CppLoopTextGenerator (outerNested, outerDistributed, innerNested, innerDist
 
     interface pushText<CppLoopTextGenerator> with
         override this.PushOuterNested newOuterNested =
-            CppLoopTextGenerator(OuterNested @ [newOuterNested], OuterDistributed, InnerNested, InnerDistributed)
+            OuterNested <- OuterNested @ [newOuterNested]
         override this.PushOuterDistributed newOuterDistributed =
-            CppLoopTextGenerator(OuterNested, OuterDistributed @ [newOuterDistributed], InnerNested, InnerDistributed)
+            OuterDistributed <- OuterDistributed @ [newOuterDistributed]
         override this.PushInnerNested newInnerNested =
-            CppLoopTextGenerator(OuterNested, OuterDistributed, InnerNested @ [newInnerNested], InnerDistributed)
+            InnerNested <- InnerNested @ [newInnerNested]
         override this.PushInnerDistributed newInnerDistributed =
-            CppLoopTextGenerator(OuterNested, OuterDistributed, InnerNested, InnerDistributed @ [newInnerDistributed])
+            InnerDistributed <- InnerDistributed @ [newInnerDistributed]
 
 (********************************************************************************)
 
@@ -435,10 +435,10 @@ module NestedLoop =
             String.concat "" ["\t"; array.Name; "_starts[q] = 0;"]
             String.concat "" ["\t"; array.Name; "_counts[q] = 1;"]
             String.concat "" ["}"]
-            String.concat "" [array.Name; "_counts["; string (array.Rank-1); "] = "; array.Name; "_extents["; string array.Rank; "];"]
+            String.concat "" [array.Name; "_counts["; string (array.Rank-1); "] = "; array.Name; "_extents["; string (array.Rank-1); "];"]
         ]
 
-        let textGenerator = (textGenerator :> pushText<LoopTextGenerator>).PushInnerNested (fun loop i ->
+        (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
             String.concat "" [array.Name; "_starts["; string i; "] = "; loop.indNames.[i]; ";\n"]
         )
 
