@@ -46,6 +46,20 @@ let unquote (s: string) =
 let quote (s: string) =
     String.concat "" ["\""; s; "\""]
 
+type ArrayInfo =
+    {
+        ExtentsName: string
+    }
+
+type NetCDFInfo =
+    {
+        FileName: string
+        VariableName: string
+    }
+
+type NestedArrayInfo =
+    | Array of ArrayInfo
+    | NetCDF of NetCDFInfo
 
 /// Container for array pragma information
 type NestedArray =
@@ -54,8 +68,13 @@ type NestedArray =
         Type: string
         Rank: int
         Symm: int list Option
-        ncFile: (string * string) Option
+        Info: NestedArrayInfo
     }
+
+let extentsName array =
+    match array.Info with
+    | Array info -> info.ExtentsName
+    | NetCDF info -> String.concat "" [array.Name; "_extents"]
 
 /// Container for function pragma information
 type NestedFunction =
@@ -403,7 +422,10 @@ module NestedLoop =
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let ncGet (textGenerator: LoopTextGenerator) (array: NestedArray) =
-        let ncFileName, ncVarName = array.ncFile |> Option.get |> fun x -> fst x, snd x
+        let ncFileName, ncVarName =
+            match array.Info with
+            | NetCDF info -> info.FileName, info.VariableName
+            | _ -> failwith "Cannot use NetCDF routines on non-NetCDF arrays"
 
         let indexNames = List.init (array.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
 
@@ -426,16 +448,16 @@ module NestedLoop =
             String.concat "" ["int "; array.Name; "_var_ncid;";]
             String.concat "" ["nc_inq_varid("; array.Name; "_file_ncid, "; quote ncVarName; ", &"; array.Name; "_var_ncid);"]
             String.concat "" ["int* ";    array.Name; "_dim_ncids = new int[";  string array.Rank; "];"]
-            String.concat "" ["size_t* "; array.Name; "_extents = new size_t["; string array.Rank; "];"]
+            String.concat "" ["size_t* "; extentsName array; " = new size_t["; string array.Rank; "];"]
             String.concat "" ["size_t* "; array.Name; "_starts = new size_t[";  string array.Rank; "];"]
             String.concat "" ["size_t* "; array.Name; "_counts = new size_t[";  string array.Rank; "];"]
             String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
             String.concat "" ["\t"; "nc_inq_dimid(";  array.Name; "_file_ncid, "; array.Name; "_var_ncid, &(";     array.Name; "_dim_ncids[q]));"]
-            String.concat "" ["\t"; "nc_inq_dimlen("; array.Name; "_file_ncid, "; array.Name; "_dim_ncids[q], &("; array.Name; "_extents[q]));"]
+            String.concat "" ["\t"; "nc_inq_dimlen("; array.Name; "_file_ncid, "; array.Name; "_dim_ncids[q], &("; extentsName array; "[q]));"]
             String.concat "" ["\t"; array.Name; "_starts[q] = 0;"]
             String.concat "" ["\t"; array.Name; "_counts[q] = 1;"]
             String.concat "" ["}"]
-            String.concat "" [array.Name; "_counts["; string (array.Rank-1); "] = "; array.Name; "_extents["; string (array.Rank-1); "];"]
+            String.concat "" [array.Name; "_counts["; string (array.Rank-1); "] = "; extentsName array; "["; string (array.Rank-1); "];"]
         ]
 
         (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
@@ -452,7 +474,7 @@ module NestedLoop =
                 iarrayType = array.Type;
                 iarrayLevels = array.Rank-1;
                 iRank = array.Rank;
-                iExtents = String.concat "" [array.Name; "_extents"];
+                iExtents = extentsName array;
                 indNames = indexNames;
                 iMins = imins;
                 parLevels = 0;
@@ -697,7 +719,7 @@ let rec toElements s =
 
 
 /// Container for method_for loop information; able to recieve messages about array and function pragmas
-type MethodLoop (nameIn: string, initIn: string list * string list, callIn: (string * (string * string) * int) list, fposition: int, lposition: int)  =
+type MethodLoop (nameIn: string, initIn: string list, callIn: (string * string * int) list, fposition: int, lposition: int)  =
     [<DefaultValue>] val mutable public iarrays: NestedArray list
     [<DefaultValue>] val mutable public oarrays: NestedArray list
     [<DefaultValue>] val mutable public funcs: NestedFunction list
@@ -713,7 +735,7 @@ type MethodLoop (nameIn: string, initIn: string list * string list, callIn: (str
     member this.PushFunc (v: NestedFunction) = this.funcs <- this.funcs @ [v]
 
 /// Container for object_for loop information; able to recieve messages about array and function pragmas
-type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list * string list) * (string * string) * int) list, fposition: int, lposition: int) =
+type ObjectLoop (nameIn: string, initIn: string, callIn: (string list * string * int) list, fposition: int, lposition: int) =
     [<DefaultValue>] val mutable public iarrays: NestedArray list list
     [<DefaultValue>] val mutable public oarrays: NestedArray list
     [<DefaultValue>] val mutable public func: NestedFunction list
@@ -733,20 +755,19 @@ type ObjectLoop (nameIn: string, initIn: string, callIn: ((string list * string 
 let rec (|MethodLoopPattern|_|) (position: int) = function
     | loop :: Token.Symbol '=' :: Token.Str "method_for" :: Token.Symbol '(' :: tail ->
         let args, tokens = toElements tail
-        let nArgs = args.Length / 2
-        let iarrays, exts = args |> tokenToStr |> List.splitAt nArgs
+        let iarrays = args |> tokenToStr
         let rec findCalls tokens' position' =
             match tokens' with
-            | lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ',' :: Token.Str oarray :: Token.Symbol ',' :: Token.Str exto :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
-                (func, (oarray, exto), position'-1) :: findCalls tail' (position' + 9)
+            | lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ',' :: Token.Str oarray :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
+                (func, oarray, position'-1) :: findCalls tail' (position' + 7)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
-        let lposition = position + 4 + (2*args.Length)
+        let lposition = position + 4 + (args.Length)
         let calls =
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens') lposition
             | _ -> []
-        let out = MethodLoop((tokenToStr [loop]).Head, (iarrays, exts), calls, position-1, lposition)
+        let out = MethodLoop((tokenToStr [loop]).Head, iarrays, calls, position-1, lposition)
         out.iarrays <- []
         out.oarrays <- []
         out.funcs <- []
@@ -773,11 +794,9 @@ let rec (|ObjectLoopPattern|_|) (position: int) = function
             match tokens' with
             | lname :: Token.Symbol '(' :: tail' when lname = loop ->
                 let args, t = toElements tail'
-                let nArgs = args.Length / 2
-                let arrs, exts = args |> tokenToStr |> List.splitAt nArgs
-                let iarrays, oarray = arrs |> List.rev |> fun x -> (x |> (List.tail >> List.rev), x |> List.head)
-                let exti, exto = exts |> List.rev |> fun x -> (x |> (List.tail >> List.rev), x |> List.head)
-                ((iarrays, exti), (oarray, exto), position') :: findCalls t (position' + 2 + (2*args.Length))
+                let arrs = args |> tokenToStr
+                let iarrays, oarray = arrs |> List.rev |> fun x -> (x.Tail |> List.rev, x.Head)
+                (iarrays, oarray, position') :: findCalls t (position' + 2 + (args.Length))
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
         let lposition = position + 6
@@ -865,11 +884,9 @@ let (|FunctionPragmaPattern|_|) = function
 
 let (|ArrayPattern|_|) (symGroups: int list Option) = function
     | Token.Str "edgi_nc_t" :: Token.Str name :: Token.Symbol '(' :: Token.Quote fileName :: Token.Symbol ',' :: Token.Quote varName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = getNCtype fileName varName; Rank = getNCnumDims fileName varName; Symm = symGroups; ncFile = Some (fileName, varName)}, tail)
-    | Token.Str valtype :: Token.Symbol '^' :: Token.Int rank :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; ncFile = None}, tail )
-    | Token.Str "promote" :: Token.Symbol '<' :: Token.Str valtype :: Token.Symbol ',' :: Token.Int rank :: Token.Symbol '>' :: Token.Symbol ':' :: Token.Symbol ':' :: Token.Str "type" :: Token.Str name :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; ncFile = None}, tail )
+        Some ( {Name = name; Type = getNCtype fileName varName; Rank = getNCnumDims fileName varName; Symm = symGroups; Info = NetCDF {FileName = fileName; VariableName = varName} }, tail)
+    | Token.Str valtype :: Token.Symbol '^' :: Token.Int rank :: Token.Str name :: Token.Symbol '(' :: Token.Str extentsName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; Info = Array {ExtentsName = extentsName} }, tail )
     | _ -> None
 
 let getArray (clauses: Clause list) (block: Token list) =
@@ -927,23 +944,23 @@ let sendArraysToLoops (arrays: NestedArray list) (mloops: MethodLoop list) (oloo
     for i in 0..mloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
         for j in 0..arrays.Length-1 do
-            for k in 0..(fst mloops.[i].Init).Length-1 do
-                if (fst mloops.[i].Init).[k] = arrays.[j].Name then
+            for k in 0..mloops.[i].Init.Length-1 do
+                if mloops.[i].Init.[k] = arrays.[j].Name then
                     mloops.[i].PushIarray arrays.[j]
             for k in 0..mloops.[i].Call.Length-1 do
-                if (mloops.[i].Call.[k] |> snd3 |> fst) = arrays.[j].Name then
+                if mloops.[i].Call.[k] |> snd3 = arrays.[j].Name then
                     mloops.[i].PushOarray arrays.[j]
     for i in 0..oloops.Length-1 do
         // search for iarray names in arrays list and copy info to loop objects (results must be in order!)
         for j in 0..oloops.[i].Call.Length-1 do
             let mutable itemp = []
-            for l in 0..(oloops.[i].Call.[j] |> fst3 |> fst).Length-1 do
+            for l in 0..(oloops.[i].Call.[j] |> fst3).Length-1 do
                 for k in 0..arrays.Length-1 do
-                    if (oloops.[i].Call.[j] |> fst3 |> fst).[l] = arrays.[k].Name then
+                    if (oloops.[i].Call.[j] |> fst3).[l] = arrays.[k].Name then
                         itemp <- itemp @ [arrays.[k]]
             oloops.[i].PushIarrays itemp
             for k in 0..arrays.Length-1 do
-                if (oloops.[i].Call.[j] |> snd3 |> fst) = arrays.[k].Name then
+                if (oloops.[i].Call.[j] |> snd3) = arrays.[k].Name then
                     oloops.[i].PushOarray arrays.[k]
 
 /// Message-passing function for sending info about function pragmas to nested loop objects
@@ -1108,7 +1125,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
                 (oloop.iarrays.[i]
-                 |> List.filter (fun x -> x.ncFile.IsSome)
+                 |> List.filter (fun x -> x.Info |> function | NetCDF _ -> true | _ -> false)
                  |> List.map (NestedLoop.ncGet textGenerator)
                  |> List.reduce (@)) @
                 (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc textGenerator |> fst)
@@ -1131,7 +1148,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
                 (oloop.iarrays.[i]
-                 |> List.filter (fun x -> x.ncFile.IsSome)
+                 |> List.filter (fun x -> x.Info |> function | NetCDF _ -> true | _ -> false)
                  |> List.map (NestedLoop.ncGet textGenerator)
                  |> List.reduce (@)) @
                 (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] textGenerator |> fst)
@@ -1220,7 +1237,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
             let textGenerator = new CppLoopTextGenerator([cppArrayDeclLine], [cppOmpLine],[],[])
             String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
             (mloop.iarrays
-             |> List.filter (fun x -> x.ncFile.IsSome)
+                 |> List.filter (fun x -> x.Info |> function | NetCDF _ -> true | _ -> false)
              |> List.map (NestedLoop.ncGet textGenerator)
              |> List.reduce (@)) @
             (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] textGenerator |> fst)
@@ -1319,8 +1336,10 @@ let parse (tokens: Token list) =
             let name = oloops.[i].Init
             let args =
                 List.init oloops.[i].Call.Length (fun j ->
-                      (oloops.[i].Call.[j] |> fst3 |> fst) @ [oloops.[i].Call.[j] |> snd3 |> fst]
-                    @ (oloops.[i].Call.[j] |> fst3 |> snd) @ [oloops.[i].Call.[j] |> snd3 |> snd])
+                      (oloops.[i].iarrays.[j] |> List.map (fun x -> x.Name))
+                    @ [oloops.[i].oarrays.[j].Name]
+                    @ (oloops.[i].iarrays.[j] |> List.map extentsName)
+                    @ [oloops.[i].oarrays.[j] |> extentsName])
                 |> List.map (withCommas >> (stringCollapse ""))
 
             let arity =
@@ -1355,8 +1374,10 @@ let parse (tokens: Token list) =
             let names = mloops.[i].Call |> List.map fst3
             let args =
                 List.init mloops.[i].Call.Length (fun j ->
-                      fst mloops.[i].Init @ [mloops.[i].Call.[j] |> snd3 |> fst]
-                    @ snd mloops.[i].Init @ [mloops.[i].Call.[j] |> snd3 |> snd])
+                      [mloops.[i].iarrays.[j].Name]
+                    @ [mloops.[i].oarrays.[j].Name]
+                    @ [mloops.[i].iarrays.[j] |> extentsName]
+                    @ [mloops.[i].oarrays.[j] |> extentsName])
                 |> List.map (withCommas >> (stringCollapse ""))
 
             let arity = mloops.[i].funcs.[1].Arity |> Option.get // hack
