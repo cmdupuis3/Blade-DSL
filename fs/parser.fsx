@@ -418,9 +418,7 @@ module NestedLoop =
         Nary [iarray] oarray func textGenerator
 
     /// Autogenerate an N-ary nested_for loop
-    /// <param name="iarrays"> A list of input array classes. </param>
-    /// <param name="oarray"> An output array class. </param>
-    /// <param name="func"> A function class. </param>
+    /// <param name="array"> An input array class. </param>
     let ncGet (textGenerator: LoopTextGenerator) (array: NestedArray) =
         let ncFileName, ncVarName =
             match array.Info with
@@ -473,7 +471,7 @@ module NestedLoop =
                 iarrayName = array.Name;
                 iarrayType = array.Type;
                 iarrayLevels = array.Rank-1;
-                iRank = array.Rank;
+                iRank = 1;
                 iExtents = extentsName array;
                 indNames = indexNames;
                 iMins = imins;
@@ -1447,84 +1445,4 @@ let main args =
 
 //let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"|];;
 //main [|"/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"|];;
-
-
-(*
-let code = """
-
-#include "things.hpp"
-#include "stuff.hpp"
-#pragma edgi function(sumThenMultiply) arity(3) input(iarray1, iarray2, iarray3) iranks(1, 1, 0) commutativity(1, 1, 3) output(oarray) orank(0)
-auto sumThenMultiply = function(iarray1, iarray2, iarray3, oarray){
-    // assume iarray1 and iarray2 last extents are same
-    for(int i = 0; i < iarray1.current_extent(); i++){
-        oarray += iarray1[i] + iarray2[i];
-    }
-
-    oarray *= iarray3;
-    return oarray;
-}
-#pragma edgi function(divideThenSum) arity(3) input(iarray4, iarray5, iarray6) iranks(1, 1, 0) output(oarray) orank(0) ompLevels(1,1,0)
-auto sumThenMultiply = function(iarray4, iarray5, iarray6, oarray){
-    // assume iarray4 and iarray5 last extents are same
-    for(int i = 0; i < iarray4.current_extent(); i++){
-        oarray += iarray4[i] / iarray5[i];
-    }
-
-    oarray += iarray6;
-    return oarray;
-}
-#pragma edgi function(add10) arity(1) input(iarray) iranks(0) output(oarray) orank(0)
-{
-    oarray = iarray + 10;
-    return oarray;
-}
-#pragma edgi function(sinThenProduct) arity(any) input(iarray) iranks(0) output(oarray) orank(0)
-{
-    oarray = sin(iarray) * tail;
-    return oarray;
-}
-int main(){
-
-    #pragma edgi array symmetry(1, 2, 2, 3)
-    promote<float, 4>::type array1;
-
-    #pragma edgi array
-    promote<float, 3>::type array3;
-
-    #pragma edgi array
-    promote<float, 3>::type ooarray;
-
-    #pragma edgi array
-    promote<float, 3>::type moarray;
-
-    #pragma edgi array
-    promote<float, 3>::type moarray2;
-
-    #pragma edgi array
-    promote<float, 3>::type voarray;
-
-    auto oloop = object_for(sumThenMultiply);
-    oloop(array1, array1, array3, ooarray, a, b, c, d);
-
-    auto mloop = method_for(array1, array1, array3, a, b, c);
-    mloop(sumThenMultiply, moarray, e);
-    mloop(divideThenSum, moarray2, f);
-
-    auto oloopv = object_for(sinThenProduct);
-    oloopv(array3, array3, voarray, g, h, i);
-
-
-    oloop(array1, array1, array3, ooarray, a, b, c, d);
-    mloop(sumThenMultiply, moarray, e);
-    mloop(divideThenSum, moarray2, f);
-    oloopv(array3, array3, voarray, g, h, i);
-
-    return 0;
-}"""
-
-let tokens = code |> tokenize
-tokens |> parse;;
-*)
-
 
