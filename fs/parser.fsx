@@ -1,17 +1,28 @@
 
 
+
+// For NetCDF integration, information about types and ranks is needed at compile time...
+
 open System.Runtime.InteropServices
 
 [<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
-extern int get_num_dims([<MarshalAs(UnmanagedType.LPStr)>] string fileName, [<MarshalAs(UnmanagedType.LPStr)>] string varName)
+extern int get_num_dims(
+        [<MarshalAs(UnmanagedType.LPStr)>] string fileName,
+        [<MarshalAs(UnmanagedType.LPStr)>] string varName)
 
 [<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
-extern int get_var_type([<MarshalAs(UnmanagedType.LPStr)>] string fileName, [<MarshalAs(UnmanagedType.LPStr)>] string varName)
+extern int get_var_type(
+    [<MarshalAs(UnmanagedType.LPStr)>] string fileName,
+    [<MarshalAs(UnmanagedType.LPStr)>] string varName)
 
-let getNCnumDims fileName variableName = get_num_dims(fileName, variableName)
+[<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
+extern void get_var_dim_types(
+    [<MarshalAs(UnmanagedType.LPStr)>] string fileName,
+    [<MarshalAs(UnmanagedType.LPStr)>] string varName,
+    int[] dimTypes)
 
-let getNCtype fileName variableName =
-    match get_var_type(fileName, variableName) with
+
+let matchNCtype = function
     | 1 | 2 -> "char"
     | 3 -> "short"
     | 4 -> "int"
@@ -25,6 +36,21 @@ let getNCtype fileName variableName =
     | 12 -> "char*" // ?
     | _ -> failwith "This NetCDF type is currently unsupported."
 
+
+let getNCnumDims fileName variableName = get_num_dims(fileName, variableName)
+
+let getNCvarType fileName variableName = get_var_type(fileName, variableName) |> matchNCtype
+
+let getNCdimTypes fileName variableName =
+    let numDims = getNCnumDims fileName variableName
+    let dimTypes = Array.init numDims (fun i -> -1)
+    get_var_dim_types(fileName, variableName, dimTypes)
+    dimTypes
+    |> Array.map matchNCtype
+    |> Array.toList
+
+//let getNCvarDimIDs fileName variableName
+
 (*
 
 let file = @"/home/username/Data/indonesia/hqp_block11.nc"
@@ -34,7 +60,7 @@ get_num_dims(file, var)
 get_var_type(file, var)
 
 getNCnumDims file var
-getNCtype file var
+getNCvarType file var
 
 *)
 
@@ -441,17 +467,19 @@ module NestedLoop =
 
         /// nc_open call
         let ncInit = [
-            String.concat "" ["int "; array.Name; "_file_ncid;"]
-            String.concat "" ["nc_open("; quote ncFileName; ", NC_NOWRITE, &"; array.Name; "_file_ncid);"]
+            String.concat "" ["int "; array.Name; "_in_file_ncid;"]
+            String.concat "" ["nc_open("; quote ncFileName; ", NC_NOWRITE, &"; array.Name; "_in_file_ncid);"]
             String.concat "" ["int "; array.Name; "_var_ncid;";]
-            String.concat "" ["nc_inq_varid("; array.Name; "_file_ncid, "; quote ncVarName; ", &"; array.Name; "_var_ncid);"]
+            String.concat "" ["nc_inq_varid("; array.Name; "_in_file_ncid, "; quote ncVarName; ", &"; array.Name; "_var_ncid);"]
             String.concat "" ["int* ";    array.Name; "_dim_ncids = new int[";  string array.Rank; "];"]
+            // Assuming dimensions and dimension variables have the same name... (should be, but don't necessarily)
+            String.concat "" [getNCtype]
             String.concat "" ["size_t* "; extentsName array; " = new size_t["; string array.Rank; "];"]
             String.concat "" ["size_t* "; array.Name; "_starts = new size_t[";  string array.Rank; "];"]
             String.concat "" ["size_t* "; array.Name; "_counts = new size_t[";  string array.Rank; "];"]
             String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
-            String.concat "" ["\t"; "nc_inq_dimid(";  array.Name; "_file_ncid, "; array.Name; "_var_ncid, &(";     array.Name; "_dim_ncids[q]));"]
-            String.concat "" ["\t"; "nc_inq_dimlen("; array.Name; "_file_ncid, "; array.Name; "_dim_ncids[q], &("; extentsName array; "[q]));"]
+            String.concat "" ["\t"; "nc_inq_dimid(";  array.Name; "_in_file_ncid, "; array.Name; "_var_ncid, &(";     array.Name; "_dim_ncids[q]));"]
+            String.concat "" ["\t"; "nc_inq_dimlen("; array.Name; "_in_file_ncid, "; array.Name; "_dim_ncids[q], &("; extentsName array; "[q]));"]
             String.concat "" ["\t"; array.Name; "_starts[q] = 0;"]
             String.concat "" ["\t"; array.Name; "_counts[q] = 1;"]
             String.concat "" ["}"]
@@ -463,7 +491,7 @@ module NestedLoop =
         )
 
         let inner = String.concat "" [
-            "nc_get_vara_"; array.Type; "("; array.Name; "_file_ncid, "; array.Name; "_var_ncid, "; array.Name; "_starts, "; array.Name; "_counts, "; lastIName; ");\n"
+            "nc_get_vara_"; array.Type; "("; array.Name; "_in_file_ncid, "; array.Name; "_var_ncid, "; array.Name; "_starts, "; array.Name; "_counts, "; lastIName; ");\n"
         ]
 
         let loop =
@@ -484,6 +512,56 @@ module NestedLoop =
                |> List.fold (|>) [inner])
             @ [String.concat "" ["nc_close("; array.Name; "_file_ncid);\n"]]
         ret
+
+    let ncPut (textGenerator: LoopTextGenerator) (iarrays: NestedArray list) (func: NestedFunction) (oarray: NestedArray) =
+
+        // This check is needed because writing NetCDF variables requires detailed information about dimensions
+        // that isn't strictly needed for basic nested iterators. In theory, it's possible to mix NetCDF
+        // and non-NetCDF arrays, the user just has to do the writes on their own.
+        iarrays |> List.map (fun iarray ->
+            match iarray.Info with
+            | NetCDF info -> ignore
+            | _ -> failwith "All input arrays must be NetCDF arrays to use ncPut"
+        )
+
+        let ncFileName, ncVarName =
+            match oarray.Info with
+            | NetCDF info -> info.FileName, info.VariableName
+            | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays"
+
+        let indexNames = List.init (oarray.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
+
+        let oSymms = oarray.Symm |> function | Some s -> s | None -> (List.init array.Rank id)
+        let states = vStates [array.Name] [iSymms] [0]
+        /// Chooses the correct iterator minimum for all input variables.
+        let imins =
+            let iMaps = iminMap states
+            List.init oarray.Rank (fun j ->
+                if iMaps.Head.[j] = (0, j) then textGenerator.Zero else indexNames.[snd iMaps.Head.[j]]
+            )
+
+        /// Last input array intermediate names to be subbed into the inner block
+        let lastOName = String.concat "" [oarray.Name; indexNames |> List.rev |> List.head]
+
+        /// nc_open call
+        let ncInit = [
+            String.concat "" ["int "; oarray.Name; "_out_file_ncid;"]
+            String.concat "" ["nc_create("; quote ncFileName; ", NC_CLOBBER, &"; oarray.Name; "_out_file_ncid);"]
+            String.concat "" ["int "; oarray.Name; "_var_ncid;";]
+            String.concat "" ["nc_inq_varid("; oarray.Name; "_out_file_ncid, "; quote ncVarName; ", &"; oarray.Name; "_var_ncid);"]
+            String.concat "" ["int* ";    oarray.Name; "_dim_ncids = new int[";  string oarray.Rank; "];"]
+            String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string oarray.Rank; "];"]
+            String.concat "" ["size_t* "; oarray.Name; "_starts = new size_t[";  string oarray.Rank; "];"]
+            String.concat "" ["size_t* "; oarray.Name; "_counts = new size_t[";  string oarray.Rank; "];"]
+            String.concat "" ["for(int q = 0; q < "; string oarray.Rank; "; q++){"]
+            String.concat "" ["\t"; "nc_inq_dimid(";  oarray.Name; "_out_file_ncid, "; oarray.Name; "_var_ncid, &(";     oarray.Name; "_dim_ncids[q]));"]
+            String.concat "" ["\t"; "nc_inq_dimlen("; oarray.Name; "_out_file_ncid, "; oarray.Name; "_dim_ncids[q], &("; extentsName oarray; "[q]));"]
+            String.concat "" ["\t"; oarray.Name; "_starts[q] = 0;"]
+            String.concat "" ["\t"; oarray.Name; "_counts[q] = 1;"]
+            String.concat "" ["}"]
+            String.concat "" [oarray.Name; "_counts["; string (oarray.Rank-1); "] = "; extentsName oarray; "["; string (oarray.Rank-1); "];"]
+        ]
+
 
 
 (********************************************************************************)
@@ -882,7 +960,7 @@ let (|FunctionPragmaPattern|_|) = function
 
 let (|ArrayPattern|_|) (symGroups: int list Option) = function
     | Token.Str "edgi_nc_t" :: Token.Str name :: Token.Symbol '(' :: Token.Quote fileName :: Token.Symbol ',' :: Token.Quote varName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Type = getNCtype fileName varName; Rank = getNCnumDims fileName varName; Symm = symGroups; Info = NetCDF {FileName = fileName; VariableName = varName} }, tail)
+        Some ( {Name = name; Type = getNCvarType fileName varName; Rank = getNCnumDims fileName varName; Symm = symGroups; Info = NetCDF {FileName = fileName; VariableName = varName} }, tail)
     | Token.Str valtype :: Token.Symbol '^' :: Token.Int rank :: Token.Str name :: Token.Symbol '(' :: Token.Str extentsName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
         Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; Info = Array {ExtentsName = extentsName} }, tail )
     | _ -> None
