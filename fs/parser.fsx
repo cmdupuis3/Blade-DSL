@@ -473,7 +473,7 @@ module NestedLoop =
             String.concat "" ["nc_inq_varid("; array.Name; "_in_file_ncid, "; quote ncVarName; ", &"; array.Name; "_var_ncid);"]
             String.concat "" ["int* ";    array.Name; "_dim_ncids = new int[";  string array.Rank; "];"]
             // Assuming dimensions and dimension variables have the same name... (should be, but don't necessarily)
-            String.concat "" [getNCtype]
+            //String.concat "" [getNCtype]
             String.concat "" ["size_t* "; extentsName array; " = new size_t["; string array.Rank; "];"]
             String.concat "" ["size_t* "; array.Name; "_starts = new size_t[";  string array.Rank; "];"]
             String.concat "" ["size_t* "; array.Name; "_counts = new size_t[";  string array.Rank; "];"]
@@ -512,7 +512,7 @@ module NestedLoop =
                |> List.fold (|>) [inner])
             @ [String.concat "" ["nc_close("; array.Name; "_file_ncid);\n"]]
         ret
-
+(*
     let ncPut (textGenerator: LoopTextGenerator) (iarrays: NestedArray list) (func: NestedFunction) (oarray: NestedArray) =
 
         // This check is needed because writing NetCDF variables requires detailed information about dimensions
@@ -562,6 +562,8 @@ module NestedLoop =
             String.concat "" [oarray.Name; "_counts["; string (oarray.Rank-1); "] = "; extentsName oarray; "["; string (oarray.Rank-1); "];"]
         ]
 
+        []
+*)
 
 
 (********************************************************************************)
@@ -965,10 +967,18 @@ let (|ArrayPattern|_|) (symGroups: int list Option) = function
         Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; Info = Array {ExtentsName = extentsName} }, tail )
     | _ -> None
 
+
+let hasClause name clauses =
+    clauses |> List.exists (fst >> (fun x -> x = name))
+
+let getClause name clauses =
+    clauses |> List.find (fst >> (fun x -> x = name))
+
+
 let getArray (clauses: Clause list) (block: Token list) =
-    let hasSym = clauses |> List.exists (fst >> (function | "symmetry" -> true | _ -> false))
+    let hasSym = clauses |> hasClause "symmetry"
     let sym = if hasSym then
-                  Some ((clauses |> List.find (fst >> (function | "symmetry" -> true | _ -> false))) |> (snd >> tokenToInt))
+                  Some ((clauses |> getClause "symmetry") |> (snd >> tokenToInt))
               else None
     match block with
     | ArrayPattern sym s -> fst s
@@ -976,29 +986,43 @@ let getArray (clauses: Clause list) (block: Token list) =
 
 let getFunction (name: string) (clauses: Clause list) (block: Token list) =
     let arity =
-        clauses |> List.find (fst >> (function | "arity" -> true | _ -> false)) |> snd
+        clauses |> getClause "arity" |> snd
         |> fun x ->
             match x with
             | [Token.Str "any"] -> None
             | _ -> Some (x |> (tokenToInt >> List.head))
 
-    let input  = (clauses |> List.find (fst >> (function | "input" -> true | _ -> false))) |> (snd >> tokenToStr)
-    let output = (clauses |> List.find (fst >> (function | "output" -> true | _ -> false))) |> (snd >> tokenToStr >> List.head)
-    let iranks = (clauses |> List.find (fst >> (function | "iranks" -> true | _ -> false))) |> (snd >> tokenToInt)
-    let orank  = (clauses |> List.find (fst >> (function | "orank" -> true | _ -> false))) |> (snd >> tokenToInt >> List.head)
+    let input  = (clauses |> getClause "input") |> (snd >> tokenToStr)
+    let output = (clauses |> getClause "output") |> (snd >> tokenToStr >> List.head)
+    let iranks = (clauses |> getClause "iranks") |> (snd >> tokenToInt)
+    let orank  = (clauses |> getClause "orank") |> (snd >> tokenToInt >> List.head)
 
-    let hasOmp = clauses |> List.exists (fst >> (function | "ompLevels" -> true | _ -> false))
     let ompLevels =
-        if hasOmp then
-            (clauses |> List.find (fst >> (function | "ompLevels" -> true | _ -> false))) |> (snd >> tokenToInt)
+        if clauses |> hasClause "ompLevels" then
+            (clauses |> getClause "ompLevels") |> (snd >> tokenToInt)
         else
             List.init iranks.Length (fun i -> 0)
 
-    let hasCom = clauses |> List.exists (fst >> (function | "commutativity" -> true | _ -> false))
     let com =
-        if hasCom then
-            Some ((clauses |> List.find (fst >> (function | "commutativity" -> true | _ -> false))) |> (snd >> tokenToInt))
+        if clauses |> hasClause "commutativity" then
+            Some ((clauses |> getClause "commutativity") |> (snd >> tokenToInt))
         else None
+
+    let ncDimNames =
+        if clauses |> hasClause "ncDimNames" then
+            Some ((clauses |> getClause "ncDimNames") |> (snd >> tokenToStr))
+        else None
+
+    let ncDimNames =
+        if clauses |> hasClause "ncDimLens" then
+            Some ((clauses |> getClause "ncDimLens") |> (snd >> tokenToStr))
+        else None
+
+    let ncDimVals =
+        if clauses |> hasClause "ncDimVals" then
+            Some ((clauses |> getClause "ncDimVals") |> (snd >> tokenToStr))
+        else None
+
 
     { Name = name;
       Arity = arity;
