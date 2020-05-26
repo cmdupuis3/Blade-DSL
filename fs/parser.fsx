@@ -21,7 +21,7 @@ extern void get_var_dim_types(
     [<MarshalAs(UnmanagedType.LPStr)>] string varName,
     int[] dimTypes)
 
-
+// These should match the macros defined by NetCDF
 let matchNCtype = function
     | 1 | 2 -> "char"
     | 3 -> "short"
@@ -35,6 +35,20 @@ let matchNCtype = function
     | 11 -> "uint64"
     | 12 -> "char*" // ?
     | _ -> failwith "This NetCDF type is currently unsupported."
+
+let revMatchNCtype = function
+    | "char" -> 1
+    | "short" -> 3
+    | "int" -> 4
+    | "float" -> 5
+    | "double" -> 6
+    | "uchar" -> 7
+    | "ushort" -> 8
+    | "uint" -> 9
+    | "int64" -> 10
+    | "uint64" -> 11
+    | "char*" -> 12 // ?
+    | _ -> failwith "Could not match to a NetCDF type."
 
 
 let getNCnumDims fileName variableName = get_num_dims(fileName, variableName)
@@ -107,6 +121,7 @@ type NetCDFOutputInfo =
         DimNames: string list
         DimExtents: int list
         DimValNames: string list
+        DimValTypes: string list
     }
 
 /// Container for function pragma information
@@ -374,7 +389,7 @@ module NestedLoop =
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) (textGenerator: LoopTextGenerator) =
-        let ilevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
+        let iLevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
 
         let states =
             let comm = func.Comm |> function | Some comm -> comm | None -> (List.init iarrays.Length id)
@@ -388,13 +403,13 @@ module NestedLoop =
         let rec indNames min (ranks: int list) =
             let rec indNames' min max = List.init (max - min) (textGenerator.IteratorName min)
             if ranks.IsEmpty then [] else indNames' min (min+ranks.Head) :: indNames (min+ranks.Head) ranks.Tail
-        let indexNames = indNames 0 ilevels
+        let indexNames = indNames 0 iLevels
 
         /// Chooses the correct iterator minimum for all input variables.
         let imins =
             let iMaps = iminMap states
-            List.init ilevels.Length (fun i ->
-                List.init ilevels.[i] (fun j ->
+            List.init iLevels.Length (fun i ->
+                List.init iLevels.[i] (fun j ->
                     if iMaps.[i].[j] = (i, j) then textGenerator.Zero else indexNames.[fst iMaps.[i].[j]].[snd iMaps.[i].[j]]
                 )
             )
@@ -433,7 +448,7 @@ module NestedLoop =
             {
                 iarrayName = func.INames.[i];
                 iarrayType = iarrays.[i].Type;
-                iarrayLevels = ilevels.[i];
+                iarrayLevels = iLevels.[i];
                 iRank = func.IRank.[i];
                 iExtents = iExtents.[i];
                 indNames = indexNames.[i];
@@ -466,6 +481,9 @@ module NestedLoop =
     let private countsName (array: NestedArray) =
         String.concat "" [array.Name; "_counts"]
 
+    let private dimNames (array: NestedArray) =
+        String.concat "" [array.Name; "_dim_names"]
+
     let private dimValsNames (array: NestedArray) =
         List.init array.Rank (fun i -> String.concat "" [array.Name; "_dim_"; string i; "_vals"])
 
@@ -491,44 +509,47 @@ module NestedLoop =
         /// Last input array intermediate names to be subbed into the inner block
         let lastIName = String.concat "" [array.Name; indexNames |> List.rev |> List.head]
 
-        let extents = extentsName array
         let ncDimTypes = getNCdimTypes ncFileName ncVarName
 
         // Assuming dimensions and dimension variables have the same name... (should, but don't necessarily)
         let ncDimValDeclLines =
             List.init array.Rank (fun i ->
-                String.concat "" [ncDimTypes.[i]; "* "; (dimValsNames array).[i];" = new "; ncDimTypes.[i]; "["; extents; "["; string i;"]];"]
+                String.concat "" [ncDimTypes.[i]; "* "; (dimValsNames array).[i];" = new "; ncDimTypes.[i]; "["; extentsName array; "["; string i;"]];"]
             )
         let ncDimValLines =
             List.init array.Rank (fun i ->
-                String.concat "" ["nc_get_var_"; ncDimTypes.[i]; "("; inputFileIDname array; ", "; variableIDname array; ", &"; (dimValsNames array).[i]; ");"]
+                String.concat "" ["nc_get_var("; inputFileIDname array; ", "; variableIDname array; ", &("; (dimValsNames array).[i]; ");"]
             )
 
         /// nc_open call
-        let ncInit = ([
-            String.concat "" ["int "; inputFileIDname array; ";"]
-            String.concat "" ["nc_open("; quote ncFileName; ", NC_NOWRITE, &"; inputFileIDname array; ");"]
-            String.concat "" ["int "; variableIDname array; ";";]
-            String.concat "" ["nc_inq_varid("; inputFileIDname array; ", "; quote ncVarName; ", &"; variableIDname array; ");"]
-            String.concat "" ["int* "; array.Name; "_dim_ncids = new int[";  string array.Rank; "];"]
-            String.concat "" ["size_t* "; extentsName array; " = new size_t["; string array.Rank; "];"]
-            String.concat "" ["size_t* "; startsName array;  " = new size_t["; string array.Rank; "];"]
-            String.concat "" ["size_t* "; countsName array;  " = new size_t["; string array.Rank; "];"]
-            String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
-            String.concat "" ["\t"; "nc_inq_dimid(";  inputFileIDname array; ", "; variableIDname array;    ", &("; array.Name; "_dim_ncids[q]));"]
-            String.concat "" ["\t"; "nc_inq_dimlen("; inputFileIDname array; ", "; array.Name; "_dim_ncids[q], &("; extentsName array; "[q]));"]
-            String.concat "" ["\t"; startsName array; "[q] = 0;"]
-            String.concat "" ["\t"; countsName array; "[q] = 1;"]
-            String.concat "" ["}"]
-            String.concat "" [countsName array; "["; string (array.Rank-1); "] = "; extentsName array; "["; string (array.Rank-1); "];"]
-        ] @ ncDimValDeclLines @ ncDimValLines)
+        let ncInit =
+            [
+                String.concat "" ["int "; inputFileIDname array; ";"]
+                String.concat "" ["nc_open("; quote ncFileName; ", NC_NOWRITE, &"; inputFileIDname array; ");"]
+                String.concat "" ["int "; variableIDname array; ";";]
+                String.concat "" ["nc_inq_varid("; inputFileIDname array; ", "; quote ncVarName; ", &"; variableIDname array; ");"]
+                String.concat "" ["int* "; array.Name; "_dim_ncids = new int[";  string array.Rank; "];"]
+                String.concat "" ["size_t* "; extentsName array; " = new size_t["; string array.Rank; "];"]
+                String.concat "" ["size_t* "; startsName array;  " = new size_t["; string array.Rank; "];"]
+                String.concat "" ["size_t* "; countsName array;  " = new size_t["; string array.Rank; "];"]
+                String.concat "" ["char** "; dimNames array;  " = new char*["; string array.Rank; "];"]
+                String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
+                String.concat "" ["\t"; "nc_inq_dimid(";   inputFileIDname array; ", "; variableIDname array;    ", &("; array.Name; "_dim_ncids[q]));"]
+                String.concat "" ["\t"; dimNames array; "[q] = new char[NC_MAX_NAME];"]
+                String.concat "" ["\t"; "nc_inq_dimname("; inputFileIDname array; ", &("; array.Name; "_dim_ncids[q]), "; dimNames array; "[q]);"]
+                String.concat "" ["\t"; "nc_inq_dimlen(";  inputFileIDname array; ", "; array.Name; "_dim_ncids[q], &("; extentsName array; "[q]));"]
+                String.concat "" ["\t"; startsName array; "[q] = 0;"]
+                String.concat "" ["\t"; countsName array; "[q] = 1;"]
+                String.concat "" ["}"]
+                String.concat "" [countsName array; "["; string (array.Rank-1); "] = "; extentsName array; "["; string (array.Rank-1); "];"]
+            ] @ ncDimValDeclLines @ ncDimValLines
 
         (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
             String.concat "" [startsName array; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
         )
 
         let inner = String.concat "" [
-            "nc_get_vara_"; array.Type; "("; inputFileIDname array; ", "; variableIDname array; ", "; startsName array; ", "; countsName array; ", "; lastIName; ");\n"
+            "nc_get_vara("; inputFileIDname array; ", "; variableIDname array; ", "; startsName array; ", "; countsName array; ", "; lastIName; ");\n"
         ]
 
         let loop =
@@ -561,9 +582,9 @@ module NestedLoop =
             | _ -> failwith "All input arrays must be NetCDF arrays to use ncPut"
         ) |> ignore
 
-        let ncFileName, ncVarName =
-            match oarray.Info with
-            | NetCDF info -> info.FileName, info.VariableName
+        let ncFileName, ncVarName, ncInfo =
+            match oarray.Info, func.NCInfo with
+            | NetCDF info, Some dims -> info.FileName, info.VariableName, dims
             | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays"
 
         let indexNames = List.init (oarray.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
@@ -580,36 +601,97 @@ module NestedLoop =
         /// Last input array intermediate names to be subbed into the inner block
         let lastOName = String.concat "" [oarray.Name; indexNames |> List.rev |> List.head]
 
-        /// Dimension algebra for names and values
-        let iDims =
-            match func.Arity with
-            | Some arity -> List.init arity (fun i -> func.IRank.[i] - iarrays.[i].Rank)
-            | None -> List.init iarrays.Length (fun i -> iarrays.Head.Rank)
+        // Dimension algebra for names and values
 
-        let oDims = (iDims |> List.sum) + func.ORank
+        let iLevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
+        let oLevels = func.ORank
 
-        /// nc_open call
-        let ncInit = [
-            String.concat "" ["int "; outputFileIDname oarray; ";"]
-            String.concat "" ["nc_create("; quote ncFileName; ", NC_CLOBBER, &"; outputFileIDname oarray; ");"]
+        let nInputDims = (iLevels |> List.sum)
+        let nOutputDims = nInputDims + oLevels
+
+        let inputDimLines =
+            List.init iarrays.Length (fun i ->
+                let acc = if i = 0 then 0 else (iLevels.[0..(i-1)] |> List.sum)
+                let iFileName, iVarName =
+                    match iarrays.[i].Info with
+                    | NetCDF info -> info.FileName, info.VariableName
+                    | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays"
+
+                let extents = extentsName
+                let ncDimNames = dimNames iarrays.[i]
+                let ncDimTypes = getNCdimTypes iFileName iVarName
+                List.init iLevels.[i] (fun j ->
+                    [
+                        String.concat "" ["nc_def_dim("; outputFileIDname oarray; ", "; ncDimNames; "["; string j; "], "; extentsName iarrays.[i]; ", &("; oarray.Name; "_dim_ncids["; string (j+acc); "]));"]
+                        String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; ncDimNames; "["; string j; "], "; ncDimTypes.[j] |> revMatchNCtype |> string; ", 1, &("; oarray.Name; "_dim_ncids["; string (j+acc); "]), &("; oarray.Name; "_dim_var_ncids["; string (j+acc); "]));"]
+                        String.concat "" ["nc_enddef(";  outputFileIDname oarray; ");"]
+                        String.concat "" ["nc_put_var("; outputFileIDname oarray; ", "; oarray.Name; "_dim_var_ncids["; string (j+acc); "], "; (dimValsNames iarrays.[i]).[j]; ");"]
+                        String.concat "" ["nc_redef(";   outputFileIDname oarray; ");"]
+                    ]
+                ) |> List.reduce (@)
+            ) |> List.reduce (@)
 
 
-            String.concat "" ["int "; variableIDname oarray; ";";]
-            String.concat "" ["nc_inq_varid("; outputFileIDname oarray; ", "; quote ncVarName; ", &"; variableIDname oarray; ");"]
-            String.concat "" ["int* "; oarray.Name; "_dim_ncids = new int[";  string oarray.Rank; "];"]
-            String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string oarray.Rank; "];"]
-            String.concat "" ["size_t* "; startsName oarray;  " = new size_t["; string oarray.Rank; "];"]
-            String.concat "" ["size_t* "; countsName oarray;  " = new size_t["; string oarray.Rank; "];"]
-            String.concat "" ["for(int q = 0; q < "; string oarray.Rank; "; q++){"]
-            String.concat "" ["\t"; "nc_inq_dimid(";  outputFileIDname oarray; ", "; variableIDname oarray; ", &("; oarray.Name; "_dim_ncids[q]));"]
-            String.concat "" ["\t"; "nc_inq_dimlen("; outputFileIDname oarray; ", "; oarray.Name; "_dim_ncids[q], &("; extentsName oarray; "[q]));"]
-            String.concat "" ["\t"; startsName oarray; "[q] = 0;"]
-            String.concat "" ["\t"; countsName oarray; "[q] = 1;"]
-            String.concat "" ["}"]
-            String.concat "" [countsName oarray; "["; string (oarray.Rank-1); "] = "; extentsName oarray; "["; string (oarray.Rank-1); "];"]
+        let outputDimLines =
+            List.init nOutputDims (fun j ->
+                [
+                    String.concat "" ["nc_def_dim("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; string ncInfo.DimExtents.[j]; ", &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]));"]
+                    String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; ncInfo.DimValTypes.[j] |> revMatchNCtype |> string; ", 1, &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]), &("; oarray.Name; "_dim_var_ncids["; string (j+nInputDims); "]));"]
+                    String.concat "" ["nc_enddef(";  outputFileIDname oarray; ");"]
+                    String.concat "" ["nc_put_var("; outputFileIDname oarray; ", "; oarray.Name; "_dim_var_ncids["; string j; "], "; ncInfo.DimValNames.[j]; ");"]
+                    String.concat "" ["nc_redef(";   outputFileIDname oarray; ");"]
+                ]
+            ) |> List.reduce (@)
+
+        /// nc_create call
+        let ncInit = (
+            [
+                String.concat "" ["int "; outputFileIDname oarray; ";"]
+                String.concat "" ["nc_create("; quote ncFileName; ", NC_CLOBBER, &"; outputFileIDname oarray; ");"]
+                String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string nOutputDims; "];"]
+                String.concat "" ["int* "; oarray.Name; "_dim_ncids = new int["; string nOutputDims; "];"]
+                String.concat "" ["int* "; oarray.Name; "_dim_var_ncids = new int["; string nOutputDims; "];"]
+            ] @ inputDimLines @ outputDimLines @
+            [
+                String.concat "" ["int "; variableIDname oarray; ";";]
+                String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncVarName; ", "; oarray.Type |> revMatchNCtype |> string; ", "; string nOutputDims; ", "; oarray.Name; "_dim_ncids, &"; variableIDname oarray; ");"]
+                String.concat "" ["size_t* "; startsName oarray;  " = new size_t["; string nOutputDims; "];"]
+                String.concat "" ["size_t* "; countsName oarray;  " = new size_t["; string nOutputDims; "];"]
+                String.concat "" ["for(int q = 0; q < "; string nOutputDims; "; q++){"]
+                String.concat "" ["\t"; startsName oarray; "[q] = 0;"]
+                String.concat "" ["\t"; countsName oarray; "[q] = 1;"]
+                String.concat "" ["}"]
+                String.concat "" [countsName oarray; "["; string (nOutputDims-1); "] = "; extentsName oarray; "["; string (nOutputDims-1); "];"]
+                String.concat "" ["nc_enddef(";  outputFileIDname oarray; ");"]
+            ]
+        )
+
+        (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
+            String.concat "" [startsName oarray; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
+        )
+
+        let inner = String.concat "" [
+            "nc_put_vara("; outputFileIDname oarray; ", "; variableIDname oarray; ", "; startsName oarray; ", "; countsName oarray; ", "; lastOName; ");\n"
         ]
 
-        []
+        let loop =
+            {
+                iarrayName = oarray.Name;
+                iarrayType = oarray.Type;
+                iarrayLevels = oarray.Rank-1;
+                iRank = 1;
+                iExtents = extentsName oarray;
+                indNames = indexNames;
+                iMins = imins;
+                parLevels = 0;
+            }
+
+        let ret =
+            newln ncInit
+            @ (unaryLoop loop textGenerator 0
+               |> List.fold (|>) [inner])
+            @ [String.concat "" ["nc_close("; outputFileIDname oarray; ");\n"]]
+        ret
 
 
 
@@ -1070,11 +1152,15 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
             Some ((clauses |> getClause "ncDimVals") |> (snd >> tokenToStr))
         else None
 
+    let ncDimTypes =
+        if clauses |> hasClause "ncDimTypes" then
+            Some ((clauses |> getClause "ncDimTypes") |> (snd >> tokenToStr))
+        else None
 
     let ncInfo =
-        match ncDimNames, ncDimLens, ncDimVals with
-        | Some names, Some lens, Some vals -> Some {DimNames = names; DimExtents = lens; DimValNames = vals}
-        | None, None, None -> None
+        match ncDimNames, ncDimLens, ncDimVals, ncDimTypes with
+        | Some names, Some lens, Some vals, Some types -> Some {DimNames = names; DimExtents = lens; DimValNames = vals; DimValTypes = types}
+        | None, None, None, None -> None
         | _ -> failwith "Incomplete specification of NetCDF output in function \"%s\"" name
 
     { Name = name;
@@ -1278,7 +1364,11 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             List.init numCalls (fun i ->
                 let textGenerator = CppLoopTextGenerator([], [cppOmpLine],[cppArrayDeclLine],[])
                 String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc textGenerator |> fst)
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc textGenerator |> fst) @
+                [match oloop.oarrays.[i].Info with
+                    | Array _ -> [""]
+                    | NetCDF _ -> oloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) oloop.iarrays.[i] oloop.GetFunc
+                    |> stringCollapse ""]
             )
         | None ->
             let funcs = List.init numCalls (fun i ->
@@ -1297,8 +1387,13 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             )
             List.init numCalls (fun i ->
                 let textGenerator = CppLoopTextGenerator([], [cppOmpLine],[cppArrayDeclLine],[])
-                String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] textGenerator |> fst)
+                (String.concat "" ["omp_set_nested("; string nOmp;");\n"]) ::
+                (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] textGenerator |> fst) @
+                [match oloop.oarrays.[i].Info with
+                    | Array _ -> [""]
+                    | NetCDF _ -> oloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) oloop.iarrays.[i] funcs.[i]
+                    |> stringCollapse ""]
+
             )
 
     List.init numCalls (fun i ->
@@ -1383,7 +1478,11 @@ let methodLoopTemplate (mloop: MethodLoop) =
             let nOmp = mloop.funcs.[i].ParallelismLevels |> List.sum
             let textGenerator = CppLoopTextGenerator([], [cppOmpLine],[cppArrayDeclLine],[])
             String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
-            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] textGenerator |> fst)
+            (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] textGenerator |> fst) @
+            [match mloop.oarrays.[i].Info with
+                | Array _ -> [""]
+                | NetCDF _ -> mloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) mloop.iarrays mloop.funcs.[i]
+                |> stringCollapse ""]
         )
 
     List.init numCalls (fun i ->
@@ -1438,12 +1537,14 @@ let parse (tokens: Token list) =
 
     let arraySwaps =
         arrays |> List.map (fun array ->
-            String.concat "" ["promote<"; array.Type; ", "; string array.Rank; ">::type "; array.Name; ";\n"]
-            :: String.concat "" [array.Name; " = allocate<"; array.Type; ", "; string array.Rank; ", "; symmVecName array; ">();\n"]
-            :: match array.Info with
-                | Array _ -> [""]
-                | NetCDF _ -> array |> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[]))
-                |> stringCollapse ""
+            [
+                String.concat "" ["promote<"; array.Type; ", "; string array.Rank; ">::type "; array.Name; ";\n"]
+                String.concat "" [array.Name; " = allocate<"; array.Type; ", "; string array.Rank; ", "; symmVecName array; ">();\n"]
+                match array.Info with
+                    | Array _ -> [""]
+                    | NetCDF _ -> array |> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[]))
+                    |> stringCollapse ""
+            ]
         )
 
     let rec deleteFunctionPragmas (tokens: Token list) =
@@ -1462,7 +1563,7 @@ let parse (tokens: Token list) =
         let rec substitute' (pre: Token list) = function
         | ArrayPragmaPattern (pragma, tail) ->
             (pre |> tokenToStr |> respace |> reconcat |> newln)
-            @ [arrayPragmaLookup pragma]
+            @ (arrayPragmaLookup pragma)
             @ (tail |> substitute' [])
         | FunctionPragmaPattern (pragma, tail) ->
             (pre |> tokenToStr |> respace |> reconcat |> newln)
