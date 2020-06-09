@@ -589,7 +589,8 @@ module NestedLoop =
         let ncFileName, ncVarName, ncInfo =
             match oarray.Info, func.NCInfo with
             | NetCDF info, Some dims -> info.FileName, info.VariableName, dims
-            | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays"
+            | NetCDF info, _ -> failwith "Function is missing NetCDF info."
+            | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays."
 
         let indexNames = List.init (oarray.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
 
@@ -635,15 +636,17 @@ module NestedLoop =
 
 
         let outputDimLines =
-            List.init nOutputDims (fun j ->
-                [
-                    String.concat "" ["nc_def_dim("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; string ncInfo.DimExtents.[j]; ", &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]));"]
-                    String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; ncInfo.DimValTypes.[j] |> revMatchNCtype |> string; ", 1, &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]), &("; oarray.Name; "_dim_var_ncids["; string (j+nInputDims); "]));"]
-                    String.concat "" ["nc_enddef(";  outputFileIDname oarray; ");"]
-                    String.concat "" ["nc_put_var("; outputFileIDname oarray; ", "; oarray.Name; "_dim_var_ncids["; string j; "], "; ncInfo.DimValNames.[j]; ");"]
-                    String.concat "" ["nc_redef(";   outputFileIDname oarray; ");"]
-                ]
-            ) |> List.reduce (@)
+            if oLevels = 0 then [] else
+                List.init oLevels (fun j ->
+                    printfn "%i" j
+                    [
+                        String.concat "" ["nc_def_dim("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; string ncInfo.DimExtents.[j]; ", &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]));"]
+                        String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; ncInfo.DimValTypes.[j] |> revMatchNCtype |> string; ", 1, &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]), &("; oarray.Name; "_dim_var_ncids["; string (j+nInputDims); "]));"]
+                        String.concat "" ["nc_enddef(";  outputFileIDname oarray; ");"]
+                        String.concat "" ["nc_put_var("; outputFileIDname oarray; ", "; oarray.Name; "_dim_var_ncids["; string j; "], "; ncInfo.DimValNames.[j]; ");"]
+                        String.concat "" ["nc_redef(";   outputFileIDname oarray; ");"]
+                    ]
+                ) |> List.reduce (@)
 
         /// nc_create call
         let ncInit = (
@@ -963,11 +966,11 @@ type ObjectLoop (nameIn: string, initIn: string, callIn: (string list * string *
 
 let (|MethodLoopCallPattern|_|) (loop: Token) (position: int) = function
     | Token.Str oarrayName :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')'
-        :: Token.Symbol '(' :: Token.Str oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
+        :: Token.Symbol '(' :: Token.Quote oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
         let oarrayInfo = { ExtentsName = oExtentsName }
         Some (func, oarrayName, Array oarrayInfo, 10, tail')
     | Token.Str oarrayName :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')'
-        :: Token.Symbol '(' :: Token.Str oFileName :: Token.Symbol ',' :: Token.Str oVarName :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
+        :: Token.Symbol '(' :: Token.Quote oFileName :: Token.Symbol ',' :: Token.Quote oVarName :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
         let oarrayInfo = { FileName = oFileName; VariableName = oVarName }
         Some (func, oarrayName, NetCDF oarrayInfo, 12, tail')
     | _ -> None
@@ -1013,11 +1016,11 @@ let (|ObjectLoopCallPattern|_|) (loop: Token) (position: int) = function
         let args, t = toElements tail'
         let iarrays = args |> tokenToStr
         match t with
-        | Token.Symbol '(' :: Token.Str oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
+        | Token.Symbol '(' :: Token.Quote oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
             let oarrayInfo = { ExtentsName = oExtentsName }
             let nTokens = args.Length + 8
             Some (iarrays, oarrayName, Array oarrayInfo, nTokens, t')
-        | Token.Symbol '(' :: Token.Str oFileName :: Token.Symbol ',' :: Token.Str oVarName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
+        | Token.Symbol '(' :: Token.Quote oFileName :: Token.Symbol ',' :: Token.Quote oVarName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
             let oarrayInfo = { FileName = oFileName; VariableName = oVarName }
             let nTokens = args.Length + 10
             Some (iarrays, oarrayName, NetCDF oarrayInfo, nTokens, t')
@@ -1188,8 +1191,12 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
 
     let ncInfo =
         match ncDimNames, ncDimLens, ncDimVals, ncDimTypes with
-        | Some names, Some lens, Some vals, Some types -> Some {DimNames = names; DimExtents = lens; DimValNames = vals; DimValTypes = types}
-        | None, None, None, None -> None
+        | Some names, Some lens, Some vals, Some types ->
+                Some { DimNames = names; DimExtents = lens; DimValNames = vals; DimValTypes = types }
+        | None, None, None, None ->
+            if orank = 0 then
+                Some { DimNames = []; DimExtents = []; DimValNames = []; DimValTypes = [] }
+            else None
         | _ -> failwith "Incomplete specification of NetCDF output in function \"%s\"" name
 
     { Name = name;
@@ -1244,7 +1251,11 @@ let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) 
             if oloops.[i].Init = funcs.[j].Name then
                 oloops.[i].SetFunc funcs.[j]
 
-let deduceSymm (comm: int list) (iarrays: NestedArray list) (func: NestedFunction) =
+/// Deduce symmetry vector of the output array from input arrays and function.
+/// <param name="iarrays"> Input arrays </param>
+/// <param name="func"> Function applied to input arrays </param>
+let deduceSymm (iarrays: NestedArray list) (func: NestedFunction) =
+    let comm = func.Comm |> Option.get
     let commGroups = comm |> List.distinct
     let iLevels =
         List.init commGroups.Length (fun i ->
@@ -1290,7 +1301,7 @@ let sendOutputArraysToLoops (mloops: MethodLoop list) (oloops: ObjectLoop list) 
     let getOSymm iarrays func orank =
         match func.Comm with
         | None -> if orank = 0 then [0] else List.init orank id
-        | Some comm -> deduceSymm comm iarrays func
+        | Some comm -> deduceSymm iarrays func
 
     for i in 0..mloops.Length-1 do
         for j in 0..mloops.[i].funcs.Length-1 do
@@ -1316,6 +1327,7 @@ let sendOutputArraysToLoops (mloops: MethodLoop list) (oloops: ObjectLoop list) 
             | NetCDF info -> {Name = oname; Type = otype; Rank = orank; Symm = Some osymm; Info = NetCDF info }
             |> oloops.[i].PushOarray
 
+/// Wrapper for message-passing routines to preserve correct calling order
 let populateLoops (arrays: NestedArray list) (funcs: NestedFunction list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
     sendArraysToLoops arrays mloops oloops
     sendFunctionsToLoops funcs mloops oloops
@@ -1631,8 +1643,7 @@ let parse (tokens: Token list) =
     let symmVecs = symmVecLines arrays
 
     // Pass array and function objects to the loops that call them, if they are visible
-    sendArraysToLoops arrays mloops oloops
-    sendFunctionsToLoops funcs mloops oloops
+    populateLoops arrays funcs mloops oloops
 
     let templates =
         (oloops |> List.map objectLoopTemplate) @ (mloops |> List.map methodLoopTemplate)
@@ -1708,14 +1719,9 @@ let parse (tokens: Token list) =
             let irank = oloops.[i].iarrays |> List.map (List.map (fun x -> x.Rank))
             let isymm = oloops.[i].iarrays |> List.map (List.map symmVecName)
 
-            // Output type deduction
-            let iLevels =
-                oloops.[i].iarrays
-                |> List.map ((List.map (fun x -> x.Rank)) >> (fun x -> (x, oloops.[i].GetFunc.IRank) ||> (List.map2 (-))))
-            let oLevels = oloops.[i].GetFunc.ORank
-
-            let orank = iLevels |> List.map (List.sum >> ((+) oLevels))
-            //let osymm = oloops.[i].oarrays |> List.map symmVecName
+            let otype = oloops.[i].oarrays |> List.map (fun x -> x.Type)
+            let orank = oloops.[i].oarrays |> List.map (fun x -> x.Rank)
+            let osymm = oloops.[i].oarrays |> List.map symmVecName
 
             let ranks = (irank, orank) ||> List.map2 (fun x y -> (x |> List.map string) @ [string y])
             let types = (itype, otype) ||> List.map2 (fun x y -> x @ [y])
@@ -1749,7 +1755,6 @@ let parse (tokens: Token list) =
             let irank = mloops.[i].iarrays |> List.map (fun x -> x.Rank)
             let isymm = mloops.[i].iarrays |> List.map symmVecName
 
-            // Output type deduction
             let otype = mloops.[i].oarrays |> List.map (fun x -> x.Type)
             let orank = mloops.[i].oarrays |> List.map (fun x -> x.Rank)
             let osymm = mloops.[i].oarrays |> List.map symmVecName
