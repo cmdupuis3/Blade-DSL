@@ -608,10 +608,7 @@ module NestedLoop =
 
         // Dimension algebra for names and values
         let iLevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
-        let oLevels = func.ORank
-
         let nInputDims = (iLevels |> List.sum)
-        let nOutputDims = nInputDims + oLevels
 
         let inputDimLines =
             List.init iarrays.Length (fun i ->
@@ -636,9 +633,8 @@ module NestedLoop =
 
 
         let outputDimLines =
-            if oLevels = 0 then [] else
-                List.init oLevels (fun j ->
-                    printfn "%i" j
+            if func.ORank = 0 then [] else
+                List.init func.ORank (fun j ->
                     [
                         String.concat "" ["nc_def_dim("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; string ncInfo.DimExtents.[j]; ", &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]));"]
                         String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncInfo.DimNames.[j]; ", "; ncInfo.DimValTypes.[j] |> revMatchNCtype |> string; ", 1, &("; oarray.Name; "_dim_ncids["; string (j+nInputDims); "]), &("; oarray.Name; "_dim_var_ncids["; string (j+nInputDims); "]));"]
@@ -653,20 +649,20 @@ module NestedLoop =
             [
                 String.concat "" ["int "; outputFileIDname oarray; ";"]
                 String.concat "" ["nc_create("; quote ncFileName; ", NC_CLOBBER, &"; outputFileIDname oarray; ");"]
-                String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string nOutputDims; "];"]
-                String.concat "" ["int* "; oarray.Name; "_dim_ncids = new int["; string nOutputDims; "];"]
-                String.concat "" ["int* "; oarray.Name; "_dim_var_ncids = new int["; string nOutputDims; "];"]
+                //String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string oarray.Rank; "];"]
+                String.concat "" ["int* "; oarray.Name; "_dim_ncids = new int["; string oarray.Rank; "];"]
+                String.concat "" ["int* "; oarray.Name; "_dim_var_ncids = new int["; string oarray.Rank; "];"]
             ] @ inputDimLines @ outputDimLines @
             [
                 String.concat "" ["int "; variableIDname oarray; ";";]
-                String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncVarName; ", "; oarray.Type |> revMatchNCtype |> string; ", "; string nOutputDims; ", "; oarray.Name; "_dim_ncids, &"; variableIDname oarray; ");"]
-                String.concat "" ["size_t* "; startsName oarray;  " = new size_t["; string nOutputDims; "];"]
-                String.concat "" ["size_t* "; countsName oarray;  " = new size_t["; string nOutputDims; "];"]
-                String.concat "" ["for(int q = 0; q < "; string nOutputDims; "; q++){"]
+                String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncVarName; ", "; oarray.Type |> revMatchNCtype |> string; ", "; string oarray.Rank; ", "; oarray.Name; "_dim_ncids, &"; variableIDname oarray; ");"]
+                String.concat "" ["size_t* "; startsName oarray;  " = new size_t["; string oarray.Rank; "];"]
+                String.concat "" ["size_t* "; countsName oarray;  " = new size_t["; string oarray.Rank; "];"]
+                String.concat "" ["for(int q = 0; q < "; string oarray.Rank; "; q++){"]
                 String.concat "" ["\t"; startsName oarray; "[q] = 0;"]
                 String.concat "" ["\t"; countsName oarray; "[q] = 1;"]
                 String.concat "" ["}"]
-                String.concat "" [countsName oarray; "["; string (nOutputDims-1); "] = "; extentsName oarray; "["; string (nOutputDims-1); "];"]
+                String.concat "" [countsName oarray; "["; string (oarray.Rank-1); "] = out_extents["; string (oarray.Rank-1); "];"]
                 String.concat "" ["nc_enddef(";  outputFileIDname oarray; ");"]
             ]
         )
@@ -685,17 +681,18 @@ module NestedLoop =
                 iarrayType = oarray.Type;
                 iarrayLevels = oarray.Rank-1;
                 iRank = 1;
-                iExtents = extentsName oarray;
+                iExtents = "out_extents";
                 indNames = indexNames;
                 iMins = imins;
                 parLevels = 0;
             }
 
         let ret =
-            newln ncInit
+            (ncInit |> newln |> tab)
             @ (unaryLoop loop textGenerator 0
-               |> List.fold (|>) [inner])
-            @ [String.concat "" ["nc_close("; outputFileIDname oarray; ");\n"]]
+               |> List.fold (|>) [inner]
+               |> tab)
+            @ ([String.concat "" ["nc_close("; outputFileIDname oarray; ");"]] |> newln |> tab)
         ret
 
 
@@ -769,6 +766,7 @@ let rec respace = function
     | Match @"^return" s1 :: Match @"^[a-zA-Z0-9_][a-zA-Z0-9_]*" s2 :: tail -> s1 :: " " :: (respace (s2 :: tail))
     | Match @"^\#" s1 :: Match @"^include" s2 :: tail -> s1 :: s2 :: " " :: respace tail
     | Match @"^\#" s1 :: Match @"^define" s2 :: s3 :: s4 :: tail -> s1 :: s2 :: " " :: s3 :: " " :: s4 :: respace tail
+    | Match @"^[a-zA-Z_][a-zA-Z0-9_]*" s1 :: Match @"^\*+" s2 :: tail -> s1 :: s2 :: " " :: respace tail
     | head :: tail -> head :: respace tail
     | [] -> []
 
@@ -1735,7 +1733,15 @@ let parse (tokens: Token list) =
                     ) |> (withCommas >> stringCollapse "")
                 )
 
-            List.init oloops.[i].Call.Length (fun j -> String.concat "" ["\n"; name; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");\n"])
+            //String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string oarray.Rank; "];"]
+            List.init oloops.[i].Call.Length (fun j ->
+                [
+                    String.concat "" ["\nsize_t* "; extentsName oloops.[i].oarrays.[j]; " = new size_t["; string oloops.[i].oarrays.[j].Rank; "];"]
+                    String.concat "" [name; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
+                ]
+                |> newln
+                |> stringCollapse ""
+            )
         )
 
     let mloopCallSwaps =
