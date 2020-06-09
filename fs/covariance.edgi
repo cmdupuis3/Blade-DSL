@@ -9,7 +9,7 @@ using namespace nested_array_utilities;
 
 #define OMP_NUM_THREADS 48
 
-#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) orank(0) ompLevels(1,0)
+#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) otype(float) orank(0) ompLevels(1,0)
 {
     int len = 5;
     float mean1 = 0;
@@ -44,10 +44,7 @@ int main() {
     edgi_nc_t a1("/home/username/Data/indonesia/hqp_block11.nc", "hqp");
 
     #pragma edgi array
-    float^3 a2(extents3);
-
-    #pragma edgi array
-    float^4 res(extents4);
+    edgi_nc_t a2("/home/username/Data/indonesia/hqp_block12.nc", "hqp");
 
     cout << "Allocation took " << (time(NULL) - start) << "s" << endl << endl;
 
@@ -58,7 +55,7 @@ int main() {
 
     time(&start);
     auto oloop = object_for(covariance);
-    oloop(a1, a2, res);
+    res = oloop(a1, a2)("/home/username/Data/indonesia/new.nc", "hqpCovariance");
 
     cout << "Calculation took " << (time(NULL) - start) << "s" << endl << endl;
 /*
