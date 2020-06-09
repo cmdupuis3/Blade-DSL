@@ -88,8 +88,6 @@ let quote (s: string) =
 
 type ArrayInfo =
     {
-        Type: string
-        Rank: int
         ExtentsName: string
     }
 
@@ -107,19 +105,11 @@ type NestedArrayInfo =
 type NestedArray =
     {
         Name: string
+        Type: string
+        Rank: int
         Symm: int list Option
         Info: NestedArrayInfo
     }
-
-let getArrayType array =
-    match array.Info with
-    | Array info -> info.Type
-    | NetCDF info -> getNCvarType info.FileName info.VariableName
-
-let getArrayRank array =
-    match array.Info with
-    | Array info -> info.Rank
-    | NetCDF info -> getNCnumDims info.FileName info.VariableName
 
 let extentsName array =
     match array.Info with
@@ -400,12 +390,12 @@ module NestedLoop =
     /// <param name="oarray"> An output array class. </param>
     /// <param name="func"> A function class. </param>
     let Nary (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) (textGenerator: LoopTextGenerator) =
-        let iLevels = (iarrays |> List.map getArrayRank, func.IRank) ||> List.map2 (-)
+        let iLevels = (iarrays |> List.map (fun arr -> arr.Rank), func.IRank) ||> List.map2 (-)
 
         let states =
             let comm = func.Comm |> function | Some comm -> comm | None -> (List.init iarrays.Length id)
             let iNames = iarrays |> List.map (fun x -> x.Name)
-            let iSymms = iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init (x |> getArrayRank) id))
+            let iSymms = iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))
             vStates iNames iSymms comm
 
         /// Generates a list of new iterator names for multiple variables based on a minumum and the ranks of variables to loop over.
@@ -429,14 +419,14 @@ module NestedLoop =
         let lastINames =
             let lastInds = indexNames |> List.map List.last
             List.init iarrays.Length (fun i ->
-                if iarrays.[i] |> getArrayRank = func.IRank.[i] then "" else lastInds.[i]
+                if iarrays.[i].Rank = func.IRank.[i] then "" else lastInds.[i]
                 |> fun x -> String.concat "" [func.INames.[i]; x]
             )
 
         /// Last output array intermediate name to be subbed into the inner block
         let lastOName =
             let index = fun (acc: int) x -> textGenerator.Index x (textGenerator.IteratorName acc 0)
-            let iDiff i = (iarrays.[i] |> getArrayRank) - func.IRank.[i]
+            let iDiff i = iarrays.[i].Rank - func.IRank.[i]
             let oDiff = (List.init (states.Length) iDiff |> List.reduce (+)) - func.ORank
             List.init states.Length (fun i ->
                 if (iDiff i > 0) && (oDiff > 0) then
@@ -458,7 +448,7 @@ module NestedLoop =
         let loops = List.init (iarrays.Length) (fun i ->
             {
                 iarrayName = func.INames.[i];
-                iarrayType = iarrays.[i] |> getArrayType;
+                iarrayType = iarrays.[i].Type;
                 iarrayLevels = iLevels.[i];
                 iRank = func.IRank.[i];
                 iExtents = iExtents.[i];
@@ -499,7 +489,7 @@ module NestedLoop =
         String.concat "" [array.Name; "_dim_names"]
 
     let private dimValsNames (array: NestedArray) =
-        List.init (array |> getArrayRank) (fun i -> String.concat "" [array.Name; "_dim_"; string i; "_vals"])
+        List.init array.Rank (fun i -> String.concat "" [array.Name; "_dim_"; string i; "_vals"])
 
     /// Autogenerate an N-ary nested_for loop
     /// <param name="array"> An input array class. </param>
@@ -509,14 +499,14 @@ module NestedLoop =
             | NetCDF info -> info.FileName, info.VariableName
             | _ -> failwith "Cannot use NetCDF routines on non-NetCDF arrays"
 
-        let indexNames = List.init ((array |> getArrayRank)-1) (fun i -> textGenerator.IteratorName 0 i)
+        let indexNames = List.init (array.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
 
-        let iSymms = array.Symm |> function | Some s -> s | None -> (List.init (array |> getArrayRank) id)
+        let iSymms = array.Symm |> function | Some s -> s | None -> (List.init array.Rank id)
         let states = vStates [array.Name] [iSymms] [0]
         /// Chooses the correct iterator minimum for all input variables.
         let imins =
             let iMaps = iminMap states
-            List.init (array |> getArrayRank) (fun j ->
+            List.init array.Rank (fun j ->
                 if iMaps.Head.[j] = (0, j) then textGenerator.Zero else indexNames.[snd iMaps.Head.[j]]
             )
 
@@ -527,11 +517,11 @@ module NestedLoop =
 
         // Assuming dimensions and dimension variables have the same name... (should, but don't necessarily)
         let ncDimValDeclLines =
-            List.init (array |> getArrayRank) (fun i ->
+            List.init array.Rank (fun i ->
                 String.concat "" [ncDimTypes.[i]; "* "; (dimValsNames array).[i];" = new "; ncDimTypes.[i]; "["; extentsName array; "["; string i;"]];"]
             )
         let ncDimValLines =
-            List.init (array |> getArrayRank) (fun i ->
+            List.init array.Rank (fun i ->
                 String.concat "" ["nc_get_var("; inputFileIDname array; ", "; variableIDname array; ", &("; (dimValsNames array).[i]; ");"]
             )
 
@@ -542,12 +532,12 @@ module NestedLoop =
                 String.concat "" ["nc_open("; quote ncFileName; ", NC_NOWRITE, &"; inputFileIDname array; ");"]
                 String.concat "" ["int "; variableIDname array; ";";]
                 String.concat "" ["nc_inq_varid("; inputFileIDname array; ", "; quote ncVarName; ", &"; variableIDname array; ");"]
-                String.concat "" ["int* "; array.Name; "_dim_ncids = new int[";  string (array |> getArrayRank); "];"]
-                String.concat "" ["size_t* "; extentsName array; " = new size_t["; string (array |> getArrayRank); "];"]
-                String.concat "" ["size_t* "; startsName array;  " = new size_t["; string (array |> getArrayRank); "];"]
-                String.concat "" ["size_t* "; countsName array;  " = new size_t["; string (array |> getArrayRank); "];"]
-                String.concat "" ["char** "; dimNames array;  " = new char*["; string (array |> getArrayRank); "];"]
-                String.concat "" ["for(int q = 0; q < "; string (array |> getArrayRank); "; q++){"]
+                String.concat "" ["int* "; array.Name; "_dim_ncids = new int[";  string array.Rank; "];"]
+                String.concat "" ["size_t* "; extentsName array; " = new size_t["; string array.Rank; "];"]
+                String.concat "" ["size_t* "; startsName array;  " = new size_t["; string array.Rank; "];"]
+                String.concat "" ["size_t* "; countsName array;  " = new size_t["; string array.Rank; "];"]
+                String.concat "" ["char** "; dimNames array;  " = new char*["; string array.Rank; "];"]
+                String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
                 String.concat "" ["\t"; "nc_inq_dimid(";   inputFileIDname array; ", "; variableIDname array;    ", &("; array.Name; "_dim_ncids[q]));"]
                 String.concat "" ["\t"; dimNames array; "[q] = new char[NC_MAX_NAME];"]
                 String.concat "" ["\t"; "nc_inq_dimname("; inputFileIDname array; ", &("; array.Name; "_dim_ncids[q]), "; dimNames array; "[q]);"]
@@ -555,7 +545,7 @@ module NestedLoop =
                 String.concat "" ["\t"; startsName array; "[q] = 0;"]
                 String.concat "" ["\t"; countsName array; "[q] = 1;"]
                 String.concat "" ["}"]
-                String.concat "" [countsName array; "["; string ((array |> getArrayRank)-1); "] = "; extentsName array; "["; string ((array |> getArrayRank)-1); "];"]
+                String.concat "" [countsName array; "["; string (array.Rank-1); "] = "; extentsName array; "["; string (array.Rank-1); "];"]
             ] @ ncDimValDeclLines @ ncDimValLines
 
         (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
@@ -569,8 +559,8 @@ module NestedLoop =
         let loop =
             {
                 iarrayName = array.Name;
-                iarrayType = (array |> getArrayType);
-                iarrayLevels = (array |> getArrayRank)-1;
+                iarrayType = array.Type;
+                iarrayLevels = array.Rank-1;
                 iRank = 1;
                 iExtents = extentsName array;
                 indNames = indexNames;
@@ -601,14 +591,14 @@ module NestedLoop =
             | NetCDF info, Some dims -> info.FileName, info.VariableName, dims
             | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays"
 
-        let indexNames = List.init ((oarray |> getArrayRank)-1) (fun i -> textGenerator.IteratorName 0 i)
+        let indexNames = List.init (oarray.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
 
-        let oSymms = oarray.Symm |> function | Some s -> s | None -> (List.init (oarray |> getArrayRank) id)
+        let oSymms = oarray.Symm |> function | Some s -> s | None -> (List.init oarray.Rank id)
         let states = vStates [oarray.Name] [oSymms] [0]
         /// Chooses the correct iterator minimum for all input variables.
         let imins =
             let iMaps = iminMap states
-            List.init (oarray |> getArrayRank) (fun j ->
+            List.init oarray.Rank (fun j ->
                 if iMaps.Head.[j] = (0, j) then textGenerator.Zero else indexNames.[snd iMaps.Head.[j]]
             )
 
@@ -616,8 +606,7 @@ module NestedLoop =
         let lastOName = String.concat "" [oarray.Name; indexNames |> List.rev |> List.head]
 
         // Dimension algebra for names and values
-
-        let iLevels = (iarrays |> List.map getArrayRank, func.IRank) ||> List.map2 (-)
+        let iLevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
         let oLevels = func.ORank
 
         let nInputDims = (iLevels |> List.sum)
@@ -631,7 +620,6 @@ module NestedLoop =
                     | NetCDF info -> info.FileName, info.VariableName
                     | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays"
 
-                let extents = extentsName
                 let ncDimNames = dimNames iarrays.[i]
                 let ncDimTypes = getNCdimTypes iFileName iVarName
                 List.init iLevels.[i] (fun j ->
@@ -668,7 +656,7 @@ module NestedLoop =
             ] @ inputDimLines @ outputDimLines @
             [
                 String.concat "" ["int "; variableIDname oarray; ";";]
-                String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncVarName; ", "; oarray |> getArrayType |> revMatchNCtype |> string; ", "; string nOutputDims; ", "; oarray.Name; "_dim_ncids, &"; variableIDname oarray; ");"]
+                String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncVarName; ", "; oarray.Type |> revMatchNCtype |> string; ", "; string nOutputDims; ", "; oarray.Name; "_dim_ncids, &"; variableIDname oarray; ");"]
                 String.concat "" ["size_t* "; startsName oarray;  " = new size_t["; string nOutputDims; "];"]
                 String.concat "" ["size_t* "; countsName oarray;  " = new size_t["; string nOutputDims; "];"]
                 String.concat "" ["for(int q = 0; q < "; string nOutputDims; "; q++){"]
@@ -691,8 +679,8 @@ module NestedLoop =
         let loop =
             {
                 iarrayName = oarray.Name;
-                iarrayType = (oarray |> getArrayType);
-                iarrayLevels = (oarray |> getArrayRank)-1;
+                iarrayType = oarray.Type;
+                iarrayLevels = oarray.Rank-1;
                 iRank = 1;
                 iExtents = extentsName oarray;
                 indNames = indexNames;
@@ -976,7 +964,7 @@ type ObjectLoop (nameIn: string, initIn: string, callIn: (string list * string *
 let (|MethodLoopCallPattern|_|) (loop: Token) (position: int) = function
     | Token.Str oarrayName :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')'
         :: Token.Symbol '(' :: Token.Str oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
-        let oarrayInfo = { Type = "placeholder_t"; Rank = -1; ExtentsName = oExtentsName }
+        let oarrayInfo = { ExtentsName = oExtentsName }
         Some (func, oarrayName, Array oarrayInfo, 10, tail')
     | Token.Str oarrayName :: Token.Symbol '=' :: lname :: Token.Symbol '(' :: Token.Str func :: Token.Symbol ')'
         :: Token.Symbol '(' :: Token.Str oFileName :: Token.Symbol ',' :: Token.Str oVarName :: Token.Symbol ')' :: Token.Symbol ';' :: tail' when lname = loop ->
@@ -1026,7 +1014,7 @@ let (|ObjectLoopCallPattern|_|) (loop: Token) (position: int) = function
         let iarrays = args |> tokenToStr
         match t with
         | Token.Symbol '(' :: Token.Str oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
-            let oarrayInfo = { Type = "placeholder_t"; Rank = -1; ExtentsName = oExtentsName }
+            let oarrayInfo = { ExtentsName = oExtentsName }
             let nTokens = args.Length + 8
             Some (iarrays, oarrayName, Array oarrayInfo, nTokens, t')
         | Token.Symbol '(' :: Token.Str oFileName :: Token.Symbol ',' :: Token.Str oVarName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
@@ -1130,9 +1118,11 @@ let (|FunctionPragmaPattern|_|) = function
 
 let (|ArrayPattern|_|) (symGroups: int list Option) = function
     | Token.Str "edgi_nc_t" :: Token.Str name :: Token.Symbol '(' :: Token.Quote fileName :: Token.Symbol ',' :: Token.Quote varName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Symm = symGroups; Info = NetCDF {FileName = fileName; VariableName = varName} }, tail)
+        let valtype = getNCvarType fileName varName
+        let rank = getNCnumDims fileName varName
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; Info = NetCDF { FileName = fileName; VariableName = varName } }, tail)
     | Token.Str valtype :: Token.Symbol '^' :: Token.Int rank :: Token.Str name :: Token.Symbol '(' :: Token.Str extentsName :: Token.Symbol ')' :: Token.Symbol ';' :: tail ->
-        Some ( {Name = name; Symm = symGroups; Info = Array {Type = valtype; Rank = rank; ExtentsName = extentsName} }, tail )
+        Some ( {Name = name; Type = valtype; Rank = rank; Symm = symGroups; Info = Array { ExtentsName = extentsName } }, tail )
     | _ -> None
 
 
@@ -1267,9 +1257,9 @@ let deduceSymm (comm: int list) (iarrays: NestedArray list) (func: NestedFunctio
             let iranks = func.IRank |> listSelect
 
             // Double-check that all ranks in the commutativity group are equal.
-            assert(iarrays |> List.map getArrayRank |> List.distinct |> List.length = 1)
+            assert(iarrays |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
 
-            ((iarrays |> List.map getArrayRank), iranks)
+            ((iarrays |> List.map (fun x -> x.Rank)), iranks)
             ||> List.map2 (-)
             |> listSelect
         )
@@ -1291,25 +1281,40 @@ let deduceSymm (comm: int list) (iarrays: NestedArray list) (func: NestedFunctio
 
 /// Generate output arrays from calls and type/rank deduction
 let sendOutputArraysToLoops (mloops: MethodLoop list) (oloops: ObjectLoop list) =
+    let getORank iarrays func =
+        iarrays
+        |> List.map (fun x -> x.Rank)
+        |> fun x -> (x, func.IRank) ||> List.map2 (-)
+        |> List.sum
+        |> (+) func.ORank
+    let getOSymm iarrays func orank =
+        match func.Comm with
+        | None -> if orank = 0 then [0] else List.init orank id
+        | Some comm -> deduceSymm comm iarrays func
+
     for i in 0..mloops.Length-1 do
-        for k in 0..mloops.[i].Call.Length-1 do
-            []
+        for j in 0..mloops.[i].funcs.Length-1 do
+            let otype = mloops.[i].funcs.[j].OType
+            let orank = getORank mloops.[i].iarrays mloops.[i].funcs.[j]
+            let osymm = getOSymm mloops.[i].iarrays mloops.[i].funcs.[j] orank
+            for k in 0..mloops.[i].Call.Length-1 do
+                if fst4 mloops.[i].Call.[k] = mloops.[i].funcs.[j].Name then
+                    let oname = snd4 mloops.[i].Call.[k]
+                    match thd4 mloops.[i].Call.[k] with
+                    | Array info  -> {Name = oname; Type = otype; Rank = orank; Symm = Some osymm; Info = Array { ExtentsName = info.ExtentsName } }
+                    | NetCDF info -> {Name = oname; Type = otype; Rank = orank; Symm = Some osymm; Info = NetCDF info }
+                    |> mloops.[i].PushOarray
+
     for i in 0..oloops.Length-1 do
         let otype = oloops.[i].GetFunc.OType
         for k in 0..oloops.[i].iarrays.Length-1 do
-            let orank =
-                oloops.[i].iarrays.[k]
-                |> List.map getArrayRank
-                |> fun x -> (x, oloops.[i].GetFunc.IRank) ||> List.map2 (-)
-                |> List.sum
-                |> (+) oloops.[i].GetFunc.ORank
-            let osymm =
-                match oloops.[i].GetFunc.Comm with
-                | None -> if orank = 0 then [0] else List.init orank id
-                | Some comm -> deduceSymm comm oloops.[i].iarrays.[k] oloops.[i].GetFunc
-
-            let asdf = {Name = oname; Symm = Some osymm; Info = info}
-            oloops.[i].PushOarray asdf
+            let orank = getORank oloops.[i].iarrays.[k] oloops.[i].GetFunc
+            let osymm = getOSymm oloops.[i].iarrays.[k] oloops.[i].GetFunc orank
+            let oname = snd4 oloops.[i].Call.[k]
+            match thd4 oloops.[i].Call.[k] with
+            | Array info  -> {Name = oname; Type = otype; Rank = orank; Symm = Some osymm; Info = Array { ExtentsName = info.ExtentsName } }
+            | NetCDF info -> {Name = oname; Type = otype; Rank = orank; Symm = Some osymm; Info = NetCDF info }
+            |> oloops.[i].PushOarray
 
 let populateLoops (arrays: NestedArray list) (funcs: NestedFunction list) (mloops: MethodLoop list) (oloops: ObjectLoop list) =
     sendArraysToLoops arrays mloops oloops
@@ -1350,10 +1355,10 @@ let symmVecName (array: NestedArray) =
 let objectLoopTemplate (oloop: ObjectLoop) =
 
     let numCalls = oloop.Call.Length
-    let itype = oloop.iarrays |> List.map (List.map getArrayType)
-    let otype = oloop.oarrays |> List.map getArrayType
-    let irank = oloop.iarrays |> List.map (List.map getArrayRank)
-    let orank = oloop.oarrays |> List.map getArrayRank
+    let itype = oloop.iarrays |> List.map (List.map (fun x -> x.Type))
+    let otype = oloop.oarrays |> List.map (fun x -> x.Type)
+    let irank = oloop.iarrays |> List.map (List.map (fun x -> x.Rank))
+    let orank = oloop.oarrays |> List.map (fun x -> x.Rank)
     let isymm = oloop.iarrays |> List.map (List.map symmVecName)
     let osymm = oloop.oarrays |> List.map symmVecName
 
@@ -1522,10 +1527,10 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let forank = mloop.funcs |> List.map (fun x -> x.ORank)
 
     let numCalls = mloop.Call.Length
-    let itype = mloop.iarrays |> List.map getArrayType
-    let otype = mloop.oarrays |> List.map getArrayType
-    let irank = mloop.iarrays |> List.map getArrayRank
-    let orank = mloop.oarrays |> List.map getArrayRank
+    let itype = mloop.iarrays |> List.map (fun x -> x.Type)
+    let otype = mloop.oarrays |> List.map (fun x -> x.Type)
+    let irank = mloop.iarrays |> List.map (fun x -> x.Rank)
+    let orank = mloop.oarrays |> List.map (fun x -> x.Rank)
     let isymm = mloop.iarrays |> List.map symmVecName
     let osymm = mloop.oarrays |> List.map symmVecName
     let inames = mloop.funcs  |> List.map (fun x -> x.INames)
@@ -1639,8 +1644,8 @@ let parse (tokens: Token list) =
     let arraySwaps =
         arrays |> List.map (fun array ->
             [
-                String.concat "" ["promote<"; (array |> getArrayType); ", "; string (array |> getArrayRank); ">::type "; array.Name; ";\n"]
-                String.concat "" [array.Name; " = allocate<"; (array |> getArrayType); ", "; string (array |> getArrayRank); ", "; symmVecName array; ">();\n"]
+                String.concat "" ["promote<"; array.Type; ", "; string array.Rank; ">::type "; array.Name; ";\n"]
+                String.concat "" [array.Name; " = allocate<"; array.Type; ", "; string array.Rank; ", "; symmVecName array; ">();\n"]
                 match array.Info with
                     | Array _ -> [""]
                     | NetCDF _ -> array |> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[]))
@@ -1699,14 +1704,14 @@ let parse (tokens: Token list) =
                 | Some a -> List.init oloops.[i].Call.Length (fun i -> a)
                 | None   -> oloops.[i].iarrays |> List.map (fun x -> x.Length)
 
-            let itype = oloops.[i].iarrays |> List.map (List.map getArrayType)
-            let irank = oloops.[i].iarrays |> List.map (List.map getArrayRank)
+            let itype = oloops.[i].iarrays |> List.map (List.map (fun x -> x.Type))
+            let irank = oloops.[i].iarrays |> List.map (List.map (fun x -> x.Rank))
             let isymm = oloops.[i].iarrays |> List.map (List.map symmVecName)
 
             // Output type deduction
             let iLevels =
                 oloops.[i].iarrays
-                |> List.map ((List.map getArrayRank) >> (fun x -> (x, oloops.[i].GetFunc.IRank) ||> (List.map2 (-))))
+                |> List.map ((List.map (fun x -> x.Rank)) >> (fun x -> (x, oloops.[i].GetFunc.IRank) ||> (List.map2 (-))))
             let oLevels = oloops.[i].GetFunc.ORank
 
             let orank = iLevels |> List.map (List.sum >> ((+) oLevels))
@@ -1740,13 +1745,13 @@ let parse (tokens: Token list) =
 
             let arity = mloops.[i].funcs.[1].Arity |> Option.get // hack
 
-            let itype = mloops.[i].iarrays |> List.map getArrayType
-            let irank = mloops.[i].iarrays |> List.map getArrayRank
+            let itype = mloops.[i].iarrays |> List.map (fun x -> x.Type)
+            let irank = mloops.[i].iarrays |> List.map (fun x -> x.Rank)
             let isymm = mloops.[i].iarrays |> List.map symmVecName
 
             // Output type deduction
-            let otype = mloops.[i].oarrays |> List.map getArrayType
-            let orank = mloops.[i].oarrays |> List.map getArrayRank
+            let otype = mloops.[i].oarrays |> List.map (fun x -> x.Type)
+            let orank = mloops.[i].oarrays |> List.map (fun x -> x.Rank)
             let osymm = mloops.[i].oarrays |> List.map symmVecName
 
             let ranks = orank |> List.map (fun y -> (irank |> List.map string) @ [string y])
