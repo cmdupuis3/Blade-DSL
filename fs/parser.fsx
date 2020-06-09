@@ -63,22 +63,6 @@ let getNCdimTypes fileName variableName =
     |> Array.map matchNCtype
     |> Array.toList
 
-//let getNCvarDimIDs fileName variableName
-
-(*
-
-let file = @"/home/username/Data/indonesia/hqp_block11.nc"
-let var = @"hqp"
-
-get_num_dims(file, var)
-get_var_type(file, var)
-
-getNCnumDims file var
-getNCvarType file var
-
-*)
-
-
 // Hack alert
 let unquote (s: string) =
     s.[1..(s.Length-2)]
@@ -648,14 +632,14 @@ module NestedLoop =
         let ncInit = (
             [
                 String.concat "" ["int "; outputFileIDname oarray; ";"]
-                String.concat "" ["nc_create("; quote ncFileName; ", NC_CLOBBER, &"; outputFileIDname oarray; ");"]
+                String.concat "" ["nc_create("; func.OName; "_file_name, NC_CLOBBER, &"; outputFileIDname oarray; ");"]
                 //String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string oarray.Rank; "];"]
                 String.concat "" ["int* "; oarray.Name; "_dim_ncids = new int["; string oarray.Rank; "];"]
                 String.concat "" ["int* "; oarray.Name; "_dim_var_ncids = new int["; string oarray.Rank; "];"]
             ] @ inputDimLines @ outputDimLines @
             [
                 String.concat "" ["int "; variableIDname oarray; ";";]
-                String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; quote ncVarName; ", "; oarray.Type |> revMatchNCtype |> string; ", "; string oarray.Rank; ", "; oarray.Name; "_dim_ncids, &"; variableIDname oarray; ");"]
+                String.concat "" ["nc_def_var("; outputFileIDname oarray; ", "; func.OName; "_variable_name, "; oarray.Type |> revMatchNCtype |> string; ", "; string oarray.Rank; ", "; oarray.Name; "_dim_ncids, &"; variableIDname oarray; ");"]
                 String.concat "" ["size_t* "; startsName oarray;  " = new size_t["; string oarray.Rank; "];"]
                 String.concat "" ["size_t* "; countsName oarray;  " = new size_t["; string oarray.Rank; "];"]
                 String.concat "" ["for(int q = 0; q < "; string oarray.Rank; "; q++){"]
@@ -1399,15 +1383,25 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
             (List.init a (fun i -> String.concat "" ["\n\ttypename promote<ITYPE"; string (i+1); ", IRANK"; string (i+1); ">::type "; names.[i]])
             |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; oloop.GetFunc.OName]])
-            @ (List.init a (fun i -> String.concat "" ["\n\tconst int "; names.[i]; "_extents[IRANK"; string (i+1); "]"])
-            |> fun x -> x @ [String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"]])
+            @ (List.init a (fun i -> String.concat "" ["\n\tconst int "; names.[i]; "_extents[IRANK"; string (i+1); "]"]))
+            //|> fun x -> x @ [String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"]])
             |> withCommas
             |> stringCollapse ""
         )
 
     let aritySuffix = List.init numCalls (fun i -> if oloop.GetFunc.Arity.IsNone then String.concat "" ["_arity"; string arity.[i]] else "")
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; aritySuffix.[i]; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
 
+    let tmain =
+        List.init numCalls (fun i ->
+            [
+                String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"] // Nested arrays
+                String.concat "" [
+                    "\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"; // (still need this as long as truly nested I/O is unimplemented)
+                    "\n\tchar* "; oloop.GetFunc.OName; "_file_name, ";
+                    "\n\tchar* "; oloop.GetFunc.OName; "_variable_name"] // NetCDF arrays
+            ]
+            |> List.map (fun x -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; aritySuffix.[i]; "("; templateArgTypes.[i]; ", "; x; "){\n\t// Nothing to see here.\n}"])
+        ) |> List.reduce (@)
 
     let tSpecTypes =
         List.init numCalls (fun i ->
@@ -1425,6 +1419,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             @ (List.init (arity.[i]+1) (fun j ->
                 String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"]
             ))
+            @ (oloop.oarrays.[i].Info |> function | Array _ -> [] | NetCDF _ -> [String.concat "" ["\n\tchar* "; oloop.GetFunc.OName; "_file_name"]; String.concat "" ["\n\tchar* "; oloop.GetFunc.OName; "_variable_name"]])
             |> (withCommas >> stringCollapse "")
         )
 
@@ -1568,7 +1563,18 @@ let methodLoopTemplate (mloop: MethodLoop) =
         )
 
     let aritySuffix = if mloop.funcs.[0].Arity.IsNone then String.concat "" ["_arity"; string arity] else ""
-    let tmain = List.init numCalls (fun i -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; aritySuffix; "("; templateArgTypes.[i]; "){\n\t// Nothing to see here.\n}"])
+
+    let tmain =
+        List.init numCalls (fun i ->
+            [
+                String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"] // Nested arrays
+                String.concat "" [
+                    "\n\tconst int "; onames.[i]; "_extents[ORANK]"; // (still need this as long as truly nested I/O is unimplemented)
+                    "\n\tchar* "; onames.[i]; "_file_name, ";
+                    "\n\tchar* "; onames.[i]; "_variable_name"] // NetCDF arrays
+            ]
+            |> List.map (fun x -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; aritySuffix; "("; templateArgTypes.[i]; ", "; x; "){\n\t// Nothing to see here.\n}"])
+        ) |> List.reduce (@)
 
     let tSpecTypes =
         List.init numCalls (fun i ->
@@ -1586,6 +1592,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
             @ (List.init (arity+1) (fun j ->
                 String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"]
             ))
+            @ (mloop.oarrays.[i].Info |> function | Array _ -> [] | NetCDF _ -> [String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_file_name"]; String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_variable_name"]])
             |> (withCommas >> stringCollapse "")
         )
 
