@@ -1504,7 +1504,6 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                     | Array _ -> [""]
                     | NetCDF _ -> oloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) oloop.iarrays.[i] funcs.[i]
                     |> stringCollapse ""]
-
             )
 
     List.init numCalls (fun i ->
@@ -1756,13 +1755,13 @@ let parse (tokens: Token list) =
             let names = mloops.[i].Call |> List.map fst4
             let args =
                 List.init mloops.[i].Call.Length (fun j ->
-                      [mloops.[i].iarrays.[j].Name]
+                      (mloops.[i].iarrays |> List.map (fun x -> x.Name))
                     @ [mloops.[i].oarrays.[j].Name]
-                    @ [mloops.[i].iarrays.[j] |> extentsName]
+                    @ (mloops.[i].iarrays |> List.map extentsName)
                     @ [mloops.[i].oarrays.[j] |> extentsName])
                 |> List.map (withCommas >> (stringCollapse ""))
 
-            let arity = mloops.[i].funcs.[1].Arity |> Option.get // hack
+            let arity = mloops.[i].funcs.[0].Arity |> Option.get // hack
 
             let itype = mloops.[i].iarrays |> List.map (fun x -> x.Type)
             let irank = mloops.[i].iarrays |> List.map (fun x -> x.Rank)
@@ -1811,7 +1810,7 @@ let parse (tokens: Token list) =
         >> List.filter (fun x -> not (x.Contains "method_for"))
         >> deleteLoopLines
         >> stringCollapse "")
-
+(*
 [<EntryPoint>]
 let main args =
     let iFileName, oFileName = args.[0], args.[1]
@@ -1822,6 +1821,15 @@ let main args =
     |> fun x -> File.WriteAllText (oFileName, x)
 
     0
+*)
+
+let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"
+let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"
+
+File.ReadAllText iFileName
+|> tokenize
+|> parse
+|> fun x -> File.WriteAllText (oFileName, x)
 
 //let tokens = File.ReadAllText iFileName |> tokenize;;
 //let args = [|"/home/Christopher.Dupuis/agu2019proj/covariance.edgi"; "/home/Christopher.Dupuis/agu2019proj/covariance.cpp"|];;
