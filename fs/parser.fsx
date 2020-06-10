@@ -1745,7 +1745,9 @@ let parse (tokens: Token list) =
             //String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string oarray.Rank; "];"]
             List.init oloops.[i].Call.Length (fun j ->
                 [
-                    String.concat "" ["\nsize_t* "; extentsName oloops.[i].oarrays.[j]; " = new size_t["; string oloops.[i].oarrays.[j].Rank; "];"]
+                    "\n"
+                    symmVecLines [oloops.[i].oarrays.[j]] |> List.head
+                    String.concat "" ["size_t* "; extentsName oloops.[i].oarrays.[j]; " = new size_t["; string oloops.[i].oarrays.[j].Rank; "];"]
                     String.concat "" [name; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
                 |> newln
@@ -1767,14 +1769,14 @@ let parse (tokens: Token list) =
             let arity = mloops.[i].funcs.[0].Arity |> Option.get // hack
 
             let itype = mloops.[i].iarrays |> List.map (fun x -> x.Type)
-            let irank = mloops.[i].iarrays |> List.map (fun x -> x.Rank)
+            let irank = mloops.[i].iarrays |> List.map ((fun x -> x.Rank) >> string)
             let isymm = mloops.[i].iarrays |> List.map symmVecName
 
             let otype = mloops.[i].oarrays |> List.map (fun x -> x.Type)
-            let orank = mloops.[i].oarrays |> List.map (fun x -> x.Rank)
+            let orank = mloops.[i].oarrays |> List.map ((fun x -> x.Rank) >> string)
             let osymm = mloops.[i].oarrays |> List.map symmVecName
 
-            let ranks = orank |> List.map (fun y -> (irank |> List.map string) @ [string y])
+            let ranks = orank |> List.map (fun y -> irank @ [y])
             let types = otype |> List.map (fun y -> itype @ [y])
             let symms = osymm |> List.map (fun y -> isymm @ [y])
 
@@ -1786,7 +1788,16 @@ let parse (tokens: Token list) =
                     ) |> (withCommas >> stringCollapse "")
                 )
 
-            List.init mloops.[i].Call.Length (fun j -> String.concat "" ["\n"; names.[j]; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");\n"])
+            List.init oloops.[i].Call.Length (fun j ->
+                [
+                    "\n"
+                    symmVecLines [mloops.[i].oarrays.[j]] |> List.head
+                    String.concat "" ["size_t* "; extentsName mloops.[i].oarrays.[j]; " = new size_t["; string mloops.[i].oarrays.[j].Rank; "];"]
+                    String.concat "" [names.[j]; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
+                ]
+                |> newln
+                |> stringCollapse ""
+            )
         )
 
     let callSwaps = (oloopCallSwaps @ mloopCallSwaps) |> List.reduce (@) |> List.map tokenize
