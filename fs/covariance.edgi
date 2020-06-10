@@ -9,7 +9,7 @@ using namespace nested_array_utilities;
 
 #define OMP_NUM_THREADS 48
 
-#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) otype(float) orank(0) ompLevels(1,0)
+#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) otype(float) orank(0) ompLevels(1,0) commutativity(1,1)
 {
     int len = 5;
     float mean1 = 0;
@@ -32,9 +32,6 @@ using namespace nested_array_utilities;
     out /= len;
 }
 
-static constexpr const int extents3[3] = {400,400,400};
-static constexpr const int extents4[4] = {400,400,400,400};
-
 int main() {
 
     time_t start;
@@ -48,20 +45,18 @@ int main() {
 
     cout << "Allocation took " << (time(NULL) - start) << "s" << endl << endl;
 
-    typedef promote<float, 3>::type float3;
-    typedef promote<float, 4>::type float4;
-
-    fill_random<float3, extents3>(a2, 10);
-
     time(&start);
     auto oloop = object_for(covariance);
-    res = oloop(a1, a2)("/home/username/Data/indonesia/new.nc", "hqpCovariance");
+    ores = oloop(a1, a2)("/home/username/Data/indonesia/new.nc", "hqpCovariance");
+
+    auto mloop = method_for(a1, a2);
+    mres = mloop(covariance)("/home/username/Data/indonesia/new2.nc", "hqpCovariance");
 
     cout << "Calculation took " << (time(NULL) - start) << "s" << endl << endl;
 /*
     for (int k = 0; k < 5; k++){
         for (int l = 0; l < 5; l++){
-            cout << res[k][l] << "\t";
+            cout << ores[k][l] << "\t";
         }
         cout << endl;
     }
