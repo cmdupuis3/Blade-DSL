@@ -1,7 +1,7 @@
 /***********************************************************************
  *                   GNU Lesser General Public License
  *
- * This file is part of the EDGI package, developed by the 
+ * This file is part of the EDGI package, developed by the
  * GFDL Flexible Modeling System (FMS) group.
  *
  * EDGI is free software: you can redistribute it and/or modify it under
@@ -73,19 +73,19 @@ namespace nested_array_utilities {
 
     };
 
-    template<typename TYPE, const int EXTENTS[], const int SYMM[], const int DEPTH = 0>
-    constexpr void fold(TYPE array) {
+    template<typename TYPE, const int SYMM[], const int DEPTH = 0>
+    constexpr void fold(TYPE array, const int extents[]) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (get_rank<TYPE>() > 1) {
-            for (int i = 0; i < EXTENTS[DEPTH]; i++) {
+            for (int i = 0; i < extents[DEPTH]; i++) {
                 if constexpr (SYMM[DEPTH] == SYMM[DEPTH+1]) {
                     for (int j = 0; j < i; j++) {
                         array[i][j] = array[j][i];
                     }
                 }
-                fold<DTYPE, EXTENTS, SYMM, DEPTH+1>(array[i]);
+                fold<DTYPE, SYMM, DEPTH+1>(array[i], extents);
             }
         }
 
@@ -94,24 +94,24 @@ namespace nested_array_utilities {
     /** Recursively allocate an array, with dimensionality deduced from TYPE, according to arrays
      *  of index minima and maxima. Minima default to zero in every dimension.
      */
-    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
-    constexpr TYPE allocate(const int lastIndex = 0) {
+    template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
+    constexpr TYPE allocate(const int extents[], const int lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        TYPE array = new DTYPE[EXTENTS[DEPTH]];
+        TYPE array = new DTYPE[extents[DEPTH]];
         if constexpr (get_rank<TYPE>() > 1) {
-            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
+            for (int i = lastIndex; i < extents[DEPTH]; i++) {
                 if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>(i);
+                    array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents, i);
                 } else {
-                    array[i] = allocate<DTYPE, EXTENTS, SYMM, DEPTH+1>();
+                    array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents);
                 }
             }
         }
 
         if constexpr (DEPTH == 0 && SYMM) {
-            fold<TYPE, EXTENTS, SYMM>(array);
+            fold<TYPE, SYMM>(array, extents);
         }
 
         return array;
@@ -119,21 +119,21 @@ namespace nested_array_utilities {
     }
 
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
-    template<typename TYPE, const int EXTENTS[], const int SYMM[] = nullptr, const int DEPTH = 0>
-    constexpr auto fill_random(TYPE array_in, int mod_in, int lastIndex = 0) {
+    template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
+    constexpr auto fill_random(TYPE array_in, const int extents[], int mod_in, int lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (std::is_pointer<DTYPE>::value) {
-            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
+            for (int i = lastIndex; i < extents[DEPTH]; i++) {
                 if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    fill_random<DTYPE, EXTENTS, SYMM, DEPTH+1>(array_in[i], mod_in, i);
+                    fill_random<DTYPE, extents, SYMM, DEPTH+1>(array_in[i], mod_in, i);
                 } else {
-                    fill_random<DTYPE, EXTENTS, SYMM, DEPTH+1>(array_in[i], mod_in);
+                    fill_random<DTYPE, extents, SYMM, DEPTH+1>(array_in[i], mod_in);
                 }
             }
         } else {
-            for (int i = lastIndex; i < EXTENTS[DEPTH]; i++) {
+            for (int i = lastIndex; i < extents[DEPTH]; i++) {
                 array_in[i] = rand() % mod_in;
             }
         }
