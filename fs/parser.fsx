@@ -7,8 +7,8 @@ open System.Runtime.InteropServices
 
 [<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
 extern int get_num_dims(
-        [<MarshalAs(UnmanagedType.LPStr)>] string fileName,
-        [<MarshalAs(UnmanagedType.LPStr)>] string varName)
+    [<MarshalAs(UnmanagedType.LPStr)>] string fileName,
+    [<MarshalAs(UnmanagedType.LPStr)>] string varName)
 
 [<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
 extern int get_var_type(
@@ -103,7 +103,6 @@ let extentsName array =
 type NetCDFOutputInfo =
     {
         DimNames: string list
-        DimExtents: int list
         DimValNames: string list
         DimValTypes: string list
     }
@@ -121,6 +120,7 @@ type NestedFunction =
         Comm:  int list Option
         ParallelismLevels: int list
         Inner: string list
+        TDimExtents: int list
         NCInfo: NetCDFOutputInfo Option
     }
 
@@ -620,8 +620,8 @@ module NestedLoop =
         let outputDimLines =
             if func.ORank = 0 then [] else
                 List.init func.ORank (fun j ->
-                    [
-                        String.concat "" ["nc_def_dim("; fileIDname func.OName; ", "; quote ncInfo.DimNames.[j]; ", "; string ncInfo.DimExtents.[j]; ", &("; dimIDnames func.OName; "["; string (j+nInputDims); "]));"]
+                    [ //ncInfo.DimExtents.[j]
+                        String.concat "" ["nc_def_dim("; fileIDname func.OName; ", "; quote ncInfo.DimNames.[j]; ", "; string func.TDimExtents.[j]; ", &("; dimIDnames func.OName; "["; string (j+nInputDims); "]));"]
                         String.concat "" ["nc_def_var("; fileIDname func.OName; ", "; quote ncInfo.DimNames.[j]; ", "; ncInfo.DimValTypes.[j] |> revMatchNCtype |> string; ", 1, &("; dimIDnames func.OName; "["; string (j+nInputDims); "]), &("; func.OName; "_dim_var_ncids["; string (j+nInputDims); "]));"]
                         String.concat "" ["nc_enddef(";  fileIDname func.OName; ");"]
                         String.concat "" ["nc_put_var("; fileIDname func.OName; ", "; func.OName; "_dim_var_ncids["; string j; "], "; ncInfo.DimValNames.[j]; ");"]
@@ -969,7 +969,7 @@ let rec (|MethodLoopPattern|_|) (position: int) = function
                 (func, oarrayName, oarrayInfo, position'-1) :: findCalls tail' (position' + nTokens)
             | head' :: tail' -> findCalls tail' (position' + 1)
             | [] -> []
-        let lposition = position + 4 + (args.Length)
+        let lposition = position + 5 + (args.Length)
         let calls =
             match tokens with
             | PostScopePattern tokens' -> findCalls (fst tokens') lposition
@@ -1152,14 +1152,16 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
             Some ((clauses |> getClause "commutativity") |> (snd >> tokenToInt))
         else None
 
+    let tDimLens =
+        if clauses |> hasClause "TDimLens" then
+            ((clauses |> getClause "TDimLens") |> (snd >> tokenToInt))
+        else []
+
+    assert (tDimLens.Length = orank)
+
     let ncDimNames =
         if clauses |> hasClause "ncDimNames" then
             Some ((clauses |> getClause "ncDimNames") |> (snd >> tokenToStr))
-        else None
-
-    let ncDimLens =
-        if clauses |> hasClause "ncDimLens" then
-            Some ((clauses |> getClause "ncDimLens") |> (snd >> tokenToInt))
         else None
 
     let ncDimVals =
@@ -1173,26 +1175,29 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
         else None
 
     let ncInfo =
-        match ncDimNames, ncDimLens, ncDimVals, ncDimTypes with
-        | Some names, Some lens, Some vals, Some types ->
-                Some { DimNames = names; DimExtents = lens; DimValNames = vals; DimValTypes = types }
-        | None, None, None, None ->
+        match ncDimNames, ncDimVals, ncDimTypes with
+        | Some names, Some vals, Some types ->
+                Some { DimNames = names; DimValNames = vals; DimValTypes = types }
+        | None, None, None ->
             if orank = 0 then
-                Some { DimNames = []; DimExtents = []; DimValNames = []; DimValTypes = [] }
+                Some { DimNames = []; DimValNames = []; DimValTypes = [] }
             else None
         | _ -> failwith "Incomplete specification of NetCDF output in function \"%s\"" name
 
-    { Name = name;
-      Arity = arity;
-      INames = input;
-      IRank = iranks;
-      OName = output;
-      OType = otype;
-      ORank = orank;
-      Comm = com;
-      ParallelismLevels = ompLevels;
-      Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln;
-      NCInfo = ncInfo }
+    {
+        Name = name;
+        Arity = arity;
+        INames = input;
+        IRank = iranks;
+        OName = output;
+        OType = otype;
+        ORank = orank;
+        Comm = com;
+        ParallelismLevels = ompLevels;
+        Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln;
+        TDimExtents = tDimLens
+        NCInfo = ncInfo
+    }
 
 
 let fst3 (c, _, _) = c
@@ -1269,8 +1274,8 @@ let deduceSymm (iarrays: NestedArray list) (func: NestedFunction) =
 
     let partialSymms = iLevels |> List.map (symmGroups 0)
     let nSymmGroups = partialSymms |> List.map (List.distinct >> List.max)
-    partialSymms
-    |> List.map (fun x -> (x, nSymmGroups) ||> List.map2 (+))
+    (partialSymms, nSymmGroups)
+    ||> List.map2 (fun x y -> x |> List.map ((+) y))
     |> List.reduce (@)
 
 /// Generate output arrays from calls and type/rank deduction
@@ -1494,6 +1499,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                     Comm = oloop.GetFunc.Comm;
                     ParallelismLevels = oloop.GetFunc.ParallelismLevels;
                     Inner = oloop.GetFunc.Inner |> List.map (tokenize >> deleteReturnLine >> (expandVariadic i))
+                    TDimExtents = oloop.GetFunc.TDimExtents
                     NCInfo = oloop.GetFunc.NCInfo
                 }
             )
@@ -1708,27 +1714,29 @@ let parse (tokens: Token list) =
 
     let oloopCallSwaps =
         List.init oloops.Length (fun i ->
+            let iarrays = oloops.[i].iarrays
+            let oarrays = oloops.[i].oarrays
             let name = oloops.[i].Init
             let args =
                 List.init oloops.[i].Call.Length (fun j ->
-                      (oloops.[i].iarrays.[j] |> List.map (fun x -> x.Name))
-                    @ [oloops.[i].oarrays.[j].Name]
-                    @ (oloops.[i].iarrays.[j] |> List.map extentsName)
-                    @ [oloops.[i].oarrays.[j] |> extentsName])
+                      (iarrays.[j] |> List.map (fun x -> x.Name))
+                    @ [oarrays.[j].Name]
+                    @ (iarrays.[j] |> List.map extentsName)
+                    @ [oarrays.[j] |> extentsName])
                 |> List.map (withCommas >> (stringCollapse ""))
 
             let arity =
                 match oloops.[i].GetFunc.Arity with
                 | Some a -> List.init oloops.[i].Call.Length (fun i -> a)
-                | None   -> oloops.[i].iarrays |> List.map (fun x -> x.Length)
+                | None   -> iarrays |> List.map (fun x -> x.Length)
 
-            let itype = oloops.[i].iarrays |> List.map (List.map (fun x -> x.Type))
-            let irank = oloops.[i].iarrays |> List.map (List.map (fun x -> x.Rank))
-            let isymm = oloops.[i].iarrays |> List.map (List.map symmVecName)
+            let itype = iarrays |> List.map (List.map (fun x -> x.Type))
+            let irank = iarrays |> List.map (List.map (fun x -> x.Rank))
+            let isymm = iarrays |> List.map (List.map symmVecName)
 
-            let otype = oloops.[i].oarrays |> List.map (fun x -> x.Type)
-            let orank = oloops.[i].oarrays |> List.map (fun x -> x.Rank)
-            let osymm = oloops.[i].oarrays |> List.map symmVecName
+            let otype = oarrays |> List.map (fun x -> x.Type)
+            let orank = oarrays |> List.map (fun x -> x.Rank)
+            let osymm = oarrays |> List.map symmVecName
 
             let ranks = (irank, orank) ||> List.map2 (fun x y -> (x |> List.map string) @ [string y])
             let types = (itype, otype) ||> List.map2 (fun x y -> x @ [y])
@@ -1742,12 +1750,38 @@ let parse (tokens: Token list) =
                     ) |> (withCommas >> stringCollapse "")
                 )
 
-            //String.concat "" ["size_t* "; extentsName oarray; " = new size_t["; string oarray.Rank; "];"]
             List.init oloops.[i].Call.Length (fun j ->
+                let func = oloops.[i].GetFunc
+                let iLevels = ((iarrays.[j] |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
+                let nInputDims = (iLevels |> List.sum)
+
+                let iExtentsLines =
+                    List.init arity.[i] (fun k ->
+                        let acc = if k = 0 then 0 else (iLevels.[0..(k-1)] |> List.sum)
+
+                        List.init iLevels.[k] (fun l ->
+                            [
+                                String.concat "" [extentsName oarrays.[j]; "["; string (acc+l); "] = "; extentsName iarrays.[j].[k]; "["; string l; "];"]
+                            ]
+                        ) |> List.reduce (@)
+                    ) |> List.reduce (@)
+
+                let oExtentsLines =
+                    if func.ORank = 0 then [] else
+                        let tDimExtents = func.TDimExtents
+                        List.init func.ORank (fun k ->
+                            String.concat "" [extentsName oarrays.[j]; "["; string (nInputDims+k); "] = "; string tDimExtents.[k] ]
+                        )
+
                 [
                     "\n"
-                    symmVecLines [oloops.[i].oarrays.[j]] |> List.head
-                    String.concat "" ["size_t* "; extentsName oloops.[i].oarrays.[j]; " = new size_t["; string oloops.[i].oarrays.[j].Rank; "];"]
+                    String.concat "" ["size_t* "; extentsName oarrays.[j]; " = new size_t["; string oarrays.[j].Rank; "];"]
+                ]
+                @ iExtentsLines
+                @ oExtentsLines
+                @ [
+                    symmVecLines [oarrays.[j]] |> List.head
+                    String.concat "" ["size_t* "; extentsName oarrays.[j]; " = new size_t["; string oarrays.[j].Rank; "];"]
                     String.concat "" [name; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
                 |> newln
@@ -1757,24 +1791,26 @@ let parse (tokens: Token list) =
 
     let mloopCallSwaps =
         List.init mloops.Length (fun i ->
+            let iarrays = mloops.[i].iarrays
+            let oarrays = mloops.[i].oarrays
             let names = mloops.[i].Call |> List.map fst4
             let args =
                 List.init mloops.[i].Call.Length (fun j ->
-                      (mloops.[i].iarrays |> List.map (fun x -> x.Name))
-                    @ [mloops.[i].oarrays.[j].Name]
-                    @ (mloops.[i].iarrays |> List.map extentsName)
-                    @ [mloops.[i].oarrays.[j] |> extentsName])
+                      (iarrays |> List.map (fun x -> x.Name))
+                    @ [oarrays.[j].Name]
+                    @ (iarrays |> List.map extentsName)
+                    @ [oarrays.[j] |> extentsName])
                 |> List.map (withCommas >> (stringCollapse ""))
 
-            let arity = mloops.[i].funcs.[0].Arity |> Option.get // hack
+            let arity = mloops.[i].funcs.Head.Arity |> Option.get // hack
 
-            let itype = mloops.[i].iarrays |> List.map (fun x -> x.Type)
-            let irank = mloops.[i].iarrays |> List.map ((fun x -> x.Rank) >> string)
-            let isymm = mloops.[i].iarrays |> List.map symmVecName
+            let itype = iarrays |> List.map (fun x -> x.Type)
+            let irank = iarrays |> List.map ((fun x -> x.Rank) >> string)
+            let isymm = iarrays |> List.map symmVecName
 
-            let otype = mloops.[i].oarrays |> List.map (fun x -> x.Type)
-            let orank = mloops.[i].oarrays |> List.map ((fun x -> x.Rank) >> string)
-            let osymm = mloops.[i].oarrays |> List.map symmVecName
+            let otype = oarrays |> List.map (fun x -> x.Type)
+            let orank = oarrays |> List.map ((fun x -> x.Rank) >> string)
+            let osymm = oarrays |> List.map symmVecName
 
             let ranks = orank |> List.map (fun y -> irank @ [y])
             let types = otype |> List.map (fun y -> itype @ [y])
@@ -1788,11 +1824,39 @@ let parse (tokens: Token list) =
                     ) |> (withCommas >> stringCollapse "")
                 )
 
-            List.init oloops.[i].Call.Length (fun j ->
+            List.init mloops.[i].Call.Length (fun j ->
+                let func = mloops.[i].funcs.[j]
+                let iLevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
+                let nInputDims = (iLevels |> List.sum)
+
+                let iExtentsLines =
+                    List.init arity (fun k ->
+                        let acc = if k = 0 then 0 else (iLevels.[0..(k-1)] |> List.sum)
+
+                        List.init iLevels.[k] (fun l ->
+                            [
+                                String.concat "" [extentsName oarrays.[j]; "["; string (acc+l); "] = "; extentsName iarrays.[k]; "["; string l; "];"]
+                            ]
+                        ) |> List.reduce (@)
+                    ) |> List.reduce (@)
+
+                let oExtentsLines =
+                    if func.ORank = 0 then [] else
+                        let tDimExtents = func.TDimExtents
+                        List.init func.ORank (fun k ->
+                            String.concat "" [extentsName oarrays.[j]; "["; string (nInputDims+k); "] = "; string tDimExtents.[k] ]
+                        )
+
                 [
                     "\n"
-                    symmVecLines [mloops.[i].oarrays.[j]] |> List.head
-                    String.concat "" ["size_t* "; extentsName mloops.[i].oarrays.[j]; " = new size_t["; string mloops.[i].oarrays.[j].Rank; "];"]
+                    String.concat "" ["size_t* "; extentsName oarrays.[j]; " = new size_t["; string oarrays.[j].Rank; "];"]
+                ]
+                @ iExtentsLines
+                @ oExtentsLines
+                @ [
+                    symmVecLines [oarrays.[j]] |> List.head
+                    String.concat "" ["promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type "; oarrays.[j].Name; ";"]
+                    String.concat "" [oarrays.[j].Name; " = allocate<"; oarrays.[j].Type; ", "; extentsName oarrays.[j]; ", "; oarrays.[j].Name; "_symm>();"]
                     String.concat "" [names.[j]; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
                 |> newln
