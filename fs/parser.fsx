@@ -603,7 +603,7 @@ module NestedLoop =
                     | NetCDF info -> info.FileName, info.VariableName
                     | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays"
 
-                let ncDimNames = dimNames iarrays.[i].Name
+                let ncDimNames = dimNames func.INames.[i]
                 let ncDimTypes = getNCdimTypes iFileName iVarName
                 List.init iLevels.[i] (fun j ->
                     [
@@ -1402,7 +1402,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             [
                 String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"] // Nested arrays
                 String.concat "" [
-                    "\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"; // (still need this as long as truly nested I/O is unimplemented)
+                    "\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK],"; // (still need this as long as truly nested I/O is unimplemented)
                     "\n\tchar* "; oloop.GetFunc.OName; "_file_name, ";
                     "\n\tchar* "; oloop.GetFunc.OName; "_variable_name"] // NetCDF arrays
             ]
@@ -1419,13 +1419,26 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let tSpecArgs =
         List.init numCalls (fun i ->
-            (List.init (arity.[i]+1) (fun j ->
-                String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]]
-            ))
-            @ (List.init (arity.[i]+1) (fun j ->
-                String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"]
-            ))
-            @ (oloop.oarrays.[i].Info |> function | Array _ -> [] | NetCDF _ -> [String.concat "" ["\n\tchar* "; oloop.GetFunc.OName; "_file_name"]; String.concat "" ["\n\tchar* "; oloop.GetFunc.OName; "_variable_name"]])
+            let specArgs =    List.init (arity.[i]+1) (fun j -> String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]])
+            let extentsArgs = List.init (arity.[i]+1) (fun j -> String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"])
+            let oarrayArgs =
+                match oloop.oarrays.[i].Info with
+                | Array _ -> []
+                | NetCDF _ -> [
+                    String.concat "" ["\n\tchar* "; oloop.GetFunc.OName; "_file_name"]
+                    String.concat "" ["\n\tchar* "; oloop.GetFunc.OName; "_variable_name"]
+                ]
+            let iarrayArgs =
+                List.init arity.[i] (fun j ->
+                    match oloop.oarrays.[i].Info with
+                    | Array _ -> []
+                    | NetCDF _ -> [
+                        String.concat "" ["\n\tchar** "; oloop.GetFunc.INames.[j]; "_dim_names"]
+                    ]
+                )
+                |> List.reduce (@)
+
+            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs
             |> (withCommas >> stringCollapse "")
         )
 
@@ -1592,13 +1605,26 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let tSpecArgs =
         List.init numCalls (fun i ->
-            (List.init (arity+1) (fun j ->
-                String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]]
-            ))
-            @ (List.init (arity+1) (fun j ->
-                String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"]
-            ))
-            @ (mloop.oarrays.[i].Info |> function | Array _ -> [] | NetCDF _ -> [String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_file_name"]; String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_variable_name"]])
+            let specArgs =    List.init (arity+1) (fun j -> String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]])
+            let extentsArgs = List.init (arity+1) (fun j -> String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"])
+            let oarrayArgs =
+                match mloop.oarrays.[i].Info with
+                | Array _ -> []
+                | NetCDF _ -> [
+                    String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_file_name"]
+                    String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_variable_name"]
+                ]
+            let iarrayArgs =
+                List.init arity (fun j ->
+                    match mloop.oarrays.[i].Info with
+                    | Array _ -> []
+                    | NetCDF _ -> [
+                        String.concat "" ["\n\tchar** "; mloop.funcs.[i].INames.[j]; "_dim_names"]
+                    ]
+                )
+                |> List.reduce (@)
+
+            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs
             |> (withCommas >> stringCollapse "")
         )
 
