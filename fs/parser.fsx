@@ -1401,10 +1401,11 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         List.init numCalls (fun i ->
             [
                 String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"] // Nested arrays
-                String.concat "" [
+                String.concat "" ([ // NetCDF arrays
                     "\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK],"; // (still need this as long as truly nested I/O is unimplemented)
                     "\n\tchar* "; oloop.GetFunc.OName; "_file_name, ";
-                    "\n\tchar* "; oloop.GetFunc.OName; "_variable_name"] // NetCDF arrays
+                    "\n\tchar* "; oloop.GetFunc.OName; "_variable_name,"
+                ] @ [inames.[i] |> List.map (fun iname -> String.concat "" ["\n\tchar** "; iname; "_dim_names"]) |> withCommas |> stringCollapse ""])
             ]
             |> List.map (fun x -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; aritySuffix.[i]; "("; templateArgTypes.[i]; ", "; x; "){\n\t// Nothing to see here.\n}"])
         ) |> List.reduce (@)
