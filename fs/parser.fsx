@@ -507,7 +507,7 @@ module NestedLoop =
             )
         let ncDimValLines =
             List.init array.Rank (fun i ->
-                String.concat "" ["nc_get_var("; fileIDname array.Name; ", "; variableIDname array.Name; ", &("; (dimValsNames array.Name array.Rank).[i]; ");"]
+                String.concat "" ["nc_get_var("; fileIDname array.Name; ", "; variableIDname array.Name; ", &("; (dimValsNames array.Name array.Rank).[i]; "));"]
             )
 
         /// nc_open call
@@ -1780,7 +1780,6 @@ let parse (tokens: Token list) =
                 @ iExtentsLines
                 @ oExtentsLines
                 @ [
-                    symmVecLines [oarrays.[j]] |> List.head
                     String.concat "" ["size_t* "; extentsName oarrays.[j]; " = new size_t["; string oarrays.[j].Rank; "];"]
                     String.concat "" [name; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
@@ -1854,7 +1853,6 @@ let parse (tokens: Token list) =
                 @ iExtentsLines
                 @ oExtentsLines
                 @ [
-                    symmVecLines [oarrays.[j]] |> List.head
                     String.concat "" ["promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type "; oarrays.[j].Name; ";"]
                     String.concat "" [oarrays.[j].Name; " = allocate<"; oarrays.[j].Type; ", "; extentsName oarrays.[j]; ", "; oarrays.[j].Name; "_symm>();"]
                     String.concat "" [names.[j]; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
@@ -1880,10 +1878,17 @@ let parse (tokens: Token list) =
     let loopNames = (oloops |> List.map (fun x -> x.Name)) @ (mloops |> List.map (fun x -> x.Name))
     let deleteLoopLines = loopNames |> List.map (fun x -> List.filter (fun (y:string) -> not (y.Contains x))) |> List.reduce (>>)
 
+    let symmLines =
+        (oloops |> List.map (fun x -> x.oarrays |> symmVecLines))
+        @ (mloops |> List.map (fun x -> x.oarrays |> symmVecLines))
+        |> List.reduce (@)
+        |> List.distinct
+
     tokens
     |> (swap 0 callBounds
         >> substitute
         >> (fun x -> "#include <omp.h>\n" :: x)
+        >> (fun x -> symmLines @ x)
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
         >> deleteLoopLines
