@@ -610,7 +610,7 @@ module NestedLoop =
                         String.concat "" ["nc_def_dim("; fileIDname func.OName; ", "; ncDimNames; "["; string j; "], "; func.INames.[i]; "_extents["; string j; "], &("; dimIDnames func.OName; "["; string (j+acc); "]));"]
                         String.concat "" ["nc_def_var("; fileIDname func.OName; ", "; ncDimNames; "["; string j; "], "; ncDimTypes.[j] |> revMatchNCtype |> string; ", 1, &("; dimIDnames func.OName; "["; string (j+acc); "]), &("; func.OName; "_dim_var_ncids["; string (j+acc); "]));"]
                         String.concat "" ["nc_enddef(";  fileIDname func.OName; ");"]
-                        String.concat "" ["nc_put_var("; fileIDname func.OName; ", "; func.OName; "_dim_var_ncids["; string (j+acc); "], "; (dimValsNames iarrays.[i].Name iarrays.[i].Rank).[j]; ");"]
+                        String.concat "" ["nc_put_var("; fileIDname func.OName; ", "; func.OName; "_dim_var_ncids["; string (j+acc); "], "; (dimValsNames func.INames.[i] iarrays.[i].Rank).[j]; ");"]
                         String.concat "" ["nc_redef(";   fileIDname func.OName; ");"]
                     ]
                 ) |> List.reduce (@)
@@ -1400,14 +1400,14 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let tmain =
         List.init numCalls (fun i ->
             [
-                String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"] // Nested arrays
+                String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"], "" // Nested arrays
                 String.concat "" ([ // NetCDF arrays
                     "\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK],"; // (still need this as long as truly nested I/O is unimplemented)
                     "\n\tchar* "; oloop.GetFunc.OName; "_file_name, ";
                     "\n\tchar* "; oloop.GetFunc.OName; "_variable_name,"
-                ] @ [inames.[i] |> List.map (fun iname -> String.concat "" ["\n\tchar** "; iname; "_dim_names"]) |> withCommas |> stringCollapse ""])
+                ] @ [inames.[i] |> List.map (fun iname -> String.concat "" ["\n\tchar** "; iname; "_dim_names"]) |> withCommas |> stringCollapse ""]), "_netcdf"
             ]
-            |> List.map (fun x -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; aritySuffix.[i]; "("; templateArgTypes.[i]; ", "; x; "){\n\t// Nothing to see here.\n}"])
+            |> List.map (fun x -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; snd x; aritySuffix.[i]; "("; templateArgTypes.[i]; ", "; fst x; "){\n\t// Nothing to see here.\n}"])
         ) |> List.reduce (@)
 
     let tSpecTypes =
@@ -1528,7 +1528,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
             )
 
     List.init numCalls (fun i ->
-        (tSpecTypes.[i], tSpecArgs.[i], String.concat "" [oloop.GetFunc.Name; aritySuffix.[i]])
+        let name =
+            match oloop.oarrays.[i].Info with | Array _ -> "" | NetCDF _ -> "_netcdf"
+            |> fun x -> String.concat "" [oloop.GetFunc.Name; x; aritySuffix.[i]]
+        (tSpecTypes.[i], tSpecArgs.[i], name)
         |||> fun x y z -> ["template<> void "; z; "<"; x; ">("; y; ")"]
         |> stringCollapse ""
     )
@@ -1587,13 +1590,13 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let tmain =
         List.init numCalls (fun i ->
             [
-                String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"] // Nested arrays
+                String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"], "" // Nested arrays
                 String.concat "" [
                     "\n\tconst int "; onames.[i]; "_extents[ORANK]"; // (still need this as long as truly nested I/O is unimplemented)
                     "\n\tchar* "; onames.[i]; "_file_name, ";
-                    "\n\tchar* "; onames.[i]; "_variable_name"] // NetCDF arrays
+                    "\n\tchar* "; onames.[i]; "_variable_name"], "_netcdf" // NetCDF arrays
             ]
-            |> List.map (fun x -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; aritySuffix; "("; templateArgTypes.[i]; ", "; x; "){\n\t// Nothing to see here.\n}"])
+            |> List.map (fun x -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; snd x; aritySuffix; "("; templateArgTypes.[i]; ", "; fst x; "){\n\t// Nothing to see here.\n}"])
         ) |> List.reduce (@)
 
     let tSpecTypes =
@@ -1642,7 +1645,10 @@ let methodLoopTemplate (mloop: MethodLoop) =
         )
 
     List.init numCalls (fun i ->
-        (tSpecTypes.[i], tSpecArgs.[i], mloop.funcs.[i].Name)
+        let name =
+            match mloop.oarrays.[i].Info with | Array _ -> "" | NetCDF _ -> "_netcdf"
+            |> fun x -> String.concat "" [mloop.funcs.[i].Name; x]
+        (tSpecTypes.[i], tSpecArgs.[i], name)
         |||> fun x y z ->
             ["template<> void "; z; "<"; x; ">("; y; ")"]
         |> stringCollapse ""
