@@ -3,6 +3,7 @@
 #include <iostream>
 using std::cout;
 using std::endl;
+#include <netcdf.h>
 
 #include "nested_array_utilities.cpp"
 using namespace nested_array_utilities;
