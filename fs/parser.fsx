@@ -487,7 +487,7 @@ module NestedLoop =
             | NetCDF info -> info.FileName, info.VariableName
             | _ -> failwith "Cannot use NetCDF routines on non-NetCDF arrays"
 
-        let indexNames = List.init (array.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
+        let indexNames = List.init (array.Rank-1) (fun i -> String.concat "" [textGenerator.IteratorName 0 i; "_"; array.Name])
 
         let iSymms = array.Symm |> function | Some s -> s | None -> (List.init array.Rank id)
         let states = vStates [array.Name] [iSymms] [0]
@@ -528,7 +528,7 @@ module NestedLoop =
                 String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
                 String.concat "" ["\t"; "nc_inq_vardimid("; fileIDname array.Name; ", "; variableIDname array.Name; ", &("; dimIDnames array.Name; "[q]));"]
                 String.concat "" ["\t"; dimNames array.Name; "[q] = new char[NC_MAX_NAME];"]
-                String.concat "" ["\t"; "nc_inq_dimname("; fileIDname array.Name; ", &("; dimIDnames array.Name; "[q]), "; dimNames array.Name; "[q]);"]
+                String.concat "" ["\t"; "nc_inq_dimname("; fileIDname array.Name; ", "; dimIDnames array.Name; "[q], "; dimNames array.Name; "[q]);"]
                 String.concat "" ["\t"; "nc_inq_dimlen("; fileIDname array.Name; ", "; dimIDnames array.Name; "[q], &("; extentsName array; "[q]));"]
                 String.concat "" ["\t"; startsName array.Name; "[q] = 0;"]
                 String.concat "" ["\t"; countsName array.Name; "[q] = 1;"]
@@ -584,7 +584,7 @@ module NestedLoop =
             | NetCDF info, _ -> failwith "Function is missing NetCDF info."
             | _ -> failwith "Cannot use NetCDF routines on non-NetCDF output arrays."
 
-        let indexNames = List.init (oarray.Rank-1) (fun i -> textGenerator.IteratorName 0 i)
+        let indexNames = List.init (oarray.Rank-1) (fun i -> String.concat "" [textGenerator.IteratorName 0 i; "_"; func.OName])
 
         let oSymms = oarray.Symm |> function | Some s -> s | None -> (List.init oarray.Rank id)
         let states = vStates [func.OName] [oSymms] [0]
