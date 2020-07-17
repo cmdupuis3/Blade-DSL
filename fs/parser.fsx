@@ -100,6 +100,9 @@ let extentsName array =
     | Array info -> info.ExtentsName
     | NetCDF info -> String.concat "" [array.Name; "_extents"]
 
+let symmVecName (array: NestedArray) =
+    if array.Symm.IsNone then "nullptr" else String.concat "" [array.Name; "_symm"]
+
 type NetCDFOutputInfo =
     {
         DimNames: string list
@@ -531,7 +534,11 @@ module NestedLoop =
                 String.concat "" ["\t"; countsName array.Name; "[q] = 1;"]
                 String.concat "" ["}"]
                 String.concat "" [countsName array.Name; "["; string (array.Rank-1); "] = "; extentsName array; "["; string (array.Rank-1); "];"]
-            ] @ ncDimValDeclLines @ ncDimValLines
+            ] @ ncDimValDeclLines @ ncDimValLines @
+            [
+                String.concat "" ["promote<"; array.Type; ", "; string array.Rank; ">::type "; array.Name; ";\n"]
+                String.concat "" [array.Name; " = allocate<typename promote<"; array.Type; ", "; string array.Rank; ">::type,"; symmVecName array; ">("; extentsName array; ");\n"]
+            ]
 
         (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
             String.concat "" [startsName array.Name; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
@@ -1349,9 +1356,6 @@ let symmVecLines (arrays: NestedArray list) =
         String.concat "" ["static constexpr const int "; name; "_symm["; symm.Length |> string; "] = {"; symm |> List.map string |> withCommas |> stringCollapse " "; "};\n"]
     )
 
-let symmVecName (array: NestedArray) =
-    if array.Symm.IsNone then "nullptr" else String.concat "" [array.Name; "_symm"]
-
 let objectLoopTemplate (oloop: ObjectLoop) =
 
     let numCalls = oloop.Call.Length
@@ -1389,8 +1393,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
         (arity, inames) ||> List.map2 (fun a (names: string list) ->
             (List.init a (fun i -> String.concat "" ["\n\ttypename promote<ITYPE"; string (i+1); ", IRANK"; string (i+1); ">::type "; names.[i]])
             |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; oloop.GetFunc.OName]])
-            @ (List.init a (fun i -> String.concat "" ["\n\tconst int "; names.[i]; "_extents[IRANK"; string (i+1); "]"]))
-            //|> fun x -> x @ [String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"]])
+            @ (List.init a (fun i -> String.concat "" ["\n\tconst size_t "; names.[i]; "_extents[IRANK"; string (i+1); "]"]))
             |> withCommas
             |> stringCollapse ""
         )
@@ -1399,16 +1402,75 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let tmain =
         List.init numCalls (fun i ->
-            [
-                String.concat "" ["\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK]"], "" // Nested arrays
-                String.concat "" ([ // NetCDF arrays
-                    "\n\tconst int "; oloop.GetFunc.OName; "_extents[ORANK],"; // (still need this as long as truly nested I/O is unimplemented)
-                    "\n\tchar* "; oloop.GetFunc.OName; "_file_name, ";
-                    "\n\tchar* "; oloop.GetFunc.OName; "_variable_name,"
-                ] @ [inames.[i] |> List.map (fun iname -> String.concat "" ["\n\tchar** "; iname; "_dim_names"]) |> withCommas |> stringCollapse ""]), "_netcdf"
+            String.concat "" [
+                "template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; aritySuffix.[i];
+                "("; templateArgTypes.[i]; ",";
+                "\n\tconst size_t "; oloop.GetFunc.OName; "_extents[ORANK]";
+                "){\n\t// Nothing to see here.\n}"
             ]
-            |> List.map (fun x -> String.concat "" ["template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; snd x; aritySuffix.[i]; "("; templateArgTypes.[i]; ", "; fst x; "){\n\t// Nothing to see here.\n}"])
-        ) |> List.reduce (@)
+        )
+
+    let tmainNC =
+        match oloop.GetFunc.NCInfo with
+        | None -> []
+        | Some _ ->
+            List.init numCalls (fun i ->
+                let iLevels = (irank.[i], oloop.GetFunc.IRank) ||> List.map2 (-)
+                let idimNames =
+                    inames.[i] |> List.map (fun iname -> String.concat "" ["\n\tchar** "; iname; "_dim_names"])
+
+                let odimNames =
+                    if oloop.GetFunc.ORank = 0 then [] else
+                        [String.concat "" ["\n\tchar** "; onames.[i]; "_dim_names"]]
+
+                let dimNames =
+                    idimNames @ odimNames
+                    |> withCommas
+                    |> stringCollapse ""
+
+                let idimTypes =
+                    oloop.iarrays.[i]
+                    |> List.map (fun iarray ->
+                        let file, var = iarray.Info |> function | NetCDF info -> info.FileName, info.VariableName | Array _ -> failwith "squuurrr"
+                        getNCdimTypes file var
+                    )
+
+                let odimTypes =
+                    oloop.GetFunc.NCInfo
+                    |> Option.get
+                    |> fun x -> x.DimValTypes
+
+                let idimValNames =
+                    List.init arity.[i] (fun j ->
+                        List.init iLevels.[j] (fun k ->
+                            String.concat "" ["\n\t"; idimTypes.[j].[k]; "* "; oloop.GetFunc.INames.[j]; "_dim_"; string k; "_vals"]
+                        )
+                    ) |> List.reduce (@)
+
+                let odimValNames =
+                    match odimTypes with
+                    | [] -> []
+                    |_ ->
+                        List.init oloop.GetFunc.ORank (fun j ->
+                            String.concat "" ["\n\t"; odimTypes.[j]; "* "; oloop.GetFunc.OName; "_dim_"; string j; "_vals"]
+                        )
+
+                let dimValNames =
+                    idimValNames @ odimValNames
+                    |> withCommas
+                    |> stringCollapse ""
+
+                String.concat "" [
+                    "template<"; templateTypes.[i]; "> void "; oloop.GetFunc.Name; "_netcdf"; aritySuffix.[i];
+                    "("; templateArgTypes.[i]; ",";
+                    "\n\tconst size_t "; oloop.GetFunc.OName; "_extents[ORANK],"; // (still need this as long as truly nested I/O is unimplemented)
+                    "\n\tchar* "; oloop.GetFunc.OName; "_file_name,";
+                    "\n\tchar* "; oloop.GetFunc.OName; "_variable_name,";
+                    dimNames; ",";
+                    dimValNames;
+                    "){\n\t// Nothing to see here.\n}"
+                ]
+            )
 
     let tSpecTypes =
         List.init numCalls (fun i ->
@@ -1421,7 +1483,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     let tSpecArgs =
         List.init numCalls (fun i ->
             let specArgs =    List.init (arity.[i]+1) (fun j -> String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]])
-            let extentsArgs = List.init (arity.[i]+1) (fun j -> String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"])
+            let extentsArgs = List.init (arity.[i]+1) (fun j -> String.concat "" ["\n\tconst size_t "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"])
             let oarrayArgs =
                 match oloop.oarrays.[i].Info with
                 | Array _ -> []
@@ -1439,7 +1501,47 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 )
                 |> List.reduce (@)
 
-            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs
+            let iLevels = (irank.[i], oloop.GetFunc.IRank) ||> List.map2 (-)
+            let idimNames =
+                inames.[i] |> List.map (fun iname -> String.concat "" ["\n\tchar** "; iname; "_dim_names"])
+
+            let odimNames =
+                if oloop.GetFunc.ORank = 0 then [] else
+                    [String.concat "" ["\n\tchar** "; onames.[i]; "_dim_names"]]
+
+            let dimNames =
+                idimNames @ odimNames
+                |> withCommas
+                |> stringCollapse ""
+
+            let idimTypes =
+                oloop.iarrays.[i]
+                |> List.map (fun iarray ->
+                    let file, var = iarray.Info |> function | NetCDF info -> info.FileName, info.VariableName | Array _ -> failwith "squuurrr"
+                    getNCdimTypes file var
+                )
+
+            let odimTypes =
+                oloop.GetFunc.NCInfo
+                |> Option.get
+                |> fun x -> x.DimValTypes
+
+            let idimValNames =
+                List.init arity.[i] (fun j ->
+                    List.init iLevels.[j] (fun k ->
+                        String.concat "" ["\n\t"; idimTypes.[j].[k]; "* "; oloop.GetFunc.INames.[j]; "_dim_"; string k; "_vals"]
+                    )
+                ) |> List.reduce (@)
+
+            let odimValNames =
+                match odimTypes with
+                | [] -> []
+                |_ ->
+                    List.init oloop.GetFunc.ORank (fun j ->
+                        String.concat "" ["\n\t"; odimTypes.[j]; "* "; oloop.GetFunc.OName; "_dim_"; string j; "_vals"]
+                    )
+
+            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs @ idimValNames @ odimValNames
             |> (withCommas >> stringCollapse "")
         )
 
@@ -1538,7 +1640,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
     |> List.map brace
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
     |> List.map (fun x -> x |> stringCollapse "")
-    |> fun x -> tmain @ x
+    |> fun x -> tmain @ tmainNC @ x
     |> List.distinct
 
 
@@ -1579,8 +1681,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
         List.init numCalls (fun i ->
             (List.init arity (fun j -> String.concat "" ["\n\ttypename promote<ITYPE"; string (j+1); ", IRANK"; string (j+1); ">::type "; inames.[i].[j]])
             |> fun x -> x @ [String.concat "" ["\n\ttypename promote<OTYPE, ORANK>::type "; onames.[i]]])
-            @ (List.init arity (fun j -> String.concat "" ["\n\tconst int "; inames.[i].[j]; "_extents[IRANK"; string (j+1); "]"]))
-            //|> fun x -> x @ [String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"]])
+            @ (List.init arity (fun j -> String.concat "" ["\n\tconst size_t "; inames.[i].[j]; "_extents[IRANK"; string (j+1); "]"]))
             |> withCommas
             |> stringCollapse ""
         )
@@ -1589,15 +1690,75 @@ let methodLoopTemplate (mloop: MethodLoop) =
 
     let tmain =
         List.init numCalls (fun i ->
-            [
-                String.concat "" ["\n\tconst int "; onames.[i]; "_extents[ORANK]"], "" // Nested arrays
-                String.concat "" [
-                    "\n\tconst int "; onames.[i]; "_extents[ORANK]"; // (still need this as long as truly nested I/O is unimplemented)
-                    "\n\tchar* "; onames.[i]; "_file_name, ";
-                    "\n\tchar* "; onames.[i]; "_variable_name"], "_netcdf" // NetCDF arrays
+            String.concat "" [
+                "template<"; templateTypes; "> void "; mloop.funcs.[i].Name; aritySuffix;
+                "("; templateArgTypes.[i]; ",";
+                "\n\tconst size_t "; mloop.funcs.[i].OName; "_extents[ORANK]";
+                "){\n\t// Nothing to see here.\n}"
             ]
-            |> List.map (fun x -> String.concat "" ["template<"; templateTypes; "> void "; mloop.funcs.[i].Name; snd x; aritySuffix; "("; templateArgTypes.[i]; ", "; fst x; "){\n\t// Nothing to see here.\n}"])
-        ) |> List.reduce (@)
+        )
+
+    let tmainNC =
+        match mloop.iarrays.Head.Info with
+        | Array _ -> []
+        | NetCDF _ ->
+            List.init numCalls (fun i ->
+                let iLevels = (irank, mloop.funcs.[i].IRank) ||> List.map2 (-)
+                let idimNames =
+                    inames.[i] |> List.map (fun iname -> String.concat "" ["\n\tchar** "; iname; "_dim_names"])
+
+                let odimNames =
+                    if mloop.funcs.[i].ORank = 0 then [] else
+                        [String.concat "" ["\n\tchar** "; onames.[i]; "_dim_names"]]
+
+                let dimNames =
+                    idimNames @ odimNames
+                    |> withCommas
+                    |> stringCollapse ""
+
+                let idimTypes =
+                    mloop.iarrays
+                    |> List.map (fun iarray ->
+                        let file, var = iarray.Info |> function | NetCDF info -> info.FileName, info.VariableName | Array _ -> failwith "squuurrr"
+                        getNCdimTypes file var
+                    )
+
+                let odimTypes =
+                    mloop.funcs.[i].NCInfo
+                    |> Option.get
+                    |> fun x -> x.DimValTypes
+
+                let idimValNames =
+                    List.init arity (fun j ->
+                        List.init iLevels.[j] (fun k ->
+                            String.concat "" ["\n\t"; idimTypes.[j].[k]; "* "; mloop.funcs.[i].INames.[j]; "_dim_"; string k; "_vals"]
+                        )
+                    ) |> List.reduce (@)
+
+                let odimValNames =
+                    match odimTypes with
+                    | [] -> []
+                    |_ ->
+                        List.init mloop.funcs.[i].ORank (fun j ->
+                            String.concat "" ["\n\t"; odimTypes.[j]; "* "; mloop.funcs.[i].OName; "_dim_"; string j; "_vals"]
+                        )
+
+                let dimValNames =
+                    idimValNames @ odimValNames
+                    |> withCommas
+                    |> stringCollapse ""
+
+                String.concat "" [
+                    "template<"; templateTypes; "> void "; mloop.funcs.[i].Name; "_netcdf"; aritySuffix;
+                    "("; templateArgTypes.[i]; ",";
+                    "\n\tconst size_t "; mloop.funcs.[i].OName; "_extents[ORANK],"; // (still need this as long as truly nested I/O is unimplemented)
+                    "\n\tchar* "; mloop.funcs.[i].OName; "_file_name,";
+                    "\n\tchar* "; mloop.funcs.[i].OName; "_variable_name,";
+                    dimNames; ",";
+                    dimValNames;
+                    "){\n\t// Nothing to see here.\n}"
+                ]
+            )
 
     let tSpecTypes =
         List.init numCalls (fun i ->
@@ -1610,14 +1771,15 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let tSpecArgs =
         List.init numCalls (fun i ->
             let specArgs =    List.init (arity+1) (fun j -> String.concat "" ["\n\ttypename promote<"; types.[i].[j]; ", "; ranks.[i].[j]; ">::type "; names.[i].[j]])
-            let extentsArgs = List.init (arity+1) (fun j -> String.concat "" ["\n\tconst int "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"])
+            let extentsArgs = List.init (arity+1) (fun j -> String.concat "" ["\n\tconst size_t "; names.[i].[j]; "_extents["; ranks.[i].[j]; "]"])
             let oarrayArgs =
                 match mloop.oarrays.[i].Info with
                 | Array _ -> []
-                | NetCDF _ -> [
-                    String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_file_name"]
-                    String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_variable_name"]
-                ]
+                | NetCDF _ ->
+                    [
+                        String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_file_name"]
+                        String.concat "" ["\n\tchar* "; mloop.funcs.[i].OName; "_variable_name"]
+                    ]
             let iarrayArgs =
                 List.init arity (fun j ->
                     match mloop.oarrays.[i].Info with
@@ -1628,7 +1790,35 @@ let methodLoopTemplate (mloop: MethodLoop) =
                 )
                 |> List.reduce (@)
 
-            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs
+            let iLevels = (irank, mloop.funcs.[i].IRank) ||> List.map2 (-)
+            let idimTypes =
+                mloop.iarrays
+                |> List.map (fun iarray ->
+                    let file, var = iarray.Info |> function | NetCDF info -> info.FileName, info.VariableName | Array _ -> failwith "squuurrr"
+                    getNCdimTypes file var
+                )
+
+            let odimTypes =
+                mloop.funcs.[i].NCInfo
+                |> Option.get
+                |> fun x -> x.DimValTypes
+
+            let idimValNames =
+                List.init arity (fun j ->
+                    List.init iLevels.[j] (fun k ->
+                        String.concat "" ["\n\t"; idimTypes.[j].[k]; "* "; mloop.funcs.[i].INames.[j]; "_dim_"; string k; "_vals"]
+                    )
+                ) |> List.reduce (@)
+
+            let odimValNames =
+                match odimTypes with
+                | [] -> []
+                |_ ->
+                    List.init mloop.funcs.[i].ORank (fun j ->
+                        String.concat "" ["\n\t"; odimTypes.[j]; "* "; mloop.funcs.[i].OName; "_dim_"; string j; "_vals"]
+                    )
+
+            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs @ idimValNames @ odimValNames
             |> (withCommas >> stringCollapse "")
         )
 
@@ -1656,7 +1846,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
     |> List.map brace
     |> (fun x -> (x, tSpecInner) ||> List.map2 (fun y z -> [y.Head] @ tab z @ y.Tail))
     |> List.map (fun x -> x |> stringCollapse "")
-    |> fun x -> tmain @ x
+    |> fun x -> tmain @ tmainNC @ x
     |> List.distinct
 
 
@@ -1698,16 +1888,12 @@ let parse (tokens: Token list) =
 
     let arraySwaps =
         List.init arrays.Length (fun i ->
-            [
-                String.concat "" ["promote<"; arrays.[i].Type; ", "; string arrays.[i].Rank; ">::type "; arrays.[i].Name; ";\n"]
-                String.concat "" [arrays.[i].Name; " = allocate<"; arrays.[i].Type; ", "; string arrays.[i].Rank; ", "; symmVecName arrays.[i]; ">();\n"]
-            ] @
-            (funcs |> List.map (fun func ->
+            funcs |> List.map (fun func ->
                 match arrays.[i].Info with
                     | Array _ -> [""]
                     | NetCDF _ -> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) arrays.[i] func i
                 |> stringCollapse ""
-            ))
+            )
         )
 
     let rec deleteFunctionPragmas (tokens: Token list) =
@@ -1813,7 +1999,8 @@ let parse (tokens: Token list) =
                 @ iExtentsLines
                 @ oExtentsLines
                 @ [
-                    String.concat "" ["size_t* "; extentsName oarrays.[j]; " = new size_t["; string oarrays.[j].Rank; "];"]
+                    String.concat "" ["promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type "; oarrays.[j].Name; ";"]
+                    String.concat "" [oarrays.[j].Name; " = allocate<typename promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type,"; oarrays.[j].Name; "_symm>("; extentsName oarrays.[j];");"]
                     String.concat "" [name; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
                 |> newln
@@ -1887,7 +2074,7 @@ let parse (tokens: Token list) =
                 @ oExtentsLines
                 @ [
                     String.concat "" ["promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type "; oarrays.[j].Name; ";"]
-                    String.concat "" [oarrays.[j].Name; " = allocate<"; oarrays.[j].Type; ", "; extentsName oarrays.[j]; ", "; oarrays.[j].Name; "_symm>();"]
+                    String.concat "" [oarrays.[j].Name; " = allocate<typename promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type,"; oarrays.[j].Name; "_symm>("; extentsName oarrays.[j];");"]
                     String.concat "" [names.[j]; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
                 |> newln
