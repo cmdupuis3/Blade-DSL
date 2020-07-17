@@ -33,8 +33,8 @@ using namespace nested_array_utilities;
     out /= len;
 }
 
-static constexpr const int extents3[3] = {400,400,400};
-static constexpr const int extents4[4] = {400,400,400,400};
+static constexpr const size_t extents3[3] = {400,400,400};
+static constexpr const size_t extents4[4] = {400,400,400,400};
 
 int main() {
 
@@ -52,7 +52,7 @@ int main() {
     typedef promote<float, 3>::type float3;
     typedef promote<float, 4>::type float4;
 
-    fill_random<float3, extents3>(a2, 10);
+    fill_random<float3>(a2, extents3, 10);
 
     time(&start);
     auto oloop = object_for(covariance);
