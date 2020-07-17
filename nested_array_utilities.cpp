@@ -74,14 +74,14 @@ namespace nested_array_utilities {
     };
 
     template<typename TYPE, const int SYMM[], const int DEPTH = 0>
-    constexpr void fold(TYPE array, const int extents[]) {
+    constexpr void fold(TYPE array, const size_t extents[]) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (get_rank<TYPE>() > 1) {
-            for (int i = 0; i < extents[DEPTH]; i++) {
+            for (size_t i = 0; i < extents[DEPTH]; i++) {
                 if constexpr (SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    for (int j = 0; j < i; j++) {
+                    for (size_t j = 0; j < i; j++) {
                         array[i][j] = array[j][i];
                     }
                 }
@@ -95,7 +95,7 @@ namespace nested_array_utilities {
      *  of index minima and maxima. Minima default to zero in every dimension.
      */
     template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
-    constexpr TYPE allocate(const int extents[], const int lastIndex = 0) {
+    constexpr TYPE allocate(const size_t extents[], const int lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
