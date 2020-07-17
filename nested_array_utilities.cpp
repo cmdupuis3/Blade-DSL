@@ -95,13 +95,13 @@ namespace nested_array_utilities {
      *  of index minima and maxima. Minima default to zero in every dimension.
      */
     template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
-    constexpr TYPE allocate(const size_t extents[], const int lastIndex = 0) {
+    constexpr TYPE allocate(const size_t extents[], const size_t lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         TYPE array = new DTYPE[extents[DEPTH]];
         if constexpr (get_rank<TYPE>() > 1) {
-            for (int i = lastIndex; i < extents[DEPTH]; i++) {
+            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
                 if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
                     array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents, i);
                 } else {
@@ -120,20 +120,20 @@ namespace nested_array_utilities {
 
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
     template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
-    constexpr auto fill_random(TYPE array_in, const int extents[], int mod_in, int lastIndex = 0) {
+    constexpr auto fill_random(TYPE array_in, const size_t extents[], int mod_in, size_t lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (std::is_pointer<DTYPE>::value) {
-            for (int i = lastIndex; i < extents[DEPTH]; i++) {
+            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
                 if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    fill_random<DTYPE, extents, SYMM, DEPTH+1>(array_in[i], mod_in, i);
+                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in, i);
                 } else {
-                    fill_random<DTYPE, extents, SYMM, DEPTH+1>(array_in[i], mod_in);
+                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in);
                 }
             }
         } else {
-            for (int i = lastIndex; i < extents[DEPTH]; i++) {
+            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
                 array_in[i] = rand() % mod_in;
             }
         }
