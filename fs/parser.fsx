@@ -526,7 +526,7 @@ module NestedLoop =
                 String.concat "" ["size_t* "; countsName array.Name; " = new size_t["; string array.Rank; "];"]
                 String.concat "" ["char** "; dimNames array.Name;  " = new char*["; string array.Rank; "];"]
                 String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
-                String.concat "" ["\t"; "nc_inq_dimid("; fileIDname array.Name; ", "; variableIDname array.Name; ", &("; dimIDnames array.Name; "[q]));"]
+                String.concat "" ["\t"; "nc_inq_vardimid("; fileIDname array.Name; ", "; variableIDname array.Name; ", &("; dimIDnames array.Name; "[q]));"]
                 String.concat "" ["\t"; dimNames array.Name; "[q] = new char[NC_MAX_NAME];"]
                 String.concat "" ["\t"; "nc_inq_dimname("; fileIDname array.Name; ", &("; dimIDnames array.Name; "[q]), "; dimNames array.Name; "[q]);"]
                 String.concat "" ["\t"; "nc_inq_dimlen("; fileIDname array.Name; ", "; dimIDnames array.Name; "[q], &("; extentsName array; "[q]));"]
