@@ -1917,8 +1917,12 @@ let parse (tokens: Token list) =
                     | None -> []
                     | Some _ ->
                         List.init oloops.[i].Call.Length (fun j ->
-                            (iarrays.[j] |> List.map (fun array -> String.concat "" [array.Name; "_dim_names"]))
-                            @ (iarrays.[j] |> List.map (fun array -> String.concat "" [array.Name; "_dim_"; string j; "_vals"]))
+                            match oarrays.[j].Info with
+                            | Array _ -> failwith "impossibru!"
+                            | NetCDF info ->
+                                [String.concat "" ["\""; info.FileName; "\""]; String.concat "" ["\""; info.VariableName; "\""]]
+                                @ (iarrays.[j] |> List.map (fun array -> String.concat "" [array.Name; "_dim_names"]))
+                                @ (iarrays.[j] |> List.map (fun array -> String.concat "" [array.Name; "_dim_"; string j; "_vals"]))
                         )
 
                 (basic, extra)
@@ -2009,12 +2013,13 @@ let parse (tokens: Token list) =
                 let extra =
                     match iarrays.Head.Info with
                     | Array _ -> []
-                    | NetCDF _ ->
+                    | NetCDF info ->
                         let dims = iarrays |> List.map (fun array -> String.concat "" [array.Name; "_dim_names"])
                         List.init mloops.[i].Call.Length (fun j ->
                             iarrays |> List.map (fun array -> String.concat "" [array.Name; "_dim_"; string j; "_vals"])
                             |> (@) dims
                         )
+                        |> List.map ((@) [String.concat "" ["\""; info.FileName; "\""]; String.concat "" ["\""; info.VariableName; "\""]])
 
                 (basic, extra)
                 ||> List.map2 (@)
