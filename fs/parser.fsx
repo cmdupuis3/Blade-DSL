@@ -1928,7 +1928,7 @@ let parse (tokens: Token list) =
                                     ||> List.map2 (fun array levels ->
                                         List.init levels (fun k -> String.concat "" [array.Name; "_dim_"; string k; "_vals"])
                                     ) |> List.reduce (@)
-                                )
+                                ) @ (List.init func.ORank (fun k -> String.concat "" [oarrays.[j].Name; "_dim_"; string k; "_vals"]))
                         )
                 (basic, extra)
                 ||> List.map2 (@)
@@ -2021,16 +2021,21 @@ let parse (tokens: Token list) =
                     | NetCDF info ->
                         let dims = iarrays |> List.map (fun array -> String.concat "" [array.Name; "_dim_names"])
                         List.init mloops.[i].Call.Length (fun j ->
+                            let fileName, varName =
+                                match oarrays.[j].Info with
+                                | Array _ -> failwith "impossibru! 2"
+                                | NetCDF info -> info.FileName, info.VariableName
+
                             let func = mloops.[i].funcs.[j]
                             let iLevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
-                            (iarrays , iLevels)
+                            (iarrays, iLevels)
                             ||> List.map2 (fun array levels ->
                                 List.init levels (fun k -> String.concat "" [array.Name; "_dim_"; string k; "_vals"])
-
                             ) |> List.reduce (@)
                             |> (@) dims
+                            |> fun x -> x @ (List.init func.ORank (fun k -> String.concat "" [oarrays.[j].Name; "_dim_"; string k; "_vals"]))
+                            |> fun x -> ([String.concat "" ["\""; fileName; "\""]; String.concat "" ["\""; varName; "\""]]) @ x
                         )
-                        |> List.map ((@) [String.concat "" ["\""; info.FileName; "\""]; String.concat "" ["\""; info.VariableName; "\""]])
 
                 (basic, extra)
                 ||> List.map2 (@)
