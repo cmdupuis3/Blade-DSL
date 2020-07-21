@@ -1920,11 +1920,16 @@ let parse (tokens: Token list) =
                             match oarrays.[j].Info with
                             | Array _ -> failwith "impossibru!"
                             | NetCDF info ->
+                                let func = oloops.[i].GetFunc
+                                let iLevels = ((iarrays.[j] |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
                                 [String.concat "" ["\""; info.FileName; "\""]; String.concat "" ["\""; info.VariableName; "\""]]
                                 @ (iarrays.[j] |> List.map (fun array -> String.concat "" [array.Name; "_dim_names"]))
-                                @ (iarrays.[j] |> List.map (fun array -> String.concat "" [array.Name; "_dim_"; string j; "_vals"]))
+                                @ ((iarrays.[j], iLevels)
+                                    ||> List.map2 (fun array levels ->
+                                        List.init levels (fun k -> String.concat "" [array.Name; "_dim_"; string k; "_vals"])
+                                    ) |> List.reduce (@)
+                                )
                         )
-
                 (basic, extra)
                 ||> List.map2 (@)
                 |> List.map (withCommas >> (stringCollapse ""))
@@ -2016,7 +2021,13 @@ let parse (tokens: Token list) =
                     | NetCDF info ->
                         let dims = iarrays |> List.map (fun array -> String.concat "" [array.Name; "_dim_names"])
                         List.init mloops.[i].Call.Length (fun j ->
-                            iarrays |> List.map (fun array -> String.concat "" [array.Name; "_dim_"; string j; "_vals"])
+                            let func = mloops.[i].funcs.[j]
+                            let iLevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
+                            (iarrays , iLevels)
+                            ||> List.map2 (fun array levels ->
+                                List.init levels (fun k -> String.concat "" [array.Name; "_dim_"; string k; "_vals"])
+
+                            ) |> List.reduce (@)
                             |> (@) dims
                         )
                         |> List.map ((@) [String.concat "" ["\""; info.FileName; "\""]; String.concat "" ["\""; info.VariableName; "\""]])
