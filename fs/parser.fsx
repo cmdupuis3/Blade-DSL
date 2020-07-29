@@ -545,9 +545,16 @@ module NestedLoop =
                 String.concat "" [array.Name; " = allocate<typename promote<"; array.Type; ", "; string array.Rank; ">::type,"; symmVecName array; ">("; extentsName array; ");\n"]
             ]
 
-        (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
-            String.concat "" [startsName array.Name; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
-        )
+        match textGenerator with
+        | :? CppLoopTextGenerator ->
+            (textGenerator :?> CppLoopTextGenerator :> pushText<CppLoopTextGenerator>).PushInnerNested (fun loop i ->
+                String.concat "" [startsName array.Name; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
+            )
+        | _ ->
+            (textGenerator :> pushText<LoopTextGenerator>).PushInnerNested (fun loop i ->
+                String.concat "" [startsName array.Name; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
+            )
+
 
         let inner = String.concat "" [
             "nc_get_vara("; fileIDname array.Name; ", "; variableIDname array.Name; ", "; startsName array.Name; ", "; countsName array.Name; ", "; lastIName; ");\n"
@@ -664,9 +671,16 @@ module NestedLoop =
             ]
         )
 
-        (textGenerator :> pushText<_>).PushInnerNested (fun loop i ->
-            String.concat "" [startsName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
-        )
+        match textGenerator with
+        | :? CppLoopTextGenerator ->
+            (textGenerator :?> CppLoopTextGenerator :> pushText<CppLoopTextGenerator>).PushInnerNested (fun loop i ->
+                String.concat "" [startsName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
+            )
+        | _ ->
+            (textGenerator :> pushText<LoopTextGenerator>).PushInnerNested (fun loop i ->
+                String.concat "" [startsName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
+            )
+
 
         let inner = String.concat "" [
             "nc_put_vara("; fileIDname func.OName; ", "; variableIDname func.OName; ", "; startsName func.OName; ", "; countsName func.OName; ", "; lastOName; ");\n"
@@ -1011,7 +1025,7 @@ let (|ObjectLoopCallPattern|_|) (loop: Token) (position: int) = function
         let args, t = toElements tail'
         let iarrays = args |> tokenToStr
         match t with
-        | Token.Symbol '(' :: Token.Quote oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
+        | Token.Symbol '(' :: Token.Str oExtentsName :: Token.Symbol ')' :: Token.Symbol ';' :: t' ->
             let oarrayInfo = { ExtentsName = oExtentsName }
             let nTokens = args.Length + 8
             Some (iarrays, oarrayName, Array oarrayInfo, nTokens, t')
@@ -1189,11 +1203,9 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
     let ncInfo =
         match ncDimNames, ncDimVals, ncDimTypes with
         | Some names, Some vals, Some types ->
-                Some { DimNames = names; DimValNames = vals; DimValTypes = types }
+            Some { DimNames = names; DimValNames = vals; DimValTypes = types }
         | None, None, None ->
-            if orank = 0 then
-                Some { DimNames = []; DimValNames = []; DimValTypes = [] }
-            else None
+            None
         | _ -> failwith "Incomplete specification of NetCDF output in function \"%s\"" name
 
     {
@@ -1264,15 +1276,14 @@ let deduceSymm (iarrays: NestedArray list) (func: NestedFunction) =
                 |> List.filter (fun x -> fst x = commGroups.[i])
                 |> List.map snd
 
-            let iarrays = iarrays |> listSelect
+            let iarraysSub = iarrays |> listSelect
             let iranks = func.IRank |> listSelect
 
             // Double-check that all ranks in the commutativity group are equal.
-            assert(iarrays |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
+            assert(iarraysSub |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
 
-            ((iarrays |> List.map (fun x -> x.Rank)), iranks)
+            ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
             ||> List.map2 (-)
-            |> listSelect
         )
 
     let rec symmGroups counter iLevels =
@@ -1521,7 +1532,10 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 )
                 |> List.reduce (@)
 
-            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs @ (oloop |> objectLoopDimValNames i)
+            match oloop.GetFunc.NCInfo with
+            | None -> []
+            | Some _ -> oloop |> objectLoopDimValNames i
+            |> fun x -> specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs @ x
             |> (withCommas >> stringCollapse "")
         )
 
@@ -1779,7 +1793,10 @@ let methodLoopTemplate (mloop: MethodLoop) =
                 )
                 |> List.reduce (@)
 
-            specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs @ (mloop |> methodLoopDimValNames i)
+            match mloop.iarrays.Head.Info with
+            | Array _ -> []
+            | NetCDF _ -> mloop |> methodLoopDimValNames i
+            |> fun x -> specArgs @ extentsArgs @ oarrayArgs @ iarrayArgs @ x
             |> (withCommas >> stringCollapse "")
         )
 
@@ -1914,7 +1931,7 @@ let parse (tokens: Token list) =
 
                 let extra =
                     match oloops.[i].GetFunc.NCInfo with
-                    | None -> []
+                    | None -> [[]]
                     | Some _ ->
                         List.init oloops.[i].Call.Length (fun j ->
                             match oarrays.[j].Info with
@@ -2017,7 +2034,7 @@ let parse (tokens: Token list) =
 
                 let extra =
                     match iarrays.Head.Info with
-                    | Array _ -> []
+                    | Array _ -> [[]]
                     | NetCDF info ->
                         let dims = iarrays |> List.map (fun array -> String.concat "" [array.Name; "_dim_names"])
                         List.init mloops.[i].Call.Length (fun j ->
@@ -2146,8 +2163,8 @@ let main args =
     0
 *)
 
-let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"
-let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"
+let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"
+let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"
 
 File.ReadAllText iFileName
 |> tokenize
