@@ -120,6 +120,7 @@ type NestedFunction =
         OName: string
         OType: string
         ORank: int
+        TDimSymm: int list
         Comm:  int list Option
         ParallelismLevels: int list
         Inner: string list
@@ -298,11 +299,11 @@ module NestedLoop =
     let rec private vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
         let symModes = symGroups |> List.map isSame
         let comModes = comGroups |> isSame
-        let sameArray = arrayNames |> isSame
+        //let sameArray = arrayNames |> isSame
 
         List.init arrayNames.Length (fun i ->
             List.init symModes.[i].Length (fun j ->
-                match (comModes.[i] && sameArray.[i]), symModes.[i].[j] with
+                match (comModes.[i](* && sameArray.[i]*)), symModes.[i].[j] with
                 | false, false -> Neither
                 | false, true  -> Symmetric
                 | true,  false -> Commutative
@@ -417,7 +418,7 @@ module NestedLoop =
             let oDiff = (List.init (states.Length) iDiff |> List.reduce (+)) - func.ORank
             List.init states.Length (fun i ->
                 if (iDiff i > 0) && (oDiff > 0) then
-                    List.init (if iDiff i > oDiff then oDiff else iDiff i) (fun i acc -> index acc)
+                    List.init (if iDiff i > oDiff then oDiff else iDiff i) (fun j acc -> index acc)
                 else
                     [fun (acc: int) x -> x]
             )
@@ -454,8 +455,43 @@ module NestedLoop =
     let Unary (iarray: NestedArray) (oarray: NestedArray) (func: NestedFunction) (textGenerator: LoopTextGenerator) =
         Nary [iarray] oarray func textGenerator
 
-    let OutputSymmetry (iarrays: NestedArray list) (oarray: NestedArray) (func: NestedFunction) =
-        []
+    /// Deduce symmetry vector of the output array from input arrays and function.
+    /// <param name="iarrays"> Input arrays </param>
+    /// <param name="func"> Function applied to input arrays </param>
+    let OutputSymmetry (iarrays: NestedArray list) (func: NestedFunction) =
+        let iSymms = iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))
+        let comm = func.Comm |> function | Some c -> c | None -> (List.init iarrays.Length id)
+
+        let commGroups = comm |> List.distinct
+        let iLevels =
+            List.init commGroups.Length (fun i ->
+                let listSelect list =
+                    List.zip comm list
+                    |> List.filter (fun x -> fst x = commGroups.[i])
+                    |> List.map snd
+
+                let iarraysSub = iarrays |> listSelect
+                let iranks = func.IRank |> listSelect
+
+                // Double-check that all ranks in the commutativity group are equal.
+                assert(iarraysSub |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
+
+                ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
+                ||> List.map2 (-)
+            )
+        let commLengths = iLevels |> List.map List.length
+        let commDims = iLevels |> List.map List.distinct |> List.reduce (@)
+
+        List.init commLengths.Length (fun i ->
+            let start = if i = 0 then 0 else commDims.[0..i] |> List.sum
+            List.init commLengths.[i] (fun j ->
+                iSymms.[i+j].[0..(iLevels.[i].[j]-1)] |> List.map ((+) start)
+            )
+            |> List.reduce (@)
+            |> List.sort
+        )
+        |> List.reduce (@)
+        |> (@) func.TDimSymm
 
     let private fileIDname (name: string) =
         String.concat "" [name; "_file_ncid"]
@@ -936,6 +972,7 @@ let rec toElements s =
         let elements, t = toElements tail
         (head :: elements), t
     | head :: Token.Symbol ')' :: tail -> [head], tail
+    | Token.Symbol ')' :: tail -> [], tail
     | _ -> [], []
 
 
@@ -1074,10 +1111,10 @@ let scanObjectLoops (tokens: Token list) =
 let rec (|ClausePattern|_|) = function
     | Token.NewLine :: tail -> None
     | Token.Str head :: Token.Symbol '(' :: tail ->
-        let elements, t = toElements tail
-        if elements.Length = 1 then
-            Some (Clause (head, elements), t)
-        else
+        match tail with
+        | Token.Symbol ')' :: t -> Some (Clause (head, []), t)
+        | _ ->
+            let elements, t = toElements tail
             Some (Clause (head, elements), t)
     | Token.Str head :: tail -> Some (Clause (head, []), tail)
     | _  -> None
@@ -1113,9 +1150,9 @@ let scanPragmas (tokens: Token list) =
 let sortPragmas (pragmas: Pragma list) =
     let bin (s: string) =
         List.filter (fun x ->
-                        let directive, clauses, scope = x
-                        fst directive = s
-                    ) pragmas
+            let directive, clauses, scope = x
+            fst directive = s
+        ) pragmas
     bin "array", bin "function"
 
 let (|ArrayPragmaPattern|_|) = function
@@ -1183,6 +1220,11 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
             ((clauses |> getClause "TDimLens") |> (snd >> tokenToInt))
         else []
 
+    let tDimSymm =
+        if clauses |> hasClause "TDimSymm" then
+            (clauses |> getClause "TDimSymm") |> (snd >> tokenToInt)
+        else List.init orank id
+
     assert (tDimLens.Length = orank)
 
     let ncDimNames =
@@ -1216,6 +1258,7 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
         OName = output;
         OType = otype;
         ORank = orank;
+        TDimSymm = tDimSymm;
         Comm = com;
         ParallelismLevels = ompLevels;
         Inner = block |> deleteReturnLine |> tokenToStr |> respace |> reconcat |> newln;
@@ -1263,44 +1306,6 @@ let sendFunctionsToLoops (funcs: NestedFunction list) (mloops: MethodLoop list) 
             if oloops.[i].Init = funcs.[j].Name then
                 oloops.[i].SetFunc funcs.[j]
 
-/// Deduce symmetry vector of the output array from input arrays and function.
-/// <param name="iarrays"> Input arrays </param>
-/// <param name="func"> Function applied to input arrays </param>
-let deduceSymm (iarrays: NestedArray list) (func: NestedFunction) =
-    let comm = func.Comm |> Option.get
-    let commGroups = comm |> List.distinct
-    let iLevels =
-        List.init commGroups.Length (fun i ->
-            let listSelect list =
-                List.zip comm list
-                |> List.filter (fun x -> fst x = commGroups.[i])
-                |> List.map snd
-
-            let iarraysSub = iarrays |> listSelect
-            let iranks = func.IRank |> listSelect
-
-            // Double-check that all ranks in the commutativity group are equal.
-            assert(iarraysSub |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
-
-            ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
-            ||> List.map2 (-)
-        )
-
-    let rec symmGroups counter iLevels =
-        iLevels
-        |> List.filter (fun x -> x > 0)
-        |> function
-            | [] -> []
-            | levels ->
-                List.init levels.Length (fun i -> counter)
-                @ symmGroups (counter + 1) (iLevels |> List.map (fun x -> x - 1))
-
-    let partialSymms = iLevels |> List.map (symmGroups 0)
-    let nSymmGroups = partialSymms |> List.map (List.distinct >> List.max)
-    (partialSymms, nSymmGroups)
-    ||> List.map2 (fun x y -> x |> List.map ((+) y))
-    |> List.reduce (@)
-
 /// Generate output arrays from calls and type/rank deduction
 let sendOutputArraysToLoops (mloops: MethodLoop list) (oloops: ObjectLoop list) =
     let getORank iarrays func =
@@ -1312,7 +1317,7 @@ let sendOutputArraysToLoops (mloops: MethodLoop list) (oloops: ObjectLoop list) 
     let getOSymm iarrays func orank =
         match func.Comm with
         | None -> if orank = 0 then [0] else List.init orank id
-        | Some comm -> deduceSymm iarrays func
+        | Some comm -> NestedLoop.OutputSymmetry iarrays func
 
     for i in 0..mloops.Length-1 do
         for j in 0..mloops.[i].funcs.Length-1 do
@@ -1606,6 +1611,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                     OName = oloop.GetFunc.OName;
                     OType = oloop.GetFunc.OType;
                     ORank = oloop.GetFunc.ORank;
+                    TDimSymm = oloop.GetFunc.TDimSymm;
                     Comm = oloop.GetFunc.Comm;
                     ParallelismLevels = oloop.GetFunc.ParallelismLevels;
                     Inner = oloop.GetFunc.Inner |> List.map (tokenize >> deleteReturnLine >> (expandVariadic i))
@@ -2163,8 +2169,8 @@ let main args =
     0
 *)
 
-let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"
-let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"
+let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"
+let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"
 
 File.ReadAllText iFileName
 |> tokenize
