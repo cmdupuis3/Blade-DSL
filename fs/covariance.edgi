@@ -10,7 +10,7 @@ using namespace nested_array_utilities;
 
 #define OMP_NUM_THREADS 48
 
-#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) otype(float) orank(0) ompLevels(1,0)
+#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) otype(float) orank(0) ompLevels(1,0) ncDimNames() ncDimVals() ncDimTypes()
 {
     int len = 5;
     float mean1 = 0;
