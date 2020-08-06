@@ -662,8 +662,11 @@ module NestedLoop =
                 let ncDimTypes = getNCdimTypes iFileName iVarName
                 List.init iLevels.[i] (fun j ->
                     [
-                        String.concat "" ["nc_def_dim("; fileIDname func.OName; ", "; ncDimNames; "["; string j; "], "; func.INames.[i]; "_extents["; string j; "], &("; dimIDnames func.OName; "["; string (j+acc); "]));"]
-                        String.concat "" ["nc_def_var("; fileIDname func.OName; ", "; ncDimNames; "["; string j; "], "; ncDimTypes.[j] |> revMatchNCtype |> string; ", 1, &("; dimIDnames func.OName; "["; string (j+acc); "]), &("; func.OName; "_dim_var_ncids["; string (j+acc); "]));"]
+                        String.concat "" ["string "; ncDimNames; string j; "_str = "; ncDimNames; "["; string j; "];"]
+                        String.concat "" [ncDimNames; string j; "_str += \"_"; string (i+1); "\";"]
+                        String.concat "" ["char* "; ncDimNames; string j; " = (char*)("; ncDimNames; string j; "_str.c_str());"]
+                        String.concat "" ["nc_def_dim("; fileIDname func.OName; ", "; ncDimNames; string j; ", "; func.INames.[i]; "_extents["; string j; "], &("; dimIDnames func.OName; "["; string (j+acc); "]));"]
+                        String.concat "" ["nc_def_var("; fileIDname func.OName; ", "; ncDimNames; string j; ", "; ncDimTypes.[j] |> revMatchNCtype |> string; ", 1, &("; dimIDnames func.OName; "["; string (j+acc); "]), &("; func.OName; "_dim_var_ncids["; string (j+acc); "]));"]
                         String.concat "" ["nc_enddef(";  fileIDname func.OName; ");"]
                         String.concat "" ["nc_put_var("; fileIDname func.OName; ", "; func.OName; "_dim_var_ncids["; string (j+acc); "], "; (dimValsNames func.INames.[i] iarrays.[i].Rank).[j]; ");"]
                         String.concat "" ["nc_redef(";   fileIDname func.OName; ");"]
@@ -2151,6 +2154,7 @@ let parse (tokens: Token list) =
     |> (swap 0 callBounds
         >> substitute
         >> (fun x -> "#include <omp.h>\n" :: x)
+        >> (fun x -> "#include <string>\nusing std::string;\n" :: x)
         >> (fun x -> symmLines @ x)
         >> List.filter (fun x -> not (x.Contains "object_for"))
         >> List.filter (fun x -> not (x.Contains "method_for"))
