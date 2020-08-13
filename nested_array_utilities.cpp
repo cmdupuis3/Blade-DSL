@@ -117,6 +117,52 @@ namespace nested_array_utilities {
         return array;
 
     }
+    
+    int* index(int ndims, int* indices, int nsymms, int* symmetry){
+
+        int* symm_cpy = new int[nsymms];
+        for (int i = 0; i < nsymms; i++) {
+            symm_cpy[i] = symmetry[i];
+        }
+
+        // count unique elements of symmetry (from https://www.tutorialspoint.com/count-distinct-elements-in-an-array-in-cplusplus)
+        //sort(symm_cpy, symm_cpy + nsymms);
+        int nsymms_un = 0;
+        for (int i = 0; i < nsymms; i++) {
+           while (i < nsymms - 1 && symmetry[i] == symmetry[i + 1]) {
+              i++;
+           }
+           nsymms_un++;
+        }
+
+        // find unique elements of symmetry
+        int* ngroups = new int[nsymms_un];
+        int* groups_unique = new int[nsymms_un];
+        int** indices_grouped = new int*[nsymms_un];
+        int* indices_folded = new int[ndims];
+        int j = 0;
+        for (int i = 0; i < nsymms_un; i++) {
+            groups_unique[i] = symmetry[j];
+            ngroups[i] = 0;
+            int j_last = j;
+            while (groups_unique[i] == symmetry[j]) {
+                ngroups[i]++;
+                j++;
+            }
+
+            indices_grouped[i] = new int[ngroups[i]];
+            for (int k = 0; k < ngroups[i]; k++) {
+                indices_grouped[i][k] = indices[j_last + k];
+            }
+            sort(indices_grouped[i], indices_grouped[i] + ngroups[i]);
+            for (int k = 0; k < ngroups[i]; k++) {
+                indices_folded[j_last + k] = indices_grouped[i][k];
+            }
+        }
+
+        return indices_folded;
+
+    }
 
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
     template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
