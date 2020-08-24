@@ -118,12 +118,8 @@ namespace nested_array_utilities {
 
     }
     
-    int* index(int ndims, int* indices, int nsymms, int* symmetry){
 
-        int* symm_cpy = new int[nsymms];
-        for (int i = 0; i < nsymms; i++) {
-            symm_cpy[i] = symmetry[i];
-        }
+    void index_impl(const int ndims, const int* indices, const int nsymms, const int symmetry[], int* indices_folded){
 
         // count unique elements of symmetry (from https://www.tutorialspoint.com/count-distinct-elements-in-an-array-in-cplusplus)
         //sort(symm_cpy, symm_cpy + nsymms);
@@ -139,7 +135,6 @@ namespace nested_array_utilities {
         int* ngroups = new int[nsymms_un];
         int* groups_unique = new int[nsymms_un];
         int** indices_grouped = new int*[nsymms_un];
-        int* indices_folded = new int[ndims];
         int j = 0;
         for (int i = 0; i < nsymms_un; i++) {
             groups_unique[i] = symmetry[j];
@@ -160,7 +155,24 @@ namespace nested_array_utilities {
             }
         }
 
-        return indices_folded;
+        return;
+
+    }
+
+    template<typename TYPE, const int SYMM[], const int nsymms, const int ndims, const int depth=0>
+    constexpr auto index(const TYPE array, const int* indices, int* indices_folded = nullptr) {
+
+        typedef typename remove_pointer<TYPE>::type DTYPE;
+
+        if constexpr (depth == ndims) {
+            return array;
+        } else if constexpr (depth == 0) {
+            int* inds_buffer = new int[ndims];
+            index_impl(ndims, indices, nsymms, SYMM, inds_buffer);
+            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], indices, inds_buffer);
+        } else {
+            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices_folded[depth]], indices, indices_folded);
+        }
 
     }
 
