@@ -117,15 +117,14 @@ namespace nested_array_utilities {
         return array;
 
     }
-    
 
     void index_impl(const int ndims, const int* indices, const int nsymms, const int symmetry[], int* indices_folded){
 
         // count unique elements of symmetry (from https://www.tutorialspoint.com/count-distinct-elements-in-an-array-in-cplusplus)
         //sort(symm_cpy, symm_cpy + nsymms);
         int nsymms_un = 0;
-        for (int i = 0; i < nsymms; i++) {
-           while (i < nsymms - 1 && symmetry[i] == symmetry[i + 1]) {
+        for (int i = 0; i < ndims; i++) {
+           while (i < ndims - 1 && symmetry[i] == symmetry[i + 1]) {
               i++;
            }
            nsymms_un++;
@@ -141,6 +140,7 @@ namespace nested_array_utilities {
             ngroups[i] = 0;
             int j_last = j;
             while (groups_unique[i] == symmetry[j]) {
+                if (j == ndims) break;
                 ngroups[i]++;
                 j++;
             }
