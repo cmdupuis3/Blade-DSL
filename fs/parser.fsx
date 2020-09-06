@@ -182,7 +182,7 @@ let cppIteratorNameGenerator min index =
 /// <param name="extentName"> Extent vector name. </param>
 /// <param name="extentIndex"> Element of extent vector to use as iterator maximum. </param>
 let cppLoopLine iName iMin extentName extentIndex =
-    String.concat "" ["for("; iName; " = "; iMin; "; "; iName; " < "; extentName; "["; extentIndex; "]; "; iName; "++)";]
+    String.concat "" ["for("; iName; " = 0; "; iName; " < "; extentName; "["; extentIndex; "] - "; iMin; "; "; iName; "++)";]
 
 /// Generates a call to operator().
 /// <param name="arrayName"> Variable name. </param>
@@ -505,6 +505,9 @@ module NestedLoop =
     let private countsName (name: string) =
         String.concat "" [name; "_counts"]
 
+    let private indicesName (name: string) =
+        String.concat "" [name; "_indices"]
+
     let private dimIDnames (name: string) =
         String.concat "" [name; "_dim_ncids"]
 
@@ -643,9 +646,6 @@ module NestedLoop =
                 if iMaps.Head.[j] = (0, j) then textGenerator.Zero else indexNames.[snd iMaps.Head.[j]]
             )
 
-        /// Last input array intermediate names to be subbed into the inner block
-        let lastOName = String.concat "" [func.OName; indexNames |> List.rev |> List.head]
-
         // Dimension algebra for names and values
         let iLevels = (iarrays |> List.map (fun x -> x.Rank), func.IRank) ||> List.map2 (-)
         let nInputDims = (iLevels |> List.sum)
@@ -701,6 +701,7 @@ module NestedLoop =
                 String.concat "" ["nc_def_var("; fileIDname func.OName; ", "; func.OName; "_variable_name, "; oarray.Type |> revMatchNCtype |> string; ", "; string oarray.Rank; ", "; dimIDnames func.OName; ", &"; variableIDname func.OName; ");"]
                 String.concat "" ["size_t* "; startsName func.OName;  " = new size_t["; string oarray.Rank; "];"]
                 String.concat "" ["size_t* "; countsName func.OName;  " = new size_t["; string oarray.Rank; "];"]
+                String.concat "" ["size_t* "; indicesName func.OName; " = new size_t["; string (oarray.Rank-1); "];"]
                 String.concat "" ["for(int q = 0; q < "; string oarray.Rank; "; q++){"]
                 String.concat "" ["\t"; startsName func.OName; "[q] = 0;"]
                 String.concat "" ["\t"; countsName func.OName; "[q] = 1;"]
@@ -713,17 +714,30 @@ module NestedLoop =
         match textGenerator with
         | :? CppLoopTextGenerator ->
             (textGenerator :?> CppLoopTextGenerator :> pushText<CppLoopTextGenerator>).PushInnerNested (fun loop i ->
-                String.concat "" [startsName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
+                String.concat "" [startsName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";"]
+            )
+            (textGenerator :?> CppLoopTextGenerator :> pushText<CppLoopTextGenerator>).PushInnerNested (fun loop i ->
+                String.concat "" [indicesName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";"]
             )
         | _ ->
             (textGenerator :> pushText<LoopTextGenerator>).PushInnerNested (fun loop i ->
-                String.concat "" [startsName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";\n"]
+                String.concat "" [startsName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";"]
+            )
+            (textGenerator :> pushText<LoopTextGenerator>).PushInnerNested (fun loop i ->
+                String.concat "" [indicesName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";"]
             )
 
+        let indirectIndex =
+            List.init (oarray.Rank-1) (fun i ->
+                String.concat "" ["["; indicesName func.OName; "_folded["; string i; "]]"]
+            )
+            |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
 
-        let inner = String.concat "" [
-            "nc_put_vara("; fileIDname func.OName; ", "; variableIDname func.OName; ", "; startsName func.OName; ", "; countsName func.OName; ", "; lastOName; ");\n"
-        ]
+        let inner =
+            [
+                String.concat "" ["auto "; indicesName func.OName; "_folded = index<typename promote<"; oarray.Type; ", "; string oarray.Rank; ">::type, "; symmVecName oarray; ", "; string oarray.Rank; ", "; string (oarray.Rank-1); ">("; func.OName; ", "; indicesName func.OName; ");\n"]
+                String.concat "" ["nc_put_vara("; fileIDname func.OName; ", "; variableIDname func.OName; ", "; startsName func.OName; ", "; countsName func.OName; ", "; func.OName; indirectIndex; ");\n"]
+            ]
 
         let loop =
             {
@@ -733,14 +747,14 @@ module NestedLoop =
                 iRank = 1;
                 iExtents = "out_extents";
                 indNames = indexNames;
-                iMins = imins;
+                iMins = List.init oarray.Rank (fun j -> textGenerator.Zero);
                 parLevels = 0;
             }
 
         let ret =
             (ncInit |> newln |> tab)
             @ (unaryLoop loop textGenerator 0
-               |> List.fold (|>) [inner]
+               |> List.fold (|>) inner
                |> tab)
             @ ([String.concat "" ["nc_close("; fileIDname func.OName; ");"]] |> newln |> tab)
         ret
@@ -1601,7 +1615,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc textGenerator |> fst) @
                 [match oloop.oarrays.[i].Info with
                     | Array _ -> [""]
-                    | NetCDF _ -> oloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) oloop.iarrays.[i] oloop.GetFunc
+                    | NetCDF _ -> oloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[],[])) oloop.iarrays.[i] oloop.GetFunc
                     |> stringCollapse ""]
             )
         | None ->
@@ -1628,7 +1642,7 @@ let objectLoopTemplate (oloop: ObjectLoop) =
                 (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] funcs.[i] textGenerator |> fst) @
                 [match oloop.oarrays.[i].Info with
                     | Array _ -> [""]
-                    | NetCDF _ -> oloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) oloop.iarrays.[i] funcs.[i]
+                    | NetCDF _ -> oloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[],[])) oloop.iarrays.[i] funcs.[i]
                     |> stringCollapse ""]
             )
 
@@ -1817,7 +1831,7 @@ let methodLoopTemplate (mloop: MethodLoop) =
             (NestedLoop.Nary mloop.iarrays mloop.oarrays.[i] mloop.funcs.[i] textGenerator |> fst) @
             [match mloop.oarrays.[i].Info with
                 | Array _ -> [""]
-                | NetCDF _ -> mloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) mloop.iarrays mloop.funcs.[i]
+                | NetCDF _ -> mloop.oarrays.[i] |> NestedLoop.ncPut (CppLoopTextGenerator([],[],[],[])) mloop.iarrays mloop.funcs.[i]
                 |> stringCollapse ""]
         )
 
@@ -1878,7 +1892,7 @@ let parse (tokens: Token list) =
             funcs |> List.map (fun func ->
                 match arrays.[i].Info with
                     | Array _ -> [""]
-                    | NetCDF _ -> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) arrays.[i] func i
+                    | NetCDF _ -> NestedLoop.ncGet (CppLoopTextGenerator([],[],[],[])) arrays.[i] func i
                 |> stringCollapse ""
             )
         )
