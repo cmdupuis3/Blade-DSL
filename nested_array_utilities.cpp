@@ -73,24 +73,6 @@ namespace nested_array_utilities {
 
     };
 
-    template<typename TYPE, const int SYMM[], const int DEPTH = 0>
-    constexpr void fold(TYPE array, const size_t extents[]) {
-
-        typedef typename remove_pointer<TYPE>::type DTYPE;
-
-        if constexpr (get_rank<TYPE>() > 1) {
-            for (size_t i = 0; i < extents[DEPTH]; i++) {
-                if constexpr (SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    for (size_t j = 0; j < i; j++) {
-                        array[i][j] = array[j][i];
-                    }
-                }
-                fold<DTYPE, SYMM, DEPTH+1>(array[i], extents);
-            }
-        }
-
-    }
-
     /** Recursively allocate an array, with dimensionality deduced from TYPE, according to arrays
      *  of index minima and maxima. Minima default to zero in every dimension.
      */
@@ -110,11 +92,29 @@ namespace nested_array_utilities {
             }
         }
 
-        if constexpr (DEPTH == 0 && SYMM) {
-            fold<TYPE, SYMM>(array, extents);
-        }
-
         return array;
+
+    }
+
+    /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
+    template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
+    constexpr auto fill_random(TYPE array_in, const size_t extents[], int mod_in, size_t lastIndex = 0) {
+
+        typedef typename remove_pointer<TYPE>::type DTYPE;
+
+        if constexpr (std::is_pointer<DTYPE>::value) {
+            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
+                if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
+                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in, i);
+                } else {
+                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in);
+                }
+            }
+        } else {
+            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
+                array_in[i] = rand() % mod_in;
+            }
+        }
 
     }
 
@@ -124,10 +124,10 @@ namespace nested_array_utilities {
         //sort(symm_cpy, symm_cpy + nsymms);
         int nsymms_un = 0;
         for (int i = 0; i < ndims; i++) {
-           while (i < ndims - 1 && symmetry[i] == symmetry[i + 1]) {
-              i++;
-           }
-           nsymms_un++;
+        while (i < ndims - 1 && symmetry[i] == symmetry[i + 1]) {
+            i++;
+        }
+        nsymms_un++;
         }
 
         // find unique elements of symmetry
@@ -175,29 +175,6 @@ namespace nested_array_utilities {
         }
 
     }
-
-    /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
-    template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
-    constexpr auto fill_random(TYPE array_in, const size_t extents[], int mod_in, size_t lastIndex = 0) {
-
-        typedef typename remove_pointer<TYPE>::type DTYPE;
-
-        if constexpr (std::is_pointer<DTYPE>::value) {
-            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
-                if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in, i);
-                } else {
-                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in);
-                }
-            }
-        } else {
-            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
-                array_in[i] = rand() % mod_in;
-            }
-        }
-
-    }
-
 
 }
 
