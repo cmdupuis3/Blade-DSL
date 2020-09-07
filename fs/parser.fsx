@@ -727,16 +727,10 @@ module NestedLoop =
                 String.concat "" [indicesName func.OName; "["; string i; "] = "; loop.indNames.[i]; ";"]
             )
 
-        let indirectIndex =
-            List.init (oarray.Rank-1) (fun i ->
-                String.concat "" ["["; indicesName func.OName; "_folded["; string i; "]]"]
-            )
-            |> List.fold (fun acc elem -> String.concat "" [acc; elem]) ""
-
         let inner =
             [
-                String.concat "" ["auto "; indicesName func.OName; "_folded = index<typename promote<"; oarray.Type; ", "; string oarray.Rank; ">::type, "; symmVecName oarray; ", "; string oarray.Rank; ", "; string (oarray.Rank-1); ">("; func.OName; ", "; indicesName func.OName; ");\n"]
-                String.concat "" ["nc_put_vara("; fileIDname func.OName; ", "; variableIDname func.OName; ", "; startsName func.OName; ", "; countsName func.OName; ", "; func.OName; indirectIndex; ");\n"]
+                String.concat "" ["auto "; func.OName; "_slice = index<typename promote<"; oarray.Type; ", "; string oarray.Rank; ">::type, "; symmVecName oarray; ", "; string oarray.Rank; ", "; string (oarray.Rank-1); ">("; func.OName; ", "; indicesName func.OName; ");\n"]
+                String.concat "" ["nc_put_vara("; fileIDname func.OName; ", "; variableIDname func.OName; ", "; startsName func.OName; ", "; countsName func.OName; ", "; func.OName; "_slice);\n"]
             ]
 
         let loop =
