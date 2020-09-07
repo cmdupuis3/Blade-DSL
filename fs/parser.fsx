@@ -1892,7 +1892,7 @@ let parse (tokens: Token list) =
             funcs |> List.map (fun func ->
                 match arrays.[i].Info with
                     | Array _ -> [""]
-                    | NetCDF _ -> NestedLoop.ncGet (CppLoopTextGenerator([],[],[],[])) arrays.[i] func i
+                    | NetCDF _ -> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) arrays.[i] func i
                 |> stringCollapse ""
             )
         )
