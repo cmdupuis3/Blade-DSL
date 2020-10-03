@@ -22,9 +22,10 @@
 #define NESTED_ARRAY_UTILITIES_CPP
 
 
-#include <functional>
-#include <type_traits>
+#include <algorithm>
+using std::sort;
 
+#include <type_traits>
 using std::add_pointer;
 using std::remove_pointer;
 using std::is_pointer;
@@ -81,9 +82,9 @@ namespace nested_array_utilities {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        TYPE array = new DTYPE[extents[DEPTH]];
+        TYPE array = new DTYPE[extents[DEPTH] - lastIndex];
         if constexpr (get_rank<TYPE>() > 1) {
-            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
+            for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
                 if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
                     array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents, i);
                 } else {
@@ -103,7 +104,7 @@ namespace nested_array_utilities {
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (std::is_pointer<DTYPE>::value) {
-            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
+            for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
                 if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
                     fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in, i);
                 } else {
@@ -111,7 +112,7 @@ namespace nested_array_utilities {
                 }
             }
         } else {
-            for (size_t i = lastIndex; i < extents[DEPTH]; i++) {
+            for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
                 array_in[i] = rand() % mod_in;
             }
         }
@@ -124,10 +125,10 @@ namespace nested_array_utilities {
         //sort(symm_cpy, symm_cpy + nsymms);
         int nsymms_un = 0;
         for (int i = 0; i < ndims; i++) {
-        while (i < ndims - 1 && symmetry[i] == symmetry[i + 1]) {
-            i++;
-        }
-        nsymms_un++;
+            while (i < ndims - 1 && symmetry[i] == symmetry[i + 1]) {
+                i++;
+            }
+            nsymms_un++;
         }
 
         // find unique elements of symmetry
