@@ -1259,7 +1259,9 @@ let getFunction (name: string) (clauses: Clause list) (block: Token list) =
             Some { DimNames = names; DimValNames = vals; DimValTypes = types }
         | None, None, None ->
             None
-        | _ -> failwith "Incomplete specification of NetCDF output in function \"%s\"" name
+        | _ ->
+            let msg = sprintf "Incomplete specification of NetCDF output in function \"%s\"" name
+            failwith msg
 
     {
         Name = name;
@@ -1944,7 +1946,7 @@ let parse (tokens: Token list) =
                           (iarrays.[j] |> List.map (fun x -> x.Name))
                         @ [oarrays.[j].Name]
                         @ (iarrays.[j] |> List.map extentsName)
-                        @ [oarrays.[j] |> extentsName])
+                        @ [String.concat "" [extentsName oarrays.[j]; "_out"]])
 
                 let extra =
                     match oloops.[i].GetFunc.NCInfo with
@@ -1994,6 +1996,7 @@ let parse (tokens: Token list) =
                 let func = oloops.[i].GetFunc
                 let iLevels = ((iarrays.[j] |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
                 let nInputDims = (iLevels |> List.sum)
+                let oExtentsName = String.concat "" [extentsName oarrays.[j]; "_out"]
 
                 let iExtentsLines =
                     List.init arity.[i] (fun k ->
@@ -2001,7 +2004,7 @@ let parse (tokens: Token list) =
 
                         List.init iLevels.[k] (fun l ->
                             [
-                                String.concat "" [extentsName oarrays.[j]; "["; string (acc+l); "] = "; extentsName iarrays.[j].[k]; "["; string l; "];"]
+                                String.concat "" [oExtentsName; "["; string (acc+l); "] = "; extentsName iarrays.[j].[k]; "["; string l; "];"]
                             ]
                         ) |> List.reduce (@)
                     ) |> List.reduce (@)
@@ -2010,18 +2013,18 @@ let parse (tokens: Token list) =
                     if func.ORank = 0 then [] else
                         let tDimExtents = func.TDimExtents
                         List.init func.ORank (fun k ->
-                            String.concat "" [extentsName oarrays.[j]; "["; string (nInputDims+k); "] = "; string tDimExtents.[k] ]
+                            String.concat "" [oExtentsName; "["; string (nInputDims+k); "] = "; string tDimExtents.[k] ]
                         )
 
                 [
                     "\n"
-                    String.concat "" ["size_t* "; extentsName oarrays.[j]; " = new size_t["; string oarrays.[j].Rank; "];"]
+                    String.concat "" ["size_t* "; oExtentsName; " = new size_t["; string oarrays.[j].Rank; "];"]
                 ]
                 @ iExtentsLines
                 @ oExtentsLines
                 @ [
                     String.concat "" ["promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type "; oarrays.[j].Name; ";"]
-                    String.concat "" [oarrays.[j].Name; " = allocate<typename promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type,"; oarrays.[j].Name; "_symm>("; extentsName oarrays.[j];");"]
+                    String.concat "" [oarrays.[j].Name; " = allocate<typename promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type,"; oarrays.[j].Name; "_symm>("; oExtentsName;");"]
                     String.concat "" [name; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
                 |> newln
@@ -2047,7 +2050,7 @@ let parse (tokens: Token list) =
                           (iarrays |> List.map (fun x -> x.Name))
                         @ [oarrays.[j].Name]
                         @ (iarrays |> List.map extentsName)
-                        @ [oarrays.[j] |> extentsName])
+                        @ [String.concat "" [extentsName oarrays.[j]; "_out"]])
 
                 let extra =
                     match iarrays.Head.Info with
@@ -2101,6 +2104,7 @@ let parse (tokens: Token list) =
                 let func = mloops.[i].funcs.[j]
                 let iLevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
                 let nInputDims = (iLevels |> List.sum)
+                let oExtentsName = String.concat "" [extentsName oarrays.[j]; "_out"]
 
                 let iExtentsLines =
                     List.init arity (fun k ->
@@ -2108,7 +2112,7 @@ let parse (tokens: Token list) =
 
                         List.init iLevels.[k] (fun l ->
                             [
-                                String.concat "" [extentsName oarrays.[j]; "["; string (acc+l); "] = "; extentsName iarrays.[k]; "["; string l; "];"]
+                                String.concat "" [oExtentsName; "["; string (acc+l); "] = "; extentsName iarrays.[k]; "["; string l; "];"]
                             ]
                         ) |> List.reduce (@)
                     ) |> List.reduce (@)
@@ -2117,18 +2121,18 @@ let parse (tokens: Token list) =
                     if func.ORank = 0 then [] else
                         let tDimExtents = func.TDimExtents
                         List.init func.ORank (fun k ->
-                            String.concat "" [extentsName oarrays.[j]; "["; string (nInputDims+k); "] = "; string tDimExtents.[k] ]
+                            String.concat "" [oExtentsName; "["; string (nInputDims+k); "] = "; string tDimExtents.[k] ]
                         )
 
                 [
                     "\n"
-                    String.concat "" ["size_t* "; extentsName oarrays.[j]; " = new size_t["; string oarrays.[j].Rank; "];"]
+                    String.concat "" ["size_t* "; oExtentsName; " = new size_t["; string oarrays.[j].Rank; "];"]
                 ]
                 @ iExtentsLines
                 @ oExtentsLines
                 @ [
                     String.concat "" ["promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type "; oarrays.[j].Name; ";"]
-                    String.concat "" [oarrays.[j].Name; " = allocate<typename promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type,"; oarrays.[j].Name; "_symm>("; extentsName oarrays.[j];");"]
+                    String.concat "" [oarrays.[j].Name; " = allocate<typename promote<"; oarrays.[j].Type; ", "; string oarrays.[j].Rank; ">::type,"; oarrays.[j].Name; "_symm>("; oExtentsName;");"]
                     String.concat "" [names.[j]; "<"; tSpecTypes.[j]; ">"; "("; args.[j]; ");"]
                 ]
                 |> newln
@@ -2181,8 +2185,14 @@ let main args =
     0
 *)
 
-let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"
-let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"
+//let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"
+//let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"
+
+
+let iFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/10D.edgi"
+let oFileName = "/home/username/Downloads/EDGI_nested_iterators/fs/10D.cpp"
+
+//let tokens = File.ReadAllText iFileName |> tokenize
 
 File.ReadAllText iFileName
 |> tokenize
