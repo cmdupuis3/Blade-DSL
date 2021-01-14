@@ -1887,7 +1887,7 @@ let parse (tokens: Token list) =
         List.init arrays.Length (fun i ->
             funcs |> List.map (fun func ->
                 match arrays.[i].Info with
-                    | Array _ -> [""]
+                    | Array  _ -> [String.concat "" ["promote<"; arrays.[i].Type; ", "; string arrays.[i].Rank; ">::type "; arrays.[i].Name; ";\n"]]
                     | NetCDF _ -> NestedLoop.ncGet (CppLoopTextGenerator([],[],[cppArrayDeclLine],[])) arrays.[i] func i
                 |> stringCollapse ""
             )
