@@ -1946,7 +1946,7 @@ let parse (tokens: Token list) =
                           (iarrays.[j] |> List.map (fun x -> x.Name))
                         @ [oarrays.[j].Name]
                         @ (iarrays.[j] |> List.map extentsName)
-                        @ [String.concat "" [extentsName oarrays.[j]; "_out"]])
+                        @ [String.concat "" [extentsName oarrays.[j]; "_"; oarrays.[j].Name]])
 
                 let extra =
                     match oloops.[i].GetFunc.NCInfo with
@@ -1996,7 +1996,7 @@ let parse (tokens: Token list) =
                 let func = oloops.[i].GetFunc
                 let iLevels = ((iarrays.[j] |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
                 let nInputDims = (iLevels |> List.sum)
-                let oExtentsName = String.concat "" [extentsName oarrays.[j]; "_out"]
+                let oExtentsName = String.concat "" [extentsName oarrays.[j]; "_"; oarrays.[j].Name]
 
                 let iExtentsLines =
                     List.init arity.[i] (fun k ->
@@ -2050,7 +2050,7 @@ let parse (tokens: Token list) =
                           (iarrays |> List.map (fun x -> x.Name))
                         @ [oarrays.[j].Name]
                         @ (iarrays |> List.map extentsName)
-                        @ [String.concat "" [extentsName oarrays.[j]; "_out"]])
+                        @ [String.concat "" [extentsName oarrays.[j]; "_"; oarrays.[j].Name]])
 
                 let extra =
                     match iarrays.Head.Info with
@@ -2104,7 +2104,7 @@ let parse (tokens: Token list) =
                 let func = mloops.[i].funcs.[j]
                 let iLevels = ((iarrays |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
                 let nInputDims = (iLevels |> List.sum)
-                let oExtentsName = String.concat "" [extentsName oarrays.[j]; "_out"]
+                let oExtentsName = String.concat "" [extentsName oarrays.[j]; "_"; oarrays.[j].Name]
 
                 let iExtentsLines =
                     List.init arity (fun k ->
