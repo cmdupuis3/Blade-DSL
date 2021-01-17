@@ -176,6 +176,43 @@ namespace nested_array_utilities {
         }
 
     }
+    
+    void index_test(){
+
+        const int ndims = 5;
+        const int inds[5]  = {2, 3, 4, 0, 9};
+        const int inds2[5] = {4, 3, 2, 0, 9};
+        static constexpr const int symms[6] = {1, 1, 1, 4, 5, 5};
+        constexpr const int nsymms = extent<decltype(symms)>::value;
+
+        typedef typename promote<int, 6>::type int6;
+        const size_t exts[6] = {10, 10, 10, 10, 10, 10};
+        int6 arr = allocate<int6, symms>(exts);
+
+        arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][0] = 20;
+
+        cout << arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][0] << endl;
+
+
+        auto a = index<int6, symms, nsymms, ndims>(arr, inds2);
+
+        cout << a[0] << endl;
+        // int inds_alt = {inds[]
+
+
+
+        int* inds_folded = new int[ndims];
+        index_impl(ndims, inds, nsymms, symms, inds_folded);
+
+        for (int i = 0; i < ndims; i++) {
+            cout << inds[i] << "\t";
+        }
+        cout << endl;
+        for (int i = 0; i < ndims; i++) {
+            cout << inds_folded[i] << "\t";
+        }
+
+    }
 
 }
 
