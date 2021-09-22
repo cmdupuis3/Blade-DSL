@@ -479,19 +479,19 @@ module NestedLoop =
                 ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
                 ||> List.map2 (-)
             )
-        let commLengths = iLevels |> List.map List.length
-        let commDims = iLevels |> List.map List.distinct |> List.reduce (@)
 
-        List.init commLengths.Length (fun i ->
-            let start = if i = 0 then 0 else commDims.[0..i] |> List.sum
+        // The number of S-dimensions in a commutativity group.
+        let commLengths = iLevels |> List.map List.length
+
+        List.init commGroups.Length (fun i ->
             List.init commLengths.[i] (fun j ->
-                iSymms.[i+j].[0..(iLevels.[i].[j]-1)] |> List.map ((+) start)
+                iSymms.[i+j].[0..(iLevels.[i].[j]-1)] |> List.map ((+) j)
             )
             |> List.reduce (@)
             |> List.sort
         )
         |> List.reduce (@)
-        |> (@) func.TDimSymm
+        |> fun x -> x @ (func.TDimSymm |> List.map ((+) (List.max x)))
 
     let private fileIDname (name: string) =
         String.concat "" [name; "_file_ncid"]
