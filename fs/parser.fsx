@@ -277,7 +277,7 @@ type CppLoopTextGenerator (outerNested, outerDistributed, innerNested, innerDist
         override this.PushInnerDistributed newInnerDistributed =
             InnerDistributed <- InnerDistributed @ [newInnerDistributed]
 
-(********************************************************************************)
+///////////////////////////////////////////////////////////////////////////
 
 module NestedLoop =
     /// Union for the symmetry/commutativity state of a variable.
@@ -459,36 +459,49 @@ module NestedLoop =
     /// <param name="iarrays"> Input arrays </param>
     /// <param name="func"> Function applied to input arrays </param>
     let OutputSymmetry (iarrays: NestedArray list) (func: NestedFunction) =
-        let iSymms = iarrays |> List.map (fun x -> x.Symm |> function | Some s -> s | None -> (List.init x.Rank id))
         let comm = func.Comm |> function | Some c -> c | None -> (List.init iarrays.Length id)
-
         let commGroups = comm |> List.distinct
-        let iLevels =
-            List.init commGroups.Length (fun i ->
-                let listSelect list =
-                    List.zip comm list
-                    |> List.filter (fun x -> fst x = commGroups.[i])
-                    |> List.map snd
+        let commLengths = List.init commGroups.Length (fun i ->
+            comm |> List.filter (fun x -> x = i+1) |> List.length
+        )
 
-                let iarraysSub = iarrays |> listSelect
-                let iranks = func.IRank |> listSelect
+        let iLevels, iSymms =
+            let listSelect commGroup list =
+                List.zip comm list
+                |> List.filter (fun x -> fst x = commGroup)
+                |> List.map snd
+
+            List.init commGroups.Length (fun i ->
+                let iSymms = iarrays |> List.map (fun x -> x.Symm |> function 
+                    | Some s -> s 
+                    | None -> (List.init x.Rank id))
+
+                let iarraysSub = iarrays |> listSelect commGroups.[i]
+                let iranks = func.IRank |> listSelect commGroups.[i]
+                let iSymmDist = 
+                    iSymms 
+                    |> listSelect commGroups.[i] 
+                    |> List.distinct 
+                    |> fun x -> x.[0]
 
                 // Double-check that all ranks in the commutativity group are equal.
                 assert(iarraysSub |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
+                assert(iSymmDist |> List.length = 1)
 
-                ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
-                ||> List.map2 (-)
+                let iLevels = 
+                    ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
+                    ||> List.map2 (-)
+                    |> List.distinct 
+                    |> fun x -> x.[0]
+
+                iLevels, iSymmDist
             )
+            |> List.unzip
 
-        // The number of S-dimensions in a commutativity group.
-        let commLengths = iLevels |> List.map List.length
-
+        // BUG: rewrite this!
         List.init commGroups.Length (fun i ->
-            List.init commLengths.[i] (fun j ->
-                iSymms.[i+j].[0..(iLevels.[i].[j]-1)] |> List.map ((+) j)
-            )
-            |> List.reduce (@)
-            |> List.sort
+            iSymms.[i].[iLevels.[i]..iSymms.[i].Length] 
+            |> (List.replicate >> List.collect) commLengths.[i]
         )
         |> List.reduce (@)
         |> fun x -> x @ (func.TDimSymm |> List.map ((+) (List.max x)))
@@ -755,7 +768,7 @@ module NestedLoop =
 
 
 
-(********************************************************************************)
+////////////////////////////////////////////////////////////////////////
 
 
 open System.IO
