@@ -15,15 +15,17 @@ let nc2 = {
     Type = "float"
 }
 
+let iarrays = [nc1; nc2]
+
 let func = {
     Name = "func"
     Arity = Some(2)
     INames = ["rav1"; "rav2"]
-    IRank = [1;1]
+    IRank = [2;2]
     OName = "res"
     OType = "float"
-    ORank = 4
-    TDimSymm = [1;1]
+    ORank = 6
+    TDimSymm = [1;2]
     Comm = Some [1;1]
     ParallelismLevels = [1;0]
     Inner = ["res = rav1 + rav2;"]
@@ -34,5 +36,4 @@ let func = {
 }
 
 
-let iarrays = [nc1; nc2]
 OutputSymmetry iarrays func;;

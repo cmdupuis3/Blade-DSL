@@ -498,10 +498,24 @@ module NestedLoop =
             )
             |> List.unzip
 
-        // BUG: rewrite this!
-        List.init commGroups.Length (fun i ->
-            iSymms.[i].[iLevels.[i]..iSymms.[i].Length] 
-            |> (List.replicate >> List.collect) commLengths.[i]
+        let commSymms =
+            List.init commGroups.Length (fun i ->
+                let iSymmsSub = iSymms.[i].[iLevels.[i]..iSymms.[i].Length]
+                if commLengths.[i] = 1 then
+                    // Copy symmetry info from array
+                    iSymmsSub
+                else
+                    // Use commutativity
+                    iSymmsSub |> (List.replicate >> List.collect) commLengths.[i]
+            )
+
+        // Re-index before reducing (needs more testing)
+        let commSymmsMaxs = commSymms |> List.map (fun x -> List.max x)
+        let commSymmsMins = commSymms |> List.map (fun x -> List.min x)
+        commSymms |> List.mapi (fun i commSymm ->
+            let start = if i = 0 then 0 else commSymmsMaxs.[0..(i-1)] |> List.reduce (+)
+            commSymm 
+            |> List.map (fun x -> x - commSymmsMins.[i] + start + 1)
         )
         |> List.reduce (@)
         |> fun x -> x @ (func.TDimSymm |> List.map ((+) (List.max x)))
