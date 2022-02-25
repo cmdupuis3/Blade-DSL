@@ -168,7 +168,7 @@ let loopBuilder iteratorDeclLine outerNested outerDistributed loopLine (scope: s
     let outerText = (outerNested |> nestedText) @ (outerDistributed |> distributedText)
     let innerText = (innerNested |> nestedText) @ (innerDistributed |> distributedText)
 
-    let iteratorDecl = iteratorDeclLine "int" loop.indNames.[j]
+    let iteratorDecl = iteratorDeclLine "size_t" loop.indNames.[j]
     let scoped = scope (loopLine loop.indNames.[j] loop.iMins.[j] loop.iExtents (string j))
     List.concat [newln [iteratorDecl]; outerText; [scoped.Head]; tab innerText; tab inner; [scoped.Tail.Head]]
 
@@ -472,26 +472,26 @@ module NestedLoop =
                 |> List.map snd
 
             List.init commGroups.Length (fun i ->
-                let iSymms = iarrays |> List.map (fun x -> x.Symm |> function 
-                    | Some s -> s 
+                let iSymms = iarrays |> List.map (fun x -> x.Symm |> function
+                    | Some s -> s
                     | None -> (List.init x.Rank id))
 
                 let iarraysSub = iarrays |> listSelect commGroups.[i]
                 let iranks = func.IRank |> listSelect commGroups.[i]
-                let iSymmDist = 
-                    iSymms 
-                    |> listSelect commGroups.[i] 
-                    |> List.distinct 
+                let iSymmDist =
+                    iSymms
+                    |> listSelect commGroups.[i]
+                    |> List.distinct
                     |> fun x -> x.[0]
 
                 // Double-check that all ranks in the commutativity group are equal.
                 assert(iarraysSub |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
                 assert(iSymmDist |> List.length = 1)
 
-                let iLevels = 
+                let iLevels =
                     ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
                     ||> List.map2 (-)
-                    |> List.distinct 
+                    |> List.distinct
                     |> fun x -> x.[0]
 
                 iLevels, iSymmDist
@@ -514,7 +514,7 @@ module NestedLoop =
         let commSymmsMins = commSymms |> List.map (fun x -> List.min x)
         commSymms |> List.mapi (fun i commSymm ->
             let start = if i = 0 then 0 else commSymmsMaxs.[0..(i-1)] |> List.reduce (+)
-            commSymm 
+            commSymm
             |> List.map (fun x -> x - commSymmsMins.[i] + start + 1)
         )
         |> List.reduce (@)
@@ -596,7 +596,7 @@ module NestedLoop =
                 String.concat "" ["size_t* "; countsName array.Name; " = new size_t["; string array.Rank; "];"]
                 String.concat "" ["char** "; dimNames array.Name;  " = new char*["; string array.Rank; "];"]
                 String.concat "" ["nc_inq_vardimid("; fileIDname array.Name; ", "; variableIDname array.Name; ", "; dimIDnames array.Name; ");"]
-                String.concat "" ["for(int q = 0; q < "; string array.Rank; "; q++){"]
+                String.concat "" ["for(size_t q = 0; q < "; string array.Rank; "; q++){"]
                 String.concat "" ["\t"; dimNames array.Name; "[q] = new char[NC_MAX_NAME];"]
                 String.concat "" ["\t"; "nc_inq_dimname("; fileIDname array.Name; ", "; dimIDnames array.Name; "[q], "; dimNames array.Name; "[q]);"]
                 String.concat "" ["\t"; "nc_inq_dimlen("; fileIDname array.Name; ", "; dimIDnames array.Name; "[q], &("; extentsName array; "[q]));"]
@@ -729,7 +729,7 @@ module NestedLoop =
                 String.concat "" ["size_t* "; startsName func.OName;  " = new size_t["; string oarray.Rank; "];"]
                 String.concat "" ["size_t* "; countsName func.OName;  " = new size_t["; string oarray.Rank; "];"]
                 String.concat "" ["size_t* "; indicesName func.OName; " = new size_t["; string (oarray.Rank-1); "];"]
-                String.concat "" ["for(int q = 0; q < "; string oarray.Rank; "; q++){"]
+                String.concat "" ["for(size_t q = 0; q < "; string oarray.Rank; "; q++){"]
                 String.concat "" ["\t"; startsName func.OName; "[q] = 0;"]
                 String.concat "" ["\t"; countsName func.OName; "[q] = 1;"]
                 String.concat "" ["}"]
@@ -1414,7 +1414,7 @@ let symmVecLines (arrays: NestedArray list) =
     |> List.map (fun x -> x.Name, x.Symm |> Option.get)
     |> List.map (fun x ->
         let name, symm = x
-        String.concat "" ["static constexpr const int "; name; "_symm["; symm.Length |> string; "] = {"; symm |> List.map string |> withCommas |> stringCollapse " "; "};\n"]
+        String.concat "" ["static constexpr const size_t "; name; "_symm["; symm.Length |> string; "] = {"; symm |> List.map string |> withCommas |> stringCollapse " "; "};\n"]
     )
 
 let objectLoopArity (oloop: ObjectLoop) =
@@ -1486,8 +1486,8 @@ let objectLoopTemplate (oloop: ObjectLoop) =
 
     let templateTypes =
         arity |> List.map (fun a ->
-            List.init a (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1); ", const int* ISYM"; string (i+1)])
-            |> fun x -> x @ ["typename OTYPE, const int ORANK, const int* OSYM"]
+            List.init a (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const size_t IRANK"; string (i+1); ", const size_t* ISYM"; string (i+1)])
+            |> fun x -> x @ ["typename OTYPE, const size_t ORANK, const size_t* OSYM"]
             |> withCommas
             |> stringCollapse ""
         )
@@ -1748,8 +1748,8 @@ let methodLoopTemplate (mloop: MethodLoop) =
     let names = (inames, onames) ||> List.map2 (fun x y -> x @ [y])
 
     let templateTypes =
-        List.init arity (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const int IRANK"; string (i+1); ", const int* ISYM"; string (i+1)])
-        |> fun x -> x @ ["typename OTYPE, const int ORANK, const int* OSYM"]
+        List.init arity (fun i -> String.concat "" ["typename ITYPE"; string (i+1); ", const size_t IRANK"; string (i+1); ", const size_t* ISYM"; string (i+1)])
+        |> fun x -> x @ ["typename OTYPE, const size_t ORANK, const size_t* OSYM"]
         |> withCommas
         |> stringCollapse ""
 
@@ -2229,17 +2229,3 @@ File.ReadAllText iFileName
 |> tokenize
 |> parse
 |> fun x -> File.WriteAllText (oFileName, x)
-
-//let tokens = File.ReadAllText iFileName |> tokenize;;
-//let args = [|"/home/Christopher.Dupuis/agu2019proj/covariance.edgi"; "/home/Christopher.Dupuis/agu2019proj/covariance.cpp"|];;
-//main [|"/home/Christopher.Dupuis/agu2019proj/covariance.edgi"; "/home/Christopher.Dupuis/agu2019proj/covariance.cpp"|];;
-
-//let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"|];;
-//main [|"/home/username/Downloads/EDGI_nested_iterators/fs/covariance.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/covariance.cpp"|];;
-
-//let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/10D.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10D.cpp"|];;
-//main [|"/home/username/Downloads/EDGI_nested_iterators/fs/10D.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10D.cpp"|];;
-
-//let args = [|"/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"|];;
-//main [|"/home/username/Downloads/EDGI_nested_iterators/fs/10vars.edgi"; "/home/username/Downloads/EDGI_nested_iterators/fs/10vars.cpp"|];;
-
