@@ -3,6 +3,7 @@
 
 // For NetCDF integration, information about types and ranks is needed at compile time...
 
+open System.IO
 open System.Runtime.InteropServices
 
 [<DllImport(@"/home/username/tropical/nested_funcs/Debug/libnested_funcs.so")>]
@@ -462,7 +463,7 @@ module NestedLoop =
         let comm = func.Comm |> function | Some c -> c | None -> (List.init iarrays.Length id)
         let commGroups = comm |> List.distinct
         let commLengths = List.init commGroups.Length (fun i ->
-            comm |> List.filter (fun x -> x = commGroups[i]) |> List.length
+            comm |> List.filter (fun x -> x = commGroups.[i]) |> List.length
         )
 
         let iLevels, iSymms =
@@ -1219,15 +1220,19 @@ let hasClause name clauses =
 let getClause name clauses =
     clauses |> List.find (fst >> (fun x -> x = name))
 
+let stripWhitespace (tokens: Token list) = 
+    tokens |> List.filter (fun x -> (x <> NewLine) && (x <> WhiteSpace))
 
 let getArray (clauses: Clause list) (block: Token list) =
     let hasSym = clauses |> hasClause "symmetry"
     let sym = if hasSym then
                   Some ((clauses |> getClause "symmetry") |> (snd >> tokenToInt))
               else None
-    match block with
-    | ArrayPattern sym s -> fst s
-    | _ -> failwith "Array pragma applied to invalid array declaration."
+    block 
+    |> stripWhitespace
+    |> function 
+        | ArrayPattern sym s -> fst s
+        | _ -> failwith "Array pragma applied to invalid array declaration."
 
 let getFunction (name: string) (clauses: Clause list) (block: Token list) =
     let arity =
