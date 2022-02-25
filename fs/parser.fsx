@@ -462,7 +462,7 @@ module NestedLoop =
         let comm = func.Comm |> function | Some c -> c | None -> (List.init iarrays.Length id)
         let commGroups = comm |> List.distinct
         let commLengths = List.init commGroups.Length (fun i ->
-            comm |> List.filter (fun x -> x = i+1) |> List.length
+            comm |> List.filter (fun x -> x = commGroups[i]) |> List.length
         )
 
         let iLevels, iSymms =
