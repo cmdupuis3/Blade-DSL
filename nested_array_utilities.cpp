@@ -27,6 +27,7 @@ using std::sort;
 
 #include <type_traits>
 using std::add_pointer;
+using std::extent;
 using std::remove_pointer;
 using std::is_pointer;
 
