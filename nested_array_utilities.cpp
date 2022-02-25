@@ -25,6 +25,8 @@
 #include <algorithm>
 using std::sort;
 
+#include <cstddef>
+
 #include <type_traits>
 using std::add_pointer;
 using std::extent;
@@ -49,7 +51,7 @@ namespace nested_array_utilities {
     }
 
     /** promote class' implementation function */
-    template<typename TYPE, const int rank, const int depth = 0>
+    template<typename TYPE, const size_t rank, const size_t depth = 0>
     constexpr auto promote_impl() {
 
         if constexpr (depth < rank) {
@@ -64,7 +66,7 @@ namespace nested_array_utilities {
     }
 
     /** Class to allow promotion of a value type by an arbitrary number of pointers at compile time. */
-    template<typename TYPE, const int rank, const int depth = 0>
+    template<typename TYPE, const size_t rank, const size_t depth = 0>
     class promote {
 
     public:
@@ -78,7 +80,7 @@ namespace nested_array_utilities {
     /** Recursively allocate an array, with dimensionality deduced from TYPE, according to arrays
      *  of index minima and maxima. Minima default to zero in every dimension.
      */
-    template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
+    template<typename TYPE, const size_t SYMM[] = nullptr, const size_t DEPTH = 0>
     constexpr TYPE allocate(const size_t extents[], const size_t lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
@@ -99,7 +101,7 @@ namespace nested_array_utilities {
     }
 
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
-    template<typename TYPE, const int SYMM[] = nullptr, const int DEPTH = 0>
+    template<typename TYPE, const size_t SYMM[] = nullptr, const size_t DEPTH = 0>
     constexpr auto fill_random(TYPE array_in, const size_t extents[], int mod_in, size_t lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
@@ -120,12 +122,12 @@ namespace nested_array_utilities {
 
     }
 
-    void index_impl(const int ndims, const int* indices, const int nsymms, const int symmetry[], int* indices_folded){
+    void index_impl(const size_t ndims, const size_t* indices, const size_t nsymms, const size_t symmetry[], size_t* indices_folded){
 
         // count unique elements of symmetry (from https://www.tutorialspoint.com/count-distinct-elements-in-an-array-in-cplusplus)
         //sort(symm_cpy, symm_cpy + nsymms);
-        int nsymms_un = 0;
-        for (int i = 0; i < ndims; i++) {
+        size_t nsymms_un = 0;
+        for (size_t i = 0; i < ndims; i++) {
             while (i < ndims - 1 && symmetry[i] == symmetry[i + 1]) {
                 i++;
             }
@@ -133,26 +135,26 @@ namespace nested_array_utilities {
         }
 
         // find unique elements of symmetry
-        int* ngroups = new int[nsymms_un];
-        int* groups_unique = new int[nsymms_un];
-        int** indices_grouped = new int*[nsymms_un];
-        int j = 0;
-        for (int i = 0; i < nsymms_un; i++) {
+        size_t* ngroups = new size_t[nsymms_un];
+        size_t* groups_unique = new size_t[nsymms_un];
+        size_t** indices_grouped = new size_t*[nsymms_un];
+        size_t j = 0;
+        for (size_t i = 0; i < nsymms_un; i++) {
             groups_unique[i] = symmetry[j];
             ngroups[i] = 0;
-            int j_last = j;
+            size_t j_last = j;
             while (groups_unique[i] == symmetry[j]) {
                 if (j == ndims) break;
                 ngroups[i]++;
                 j++;
             }
 
-            indices_grouped[i] = new int[ngroups[i]];
-            for (int k = 0; k < ngroups[i]; k++) {
+            indices_grouped[i] = new size_t[ngroups[i]];
+            for (size_t k = 0; k < ngroups[i]; k++) {
                 indices_grouped[i][k] = indices[j_last + k];
             }
             sort(indices_grouped[i], indices_grouped[i] + ngroups[i]);
-            for (int k = 0; k < ngroups[i]; k++) {
+            for (size_t k = 0; k < ngroups[i]; k++) {
                 indices_folded[j_last + k] = indices_grouped[i][k];
             }
         }
@@ -161,15 +163,15 @@ namespace nested_array_utilities {
 
     }
 
-    template<typename TYPE, const int SYMM[], const int nsymms, const int ndims, const int depth=0>
-    constexpr auto index(const TYPE array, const int* indices, int* indices_folded = nullptr) {
+    template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
+    constexpr auto index(const TYPE array, const size_t* indices, size_t* indices_folded = nullptr) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (depth == ndims) {
             return array;
         } else if constexpr (depth == 0) {
-            int* inds_buffer = new int[ndims];
+            size_t* inds_buffer = new size_t[ndims];
             index_impl(ndims, indices, nsymms, SYMM, inds_buffer);
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], indices, inds_buffer);
         } else {
@@ -177,39 +179,39 @@ namespace nested_array_utilities {
         }
 
     }
-    
+
     void index_test(){
 
-        const int ndims = 5;
-        const int inds[5]  = {2, 3, 4, 0, 9};
-        const int inds2[5] = {4, 3, 2, 0, 9};
-        static constexpr const int symms[6] = {1, 1, 1, 4, 5, 5};
-        constexpr const int nsymms = extent<decltype(symms)>::value;
+        const size_t ndims = 5;
+        const size_t inds[5]  = {2, 3, 4, 0, 9};
+        const size_t inds2[5] = {4, 3, 2, 0, 9};
+        static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
+        constexpr const size_t nsymms = extent<decltype(symms)>::value;
 
-        typedef typename promote<int, 6>::type int6;
+        typedef typename promote<size_t, 6>::type size_t6;
         const size_t exts[6] = {10, 10, 10, 10, 10, 10};
-        int6 arr = allocate<int6, symms>(exts);
+        size_t6 arr = allocate<size_t6, symms>(exts);
 
         arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][0] = 20;
 
         cout << arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][0] << endl;
 
 
-        auto a = index<int6, symms, nsymms, ndims>(arr, inds2);
+        auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
 
         cout << a[0] << endl;
-        // int inds_alt = {inds[]
+        // size_t inds_alt = {inds[]
 
 
 
-        int* inds_folded = new int[ndims];
+        size_t* inds_folded = new size_t[ndims];
         index_impl(ndims, inds, nsymms, symms, inds_folded);
 
-        for (int i = 0; i < ndims; i++) {
+        for (size_t i = 0; i < ndims; i++) {
             cout << inds[i] << "\t";
         }
         cout << endl;
-        for (int i = 0; i < ndims; i++) {
+        for (size_t i = 0; i < ndims; i++) {
             cout << inds_folded[i] << "\t";
         }
 
