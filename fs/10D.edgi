@@ -16,7 +16,7 @@ using namespace nested_array_utilities;
 }
 
 
-static constexpr const int extents10[10] = {10,10,10,10,10,10,10,10,10,10};
+static constexpr const size_t extents10[10] = {10,10,10,10,10,10,10,10,10,10};
 
 int main() {
 
@@ -30,7 +30,7 @@ int main() {
 
     typedef promote<float, 10>::type float10;
 
-    fill_random<float10, a1_symm>(a1, extents10, 10);
+    fill_random<float10, extents10, a1_symm>(a1, 10);
 
     start = clock();
     auto oloop = object_for(add10);
@@ -47,4 +47,3 @@ int main() {
 */
     return 0;
 }
-
