@@ -33,6 +33,10 @@ using std::extent;
 using std::remove_pointer;
 using std::is_pointer;
 
+// only needed for unit tests
+#include <iostream>
+using std::cout;
+using std::endl;
 
 // Helper functions (must be constexpr)
 
@@ -163,6 +167,22 @@ namespace nested_array_utilities {
 
     }
 
+    template<const size_t ndims, const size_t SYMM[]>
+    size_t* ljustify(size_t* indices_folded){
+        size_t* indices_justified = new size_t[ndims];
+        indices_justified[0] = indices_folded[0];
+        for (size_t i = 1; i < ndims; i++) {
+            if (SYMM[i] == SYMM[i-1]) {
+                indices_justified[i] = indices_folded[i] - indices_folded[i-1];
+            } else {
+                indices_justified[i] = indices_folded[i];
+            }
+        }
+        return indices_justified;
+    }
+
+
+
     template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
     constexpr auto index(const TYPE array, const size_t* indices, size_t* indices_folded = nullptr) {
 
@@ -182,9 +202,9 @@ namespace nested_array_utilities {
 
     void index_test(){
 
-        const size_t ndims = 5;
-        const size_t inds[5]  = {2, 3, 4, 0, 9};
-        const size_t inds2[5] = {4, 3, 2, 0, 9};
+        const size_t ndims = 6;
+        const size_t inds[6]  = {2, 3, 4, 0, 1, 9};
+        const size_t inds2[6] = {4, 3, 2, 0, 9, 1};
         static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
         constexpr const size_t nsymms = extent<decltype(symms)>::value;
 
@@ -192,15 +212,12 @@ namespace nested_array_utilities {
         const size_t exts[6] = {10, 10, 10, 10, 10, 10};
         size_t6 arr = allocate<size_t6, symms>(exts);
 
-        arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][0] = 20;
-
-        cout << arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][0] << endl;
+        arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][inds[5]] = 20;
+        cout << arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][inds[5]] << endl;
 
 
         auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
-
-        cout << a[0] << endl;
-        // size_t inds_alt = {inds[]
+        cout << a << endl;
 
 
 
@@ -214,6 +231,15 @@ namespace nested_array_utilities {
         for (size_t i = 0; i < ndims; i++) {
             cout << inds_folded[i] << "\t";
         }
+        cout << endl;
+
+
+        size_t* inds_justified = ljustify<ndims, symms>(inds_folded);
+        for (size_t i = 0; i < ndims; i++) {
+            cout << inds_justified[i] << "\t";
+        }
+        
+
 
     }
 
