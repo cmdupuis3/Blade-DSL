@@ -3,13 +3,14 @@
 #include <iostream>
 using std::cout;
 using std::endl;
+#include <netcdf.h>
 
 #include "nested_array_utilities.cpp"
 using namespace nested_array_utilities;
 
 #define OMP_NUM_THREADS 48
 
-#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) orank(0) ompLevels(1,0)
+#pragma edgi function(covariance) arity(2) input(in1, in2) iranks(1,1) output(out) otype(float) orank(0) ompLevels(1,0) commutativity(1,1) ncDimNames() ncDimVals() ncDimTypes()
 {
     int len = 5;
     float mean1 = 0;
@@ -32,37 +33,19 @@ using namespace nested_array_utilities;
     out /= len;
 }
 
-static constexpr const int extents3[3] = {400,400,400};
-static constexpr const int extents4[4] = {400,400,400,400};
-
 int main() {
 
     time_t start;
-
-    #pragma edgi array symmetry(1,1,3)
-    float~3 a1;
-
-    #pragma edgi array
-    float~3 a2;
-
-    #pragma edgi array
-    float~4 res;
-
-    typedef promote<float, 3>::type float3;
-    typedef promote<float, 4>::type float4;
-
     time(&start);
-    a1  = allocate<float3, extents3, nullptr>();
-    a2  = allocate<float3, extents3, nullptr>();
-    res = allocate<float4, extents4, nullptr>();
-    cout << "Allocation took " << (time(NULL) - start) << "s" << endl << endl;
 
-    fill_random<float3, extents3>(a1, 10);
-    fill_random<float3, extents3>(a2, 10);
+    #pragma edgi array
+    edgi_nc_t a1("/home/username/Data/indonesia/hqp_block11.nc", "hqp");
+
+    cout << "Allocation took " << (time(NULL) - start) << "s" << endl << endl;
 
     time(&start);
     auto oloop = object_for(covariance);
-    oloop(a1, a2, res, extents3, extents3, extents4);
+    res = oloop(a1, a1)("/home/username/Data/indonesia/new.nc", "hqpCovariance");
 
     cout << "Calculation took " << (time(NULL) - start) << "s" << endl << endl;
 /*
