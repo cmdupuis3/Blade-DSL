@@ -93,7 +93,7 @@ namespace nested_array_utilities {
         if constexpr (get_rank<TYPE>() > 1) {
             for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
                 if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents, i);
+                    array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents, i + lastIndex);
                 } else {
                     array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents);
                 }
@@ -126,7 +126,9 @@ namespace nested_array_utilities {
 
     }
 
-    void index_impl(const size_t ndims, const size_t* indices, const size_t nsymms, const size_t symmetry[], size_t* indices_folded){
+    size_t* index_impl(const size_t ndims, const size_t* indices, const size_t nsymms, const size_t symmetry[]){
+
+        size_t* indices_folded = new size_t[ndims];
 
         // count unique elements of symmetry (from https://www.tutorialspoint.com/count-distinct-elements-in-an-array-in-cplusplus)
         //sort(symm_cpy, symm_cpy + nsymms);
@@ -163,7 +165,7 @@ namespace nested_array_utilities {
             }
         }
 
-        return;
+        return indices_folded;
 
     }
 
@@ -191,8 +193,7 @@ namespace nested_array_utilities {
         if constexpr (depth == ndims) {
             return array;
         } else if constexpr (depth == 0) {
-            size_t* inds_buffer = new size_t[ndims];
-            index_impl(ndims, indices, nsymms, SYMM, inds_buffer);
+            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], indices, inds_buffer);
         } else {
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices_folded[depth]], indices, indices_folded);
@@ -203,8 +204,8 @@ namespace nested_array_utilities {
     void index_test(){
 
         const size_t ndims = 6;
-        const size_t inds[6]  = {2, 3, 4, 0, 1, 9};
-        const size_t inds2[6] = {4, 3, 2, 0, 9, 1};
+        const size_t inds[6]  = {2, 3, 9, 0, 1, 9};
+        const size_t inds2[6] = {9, 3, 2, 0, 9, 1};
         static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
         constexpr const size_t nsymms = extent<decltype(symms)>::value;
 
@@ -212,17 +213,13 @@ namespace nested_array_utilities {
         const size_t exts[6] = {10, 10, 10, 10, 10, 10};
         size_t6 arr = allocate<size_t6, symms>(exts);
 
-        arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][inds[5]] = 20;
-        cout << arr[inds[0]][inds[1]][inds[2]][inds[3]][inds[4]][inds[5]] << endl;
-
+                arr[inds[0]][inds[1]-inds[0]][inds[2]-(inds[1]-inds[0])-inds[0]][inds[3]][inds[4]][inds[5]-inds[4]] = 20;
+        cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-(inds[1]-inds[0])-inds[0]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
 
         auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
         cout << a << endl;
 
-
-
-        size_t* inds_folded = new size_t[ndims];
-        index_impl(ndims, inds, nsymms, symms, inds_folded);
+        size_t* inds_folded = index_impl(ndims, inds, nsymms, symms);
 
         for (size_t i = 0; i < ndims; i++) {
             cout << inds[i] << "\t";
@@ -238,8 +235,6 @@ namespace nested_array_utilities {
         for (size_t i = 0; i < ndims; i++) {
             cout << inds_justified[i] << "\t";
         }
-        
-
 
     }
 
