@@ -186,19 +186,36 @@ namespace nested_array_utilities {
 
 
     template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
-    constexpr auto index(const TYPE array, const size_t* indices, size_t* indices_folded = nullptr) {
+    constexpr auto index(const TYPE array, /*const size_t nindices,*/ const size_t* indices) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        if constexpr (depth == ndims) {
+        if constexpr (/*depth == nindices || */depth == ndims) {
             return array;
         } else if constexpr (depth == 0) {
             size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
-            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], indices, inds_buffer);
+            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], nindices, inds_buffer);
         } else {
-            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices_folded[depth]], indices, indices_folded);
+            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], nindices, indices);
         }
 
+    }
+
+    template<typename TYPE, typename VTYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
+    void set_index(TYPE array, const size_t* indices, const VTYPE value){
+
+        typedef typename remove_pointer<TYPE>::type DTYPE;
+
+        if constexpr (get_rank<DTYPE>() == get_rank<VTYPE>()) {
+            array[indices[depth]] = value;
+        } else if constexpr (depth == 0) {
+            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
+            set_index<DTYPE, VTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], inds_buffer, value);
+        } else {
+            set_index<DTYPE, VTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], indices, value);
+        }
+
+        return;
     }
 
     void index_test(){
@@ -214,6 +231,9 @@ namespace nested_array_utilities {
         size_t6 arr = allocate<size_t6, symms>(exts);
 
                 arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] = 20;
+        cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
+
+        set_index<size_t6, size_t, symms, nsymms, ndims>(arr, inds, 30);
         cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
 
         auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
