@@ -213,8 +213,8 @@ namespace nested_array_utilities {
         const size_t exts[6] = {10, 10, 10, 10, 10, 10};
         size_t6 arr = allocate<size_t6, symms>(exts);
 
-                arr[inds[0]][inds[1]-inds[0]][inds[2]-(inds[1]-inds[0])-inds[0]][inds[3]][inds[4]][inds[5]-inds[4]] = 20;
-        cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-(inds[1]-inds[0])-inds[0]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
+                arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] = 20;
+        cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
 
         auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
         cout << a << endl;
