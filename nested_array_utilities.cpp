@@ -131,16 +131,16 @@ namespace nested_array_utilities {
 
     }
 
-    template<const size_t ndims, const size_t nsymms, const size_t symmetry[]>
+    template<const size_t nindices, const size_t symmetry[]>
     size_t* index_impl(const size_t* indices){
 
-        size_t* indices_folded = new size_t[ndims];
+        size_t* indices_folded = new size_t[nindices];
 
         // count unique elements of symmetry (from https://www.tutorialspoint.com/count-distinct-elements-in-an-array-in-cplusplus)
         //sort(symm_cpy, symm_cpy + nsymms);
         size_t nsymms_un = 0;
-        for (size_t i = 0; i < ndims; i++) {
-            while (i < ndims - 1 && symmetry[i] == symmetry[i + 1]) {
+        for (size_t i = 0; i < nindices; i++) {
+            while (i < nindices - 1 && symmetry[i] == symmetry[i + 1]) {
                 i++;
             }
             nsymms_un++;
@@ -156,7 +156,7 @@ namespace nested_array_utilities {
             ngroups[i] = 0;
             size_t j_last = j;
             while (groups_unique[i] == symmetry[j]) {
-                if (j == ndims) break;
+                if (j == nindices) break;
                 ngroups[i]++;
                 j++;
             }
@@ -175,11 +175,11 @@ namespace nested_array_utilities {
 
     }
 
-    template<const size_t ndims, const size_t SYMM[]>
+    template<const size_t nindices, const size_t SYMM[]>
     size_t* ljustify(size_t* indices_folded){
-        size_t* indices_justified = new size_t[ndims];
+        size_t* indices_justified = new size_t[nindices];
         indices_justified[0] = indices_folded[0];
-        for (size_t i = 1; i < ndims; i++) {
+        for (size_t i = 1; i < nindices; i++) {
             if (SYMM[i] == SYMM[i-1]) {
                 indices_justified[i] = indices_folded[i] - indices_folded[i-1];
             } else {
@@ -193,45 +193,21 @@ namespace nested_array_utilities {
     /** Indexing function for symmetrically allocated arrays. Symmetrically allocated arrays are unintuitive to index
      *  into because indices in symmetric dimensions become mutually dependent. This function basically provides a way
      *  to map indices from a standard, n-D array perspective into indices that make sense for symmetric arrays.
+     *  Partial indexing is supported by supplying the nindices template parameter and an array of indices at runtime.
      */
-    template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
+    template<typename TYPE, const size_t SYMM[], const size_t nindices=get_rank<TYPE>(),
+             const size_t ndims=get_rank<TYPE>(), const size_t depth=0>
     constexpr auto index(const TYPE array, const size_t* indices) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        if constexpr (depth == ndims) {
+        if constexpr (depth == nindices || depth == ndims) {
             return array;
         } else if constexpr (depth == 0) {
-            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl<ndims, nsymms, SYMM>(indices));
-            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], inds_buffer);
+            size_t* inds_buffer = ljustify<nindices, SYMM>(index_impl<nindices, SYMM>(indices));
+            return index<DTYPE, SYMM, nindices, ndims, depth+1>(array[inds_buffer[depth]], inds_buffer);
         } else {
-            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], indices);
-        }
-
-    }
-
-    /** Indexing function for partial indexing. Using this as an alternative to full indexing may be slower, so 
-     *  full indexing should be used if possible. This function will try to defer to full indexing if it thinks
-     *  that's possible.
-     */
-    template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
-    auto index_partial(const TYPE array, const size_t nindices, const size_t* indices) {
-
-        typedef typename remove_pointer<TYPE>::type DTYPE;
-
-        if (nindices == ndims) {
-            return index<TYPE, SYMM, nsymms, ndims>(array, indices);
-        } else if constexpr (depth == ndims) {
-            return array;
-        } else if constexpr (depth == 0) {
-            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl<ndims, nsymms, SYMM>(indices));
-            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], nindices, inds_buffer);
-        } else if (depth == nindices) {
-            /* This block is lower down to short-circuit the if/else with constexpr, if possible.
-             * Note that for full indexing, this block does not appear */
-            return array;
-        } else {
-            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], nindices, indices);
+            return index<DTYPE, SYMM, nindices, ndims, depth+1>(array[indices[depth]], indices);
         }
 
     }
@@ -239,24 +215,47 @@ namespace nested_array_utilities {
     /** This function provides a way to set an element of a symmetrically allocated array. This includes partial indexing, which
      *  is deduced from the type of the input value.
      */
-    template<typename TYPE, typename VTYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
+    template<typename TYPE, const size_t SYMM[], typename VTYPE, const size_t ndims=get_rank<TYPE>(),
+             const size_t nindices=get_rank<TYPE>()-get_rank<VTYPE>(), const size_t depth=0>
     void set_index(TYPE array, const size_t* indices, const VTYPE value){
-
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
         if constexpr (get_rank<DTYPE>() == get_rank<VTYPE>()) {
             array[indices[depth]] = value;
         } else if constexpr (depth == 0) {
-            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl<ndims, nsymms, SYMM>(indices));
-            set_index<DTYPE, VTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], inds_buffer, value);
+            size_t* inds_buffer = ljustify<nindices, SYMM>(index_impl<nindices, SYMM>(indices));
+            set_index<DTYPE, SYMM, VTYPE, ndims, nindices, depth+1>(array[inds_buffer[depth]], inds_buffer, value);
         } else {
-            set_index<DTYPE, VTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], indices, value);
+            set_index<DTYPE, SYMM, VTYPE, ndims, nindices, depth+1>(array[indices[depth]], indices, value);
         }
 
         return;
     }
 
-    void index_test(){
+    void test_partial_set_index(){
+
+        typedef typename promote<size_t, 6>::type size_t6;
+        static constexpr const size_t ndims = get_rank<size_t6>();
+        static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
+        const size_t inds[5]  = {2, 3, 9, 0, 2};
+        constexpr const size_t ninds = extent<decltype(inds)>::value;
+
+        const size_t exts[6] = {10, 10, 10, 10, 10, 10};
+        size_t6 arr = allocate<size_t6, symms>(exts);
+
+        size_t* derp = new size_t[5];
+        for (size_t i = 0; i < 5; i++) {
+            derp[i] = i;
+        }
+
+        set_index<size_t6, symms, size_t*>(arr, inds, derp);
+        for (size_t i = 0; i < 5; i++) {
+            cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][i] << endl;
+        }
+
+    }
+
+   void index_test(){
 
         const size_t ndims = 6;
         const size_t inds[6]  = {2, 3, 9, 0, 1, 9};
