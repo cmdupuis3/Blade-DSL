@@ -83,6 +83,11 @@ namespace nested_array_utilities {
 
     /** Recursively allocate an array, with dimensionality deduced from TYPE, according to arrays
      *  of index minima and maxima. Minima default to zero in every dimension.
+     *
+     *  Symmetric arrays are allocated such that they use the minimum space required. This means
+     *  that, for example, a 2D symmetric array will only have the upper triangle allocated.
+     *  However, these must then be left-justified so that each row begins at index 0. To index
+     *  into symmetrically allocated arrays, you must use either index() or index_partial().
      */
     template<typename TYPE, const size_t SYMM[] = nullptr, const size_t DEPTH = 0>
     constexpr TYPE allocate(const size_t extents[], const size_t lastIndex = 0) {
@@ -184,23 +189,55 @@ namespace nested_array_utilities {
     }
 
 
-
+    /** Indexing function for symmetrically allocated arrays. Symmetrically allocated arrays are unintuitive to index
+     *  into because indices in symmetric dimensions become mutually dependent. This function basically provides a way
+     *  to map indices from a standard, n-D array perspective into indices that make sense for symmetric arrays.
+     */
     template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
-    constexpr auto index(const TYPE array, /*const size_t nindices,*/ const size_t* indices) {
+    constexpr auto index(const TYPE array, const size_t* indices) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        if constexpr (/*depth == nindices || */depth == ndims) {
+        if constexpr (depth == ndims) {
+            return array;
+        } else if constexpr (depth == 0) {
+            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
+            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], inds_buffer);
+        } else {
+            return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], indices);
+        }
+
+    }
+
+    /** Indexing function for partial indexing. Using this as an alternative to full indexing may be slower, so 
+     *  full indexing should be used if possible. This function will try to defer to full indexing if it thinks
+     *  that's possible.
+     */
+    template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
+    constexpr auto index_partial(const TYPE array, const size_t nindices, const size_t* indices) {
+
+        typedef typename remove_pointer<TYPE>::type DTYPE;
+
+        if (nindices == ndims) {
+            return index<TYPE, SYMM, nsymms, ndims>(array, indices);
+        } else if constexpr (depth == ndims) {
             return array;
         } else if constexpr (depth == 0) {
             size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], nindices, inds_buffer);
+        } else if (depth == nindices) {
+            /* This block is lower down to short-circuit the if/else with constexpr, if possible.
+             * Note that for full indexing, this block does not appear */
+            return array;
         } else {
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], nindices, indices);
         }
 
     }
 
+    /** This function provides a way to set an element of a symmetrically allocated array. This includes partial indexing, which
+     *  is deduced from the type of the input value.
+     */
     template<typename TYPE, typename VTYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
     void set_index(TYPE array, const size_t* indices, const VTYPE value){
 
