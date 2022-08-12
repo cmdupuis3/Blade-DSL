@@ -131,7 +131,8 @@ namespace nested_array_utilities {
 
     }
 
-    size_t* index_impl(const size_t ndims, const size_t* indices, const size_t nsymms, const size_t symmetry[]){
+    template<const size_t ndims, const size_t nsymms, const size_t symmetry[]>
+    size_t* index_impl(const size_t* indices){
 
         size_t* indices_folded = new size_t[ndims];
 
@@ -201,7 +202,7 @@ namespace nested_array_utilities {
         if constexpr (depth == ndims) {
             return array;
         } else if constexpr (depth == 0) {
-            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
+            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl<ndims, nsymms, SYMM>(indices));
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], inds_buffer);
         } else {
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], indices);
@@ -223,7 +224,7 @@ namespace nested_array_utilities {
         } else if constexpr (depth == ndims) {
             return array;
         } else if constexpr (depth == 0) {
-            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
+            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl<ndims, nsymms, SYMM>(indices));
             return index<DTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], nindices, inds_buffer);
         } else if (depth == nindices) {
             /* This block is lower down to short-circuit the if/else with constexpr, if possible.
@@ -246,7 +247,7 @@ namespace nested_array_utilities {
         if constexpr (get_rank<DTYPE>() == get_rank<VTYPE>()) {
             array[indices[depth]] = value;
         } else if constexpr (depth == 0) {
-            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl(ndims, indices, nsymms, SYMM));
+            size_t* inds_buffer = ljustify<ndims, SYMM>(index_impl<ndims, nsymms, SYMM>(indices));
             set_index<DTYPE, VTYPE, SYMM, nsymms, ndims, depth+1>(array[inds_buffer[depth]], inds_buffer, value);
         } else {
             set_index<DTYPE, VTYPE, SYMM, nsymms, ndims, depth+1>(array[indices[depth]], indices, value);
@@ -276,7 +277,7 @@ namespace nested_array_utilities {
         auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
         cout << a << endl;
 
-        size_t* inds_folded = index_impl(ndims, inds, nsymms, symms);
+        size_t* inds_folded = index_impl<ndims, nsymms, symms>(inds);
 
         for (size_t i = 0; i < ndims; i++) {
             cout << inds[i] << "\t";
