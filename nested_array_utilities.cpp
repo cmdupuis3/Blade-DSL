@@ -214,7 +214,7 @@ namespace nested_array_utilities {
      *  that's possible.
      */
     template<typename TYPE, const size_t SYMM[], const size_t nsymms, const size_t ndims, const size_t depth=0>
-    constexpr auto index_partial(const TYPE array, const size_t nindices, const size_t* indices) {
+    auto index_partial(const TYPE array, const size_t nindices, const size_t* indices) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
