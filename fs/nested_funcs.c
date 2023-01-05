@@ -45,7 +45,7 @@ extern void get_var_dim_types(char* file_name, char* variable_name, int dim_type
     nc_inq_varid(file_ncid, variable_name, &var_ncid);
     nc_inq_varndims(file_ncid, var_ncid, &num_dims);
 
-    int var_dimids[num_dims];
+    int* var_dimids = (int*)malloc(num_dims * sizeof(int));
 
     nc_inq_vardimid(file_ncid, var_ncid, var_dimids);
     for(int i = 0; i < num_dims; i++){
