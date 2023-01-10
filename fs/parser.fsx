@@ -510,20 +510,9 @@ module NestedLoop =
             )
             |> List.reduce (@)
 
-        let commSymms = 
-            List.init commGroups.Length (fun i ->
-                let iSymmsSub = iSymms.[i].[iLevels.[i]..iSymms.[i].Length]
-                if commLengths.[i] = 1 then
-                    // Copy symmetry info from array
-                    iSymmsSub
-                else
-                    // Use commutativity
-                    iSymmsSub |> (List.replicate >> List.collect) commLengths.[i]
-            )
-            |> reIndex
-            |> fun x -> x @ (func.TDimSymm |> List.map ((+) (List.max x)))
-
-        let symmSymms = 
+        let oSymms = 
+            // This is okay because we already guaranteed that comm groups can only contain
+            // copies of the same variable
             List.init commGroups.Length (fun i ->
                 iSymms.[i].[0..(iLevels.[i]-1)] 
                 |> (List.replicate >> List.collect) commLengths.[i]
@@ -531,7 +520,7 @@ module NestedLoop =
             )
             |> reIndex
 
-        symmSymms @ (commSymms |> List.map ((+) (List.max symmSymms)))
+        oSymms @ (func.TDimSymm |> List.map ((+) (List.max oSymms)))
 
 
     let private fileIDname (name: string) =
