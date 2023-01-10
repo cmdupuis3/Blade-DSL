@@ -499,7 +499,18 @@ module NestedLoop =
             )
             |> List.unzip
 
-        let commSymms =
+        /// Re-index before reducing (needs more testing)
+        let reIndex symms =
+            let symmsMaxs = symms |> List.map (fun x -> List.max x)
+            let symmsMins = symms |> List.map (fun x -> List.min x)
+            symms |> List.mapi (fun i symm ->
+                let start = if i = 0 then 0 else symmsMaxs.[0..(i-1)] |> List.reduce (+)
+                symm
+                |> List.map (fun x -> x - symmsMins.[i] + start + 1)
+            )
+            |> List.reduce (@)
+
+        let commSymms = 
             List.init commGroups.Length (fun i ->
                 let iSymmsSub = iSymms.[i].[iLevels.[i]..iSymms.[i].Length]
                 if commLengths.[i] = 1 then
@@ -509,17 +520,19 @@ module NestedLoop =
                     // Use commutativity
                     iSymmsSub |> (List.replicate >> List.collect) commLengths.[i]
             )
+            |> reIndex
+            |> fun x -> x @ (func.TDimSymm |> List.map ((+) (List.max x)))
 
-        // Re-index before reducing (needs more testing)
-        let commSymmsMaxs = commSymms |> List.map (fun x -> List.max x)
-        let commSymmsMins = commSymms |> List.map (fun x -> List.min x)
-        commSymms |> List.mapi (fun i commSymm ->
-            let start = if i = 0 then 0 else commSymmsMaxs.[0..(i-1)] |> List.reduce (+)
-            commSymm
-            |> List.map (fun x -> x - commSymmsMins.[i] + start + 1)
-        )
-        |> List.reduce (@)
-        |> fun x -> x @ (func.TDimSymm |> List.map ((+) (List.max x)))
+        let symmSymms = 
+            List.init commGroups.Length (fun i ->
+                iSymms.[i].[0..(iLevels.[i]-1)] 
+                |> (List.replicate >> List.collect) commLengths.[i]
+                |> List.sort // to be on the safe side
+            )
+            |> reIndex
+
+        symmSymms @ (commSymms |> List.map ((+) (List.max symmSymms)))
+
 
     let private fileIDname (name: string) =
         String.concat "" [name; "_file_ncid"]
