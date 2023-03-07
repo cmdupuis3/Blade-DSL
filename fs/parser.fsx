@@ -644,7 +644,7 @@ module Parser.Parser
             let ret =
                 newln ncInit
                 @ (unaryLoop loop textGenerator 0
-                   |> List.fold (|>) [inner])
+                    |> List.fold (|>) [inner])
                 @ [String.concat "" ["nc_close("; fileIDname array.Name; ");\n"]]
             ret
 
@@ -778,8 +778,8 @@ module Parser.Parser
             let ret =
                 (ncInit |> newln |> tab)
                 @ (unaryLoop loop textGenerator 0
-                   |> List.fold (|>) inner
-                   |> tab)
+                    |> List.fold (|>) inner
+                    |> tab)
                 @ ([String.concat "" ["nc_close("; fileIDname func.OName; ");"]] |> newln |> tab)
             ret
 
@@ -1228,8 +1228,8 @@ module Parser.Parser
     let getArray (clauses: Clause list) (block: Token list) =
         let hasSym = clauses |> hasClause "symmetry"
         let sym = if hasSym then
-                      Some ((clauses |> getClause "symmetry") |> (snd >> tokenToInt))
-                  else None
+                        Some ((clauses |> getClause "symmetry") |> (snd >> tokenToInt))
+                    else None
         block 
         |> stripWhitespace
         |> function 
@@ -1361,16 +1361,13 @@ module Parser.Parser
             |> fun x -> (x, func.IRank) ||> List.map2 (-)
             |> List.sum
             |> (+) func.ORank
-        let getOSymm iarrays func orank =
-            match func.Comm with
-            | None -> if orank = 0 then [0] else List.init orank id
-            | Some comm -> NestedLoop.OutputSymmetry iarrays func
+        let getOSymm iarrays func = NestedLoop.OutputSymmetry iarrays func
 
         for i in 0..mloops.Length-1 do
             for j in 0..mloops.[i].funcs.Length-1 do
                 let otype = mloops.[i].funcs.[j].OType
                 let orank = getORank mloops.[i].iarrays mloops.[i].funcs.[j]
-                let osymm = getOSymm mloops.[i].iarrays mloops.[i].funcs.[j] orank
+                let osymm = getOSymm mloops.[i].iarrays mloops.[i].funcs.[j]
                 for k in 0..mloops.[i].Call.Length-1 do
                     if fst4 mloops.[i].Call.[k] = mloops.[i].funcs.[j].Name then
                         let oname = snd4 mloops.[i].Call.[k]
@@ -1383,7 +1380,7 @@ module Parser.Parser
             let otype = oloops.[i].GetFunc.OType
             for k in 0..oloops.[i].iarrays.Length-1 do
                 let orank = getORank oloops.[i].iarrays.[k] oloops.[i].GetFunc
-                let osymm = getOSymm oloops.[i].iarrays.[k] oloops.[i].GetFunc orank
+                let osymm = getOSymm oloops.[i].iarrays.[k] oloops.[i].GetFunc
                 let oname = snd4 oloops.[i].Call.[k]
                 match thd4 oloops.[i].Call.[k] with
                 | Array info  -> {Name = oname; Type = otype; Rank = orank; Symm = Some osymm; Info = Array { ExtentsName = info.ExtentsName } }
@@ -1981,7 +1978,7 @@ module Parser.Parser
                 let args =
                     let basic =
                         List.init oloops.[i].Call.Length (fun j ->
-                              (iarrays.[j] |> List.map (fun x -> x.Name))
+                            (iarrays.[j] |> List.map (fun x -> x.Name))
                             @ [oarrays.[j].Name]
                             @ (iarrays.[j] |> List.map extentsName)
                             @ [String.concat "" [extentsName oarrays.[j]; "_"; oarrays.[j].Name]])
@@ -2085,7 +2082,7 @@ module Parser.Parser
                 let args =
                     let basic =
                         List.init mloops.[i].Call.Length (fun j ->
-                              (iarrays |> List.map (fun x -> x.Name))
+                            (iarrays |> List.map (fun x -> x.Name))
                             @ [oarrays.[j].Name]
                             @ (iarrays |> List.map extentsName)
                             @ [String.concat "" [extentsName oarrays.[j]; "_"; oarrays.[j].Name]])
