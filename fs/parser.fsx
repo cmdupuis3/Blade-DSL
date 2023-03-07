@@ -1638,7 +1638,6 @@ module Parser.Parser
             | Some a -> // fixed arity => specify all argument names
                 List.init numCalls (fun i ->
                     let textGenerator = CppLoopTextGenerator([], [cppOmpLine],[cppArrayDeclLine],[])
-                    String.concat "" ["omp_set_nested("; string nOmp;");\n"] ::
                     (NestedLoop.Nary oloop.iarrays.[i] oloop.oarrays.[i] oloop.GetFunc textGenerator |> fst) @
                     [match oloop.oarrays.[i].Info with
                         | Array _ -> [""]
