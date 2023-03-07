@@ -94,13 +94,30 @@ namespace nested_array_utilities {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        TYPE array = new DTYPE[extents[DEPTH] - lastIndex];
-        if constexpr (get_rank<TYPE>() > 1) {
-            for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
-                if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents, i + lastIndex);
-                } else {
-                    array[i] = allocate<DTYPE, SYMM, DEPTH+1>(extents);
+        TYPE array;        
+
+        if constexpr (SYMM && DEPTH > 0 && SYMM[DEPTH-1] == SYMM[DEPTH]) {
+            array = new DTYPE[extents[DEPTH] - lastIndex];
+            if constexpr (std::is_pointer<DTYPE>::value) {
+                for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
+                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                        array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents, i);
+                    }
+                    else {
+                        array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents);
+                    }
+                }
+            }
+        } else {
+            array = new DTYPE[extents[DEPTH]];
+            if constexpr (std::is_pointer<DTYPE>::value) {
+                for (size_t i = 0; i < extents[DEPTH]; i++) {
+                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                        array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents, i);
+                    }
+                    else {
+                        array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents);
+                    }
                 }
             }
         }
@@ -111,24 +128,47 @@ namespace nested_array_utilities {
 
     /** Recursively fill an array with random numbers, with dimensionality deduced from TYPE. */
     template<typename TYPE, const size_t SYMM[] = nullptr, const size_t DEPTH = 0>
-    constexpr auto fill_random(TYPE array_in, const size_t extents[], int mod_in, size_t lastIndex = 0) {
+    constexpr void fill_random(TYPE array_in, const size_t extents[], int mod_in, size_t lastIndex = 0) {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        if constexpr (std::is_pointer<DTYPE>::value) {
-            for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
-                if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH+1]) {
-                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in, i);
-                } else {
-                    fill_random<DTYPE, SYMM, DEPTH+1>(array_in[i], extents, mod_in);
+
+        if constexpr (SYMM && DEPTH > 0 && SYMM[DEPTH - 1] == SYMM[DEPTH]) {
+            if constexpr (std::is_pointer<DTYPE>::value) {
+                for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
+                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                        fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in, i);
+                    }
+                    else {
+                        fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in);
+                    }
                 }
             }
-        } else {
-            for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
-                array_in[i] = rand() % mod_in;
+            else {
+                for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
+                    array_in[i] = rand() % mod_in;
+                }
+            }
+        }
+        else {
+            if constexpr (std::is_pointer<DTYPE>::value) {
+                for (size_t i = 0; i < extents[DEPTH]; i++) {
+                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                        fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in, i);
+                    }
+                    else {
+                        fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in);
+                    }
+                }
+            }
+            else {
+                for (size_t i = 0; i < extents[DEPTH]; i++) {
+                    array_in[i] = rand() % mod_in;
+                }
             }
         }
 
+        return;
     }
 
     template<const size_t nindices, const size_t symmetry[]>
@@ -232,70 +272,70 @@ namespace nested_array_utilities {
         return;
     }
 
-    void test_partial_set_index(){
+   // void test_partial_set_index(){
 
-        typedef typename promote<size_t, 6>::type size_t6;
-        static constexpr const size_t ndims = get_rank<size_t6>();
-        static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
-        const size_t inds[5]  = {2, 3, 9, 0, 2};
-        constexpr const size_t ninds = extent<decltype(inds)>::value;
+   //     typedef typename promote<size_t, 6>::type size_t6;
+   //     static constexpr const size_t ndims = get_rank<size_t6>();
+   //     static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
+   //     const size_t inds[5]  = {2, 3, 9, 0, 2};
+   //     constexpr const size_t ninds = extent<decltype(inds)>::value;
 
-        const size_t exts[6] = {10, 10, 10, 10, 10, 10};
-        size_t6 arr = allocate<size_t6, symms>(exts);
+   //     const size_t exts[6] = {10, 10, 10, 10, 10, 10};
+   //     size_t6 arr = allocate<size_t6, symms>(exts);
 
-        size_t* derp = new size_t[5];
-        for (size_t i = 0; i < 5; i++) {
-            derp[i] = i;
-        }
+   //     size_t* derp = new size_t[5];
+   //     for (size_t i = 0; i < 5; i++) {
+   //         derp[i] = i;
+   //     }
 
-        set_index<size_t6, symms, size_t*>(arr, inds, derp);
-        for (size_t i = 0; i < 5; i++) {
-            cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][i] << endl;
-        }
+   //     set_index<size_t6, symms, size_t*>(arr, inds, derp);
+   //     for (size_t i = 0; i < 5; i++) {
+   //         cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][i] << endl;
+   //     }
 
-        return;
-    }
+   //     return;
+   // }
 
-   void index_test(){
+   //void index_test(){
 
-        const size_t ndims = 6;
-        const size_t inds[6]  = {2, 3, 9, 0, 1, 9};
-        const size_t inds2[6] = {9, 3, 2, 0, 9, 1};
-        static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
-        constexpr const size_t nsymms = extent<decltype(symms)>::value;
+   //     const size_t ndims = 6;
+   //     const size_t inds[6]  = {2, 3, 9, 0, 1, 9};
+   //     const size_t inds2[6] = {9, 3, 2, 0, 9, 1};
+   //     static constexpr const size_t symms[6] = {1, 1, 1, 4, 5, 5};
+   //     constexpr const size_t nsymms = extent<decltype(symms)>::value;
 
-        typedef typename promote<size_t, 6>::type size_t6;
-        const size_t exts[6] = {10, 10, 10, 10, 10, 10};
-        size_t6 arr = allocate<size_t6, symms>(exts);
+   //     typedef typename promote<size_t, 6>::type size_t6;
+   //     const size_t exts[6] = {10, 10, 10, 10, 10, 10};
+   //     size_t6 arr = allocate<size_t6, symms>(exts);
 
-                arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] = 20;
-        cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
+   //             arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] = 20;
+   //     cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
 
-        set_index<size_t6, symms, size_t>(arr, inds, 30);
-        cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
+   //     set_index<size_t6, symms, size_t>(arr, inds, 30);
+   //     cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
 
-        auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
-        cout << a << endl;
+   //     auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
+   //     cout << a << endl;
 
-        size_t* inds_folded = index_impl<ndims, symms>(inds);
+   //     size_t* inds_folded = index_impl<ndims, symms>(inds);
 
-        for (size_t i = 0; i < ndims; i++) {
-            cout << inds[i] << "\t";
-        }
-        cout << endl;
-        for (size_t i = 0; i < ndims; i++) {
-            cout << inds_folded[i] << "\t";
-        }
-        cout << endl;
+   //     for (size_t i = 0; i < ndims; i++) {
+   //         cout << inds[i] << "\t";
+   //     }
+   //     cout << endl;
+   //     for (size_t i = 0; i < ndims; i++) {
+   //         cout << inds_folded[i] << "\t";
+   //     }
+   //     cout << endl;
 
 
-        size_t* inds_justified = ljustify<ndims, symms>(inds_folded);
-        for (size_t i = 0; i < ndims; i++) {
-            cout << inds_justified[i] << "\t";
-        }
+   //     size_t* inds_justified = ljustify<ndims, symms>(inds_folded);
+   //     for (size_t i = 0; i < ndims; i++) {
+   //         cout << inds_justified[i] << "\t";
+   //     }
 
-        return;
-    }
+   //     return;
+   // }
 
 }
 
