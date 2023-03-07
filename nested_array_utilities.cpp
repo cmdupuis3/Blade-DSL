@@ -253,6 +253,7 @@ namespace nested_array_utilities {
             cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][i] << endl;
         }
 
+        return;
     }
 
    void index_test(){
@@ -270,13 +271,13 @@ namespace nested_array_utilities {
                 arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] = 20;
         cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
 
-        set_index<size_t6, size_t, symms, nsymms, ndims>(arr, inds, 30);
+        set_index<size_t6, symms, size_t>(arr, inds, 30);
         cout << arr[inds[0]][inds[1]-inds[0]][inds[2]-inds[1]][inds[3]][inds[4]][inds[5]-inds[4]] << endl;
 
         auto a = index<size_t6, symms, nsymms, ndims>(arr, inds2);
         cout << a << endl;
 
-        size_t* inds_folded = index_impl<ndims, nsymms, symms>(inds);
+        size_t* inds_folded = index_impl<ndims, symms>(inds);
 
         for (size_t i = 0; i < ndims; i++) {
             cout << inds[i] << "\t";
@@ -293,6 +294,7 @@ namespace nested_array_utilities {
             cout << inds_justified[i] << "\t";
         }
 
+        return;
     }
 
 }
