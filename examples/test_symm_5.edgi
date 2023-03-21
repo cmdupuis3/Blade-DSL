@@ -1,0 +1,51 @@
+
+#include <cmath>
+#include <ctime>
+#include <iostream>
+using std::cout;
+using std::endl;
+
+#include "nested_array_utilities.cpp"
+using namespace nested_array_utilities;
+
+#define OMP_NUM_THREADS 10
+
+#pragma edgi function(add10) arity(1) input(in1) iranks(0) output(out) otype(float) orank(0) ompLevels(2)
+{
+    out = in1 + 10;
+}
+
+
+static constexpr const size_t extents7[7] = {10,10,10,10,10,10,5000};
+
+int main() {
+
+    clock_t start;
+    start = clock();
+
+    #pragma edgi array symmetry(1,1,1,1,1,6,7)
+    float^7 a1(extents7);
+
+    cout << "Input allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+
+    typedef promote<float, 7>::type float7;
+
+    start = clock();
+    fill_random<float7, a1_symm>(a1, extents7, 7);
+    cout << "Random fill took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+
+    start = clock();
+    auto oloop = object_for(add10);
+    res = oloop(a1)(extents7);
+
+    cout << "Calculation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+/*
+    for (int k = 0; k < 5; k++){
+        for (int l = 0; l < 5; l++){
+            cout << res[k][l] << "\t";
+        }
+        cout << endl;
+    }
+*/
+    return 0;
+}
