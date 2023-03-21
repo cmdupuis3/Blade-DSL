@@ -18,10 +18,12 @@ NC_INCLUDES="-I/usr/include/"
 BLADE_ROOT=`pwd`
 mkdir exec
 
+
 # Step 1: compile nested_funcs.c
 pushd $BLADE_ROOT/src
 gcc nested_funcs.c -o $BLADE_ROOT/exec/nested_funcs.so --std=c11 -fPIC -shared $NC_INCLUDES $NC_LIBS
 popd
+
 
 # Step 2: compile parser.fsx and run parser on user file
 pushd $BLADE_ROOT/exec
@@ -61,18 +63,18 @@ $DOTNET_PATH/dotnet run
 
 popd
 
+
 # Step 3: compile intermediate file with nested_array_utilities.cpp
 
 cp $BLADE_ROOT/src/nested_array_utilities.cpp .
-g++ nested_array_utilities.cpp blade.cpp -fopenmp -std=c++17 -O3 -o "$OUT_FILE_NAME.x" $NC_INCLUDES $NC_LIBS
+g++ nested_array_utilities.cpp blade.cpp -fopenmp -std=c++17 -O3 -o $OUT_FILE_NAME $NC_INCLUDES $NC_LIBS
 
-cp blade.x $USER_PWD
+cp $OUT_FILE_NAME $BLADE_ROOT
 popd
 
-popd
 
 # Step 4: run executable
-./blade.x
+# ./$OUT_FILE_NAME
 
 
 
