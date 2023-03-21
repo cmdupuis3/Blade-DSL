@@ -69,7 +69,7 @@ mkdir exec
 pushd exec
 cp $USER_PWD/$OUT_FILE_NAME .
 cp ~/tmp2/blade/EDGI_nested_iterators/nested_array_utilities.cpp .
-g++ nested_array_utilities.cpp $OUT_FILE_NAME -fopenmp -std=c++17 -o blade.x $NC_INCLUDES $NC_LIBS
+g++ nested_array_utilities.cpp $OUT_FILE_NAME -fopenmp -std=c++17 -O3 -o blade.x $NC_INCLUDES $NC_LIBS
 
 cp blade.x $USER_PWD
 popd
