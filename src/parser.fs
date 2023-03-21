@@ -1987,7 +1987,7 @@ module Parser.Parser
                         | Some _ ->
                             List.init oloops.[i].Call.Length (fun j ->
                                 match oarrays.[j].Info with
-                                | Array _ -> failwith "impossibru!"
+                                | Array _ -> failwith "impossible"
                                 | NetCDF info ->
                                     let func = oloops.[i].GetFunc
                                     let iLevels = ((iarrays.[j] |> List.map (fun x -> x.Rank)), func.IRank) ||> List.map2 (-)
@@ -2093,7 +2093,7 @@ module Parser.Parser
                             List.init mloops.[i].Call.Length (fun j ->
                                 let fileName, varName =
                                     match oarrays.[j].Info with
-                                    | Array _ -> failwith "impossibru! 2"
+                                    | Array _ -> failwith "impossible 2"
                                     | NetCDF info -> info.FileName, info.VariableName
 
                                 let func = mloops.[i].funcs.[j]
@@ -2189,18 +2189,34 @@ module Parser.Parser
         let loopNames = (oloops |> List.map (fun x -> x.Name)) @ (mloops |> List.map (fun x -> x.Name))
         let deleteLoopLines = loopNames |> List.map (fun x -> List.filter (fun (y:string) -> not (y.Contains x))) |> List.reduce (>>)
 
-        let symmLines =
-            (oloops |> List.map (fun x -> x.oarrays |> symmVecLines))
-            @ (mloops |> List.map (fun x -> x.oarrays |> symmVecLines))
-            |> List.reduce (@)
-            |> List.distinct
+        let addOSymmLines tokens =
+
+            let rec addOSymmLines' tokens ind max =
+                match tokens with
+                | [] -> max
+                | Token.Symbol '#' :: Token.Str "include" :: tail -> addOSymmLines' tail (ind+2) ind
+                | Token.Symbol '#' :: Token.Str "define"  :: tail -> addOSymmLines' tail (ind+2) ind
+                | Token.Str "using" :: tail -> addOSymmLines' tail (ind+1) ind
+                | head :: tail -> addOSymmLines' tail (ind+1) max
+            let last = addOSymmLines' tokens 0 -1
+            let nextNewln = last + (tokens.[last..] |> List.findIndex (fun x -> x = Token.NewLine))
+
+            let oSymmLines =
+                (oloops |> List.map (fun x -> x.oarrays |> symmVecLines))
+                @ (mloops |> List.map (fun x -> x.oarrays |> symmVecLines))
+                |> List.reduce (@)
+                |> List.distinct
+                |> List.map tokenize
+                |> List.reduce (@)
+
+            tokens.[..nextNewln] @ oSymmLines @ tokens.[(nextNewln+1)..]
 
         tokens
+        |> addOSymmLines
         |> (swap 0 callBounds
             >> substitute
             >> (fun x -> "#include <omp.h>\n" :: x)
             >> (fun x -> "#include <string>\nusing std::string;\n" :: x)
-            >> (fun x -> symmLines @ x)
             >> List.filter (fun x -> not (x.Contains "object_for"))
             >> List.filter (fun x -> not (x.Contains "method_for"))
             >> deleteLoopLines
