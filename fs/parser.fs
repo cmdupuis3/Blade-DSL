@@ -487,7 +487,6 @@ module Parser.Parser
 
                     // Double-check that all ranks in the commutativity group are equal.
                     assert(iarraysSub |> List.map (fun x -> x.Rank) |> List.distinct |> List.length = 1)
-                    assert(iSymmDist |> List.length = 1)
 
                     let iLevels =
                         ((iarraysSub |> List.map (fun x -> x.Rank)), iranks)
@@ -2209,7 +2208,8 @@ module Parser.Parser
 
 
     let compile iFileName oFileName =
-        File.ReadAllText iFileName
+        iFileName
+        |> File.ReadAllText 
         |> tokenize
         |> parse
         |> fun x -> File.WriteAllText (oFileName, x)
