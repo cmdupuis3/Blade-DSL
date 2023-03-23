@@ -1,0 +1,79 @@
+
+#include <cmath>
+#include <ctime>
+#include <iostream>
+using std::cout;
+using std::endl;
+
+#include "nested_array_utilities.cpp"
+using namespace nested_array_utilities;
+
+#define OMP_NUM_THREADS 8
+
+#pragma edgi function(add10) arity(8) input(in1,in2,in3,in4,in5,in6,in7,in8) iranks(0,0,0,0,0,0,0,0) output(out) otype(float) orank(0) ompLevels(1,0,0,0,0,0,0,0) commutativity(1,1,1,1,1,1,1,8)
+{
+    out = in1 + in2 + in3 + in4 + in5 + in6 + in7 + in8;
+}
+
+
+static constexpr const size_t extents1[1] = {16};
+static constexpr const size_t extents0[0] = {};
+
+int main() {
+
+    clock_t start;
+    start = clock();
+
+    #pragma edgi array
+    float^1 a1(extents1);
+
+    #pragma edgi array
+    float^1 a2(extents1);
+
+    #pragma edgi array
+    float^1 a3(extents1);
+
+    #pragma edgi array
+    float^1 a4(extents1);
+
+    #pragma edgi array
+    float^1 a5(extents1);
+
+    #pragma edgi array
+    float^1 a6(extents1);
+
+    #pragma edgi array
+    float^1 a7(extents1);
+
+    #pragma edgi array
+    float^1 a8(extents1);
+
+    cout << "Allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+
+    typedef promote<float, 1>::type float1;
+
+    fill_random<float1>(a1, extents1, 10);
+    fill_random<float1>(a2, extents1, 10);
+    fill_random<float1>(a3, extents1, 10);
+    fill_random<float1>(a4, extents1, 10);
+    fill_random<float1>(a5, extents1, 10);
+    fill_random<float1>(a6, extents1, 10);
+    fill_random<float1>(a7, extents1, 10);
+    fill_random<float1>(a8, extents1, 10);
+
+    start = clock();
+    auto oloop = object_for(add10);
+    res = oloop(a1, a1, a1, a1, a1, a1, a1, a8)(extents0);
+
+    cout << "Calculation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+/*
+    for (int k = 0; k < 5; k++){
+        for (int l = 0; l < 5; l++){
+            cout << res[k][l] << "\t";
+        }
+        cout << endl;
+    }
+*/
+    return 0;
+}
+
