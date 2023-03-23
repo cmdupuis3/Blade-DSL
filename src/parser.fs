@@ -1959,7 +1959,6 @@ module Parser.Parser
                 |> List.findIndex (fun z -> z = Token.Symbol ';')
                 |> (+) y
             )
-        let callBounds = (FPositions, LPositions) ||> List.map2 (fun f l -> seq{f..l})
 
         let oloopCallSwaps =
             List.init oloops.Length (fun i ->
@@ -2175,16 +2174,16 @@ module Parser.Parser
 
         let callSwaps = (oloopCallSwaps @ mloopCallSwaps) |> List.reduce (@) |> List.map tokenize
 
-        let rec swap (position: int) (bounds: seq<int> list) (tokens: Token list) : Token list =
-            match tokens with
-            | [] -> []
-            | head :: tail ->
-                if FPositions |> List.contains position then
-                    let i = FPositions |> List.findIndex (fun x -> x = position)
-                    let mask = Seq.concat [seq{0 .. (i-1)}; seq{(i+1) .. (bounds.Length)}] |> Seq.toList
-                    callSwaps.[i] @ swap (position+1) (List.init (bounds.Length - 1) (fun i -> bounds.[mask.[i]])) tail
-                else
-                    head :: swap (position+1) bounds tail
+        let bounds = (FPositions, LPositions) ||> List.zip
+        let rec swap (bounds: (int * int) list) (callSwaps: Token list list) (tokens: Token list) : Token list = 
+            if tokens.IsEmpty then [] else
+                match bounds, callSwaps with
+                | [], [] -> tokens
+                | boundsHead :: boundsTail, swapsHead :: swapsTail ->
+                    let f, l = boundsHead
+                    let swapped = tokens[0..f] @ swapsHead @ tokens[(l+1)..tokens.Length]
+                    swap boundsTail swapsTail swapped
+        let swap = swap bounds callSwaps
 
         let loopNames = (oloops |> List.map (fun x -> x.Name)) @ (mloops |> List.map (fun x -> x.Name))
         let deleteLoopLines = loopNames |> List.map (fun x -> List.filter (fun (y:string) -> not (y.Contains x))) |> List.reduce (>>)
@@ -2213,7 +2212,7 @@ module Parser.Parser
 
         tokens
         |> addOSymmLines
-        |> (swap 0 callBounds
+        |> (swap
             >> substitute
             >> (fun x -> "#include <omp.h>\n" :: x)
             >> (fun x -> "#include <string>\nusing std::string;\n" :: x)
