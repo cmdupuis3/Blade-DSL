@@ -503,7 +503,11 @@ module Parser.Parser
                 let symmsMaxs = symms |> List.map (fun x -> List.max x)
                 let symmsMins = symms |> List.map (fun x -> List.min x)
                 symms |> List.mapi (fun i symm ->
-                    let start = if i = 0 then 0 else symmsMaxs.[0..(i-1)] |> List.reduce (+)
+                    let start = 
+                        if i = 0 then 0 else 
+                            symmsMaxs.[0..(i-1)] 
+                            |> List.map ((+) 1) 
+                            |> List.reduce (+)
                     symm
                     |> List.map (fun x -> x - symmsMins.[i] + start + 1)
                 )
