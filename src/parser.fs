@@ -2211,9 +2211,9 @@ module Parser.Parser
             tokens.[..nextNewln] @ oSymmLines @ tokens.[(nextNewln+1)..]
 
         tokens
+        |> swap
         |> addOSymmLines
-        |> (swap
-            >> substitute
+        |> (substitute
             >> (fun x -> "#include <omp.h>\n" :: x)
             >> (fun x -> "#include <string>\nusing std::string;\n" :: x)
             >> List.filter (fun x -> not (x.Contains "object_for"))
