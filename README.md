@@ -1,6 +1,6 @@
 # Blade DSL
 
-Blade DSL is a C++ extension created to support simple expression of complex array-oriented problems, while maximizing parallel performance.
+Blade DSL is an experimental C++ extension created to support simple expression of complex array-oriented problems, while maximizing parallel performance.
 
 Blade DSL was created for two main reasons:
   - To enable application of a higher-than-unary function to multiple sets of arrays of different ranks without worrying about rewriting the iteration patterns.
