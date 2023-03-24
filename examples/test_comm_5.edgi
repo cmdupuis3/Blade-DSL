@@ -1,9 +1,12 @@
 
 #include <cmath>
-#include <ctime>
 #include <iostream>
 using std::cout;
 using std::endl;
+#include <chrono>
+
+#define TIME std::chrono::high_resolution_clock::now()
+#define TIME_DIFF std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()
 
 #include "nested_array_utilities.cpp"
 using namespace nested_array_utilities;
@@ -21,8 +24,7 @@ static constexpr const size_t extents0[0] = {};
 
 int main() {
 
-    clock_t start;
-    start = clock();
+    auto start = TIME;
 
     #pragma edgi array
     float^1 a1(extents1);
@@ -48,7 +50,9 @@ int main() {
     #pragma edgi array
     float^1 a8(extents1);
 
-    cout << "Allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+    auto end = TIME;
+    double diff = 1e-9 * TIME_DIFF;
+    cout << "Input Allocation took " << diff << "s" << endl << endl;
 
     typedef promote<float, 1>::type float1;
 
@@ -61,19 +65,14 @@ int main() {
     fill_random<float1>(a7, extents1, 10);
     fill_random<float1>(a8, extents1, 10);
 
-    start = clock();
+    start = TIME;
     auto oloop = object_for(add10);
     res = oloop(a1, a1, a1, a1, a1, a6, a7, a8)(extents0);
+    end = TIME;
+    diff = 1e-9 * TIME_DIFF;
 
-    cout << "Calculation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
-/*
-    for (int k = 0; k < 5; k++){
-        for (int l = 0; l < 5; l++){
-            cout << res[k][l] << "\t";
-        }
-        cout << endl;
-    }
-*/
+    cout << "Calculation took " << diff << "s" << endl << endl;
+    
     return 0;
 }
 
