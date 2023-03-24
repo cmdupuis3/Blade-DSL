@@ -1,9 +1,12 @@
 
 #include <cmath>
-#include <ctime>
 #include <iostream>
 using std::cout;
 using std::endl;
+#include <chrono>
+
+#define TIME std::chrono::high_resolution_clock::now()
+#define TIME_DIFF std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()
 
 #include "nested_array_utilities.cpp"
 using namespace nested_array_utilities;
@@ -20,32 +23,30 @@ static constexpr const size_t extents7[7] = {10,10,10,10,10,10,5000};
 
 int main() {
 
-    clock_t start;
-    start = clock();
+    auto start = TIME;
 
     #pragma edgi array symmetry(1,1,1,1,1,6,7)
     float^7 a1(extents7);
 
-    cout << "Input allocation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+    auto end = TIME;
+    double diff = 1e-9 * TIME_DIFF;
+    cout << "Input Allocation took " << diff << "s" << endl << endl;
 
     typedef promote<float, 7>::type float7;
 
-    start = clock();
+    start = TIME;
     fill_random<float7, a1_symm>(a1, extents7, 7);
-    cout << "Random fill took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
+    end = TIME;
+    diff = 1e-9 * TIME_DIFF;
+    cout << "Random fill took " << diff << "s" << endl << endl;
 
-    start = clock();
+    start = TIME;
     auto oloop = object_for(add10);
     res = oloop(a1)(extents7);
+    end = TIME;
+    diff = 1e-9 * TIME_DIFF;
 
-    cout << "Calculation took " << (clock() - start) / ((float)CLOCKS_PER_SEC) << "s" << endl << endl;
-/*
-    for (int k = 0; k < 5; k++){
-        for (int l = 0; l < 5; l++){
-            cout << res[k][l] << "\t";
-        }
-        cout << endl;
-    }
-*/
+    cout << "Calculation took " << diff << "s" << endl << endl;
+    
     return 0;
 }
