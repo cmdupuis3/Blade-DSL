@@ -33,10 +33,6 @@ using std::extent;
 using std::remove_pointer;
 using std::is_pointer;
 
-#include <iostream>
-using std::cout;
-using std::endl;
-
 // Helper functions (must be constexpr)
 
 namespace nested_array_utilities {
