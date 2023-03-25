@@ -33,6 +33,10 @@ using std::extent;
 using std::remove_pointer;
 using std::is_pointer;
 
+#include <iostream>
+using std::cout;
+using std::endl;
+
 // Helper functions (must be constexpr)
 
 namespace nested_array_utilities {
@@ -89,16 +93,15 @@ namespace nested_array_utilities {
 
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
-        TYPE array;        
+        TYPE array;
 
-        if constexpr (SYMM && DEPTH > 0 && SYMM[DEPTH-1] == SYMM[DEPTH]) {
+        if constexpr ((bool)SYMM && DEPTH > 0 && SYMM[DEPTH-1] == SYMM[DEPTH]) {
             array = new DTYPE[extents[DEPTH] - lastIndex];
             if constexpr (std::is_pointer<DTYPE>::value) {
                 for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
-                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
-                        array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents, i);
-                    }
-                    else {
+                    if constexpr ((bool)SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                        array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents, i + lastIndex);
+                    } else {
                         array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents);
                     }
                 }
@@ -107,10 +110,9 @@ namespace nested_array_utilities {
             array = new DTYPE[extents[DEPTH]];
             if constexpr (std::is_pointer<DTYPE>::value) {
                 for (size_t i = 0; i < extents[DEPTH]; i++) {
-                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                    if constexpr ((bool)SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
                         array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents, i);
-                    }
-                    else {
+                    } else {
                         array[i] = allocate<DTYPE, SYMM, DEPTH + 1>(extents);
                     }
                 }
@@ -128,13 +130,12 @@ namespace nested_array_utilities {
         typedef typename remove_pointer<TYPE>::type DTYPE;
 
 
-        if constexpr (SYMM && DEPTH > 0 && SYMM[DEPTH - 1] == SYMM[DEPTH]) {
+        if constexpr ((bool)SYMM && DEPTH > 0 && SYMM[DEPTH - 1] == SYMM[DEPTH]) {
             if constexpr (std::is_pointer<DTYPE>::value) {
                 for (size_t i = 0; i < extents[DEPTH] - lastIndex; i++) {
-                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
-                        fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in, i);
-                    }
-                    else {
+                    if constexpr ((bool)SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                        fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in, i + lastIndex);
+                    } else {
                         fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in);
                     }
                 }
@@ -148,10 +149,9 @@ namespace nested_array_utilities {
         else {
             if constexpr (std::is_pointer<DTYPE>::value) {
                 for (size_t i = 0; i < extents[DEPTH]; i++) {
-                    if constexpr (SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
+                    if constexpr ((bool)SYMM && SYMM[DEPTH] == SYMM[DEPTH + 1]) {
                         fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in, i);
-                    }
-                    else {
+                    } else {
                         fill_random<DTYPE, SYMM, DEPTH + 1>(array_in[i], extents, mod_in);
                     }
                 }
