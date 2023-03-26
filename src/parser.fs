@@ -154,6 +154,9 @@ module Parser.Parser
     let brace x =
         [String.concat " " [x; "{\n"]] @ ["}\n"]
 
+    let stringCollapse (sep: string) =
+        List.reduce (fun acc elem -> String.concat sep [acc; elem])
+
     /// Generate all text for a single nested loop (language agnostic).
     /// <param name="outerNested"> A list of functions for generating nested lines outside the loop line, based on a template. </param>
     /// <param name="innerNested"> A list of functions for generating nested lines inside the loop line, based on a template. </param>
@@ -179,7 +182,7 @@ module Parser.Parser
 
     /// Generates a single "for(...)" statement.
     /// <param name="iName"> Iterator name. </param>
-    /// <param name="iMin"> Iterator minimum name. </param>
+    /// <param name="iMin"> Iterator minimum names. </param>
     /// <param name="extentName"> Extent vector name. </param>
     /// <param name="extentIndex"> Element of extent vector to use as iterator maximum. </param>
     let cppLoopLine iName iMin extentName extentIndex =
@@ -290,14 +293,14 @@ module Parser.Parser
 
         /// For each element, finds whether it's the same as the previous.
         /// <param name="elements"> A vector. </param>
-        let rec private isSame (elements: 'a list) =
+        let rec  isSame (elements: 'a list) =
             List.init elements.Length (fun i -> if i = 0 then false else elements.[i] = elements.[i-1])
 
         /// Finds the states of all the input variables, given symmetry and commutativity vectors.
         /// <param name="arrayNames"> List of variable names. </param>
         /// <param name="symGroups"> A list of symmetry vectors. </param>
         /// <param name="comGroups"> A commutativity vector. </param>
-        let rec private vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
+        let rec  vStates (arrayNames: string list) (symGroups: int list list) (comGroups: int list) =
             let symModes = symGroups |> List.map isSame
             let comModes = comGroups |> isSame
             //let sameArray = arrayNames |> isSame
@@ -314,7 +317,7 @@ module Parser.Parser
         // let states = vStates ["arr1"; "arr2"; "arr2"] [[1;1]; [1;2;2]; [1;2;2]] [1;2;2];;
 
         /// Create a map of iterator minima
-        let private iminMap (states: SymcomState list list) =
+        let  iminMap (states: SymcomState list list) =
             List.init states.Length (fun i ->
                 List.init states.[i].Length (fun j ->
                     match states.[i].[j] with
@@ -328,7 +331,7 @@ module Parser.Parser
         /// Rearrange a table of functions ("items") to fold differently for commutative functions
         /// <param name="states"> List of symmetry/commutativity states for each unary nested iterator. </param>
         /// <param name="items"> Table of functions to reorganize; takes a counter and an input and returns an output of the same type as the input </param>
-        let private swap (states: SymcomState list list) (items: (int -> 'a -> 'a) list list) =
+        let  swap (states: SymcomState list list) (items: (int -> 'a -> 'a) list list) =
             /// <param name="acc"> A counter threaded through all functions. </param>
             let rec swap' (states: SymcomState list list) (acc: int) (items: (int -> 'a -> 'a) list list) =
                 match states with
@@ -344,12 +347,12 @@ module Parser.Parser
             swap' (List.rev states) 0 (List.rev items)
 
         /// Autogenerate a unary nested_for loop.
-        let private unaryLoop (loop: Loop) (textGenerator: LoopTextGenerator) (i: int) =
+        let  unaryLoop (loop: Loop) (textGenerator: LoopTextGenerator) (i: int) =
             List.init loop.iarrayLevels (fun j inner-> textGenerator.Text loop i j inner)
             |> List.rev
 
         /// Autogenerate an N-ary nested_for loop.
-        let private naryLoop (loops: Loop list) (states: SymcomState list list) (textGenerator: LoopTextGenerator) =
+        let  naryLoop (loops: Loop list) (states: SymcomState list list) (textGenerator: LoopTextGenerator) =
             List.init states.Length (fun i ->
                 unaryLoop loops.[i] textGenerator i
                 |> List.map (fun y (acc: int) -> y)
@@ -359,7 +362,7 @@ module Parser.Parser
         /// Substitute the first string with the second in a list of strings
         /// <param name="subs"> A list of substitution pairs; find the first, swap the second in. </param>
         /// <param name="text"> The text to be substituted. </param>
-        let private subInner (subs: (string * string) list) (inner: string list) =
+        let  subInner (subs: (string * string) list) (inner: string list) =
             let rec subInner' (subs: (string * string) list) (str: string) =
                 match subs with
                 | []           -> str
@@ -395,14 +398,31 @@ module Parser.Parser
                 if ranks.IsEmpty then [] else indNames' min (min+ranks.Head) :: indNames (min+ranks.Head) ranks.Tail
             let indexNames = indNames 0 iLevels
 
-            /// Chooses the correct iterator minimum for all input variables.
+            /// Chooses the correct iterator minima for all input variables.
             let imins =
                 let iMaps = iminMap states
+
+                let rec path ij =
+                    let i, j = ij
+                    if iMaps.[i].[j] = (i, j) then [] else
+                        iMaps.[i].[j] :: path iMaps.[i].[j]
+
+                let iminsPath =
+                    List.init iLevels.Length (fun m ->
+                        List.init iLevels.[m] (fun n ->
+                            path (m, n)
+                        )
+                    )
+
                 List.init iLevels.Length (fun i ->
                     List.init iLevels.[i] (fun j ->
-                        if iMaps.[i].[j] = (i, j) then textGenerator.Zero else indexNames.[fst iMaps.[i].[j]].[snd iMaps.[i].[j]]
+                        if iminsPath.[i].[j].IsEmpty then textGenerator.Zero else
+                            iminsPath.[i].[j] 
+                            |> List.map (fun x -> indexNames.[fst x].[snd x])
+                            |> stringCollapse " - "
                     )
                 )
+
 
             /// Last input array intermediate names to be subbed into the inner block
             let lastINames =
@@ -526,31 +546,31 @@ module Parser.Parser
             oSymms @ (func.TDimSymm |> List.map ((+) (List.max oSymms)))
 
 
-        let private fileIDname (name: string) =
+        let  fileIDname (name: string) =
             String.concat "" [name; "_file_ncid"]
 
-        let private variableIDname (name: string) =
+        let  variableIDname (name: string) =
             String.concat "" [name; "_var_ncid"]
 
-        let private startsName (name: string) =
+        let  startsName (name: string) =
             String.concat "" [name; "_starts"]
 
-        let private countsName (name: string) =
+        let  countsName (name: string) =
             String.concat "" [name; "_counts"]
 
-        let private indicesName (name: string) =
+        let  indicesName (name: string) =
             String.concat "" [name; "_indices"]
 
-        let private dimIDnames (name: string) =
+        let  dimIDnames (name: string) =
             String.concat "" [name; "_dim_ncids"]
 
-        let private dimVarIDnames (name: string) =
+        let  dimVarIDnames (name: string) =
             String.concat "" [name; "_dim_var_ncids"]
 
-        let private dimNames (name: string) =
+        let  dimNames (name: string) =
             String.concat "" [name; "_dim_names"]
 
-        let private dimValsNames (name: string) (rank: int) =
+        let  dimValsNames (name: string) (rank: int) =
             List.init rank (fun i -> String.concat "" [name; "_dim_"; string i; "_vals"])
 
         /// Autogenerate an N-ary nested_for loop
@@ -873,9 +893,6 @@ module Parser.Parser
         | Reconcat (head, tail) -> head :: (reconcat tail)
         | head :: tail -> [String.concat "" (head :: tail)]
         | [] -> []
-
-    let stringCollapse (sep: string) =
-        List.reduce (fun acc elem -> String.concat sep [acc; elem])
 
     /// Pragma clause type; a tuple of the clause name and a list of arguments
     type Clause = string * Token list
@@ -2225,7 +2242,8 @@ module Parser.Parser
             >> deleteLoopLines
             >> stringCollapse "")
 
-
+    // let iFileName = "/home/username/tmp3/Blade-DSL/examples/test_comm_7.edgi"
+    // let tokens = iFileName |> File.ReadAllText |> tokenize
     let compile iFileName oFileName =
         iFileName
         |> File.ReadAllText 
