@@ -65,23 +65,23 @@ template<> void add10<float, 1, nullptr, float, 1, nullptr, float, 1, nullptr, f
 			promote<float, 0>::type in2__i1 = in2[__i1];
 			size_t __i2 = 0;
 			
-			for(__i2 = 0; __i2 < in3_extents[0] - __i1; __i2++) {
+			for(__i2 = 0; __i2 < in3_extents[0] - __i1 - __i0; __i2++) {
 				promote<float, 0>::type in3__i2 = in3[__i2];
 				size_t __i3 = 0;
 				
-				for(__i3 = 0; __i3 < in4_extents[0] - __i2; __i3++) {
+				for(__i3 = 0; __i3 < in4_extents[0] - __i2 - __i1 - __i0; __i3++) {
 					promote<float, 0>::type in4__i3 = in4[__i3];
 					size_t __i4 = 0;
 					
-					for(__i4 = 0; __i4 < in5_extents[0] - __i3; __i4++) {
+					for(__i4 = 0; __i4 < in5_extents[0] - __i3 - __i2 - __i1 - __i0; __i4++) {
 						promote<float, 0>::type in5__i4 = in5[__i4];
 						size_t __i5 = 0;
 						
-						for(__i5 = 0; __i5 < in6_extents[0] - __i4; __i5++) {
+						for(__i5 = 0; __i5 < in6_extents[0] - __i4 - __i3 - __i2 - __i1 - __i0; __i5++) {
 							promote<float, 0>::type in6__i5 = in6[__i5];
 							size_t __i6 = 0;
 							
-							for(__i6 = 0; __i6 < in7_extents[0] - __i5; __i6++) {
+							for(__i6 = 0; __i6 < in7_extents[0] - __i5 - __i4 - __i3 - __i2 - __i1 - __i0; __i6++) {
 								promote<float, 0>::type in7__i6 = in7[__i6];
 								size_t __i7 = 0;
 								
@@ -161,19 +161,10 @@ end=TIME;
 diff=1e-9*TIME_DIFF;
 cout<<"Output Allocation took "<<diff<<"s"<<endl<<endl;
 start=TIME;
-
 add10<float,1,nullptr,float,1,nullptr,float,1,nullptr,float,1,nullptr,float,1,nullptr,float,1,nullptr,float,1,nullptr,float,1,nullptr,float,8,res_symm>(a1,a1,a1,a1,a1,a1,a1,a8,res,extents1,extents1,extents1,extents1,extents1,extents1,extents1,extents1,extents0_res);
 end=TIME;
 diff=1e-9*TIME_DIFF;
 cout<<"Calculation took "<<diff<<"s"<<endl<<endl;
-/*
-for(int k=0;k<5;k++){
-for(int l=0;l<5;l++){
-cout<<res[k][l]<<"\t";
-}
-cout<<endl;
-}
-*/
 return 0;
 }
 

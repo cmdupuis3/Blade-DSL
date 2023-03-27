@@ -65,7 +65,7 @@ template<> void add10<float, 1, nullptr, float, 1, nullptr, float, 1, nullptr, f
 			promote<float, 0>::type in2__i1 = in2[__i1];
 			size_t __i2 = 0;
 			
-			for(__i2 = 0; __i2 < in3_extents[0] - __i1; __i2++) {
+			for(__i2 = 0; __i2 < in3_extents[0] - __i1 - __i0; __i2++) {
 				promote<float, 0>::type in3__i2 = in3[__i2];
 				size_t __i3 = 0;
 				

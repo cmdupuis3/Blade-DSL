@@ -42,7 +42,7 @@ template<> void add10<float, 7, a1_symm, float, 7, res_symm>(
 			promote<float, 5>::type in1__i1 = in1__i0[__i1];
 			size_t __i2 = 0;
 			
-			for(__i2 = 0; __i2 < in1_extents[2] - __i1; __i2++) {
+			for(__i2 = 0; __i2 < in1_extents[2] - __i1 - __i0; __i2++) {
 				promote<float, 4>::type in1__i2 = in1__i1[__i2];
 				size_t __i3 = 0;
 				
