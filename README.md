@@ -10,7 +10,7 @@ Blade DSL syntax is heavily inspired by functional languages, and applies some f
 
 ## Using / "Installing"
 
-Blade DSL requires compilers for C++ and F#. Also, the NetCDF library is currently required, but in the future it will be optional for non-NetCDF core functionalities. It is recommended to use a Linux OS with Microsoft's [Dotnet](https://dotnet.microsoft.com/en-us/download) framework installed, along with the latest versions of GCC and [NetCDF](https://downloads.unidata.ucar.edu/netcdf/). At this time, Blade DSL runs with F# 6.0. In testing, F# 7.0 was found to cause compilation errors, so if that continues to occur, F# 6.0 is recommended instead. C11 and C++17 are the standards of C and C++ used here.
+Blade DSL requires compilers for C++ and F#. Also, the NetCDF library is currently required, but in the future it will be optional for non-NetCDF core functionalities. It is recommended to use a Linux OS with Microsoft's [Dotnet](https://dotnet.microsoft.com/en-us/download) framework installed, along with the latest versions of GCC and [NetCDF](https://downloads.unidata.ucar.edu/netcdf/). At this time, Blade DSL runs with F# 6.0. In testing, F# 7.0 was found to cause compilation errors, so if that continues to occur, F# 6.0 is recommended instead. C11 and C++17 are the standards of C and C++ used here. Note that Blade DSL *cannot* be compiled with msvc (I.e., Visual Studio) because it does not have adequate OpenMP support.
 
 Different parts of Blade DSL are compiled in stages, which requires a somewhat unintuitive build system. An example bash script is provided as an example of how to compile a valid Blade DSL file into an executable, although we can safely say it won't be winning any beauty contests. 
 
