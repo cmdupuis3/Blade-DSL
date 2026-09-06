@@ -1,0 +1,10 @@
+// TEST: Gram Explicit Cast Shares Element Type
+// ============================================================================
+// The green companion to 256: the refusal there is not a dead end, it is a
+// redirection to the cast. `Float64(C)` lifts elementwise over the array, so
+// the contraction runs at one named width and the source says which.
+let C: Array<Float32 like Idx<1>, Idx<2>> = [[1.0, 2.0]]
+let D: Array<Float64 like Idx<1>, Idx<2>> = [[3.0, 4.0]]
+let Cd = Float64(C)
+let H = gram(Cd, D)
+// EXPECT: H = [[11]]

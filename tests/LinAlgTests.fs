@@ -231,16 +231,16 @@ let private emissionCases : (string * bool * string * string list * string list)
        "let G = gram(A, A)\n",
        [ "__gacc" ],
        [ shimInclude; "blade_linalg::"; "cblas_" ])
-      // MIXED precisions decline rather than promote: BLAS has no mixed-width
-      // routine, and silently widening an operand would be a storage change the
-      // caller never asked for. The native loops promote per Blade's own
-      // element rules, which is exactly what a decline falls back to.
-      ("mixed_precision_gram_distinct_declines", true,
-       "let A: Array<Float64 like Idx<3>, Idx<2>> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]\n" +
-       "let B: Array<Float32 like Idx<4>, Idx<2>> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]\n" +
-       "let G = gram(A, B)\n",
-       [ "__gacc" ],
-       [ shimInclude; "blade_linalg::"; "cblas_" ])
+      // MIXED precisions never reach the router at all: `gram` REFUSES
+      // operands whose element types differ (rejectionCases below), because
+      // Blade has explicit numeric casts and an implicit widening inside a
+      // contraction would change the arithmetic without naming the
+      // conversion. Once a cast has made the pair agree there is nothing
+      // mixed left to decline, so this is a typecheck rule and not a routing
+      // one. The earlier version of this case asserted that mixed precision
+      // compiled and fell back to the native loops -- but the emitter
+      // converted neither operand, so `complex<float> * double` and
+      // double-products-into-a-float-accumulator went to g++ instead.
       // NO GRATUITOUS DEPENDENCY SURFACE. A program with no linalg route must
       // not name the header at all — the include is collector-driven, not
       // unconditional, even though the file itself is deployed unconditionally.
@@ -724,7 +724,17 @@ let runLinAlgEmissionTests () : BlockResult =
            matmulHeader
            + "let A: Array<Int64 like Idx<2>, Idx<2>> = [[1, 2], [3, 4]]\n"
            + "let C = m.matmul(A, A)\n",
-           elemGateMsg) ]
+           elemGateMsg)
+          // gram's element-type rule, stated where matmul's lives. The old
+          // rule chose a RESULT width ("the complex operand, else the left
+          // one") and converted neither operand, so a mixed pair typechecked
+          // and then died in g++. Refusing sends the user to the explicit
+          // cast, which is the one pathway that names the conversion.
+          ("gram_rejects_mixed_precision_operands",
+           "let A: Array<Float64 like Idx<3>, Idx<2>> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]\n"
+           + "let B: Array<Float32 like Idx<4>, Idx<2>> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]\n"
+           + "let G = gram(A, B)\n",
+           "must share one element type") ]
     for (name, src, expectedFragment) in rejectionCases do
         // Gate ON, so a decline can only be about the ELEMENT TYPE.
         match cppOf true name src with

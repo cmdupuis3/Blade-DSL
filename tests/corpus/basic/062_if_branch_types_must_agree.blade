@@ -1,0 +1,20 @@
+// TEST: If Branch Types Must Agree (rejects)
+// ERROR: BL3001
+// ============================================================================
+// The two branches of an `if` must already share a type. Blade has explicit
+// numeric casts, and those are the licensed widening pathway (see 063); an
+// implicit promotion at a site whose whole job is to CHOOSE between two
+// values would convert one of them without the source ever saying so.
+//
+// A LITERAL DOES NOT ADAPT HERE. Both branches are inferred independently,
+// so this `10` is an Int64 beside a Float64 and the pair is refused: write
+// `10.0`. Adaptation belongs where a type is being checked against (an
+// ascription, a declared parameter); an `if` has no expected type to push
+// down, and taking one from whichever branch came first is exactly the
+// order-dependence this check removes.
+//
+// The old arm discarded its branch unification and typed the node from the
+// then-branch, so `if c then 2.5 else n` compiled to a C++ ternary that
+// widened `n` silently, while the reverse order died inside g++ as a
+// narrowing conversion with no Blade diagnostic at all.
+let x = if false then 2.5 else 10

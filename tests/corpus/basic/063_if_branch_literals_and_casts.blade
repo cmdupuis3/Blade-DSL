@@ -1,0 +1,14 @@
+// TEST: If Branch Literals And Casts
+// ============================================================================
+// The green companion to 062: what the refusal there asks you to write.
+// Branches that already agree are accepted in either order, and an explicit
+// cast names a widening at the point it happens.
+let a = if false then 2.5 else 10.0
+let b = if true then 10.0 else 2.5
+let n = 3
+let c = if true then Float64(n) else 2.5
+let i = if false then 1 else 2
+// EXPECT: a = 10
+// EXPECT: b = 10
+// EXPECT: c = 3
+// EXPECT: i = 2

@@ -1259,54 +1259,29 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
          else unify env.Subst (IRTScalar ETBool) tCond.Type) |> Result.bind (fun () ->
         inferExpr env thenBr |> Result.bind (fun tThen ->
         inferExpr env elseBr |> Result.bind (fun tElse ->
-            // The branches agree, SYMMETRICALLY. `unify` is directional for
-            // numeric widths (a Float64 slot accepts an Int64 literal, not
-            // the reverse), so a failed first try is retried the other way
-            // round and the result takes the accepting branch's type --
-            // otherwise `if c then 10 else 2.5` depended on branch order,
-            // and the losing order was not refused at all: the discarded
-            // unify failure left the node typed Int64 over a 2.5, which g++
-            // rejected as a narrowing conversion.
-            match unify env.Subst tThen.Type tElse.Type with
-            | Ok () -> Ok (mkTyped (TExprIf (tCond, tThen, tElse)) tThen.Type)
-            | Error e1 ->
-                match unify env.Subst tElse.Type tThen.Type with
-                | Ok () -> Ok (mkTyped (TExprIf (tCond, tThen, tElse)) tElse.Type)
-                | Error _ ->
-                    // NUMERIC BRANCHES PROMOTE the way `+`'s operands do
-                    // (inferArithType's join; BL3020 for a converted
-                    // NON-literal, silence for a literal), and the converted
-                    // branch becomes an EXPLICIT cast node so both lanes
-                    // widen it identically rather than the C++ ternary
-                    // doing so behind the interpreter's back. Anything else
-                    // -- a unit-carrying branch, an array, two ints of
-                    // different width -- keeps the refusal.
-                    let scalarElem (t: TypedExpr) =
-                        match env.Subst.Resolve t.Type with
-                        | IRTScalar et -> Some et
-                        | _ -> None
-                    let numeric = function
-                        | ETInt32 | ETInt64 | ETFloat32 | ETFloat64 | ETComplex64 | ETComplex128 -> true
-                        | _ -> false
-                    let isInt = function ETInt32 | ETInt64 -> true | _ -> false
-                    match scalarElem tThen, scalarElem tElse with
-                    | Some te, Some ee when numeric te && numeric ee && not (isInt te && isInt ee) ->
-                        let join =
-                            match IR.promoteElemType te ee with
-                            | Some (ETComplex64 | ETComplex128 as c) -> Some c
-                            | _ ->
-                                if te = ETFloat64 || ee = ETFloat64 then Some ETFloat64
-                                elif te = ETFloat32 || ee = ETFloat32 then Some ETFloat32
-                                else None
-                        (match join with
-                         | Some j ->
-                             warnImplicitNumericMix env thenBr.Span elseBr.Span tThen tElse
-                             let widen (t: TypedExpr) (et: ElemType) =
-                                 if et = j then t
-                                 else mkTyped (TExprUnaryOp (OpCast (castNameOf j), t)) (IRTScalar j)
-                             Ok (mkTyped (TExprIf (tCond, widen tThen te, widen tElse ee)) (IRTScalar j))
-                         | None -> Error e1)
-                    | _ -> Error e1))))
+            // THE BRANCHES MUST ALREADY SHARE A TYPE. Blade has explicit
+            // numeric casts (`Float64(n)`), and those are the one licensed
+            // widening pathway: an implicit promotion here would convert a
+            // value the source never asked to convert, at a site whose whole
+            // job is to choose between two values. Refusing is also what
+            // makes the two lanes agree -- an accepted mixed pair would be
+            // widened by the C++ ternary, which the interpreter cannot see.
+            //
+            // This result used to be DISCARDED and the node typed from the
+            // then-branch, so acceptance depended on branch order: one order
+            // emitted a silently-widening ternary and the other died in g++
+            // as a narrowing conversion, with no Blade diagnostic either way.
+            //
+            // A NUMERIC LITERAL DOES NOT ADAPT HERE, and that is deliberate.
+            // Both branches are inferred independently, so the `10` in
+            // `if c then 2.5 else 10` is an Int64 and the pair is refused;
+            // write `10.0`. Literal adaptation happens where a type is being
+            // CHECKED against (an ascription, a declared parameter), and an
+            // `if` has no such expected type to push down -- inventing one
+            // from whichever branch was written first is the order-dependence
+            // above.
+            unify env.Subst tThen.Type tElse.Type |> Result.map (fun () ->
+                mkTyped (TExprIf (tCond, tThen, tElse)) tThen.Type)))))
 
     // ---- Tuple ----
     | ExprKind.ExprTuple exprs ->
@@ -3389,52 +3364,35 @@ and inferGram (env: TypeEnv) leftE rightE : TypeResult<TypedExpr> =
                 if innerMismatch then
                     Error (Other "gram(A, B): the contracted (trailing) dimensions of A and B must match.")
                 else
-                // ONE element type for the contraction, by PROMOTION -- the
-                // same table `*` uses (IR.promoteElemType), with the same
-                // BL3020 warning mixed arithmetic gives a converted operand.
-                // The old join picked "the complex one, else the left one",
-                // a choice of RESULT width that converted nothing: Complex64
-                // against Float64 checked clean and failed in g++
-                // (`complex<float> * double` has no overload), and Float32
-                // against Float64 accumulated a double product into a float
-                // (g++: float-conversion). Now the operands are cast to the
-                // join in the emitted loop (materializeGramForm's mulTerm)
-                // and the interpreter narrows through the joined width.
-                // Units are stripped first -- they combine through
-                // `unitRulesForOp` below -- and an open element variable is
-                // simply bound (a `T^2` pair stays generic). A pair the table
-                // cannot join (a Bool, a struct) keeps the unify refusal.
+                // ONE element type, both operands, and the operands must
+                // ALREADY agree on it. The old rule picked "the complex one,
+                // else the left one", which chose a RESULT width and
+                // converted nothing: a Complex64 A against a Float64 B
+                // checked clean and then failed in g++ (`complex<float> *
+                // double` has no overload), and a Float32 A against a
+                // Float64 B accumulated double products into a float
+                // accumulator. Blade has explicit numeric casts
+                // (`Float64(B)`, which lifts elementwise over an array), and
+                // those are the licensed widening pathway: an implicit
+                // promotion inside a contraction would change the arithmetic
+                // the caller wrote without naming the conversion anywhere.
+                // Units are stripped first, since they combine through
+                // `unitRulesForOp` below; an open element variable is simply
+                // bound, so a `T^2` pair stays generic.
                 let isComplexElem (t: IRType) =
                     match stripUnits t with
                     | IRTScalar (ETComplex64 | ETComplex128) -> true
                     | _ -> false
-                let lBare = env.Subst.Resolve (stripUnits lTy.ElemType)
-                let rBare = env.Subst.Resolve (stripUnits rTy.ElemType)
-                let promoted =
-                    match unify env.Subst lBare rBare with
-                    | Ok () -> Ok None
-                    | Error e ->
-                        match lBare, rBare with
-                        | IRTScalar le, IRTScalar re ->
-                            (match IR.promoteElemType le re with
-                             | Some j -> Ok (Some j)
-                             | None -> Error e)
-                        | _ -> Error e
-                match promoted with
-                | Error e -> Error e
-                | Ok promotedElem ->
-                    (match promotedElem with
-                     | Some _ -> warnImplicitNumericMix env leftE.Span rightE.Span tL tR
-                     | None -> ())
+                match unify env.Subst (stripUnits lTy.ElemType) (stripUnits rTy.ElemType) with
+                | Error _ ->
+                    Error (Other (sprintf "gram(A, B): the operands must share one element type, got %A and %A. Convert one operand explicitly (e.g. `Float64(B)` / `Complex128(A)`, which lift elementwise) so the contraction's width is named in the source." (env.Subst.Resolve (stripUnits lTy.ElemType)) (env.Subst.Resolve (stripUnits rTy.ElemType))))
+                | Ok () ->
                     // The contraction sum_k A[i][k]*conj(B[j][k]) is
                     // multiplicative, so the result's unit signature follows
                     // `*`'s rule (unitMul when both sides carry one, nominal
                     // dropped one-sided; conj never changes a unit) and is
-                    // re-attached to the joined bare type.
-                    let outBare =
-                        match promotedElem with
-                        | Some j -> IRTScalar j
-                        | None -> env.Subst.Resolve (stripUnits lTy.ElemType)
+                    // re-attached to the agreed bare type.
+                    let outBare = env.Subst.Resolve (stripUnits lTy.ElemType)
                     let isComplex = isComplexElem outBare
                     unitRulesForOp OpMul (getUnits lTy.ElemType) (getUnits rTy.ElemType) |> Result.bind (fun outUnit ->
                     let outElem =
