@@ -69,7 +69,7 @@ let freezeIdiomEnabled () =
 // budget, freeze if done early, never abort. Same analysis, same break,
 // different contract, chosen by spelling.
 //
-// Soundness demands two shape checks, both CONSERVATIVE (any unrecognized
+// Soundness demands three shape checks, all CONSERVATIVE (any unrecognized
 // node declines recognition rather than guessing):
 //   - the else-arm is EXACTLY `prefix(n - 1)` (the whole previous slice --
 //     an else that repairs, decays, or reads deeper lags is a live arm, not
@@ -77,7 +77,21 @@ let freezeIdiomEnabled () =
 //   - the guard's prefix reads are all at lag 1, and it references neither
 //     the step ordinal outside those reads (a guard varying with `n`
 //     independently of the trajectory is NOT absorbing: `n < k` flips on
-//     its own) nor the bare prefix family.
+//     its own) nor the bare prefix family;
+//   - every call the guard makes is to a PURE scalar intrinsic (the caller
+//     decides which names qualify -- see `calleeAdmissible` below). The
+//     skipped guard evaluations are only repeats if evaluating the guard
+//     changes nothing: a guard that calls a helper with a `mut` parameter
+//     mutates its own input, so its first false answer is not absorbing
+//     (plan-fortran-killer-2.md appendix A: `if tick(counter) then ...`
+//     froze the trajectory at 1 and dropped six of seven `tick` calls), and
+//     a helper that prints or aborts has effects the freeze would drop even
+//     when its value would repeat. A user-declared function -- pure or not
+//     -- therefore declines today: this seam sees names, not resolved
+//     bodies, and an invariant NAME does not make a call repeatable. The
+//     P0 follow-up (plan-fortran-killer-2.md section 3) is to keep the
+//     candidate and discharge purity against the typed callee, which would
+//     re-admit provably pure helpers.
 
 /// `e` is syntactically `<stepVar> - 1`.
 let private isStepMinusOne (stepVar: Ident) (e: Expr) : bool =
@@ -99,12 +113,16 @@ let private isPrevSliceRead (prefixVar: Ident) (stepVar: Ident) (e: Expr) : bool
 
 /// Guard admissibility: every read of the prefix is at lag 1, the step
 /// ordinal appears ONLY inside those lag expressions, the prefix family is
-/// never referenced bare, and the whole guard is built from the shapes a
-/// convergence predicate uses (literals, variables, arithmetic/comparison/
-/// boolean operators, unary ops, applications, ascriptions). Anything else
-/// -- a lambda, a block, a match -- declines recognition conservatively.
-let rec private guardAdmissible (prefixVar: Ident) (stepVar: Ident) (e: Expr) : bool =
-    let ok = guardAdmissible prefixVar stepVar
+/// never referenced bare, every ordinary call's head satisfies
+/// `calleeAdmissible` (a pure scalar intrinsic that is not user-shadowed --
+/// the caller supplies the judgment because the name table lives in
+/// TypeEnv, downstream of this file), and the whole guard is built from the
+/// shapes a convergence predicate uses (literals, variables, arithmetic/
+/// comparison/boolean operators, unary ops, applications, ascriptions).
+/// Anything else -- a lambda, a block, a match, a call to a user function
+/// -- declines recognition conservatively.
+let rec private guardAdmissible (calleeAdmissible: string -> bool) (prefixVar: Ident) (stepVar: Ident) (e: Expr) : bool =
+    let ok = guardAdmissible calleeAdmissible prefixVar stepVar
     match e.Kind with
     | ExprLit _ -> true
     | ExprVar v -> v <> stepVar && v <> prefixVar
@@ -128,9 +146,13 @@ let rec private guardAdmissible (prefixVar: Ident) (stepVar: Ident) (e: Expr) : 
                   && restFirst |> List.forall ok
                   && deeper |> List.forall (List.forall ok)
               | _ -> false)
-         | ExprVar fn when fn <> stepVar ->
-             // An ordinary call (abs, sqrt, a named helper): the head name
-             // is loop-invariant; the arguments carry the discipline.
+         | ExprVar fn when fn <> stepVar && fn <> prefixVar && calleeAdmissible fn ->
+             // An ordinary call to a pure intrinsic (abs, sqrt, exp, a
+             // numeric cast): evaluating it again on the same inputs gives
+             // the same value and changes nothing, so the skipped
+             // evaluations really are repeats. The arguments carry the
+             // lag discipline. Any other head -- a user function, a
+             // shadowed intrinsic -- fails `calleeAdmissible` and declines.
              argLists |> List.forall (List.forall ok)
          | _ -> false)
     | _ -> false
@@ -139,7 +161,11 @@ let rec private guardAdmissible (prefixVar: Ident) (stepVar: Ident) (e: Expr) : 
 /// repartition it into the guarded best-effort form. Returns None (leave the
 /// definition alone -- it still compiles and still means the same thing) for
 /// anything that is not exactly the idiom.
-let recognizeFreezeIdiom (def: RecArrayDef) : RecArrayDef option =
+///
+/// `calleeAdmissible name` is the caller's judgment that a plain call to
+/// `name` is pure and repeatable (TypeCheck passes "is a scalar intrinsic
+/// and not user-bound"); the guard may call nothing else.
+let recognizeFreezeIdiom (calleeAdmissible: string -> bool) (def: RecArrayDef) : RecArrayDef option =
     if not (freezeIdiomEnabled ()) then None else
     match def.Guard with
     | Some _ -> None
@@ -147,7 +173,7 @@ let recognizeFreezeIdiom (def: RecArrayDef) : RecArrayDef option =
         match def.SliceExpr.Kind with
         | ExprIf (g, stepExpr, elseExpr) when
                 isPrevSliceRead def.PrefixVar def.StepVar elseExpr
-                && guardAdmissible def.PrefixVar def.StepVar g ->
+                && guardAdmissible calleeAdmissible def.PrefixVar def.StepVar g ->
             Some { def with Guard = Some g; SliceExpr = stepExpr }
         | _ -> None
 

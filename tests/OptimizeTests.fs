@@ -75,6 +75,59 @@ let private ordinalGuardDeclines =
     + "    | prefix :: n -> prefix :: (if n < 5 then prefix(n - 1) * 2.0 else prefix(n - 1))\n"
     + "let last = ys(9)\n"
 
+/// A guard that CALLS a user function with a `mut` parameter. The call
+/// mutates the guard's own input, so its first false answer is not
+/// absorbing: run to budget, the counter climbs and the guard flips back
+/// true; recognized, the trajectory froze at 1 and six of seven `tick`
+/// calls vanished (plan-fortran-killer-2.md appendix A). Recognition must
+/// decline any non-intrinsic callee -- pure or not, this seam sees names.
+let private effectfulGuardDeclines =
+    "type C = Idx<1>\n"
+    + "type It = Idx<8>\n"
+    + "function tick(c: mut Array<Float like C>) -> Bool = {\n"
+    + "    c((0 : C)) += 1.0\n"
+    + "    c((0 : C)) > 2.0\n"
+    + "}\n"
+    + "let mut counter: Array<Float like C> = [0.0]\n"
+    + "let rec xs: Array<Float like It> =\n"
+    + "    match xs with\n"
+    + "    | zero -> zero\n"
+    + "    | zero :: s -> zero :: 1.0\n"
+    + "    | prefix :: n -> prefix :: (if tick(counter) then prefix(n - 1) + 1.0 else prefix(n - 1))\n"
+    + "let last = xs((7 : It))\n"
+    + "let calls = counter((0 : C))\n"
+
+/// The same shape with a PURE user helper in the guard. Semantically this
+/// freeze would be sound, but the recognizer cannot tell `residual` from
+/// `tick` by name, so it must decline here too until callee purity is
+/// discharged against the typed body (the P0 follow-up). Pinning the
+/// decline keeps that limitation visible; re-admitting it is a deliberate
+/// change to this line, not drift.
+let private pureHelperGuardDeclines =
+    "type It = Idx<30>\n"
+    + "let tol = 0.000000001\n"
+    + "function residual(x: Float) -> Float = abs(x * x - 2.0)\n"
+    + "let rec xs: Array<Float like It> =\n"
+    + "    match xs with\n"
+    + "    | zero -> zero\n"
+    + "    | zero :: s -> zero :: 1.0\n"
+    + "    | prefix :: n -> prefix :: (if residual(prefix(n - 1)) > tol then (prefix(n - 1) + 2.0 / prefix(n - 1)) * 0.5 else prefix(n - 1))\n"
+    + "let root = xs(29)\n"
+
+/// A guard whose `abs` is SHADOWED by a user binding of the same name. The
+/// intrinsic spelling no longer means the intrinsic, so the callee test must
+/// consult the scope, not the name table alone.
+let private shadowedIntrinsicGuardDeclines =
+    "type It = Idx<30>\n"
+    + "let tol = 0.000000001\n"
+    + "function abs(x: Float) -> Float = if x < 0.0 then 0.0 - x else x\n"
+    + "let rec xs: Array<Float like It> =\n"
+    + "    match xs with\n"
+    + "    | zero -> zero\n"
+    + "    | zero :: s -> zero :: 1.0\n"
+    + "    | prefix :: n -> prefix :: (if abs(prefix(n - 1) * prefix(n - 1) - 2.0) > tol then (prefix(n - 1) + 2.0 / prefix(n - 1)) * 0.5 else prefix(n - 1))\n"
+    + "let root = xs(29)\n"
+
 // ---------------------------------------------------------------------------
 
 let private runCase (name: string) (src: string) (wantBreaks: int) (wantAborts: int) =
@@ -99,7 +152,12 @@ let runOptimizeTests () =
           // The `while` spelling keeps its contract: break AND abort.
           runCase "while_spelling_break_and_abort" whileSpelling 1 1
           // Not absorbing -> declined: no break, no abort, full budget.
-          runCase "ordinal_guard_declines" ordinalGuardDeclines 0 0 ]
+          runCase "ordinal_guard_declines" ordinalGuardDeclines 0 0
+          // A guard that calls a user function declines -- effectful,
+          // provably pure, or an intrinsic name the program shadows.
+          runCase "effectful_guard_declines" effectfulGuardDeclines 0 0
+          runCase "pure_helper_guard_declines" pureHelperGuardDeclines 0 0
+          runCase "shadowed_intrinsic_guard_declines" shadowedIntrinsicGuardDeclines 0 0 ]
     let passed = results |> List.filter id |> List.length
     let failed = results.Length - passed
     printFooter "Optimization Layer" [$"{passed} passed"; $"{failed} failed"]

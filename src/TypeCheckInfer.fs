@@ -10284,8 +10284,24 @@ and inferRecArray (env: TypeEnv) (annot: TypeExpr) (annotTy: IRType) (def: RecAr
     // running the budget out. Recognition happens here, not at IR level,
     // because this is the last seam where the idiom's declarative shape
     // still exists.
+    //
+    // The guard may CALL only pure scalar intrinsics the program has not
+    // shadowed -- the math table (exp/sqrt/...), abs and the complex
+    // accessors, the binary/ternary intrinsics (atan2, log_base, fma) and
+    // the numeric casts (`Float64(x)`). `lookupVar` is the same shadowing
+    // test the intrinsic arms of inferExpr apply. A user-declared helper
+    // declines: its body may mutate a `mut` argument, print, or abort, and
+    // the skipped evaluations would then not be repeats (Optimize.fs has
+    // the reproducer). Re-admitting provably pure helpers is the P0
+    // follow-up in plan-fortran-killer-2.md section 3.
+    let pureIntrinsicCallee (name: string) : bool =
+        (lookupVar name env).IsNone
+        && (isUnaryIntrinsic name
+            || isBinaryIntrinsic name
+            || Blade.GradCommon.isTernaryMathIntrinsic name
+            || (castTargetOf name).IsSome)
     let def, guardIsBestEffort =
-        match Blade.Optimize.recognizeFreezeIdiom def with
+        match Blade.Optimize.recognizeFreezeIdiom pureIntrinsicCallee def with
         | Some recognized -> recognized, true
         | None -> def, false
     let synAt k = mkExpr span k
