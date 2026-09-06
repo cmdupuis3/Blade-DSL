@@ -143,6 +143,7 @@ final-newline fixing — these are byte-pinned assets; never auto-reformat them.
 | `BLADE_MEMCHECK` | non-`0` → ASan-instrumented Debug profile (clang64 preferred, MSVC fallback) |
 | `BLADE_OMP_THREADS` | `1`/`0`/`off` **suppresses OMP pragma emission**; runtime thread count is plain `OMP_NUM_THREADS` |
 | `BLADE_FP_REASSOC` | `1`/`on` licenses reassociated (lane-parallel) fold codegen |
+| `BLADE_AD_HALO_GATHER` | reverse-mode rule for a `halo` stencil map: unset/`1` keeps the map and emits the GATHER adjoint (default); `0`/`off` lowers it into the construction loop and scatters. Same function either way; `blade test access` compares the two byte-for-byte |
 | `BLADE_MARCH` / `BLADE_FP_CONTRACT` | g++ `-march=` (default `native`) / `-ffp-contract=` (default `fast`) |
 | `BLADE_STDLIB` | extra stdlib search root |
 | `NETCDF_DIR` | NetCDF provider include/link root |

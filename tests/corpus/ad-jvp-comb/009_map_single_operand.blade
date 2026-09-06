@@ -20,6 +20,5 @@ function f(a: Array<Float like I>) -> Float = {
 let (v, t) = ad.jvp(f)([1.0, 2.0, 3.0], [1.0, 1.0, 1.0])
 // The reduce lowering reads the mapped array with a plain loop counter,
 // which is untagged against the operand's index type.
-// WARN: BL4003
 // EXPECT: v = 14
 // EXPECT: t = 12

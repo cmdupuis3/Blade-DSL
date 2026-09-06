@@ -252,6 +252,21 @@ let internal errMode = ref "grad"
 let internal err (fname: string) (msg: string) : Result<'a, string> =
     Error $"{errMode.Value}({fname}): {msg}"
 
+/// Route selector for the reverse-mode halo stencil rule (docs/plans/
+/// structural/02, section 3.3). ON (the default): the map is KEPT and its
+/// adjoint is the gather -- one guarded loop per (array, offset) the kernel
+/// reads. OFF: the map lowers into the construction loop like any other
+/// eager map and its adjoint scatters. The two are the same function; the
+/// harness (tests/AccessTests.fs) runs both and compares the outputs
+/// byte-for-byte. Read per call, never cached, so that toggle works.
+let internal haloGatherEnabled () : bool =
+    match System.Environment.GetEnvironmentVariable "BLADE_AD_HALO_GATHER" with
+    | null | "" -> true
+    | s ->
+        match s.Trim().ToLowerInvariant() with
+        | "0" | "off" | "false" | "no" -> false
+        | _ -> true
+
 // Kernel-shape refusal wording, spoken by more than one site.
 //
 // `asKernelLambda` (further down) decides what counts as a kernel and

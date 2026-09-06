@@ -1,0 +1,21 @@
+// TEST: JVP Halo One-Sided Lag Set Extent
+// The forward-mode twin of ad/032: a one-sided offset set `[-2, -4]` whose
+// reach is {-4, ..., 0} (the centre is always readable), so the interior is
+// 4 of the 8 cells, not 6. The tangent lane's static extent of a halo
+// traversal used to be `max - min` over the DECLARED offsets -- right only
+// when 0 is among them -- and its reduce over the tangent map ran two cells
+// past the buffer here. Now read off the halo access record.
+// v = a4*a2 + a5*a3 + a6*a4 + a7*a5 = 122; with an all-ones seed the tangent
+// is the gradient's sum: [0, 0, 5, 6, 10, 12, 5, 6] -> 44.
+import ad as ad
+
+type T = Idx<8>
+
+function f(a: Array<Float like T>) -> Float = {
+    let d = method_for(halo<T, [-2, -4]>) <@> lambda(w) -> a(w(0)) * a(w(-2)) |> compute
+    reduce(d, (+))
+}
+
+let (v, t) = ad.jvp(f)([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+// EXPECT: v = 122
+// EXPECT: t = 44

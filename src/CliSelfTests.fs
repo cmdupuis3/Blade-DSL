@@ -2343,6 +2343,12 @@ let rec internal dispatchTest (rest: string list) : int =
         // Pure lowering + codegen, no toolchain.
         let failed = (Blade.Tests.FlatPathTests.runFlatPathTests ()).Failed
         if failed = 0 then 0 else 1
+    | [ "access" ] ->
+        // The halo access record and the reverse-mode halo route
+        // differential: gather vs scatter, byte-for-byte on the same
+        // programs. Emission pins run everywhere; the differential needs g++.
+        let failed = (Blade.Tests.AccessTests.runAccessTests ()).Failed
+        if failed = 0 then 0 else 1
     | [ "optimize" ] ->
         // The semantic-equivalence layer's emission pins: freeze-idiom
         // recognition derives the break without the abort, `while` keeps

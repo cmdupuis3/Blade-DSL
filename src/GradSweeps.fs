@@ -296,6 +296,76 @@ let rec internal adjointOf (rc: RevCtx) (e: Expr) (cot: Expr) : Result<NStmt lis
 /// from the shape of `value`: only the identity reader may reach the gram arm.
 let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: string) (value: Expr) : Result<NStmt list, string> option =
     let ctx = rc.Ctx
+    // ROUTE G (docs/plans/structural/02, 3.3): the reverse rule of a
+    // sole-halo stencil map is a GATHER. The kernel body is differentiated
+    // ONCE against a symbolic interior ordinal i and a cotangent cell c;
+    // every accumulation it produces targets either a windowed cell
+    // `__g_x(i + K)` (K static, by the admissibility test) or a captured
+    // scalar. Per (x, K), one loop over the INPUT ordinal j collects the
+    // cotangent of output ordinal i = j - K WHEN that window exists: the
+    // boundary is ZeroOutside -- outside [0, M) there is no window and the
+    // cell is left as it is (the `else` re-assigns the same value; a `+ 0.0`
+    // would not be the same, it flips a signed zero). The loops run in
+    // DESCENDING K, the order the scatter would have written each cell in,
+    // so the two routes accumulate in the same order and agree bitwise.
+    // Scalar accumulators collect in one loop over the output ordinals.
+    let haloGather (h: Blade.Types.HaloAccess) (n: int) (wname: string) (kbody: Expr) : Result<NStmt list, string> =
+        let m = n - int h.Shrink
+        let i = fresh ctx "__hi"
+        let j = fresh ctx "__hj"
+        let c = fresh ctx "__hc"
+        substWindowReads rc.Fname wname h (v i) kbody |> Result.bind (fun body' ->
+        adjointOf rc body' (v c) |> Result.bind (fun adj ->
+        let temps = adj |> List.choose (function NLet (nm, mt, e) -> Some (nm, mt, e) | _ -> None)
+        let assigns = adj |> List.choose (function NAssign (t, rhs) -> Some (t, rhs) | _ -> None)
+        let windowTarget (t: Expr) =
+            match t.Kind with
+            | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar g },
+                                [ { Kind = ExprKind.ExprBinOp (_, OpAdd, { Kind = ExprKind.ExprVar i' }, { Kind = ExprKind.ExprLit (LitInt k) }) } ])
+                    when i' = i -> Some (g, int k)
+            | _ -> None
+        let addend (rhs: Expr) =
+            match rhs.Kind with
+            | ExprKind.ExprBinOp (_, OpAdd, _, t) -> Some t
+            | _ -> None
+        let isScalarTarget (t: Expr) = match t.Kind with ExprKind.ExprVar _ -> true | _ -> false
+        let malformed =
+            adj |> List.exists (function NFor _ -> true | _ -> false)
+            || assigns |> List.exists (fun (t, rhs) ->
+                   match windowTarget t with
+                   | Some _ -> (addend rhs).IsNone
+                   | None -> not (isScalarTarget t))
+        if malformed then
+            err rc.Fname "internal: the halo gather rule met an adjoint shape its admissibility test should have declined -- please report it"
+        else
+        let cotRead = syn (ExprApp (v (dName xname), [ v i ]))
+        let inRange =
+            syn (ExprBinOp (Elementwise, OpAnd,
+                            syn (ExprBinOp (Elementwise, OpLe, iLit 0L, v i)),
+                            syn (ExprBinOp (Elementwise, OpLt, v i, iLit (int64 m)))))
+        let letOf (nm: string) (e: Expr) =
+            StmtLet { Mutability = BindLet; Pattern = synPat (PatVar nm); Type = None; Value = e }
+        let tempLets = temps |> List.map (fun (nm, _, e) -> letOf nm e)
+        let gathers =
+            assigns
+            |> List.choose (fun (t, rhs) ->
+                windowTarget t |> Option.bind (fun (g, k) -> addend rhs |> Option.map (fun a -> (g, k, a))))
+            |> List.sortByDescending (fun (_, k, _) -> k)
+            |> List.map (fun (g, k, a) ->
+                let cell = syn (ExprApp (v g, [ v j ]))
+                let collected = syn (ExprBlock (letOf c cotRead :: tempLets, Some (add cell a)))
+                NFor (j, iLit 0L, iLit (int64 n),
+                      [ NLet (i, false, sub (v j) (iLit (int64 k)))
+                        NAssign (cell, syn (ExprIf (inRange, collected, cell))) ]))
+        let scalars = assigns |> List.filter (fun (t, _) -> isScalarTarget t)
+        let scalarLoop =
+            if scalars.IsEmpty then []
+            else
+                [ NFor (i, iLit 0L, iLit (int64 m),
+                        NLet (c, false, cotRead)
+                        :: (temps |> List.map (fun (nm, mt, e) -> NLet (nm, mt, e)))
+                        @ (scalars |> List.map NAssign)) ]
+        Ok (gathers @ scalarLoop)))
     let accumInto (aname: string) (mkIdx: Expr list -> Expr list) (dims: int list) (cotAt: Expr list -> Expr) =
         if Set.contains aname rc.Diff then
             accumLoop ctx dims (fun idx -> syn (ExprApp (v (dName aname), mkIdx idx))) cotAt
@@ -396,6 +466,10 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
     // dispatch: only takes over for the combinator forms; literals and
     // scalar expressions keep their existing arms
     match value.Kind with
+    | _ when haloGatherEnabled () && (haloGatherPlan ctx (fun n -> Map.tryFind n rc.LoopBindings) value).IsSome ->
+        (match haloGatherPlan ctx (fun n -> Map.tryFind n rc.LoopBindings) value, Map.tryFind xname denv with
+         | Some (h, n, w, kbody), Some [ _ ] -> Some (haloGather h n w kbody)
+         | _ -> Some (err rc.Fname "internal: a halo stencil local reached the reverse sweep without its rank-1 shape -- please report it"))
     | ExprKind.ExprVar _ when Set.contains xname rc.Arrays ->
         // array ALIAS: cotangent flows whole-buffer (grad refused this
         // before C6 because no adjoint existed; now one does)

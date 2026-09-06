@@ -388,6 +388,10 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
                           | ExprKind.ExprPure _ | ExprKind.ExprCompute _
                           | ExprKind.ExprSort _ | ExprKind.ExprSequence _
                           | ExprKind.ExprReplicate _ } when Map.containsKey n dimsEnv -> None
+                 // A sole-halo stencil map the gather route kept (its dims
+                 // come from the surface literals; its flow is the gather
+                 // arm of GradSweeps.adjointOfInit).
+                 | { Kind = ExprKind.ExprBinOp (_, OpApply, _, _) } when Map.containsKey n dimsEnv -> None
                  // The `pure`/`compute`/annotation wrappers are transparent
                  // to WHICH combinator this is, so the specific arms below
                  // look through them: `a <|:> b |> compute` parses with the

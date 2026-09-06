@@ -53,6 +53,10 @@ let internal elemUnitOf (ctx: Ctx) (t: TypeExpr) : UnitExpr option =
 type private MapSlot = {
     Axes: int list
     Readers: (Expr list -> Expr) list
+    /// A halo slot: the reader hands its parameter the INTERIOR ordinal, and
+    /// the kernel body's window reads `w(k)` are rewritten against it rather
+    /// than the parameter being substituted (GradExpand.substWindowReads).
+    Window: Blade.Types.HaloAccess option
 }
 
 /// Statements that are pure loop-object / kernel PLUMBING: `let L =
@@ -110,6 +114,52 @@ let private literalIdxExtent (ctx: Ctx) (t: TypeExpr) : int option =
 /// the emitted AST is proportional to the iteration space. Past this the
 /// refusal names the size rather than letting the compiler grind.
 let private maxLoweredCells = 65536
+
+/// ROUTE G admissibility (docs/plans/structural/02, 3.3): a sole-halo
+/// stencil map whose reverse rule is the GATHER. Direct spelling with a
+/// literal `Idx<n>` inner and literal offsets; a plain rank-0 lambda kernel
+/// with no `where`; and a READ DISCIPLINE -- the window is read only as the
+/// sole subscript of an array read `x(w(k))` with k literal, never passed to
+/// a user function -- so every cotangent target the kernel's adjoint
+/// produces is `__g_x(i + K)` with K static, and the gather's inverse is
+/// exact. Anything else falls to the construction-loop lowering (route S),
+/// which scatters and needs none of this.
+let internal haloGatherPlan (ctx: Ctx) (resolve: string -> Expr option) (value: Expr)
+    : (Blade.Types.HaloAccess * int * string * Expr) option =
+    match soleHaloOfWith resolve value with
+    | Some (inner, offs, kern) when (match kern.Kind with ExprKind.ExprLambda _ -> true | _ -> false) ->
+        (match haloAccessOfSurface ctx inner offs, asKernelLambda ctx kern with
+         | Some (h, n), Ok ([ p ], None, kbody, None)
+                 when n - int h.Shrink >= 0
+                      && (match p.Type |> Option.map (resolveTy ctx) with
+                          | Some (TyVar (_, Some r)) -> r = 0
+                          | Some (TyAbstractArray _) | Some (TyArray _) -> false
+                          | _ -> true) ->
+             let w = p.Name
+             let isCombinatorOp op =
+                 match op with
+                 | OpApply | OpBind | OpParallel | OpFusion | OpArrayProd | OpFunctor | OpChoice
+                 | OpComposeObj | OpComposeMeth | OpCompose | OpCons -> true
+                 | _ -> false
+             let rec ok (e: Expr) : bool =
+                 match e.Kind with
+                 | ExprKind.ExprLit _ -> true
+                 | ExprKind.ExprVar n -> n <> w
+                 // the one admitted window read: `x(w(k))`, k literal
+                 | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar f },
+                                     [ { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar w' }, [ off ]) } ])
+                         when w' = w && f <> w && not (Map.containsKey f ctx.Decls) ->
+                     (literalOffsetOf off).IsSome
+                 | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar f }, args) when f <> w && not (Map.containsKey f ctx.Decls) ->
+                     args |> List.forall ok
+                 | ExprKind.ExprApp _ -> false
+                 | ExprKind.ExprBinOp (_, op, l, r) -> not (isCombinatorOp op) && ok l && ok r
+                 | ExprKind.ExprUnaryOp (_, x) | ExprKind.ExprTyped (x, _) -> ok x
+                 | ExprKind.ExprIf (c, t, f) -> ok c && ok t && ok f
+                 | _ -> false
+             if ok kbody then Some (h, n, w, kbody) else None
+         | _ -> None)
+    | _ -> None
 
 /// Lower an EAGER map pipeline into the element-write construction loop the
 /// reverse sweep already differentiates:
@@ -184,6 +234,9 @@ let internal expandEagerMap (fname: string) (ctx: Ctx)
     // plumbing. Lowering it would replace an Int iota with a Float buffer and
     // strand `SortPermForm`, which recognizes the surface shape.
     | IndexIota -> Ok None
+    // ROUTE G keeps the map: its reverse rule is the gather in
+    // GradSweeps.adjointOfInit, and it replays verbatim in the forward half.
+    | MapApplyWith resolveLoop _ when haloGatherEnabled () && (haloGatherPlan ctx resolveLoop core).IsSome -> Ok None
     | MapApplyWith resolveLoop mv ->
         let refuse (m: string) : Result<(Stmt list * int list) option, string> = err fname m
         let kernE =
@@ -240,14 +293,14 @@ let internal expandEagerMap (fname: string) (ctx: Ctx)
             match op.Kind with
             | ExprKind.ExprRange [t] ->
                 (match literalIdxExtent ctx t with
-                 | Some n -> Ok { Axes = [n]; Readers = [ fun ixs -> List.head ixs ] }
+                 | Some n -> Ok { Axes = [n]; Readers = [ fun ixs -> List.head ixs ]; Window = None }
                  | None ->
                      err fname "reverse mode lowers `range<I>` loops over a literal `Idx<n>` only (v1): a `SymIdx`/`AntisymIdx`/compound range hands the kernel PREFIX OFFSETS rather than canonical indices, so a dense construction loop would address the wrong cells")
             | ExprKind.ExprRange _ ->
                 err fname "reverse mode lowers single-index `range<I>` loops only (v1); a multi-index `range<I, J>` is not supported -- spell it as `method_for(range<I>, range<J>)`"
             | ExprKind.ExprVar n ->
                 (match arrayDims n with
-                 | Some ds -> Ok { Axes = ds; Readers = [ fun ixs -> syn (ExprApp (v n, ixs)) ] }
+                 | Some ds -> Ok { Axes = ds; Readers = [ fun ixs -> syn (ExprApp (v n, ixs)) ]; Window = None }
                  | None ->
                      err fname $"reverse mode needs each map operand to be a named array with statically-known extents (v1); '{n}' has none here -- annotate it `Array<Float like Idx<n>, ...>` or pass it as a parameter")
             | ExprKind.ExprZip zs ->
@@ -265,9 +318,20 @@ let internal expandEagerMap (fname: string) (ctx: Ctx)
                         err fname "reverse mode co-iterates `zip(...)` over operands of IDENTICAL extents (v1); zip's shared min-rank prefix rule is not modelled by this lowering"
                     else
                         Ok { Axes = ds0
-                             Readers = named |> List.map (fun (n, _) -> fun ixs -> syn (ExprApp (v n, ixs))) }
-            | ExprKind.ExprHalo _ ->
-                err fname "reverse mode cannot lower a `halo` stencil map (v1): the transposed stencil's adjoint needs a zero-Pad boundary the surface has no spelling for -- use `ad.jvp`, whose capture-read rule differentiates halos directly"
+                             Readers = named |> List.map (fun (n, _) -> fun ixs -> syn (ExprApp (v n, ixs)))
+                             Window = None }
+            // ROUTE S (docs/plans/structural/02, 3.2): a halo slot iterates
+            // the shrunk interior [0, N - Shrink); the kernel's window reads
+            // become interior-ordinal-plus-offset reads of the operand, so
+            // the construction loop's element write differentiates by the
+            // ordinary rule and the adjoint SCATTERS -- no zero-Pad boundary
+            // is needed, because a window that exists reads only inside.
+            | ExprKind.ExprHalo (inner, offs) ->
+                (match haloAccessOfSurface ctx inner offs with
+                 | Some (h, n) when n - int h.Shrink >= 0 ->
+                     Ok { Axes = [ n - int h.Shrink ]; Readers = [ fun ixs -> List.head ixs ]; Window = Some h }
+                 | _ ->
+                     err fname "reverse mode lowers a `halo<I, [offs]>` stencil map over a literal `Idx<n>` inner index with a literal offset set (v1); a compound inner or a computed offset set has no static interior here -- use `ad.jvp`, whose capture-read rule keeps the window")
             | ExprKind.ExprReverse _ | ExprKind.ExprBlocked _ ->
                 err fname "reverse mode lowers `range<I>`, named-array and `zip(...)` map operands (v1); `reverse<I>` / `blocked<I, K>` traversals are not supported"
             | _ ->
@@ -314,7 +378,19 @@ let internal expandEagerMap (fname: string) (ctx: Ctx)
                 let mine, remaining = List.splitAt slot.Axes.Length rest
                 (remaining, acc @ (slot.Readers |> List.map (fun r -> r mine))))
                 (idxVars, [])
-        substParamMany fname (List.zip (ps |> List.map _.Name) subs) kbody
+        // A halo slot's parameter is the window: its reads are rewritten in
+        // the body against the interior ordinal; every other parameter is
+        // substituted by its reader's expression.
+        let windows = slots |> List.collect (fun s -> s.Readers |> List.map (fun _ -> s.Window))
+        List.zip3 (ps |> List.map _.Name) subs windows
+        |> List.fold (fun acc (pn, sub, win) ->
+            acc |> Result.bind (fun (body, keep) ->
+                match win with
+                | Some h -> substWindowReads fname pn h sub body |> Result.map (fun b -> (b, keep))
+                | None -> Ok (body, keep @ [ (pn, sub) ])))
+            (Ok (kbody, []))
+        |> Result.bind (fun (kbody', keep) ->
+        substParamMany fname keep kbody'
         |> Result.bind (fun substituted ->
         // A `reduce` inside the kernel body is now in STATEMENT position, so
         // it lowers by the ordinary additive-fold rule -- into the innermost
@@ -331,7 +407,7 @@ let internal expandEagerMap (fname: string) (ctx: Ctx)
             List.foldBack2 (fun nm n inner ->
                 [ StmtForIn (nm, syn (ExprDotDot (iLit 0L, iLit (int64 n))), inner) ])
                 idxNames dims (pre @ [write])
-        (Some (bufLet :: loops, dims))))))
+        (Some (bufLet :: loops, dims)))))))
     | _ -> Ok None
 
 /// The pre-pass proper: rewrite one function body's statements, expanding

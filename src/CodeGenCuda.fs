@@ -2782,8 +2782,10 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
         |> List.choose (fun ix ->
             match ix.Tag with
             | Some tag when tag.StartsWith (haloWinTagPrefix + "d:") ->
-                (match ix.Extent, haloShrinkOfTag tag with
-                 | IRLit (IRLitInt shrunk), Some shrink -> Some (tag, shrunk + shrink)
+                // The declared inner extent is the window's forward DEMAND
+                // over the whole shrunk output: N = M + Shrink.
+                (match ix.Extent, haloAccessOfTag tag with
+                 | IRLit (IRLitInt shrunk), Some h -> Some (tag, snd (haloDemand h (0L, shrunk)))
                  | _ -> None)
             | _ -> None)
         // Same-tag ambiguity rule as TypeCheck's haloExtentClash: the tag
@@ -2800,24 +2802,17 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
         match resolveCallable info.Kernel with
         | None -> ()
         | Some callable ->
-            let haloTagOfIdx (e: IRExpr) =
-                match e with
-                | IRBinOp (_, IRAdd, IRVar (_, IRTIdxTagged (_, IRefNamed t)), _)
-                | IRBinOp (_, IRAdd, IRParam (_, _, IRTIdxTagged (_, IRefNamed t)), _)
-                    when t.StartsWith (haloWinTagPrefix + "d:") -> Some t
-                | _ -> None
+            // Every window read in the body, from the one shared scan
+            // (IRAccess.windowReadsOf), computed offsets included -- the
+            // extent obligation does not depend on the offset.
             let mutable guards : (string * int * int64) list = []
-            iterIRExpr (fun e ->
-                match e with
-                | IRIndex (IRVar (tid, _), idxs, _) ->
-                    idxs |> List.iteri (fun d ix ->
-                        match haloTagOfIdx ix |> Option.bind (fun t -> Map.tryFind t haloDecl) with
-                        | Some declared ->
-                            (match Map.tryFind tid tempCtx.VarNames with
-                             | Some tname -> guards <- (tname, d, declared) :: guards
-                             | None -> ())
-                        | None -> ())
-                | _ -> ()) callable.Body
+            for r in Blade.IRAccess.windowReadsOf (fun wv -> (Blade.IRAccess.denseHaloTagOf wv).IsSome) callable.Body do
+                match Blade.IRAccess.denseHaloTagOf r.Window |> Option.bind (fun t -> Map.tryFind t haloDecl) with
+                | Some declared ->
+                    (match Map.tryFind r.ArrayId tempCtx.VarNames with
+                     | Some tname -> guards <- (tname, r.Dim, declared) :: guards
+                     | None -> ())
+                | None -> ()
             let guardLines =
                 guards
                 |> List.distinct

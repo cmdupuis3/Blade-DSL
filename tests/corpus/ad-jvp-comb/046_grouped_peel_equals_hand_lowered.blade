@@ -24,7 +24,6 @@ function loss(v: Array<Float like R>, cw: Array<Float like Idx<2>>) -> Float = {
 
 let v0 = [10.0, 20.0, 30.0, 40.0, 50.0]
 let c0 = [2.0, 5.0]
-// WARN: BL4003
 let mut dv = [0.0, 0.0, 0.0, 0.0, 0.0]
 let mut dc = [0.0, 0.0]
 let gv = ad.grad(loss)(v0, c0, dv, dc)

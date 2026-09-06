@@ -117,6 +117,10 @@
     <Compile Include="src/IR.fs" />
     <Compile Include="src/IRLoopStructure.fs" />
     <Compile Include="src/IRStorage.fs" />
+    <!-- The one IR-level matcher of a halo window read (docs/plans/structural/02
+         section 3.1.2): the carousel, both BL8009 guards and the reverse-mode
+         gather read it instead of scanning for the shape themselves. -->
+    <Compile Include="src/IRAccess.fs" />
     <Compile Include="src/IRLift.fs" />
     <Compile Include="src/IRMono.fs" />
     <Compile Include="src/Optimize.fs" />
@@ -549,6 +553,7 @@
          Parity pins: the anonymous range must decide as `range<I>` does. -->
     <Compile Include="tests/FlatPathTests.fs" />
     <Compile Include="tests/OptimizeTests.fs" />
+    <Compile Include="tests/AccessTests.fs" />
     <!-- Eigensolver dispatch emission + the inferEigh rejections (Phase 6 /
          Round B2). Separate block from LinAlgTests because the two gates,
          headers and defines are separate by design — and because this one must

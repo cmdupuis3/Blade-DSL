@@ -354,6 +354,52 @@ let internal noLoopResolve : string -> Expr option = fun _ -> None
 
 let internal (|MapApply|_|) (e: Expr) : MapApplyView option = (|MapApplyWith|_|) noLoopResolve e
 
+// ---------------------------------------------------------------------------
+// Halo stencil maps (docs/plans/structural/02, sections 3.2-3.3). A
+// `method_for(halo<I, [offs]>) <@> lambda(w) -> ...` reads its operands
+// through the window, `x(w(k))`; both reverse routes need the same three
+// facts about it: its ACCESS record (built here from the surface literals,
+// the same record the checker and the runtime guards parse from the slot
+// tag), whether a map is a SOLE-halo map, and the rewrite of `w(k)` into
+// the interior ordinal plus a static offset.
+// ---------------------------------------------------------------------------
+
+/// A literal or negated-literal offset.
+let internal literalOffsetOf (e: Expr) : int option =
+    match e.Kind with
+    | ExprKind.ExprLit (LitInt k) -> Some (int k)
+    | ExprKind.ExprUnaryOp (OpNeg, { Kind = ExprKind.ExprLit (LitInt k) }) -> Some (int -k)
+    | _ -> None
+
+/// The access record and the inner extent N of a surface `halo<I, [offs]>`
+/// operand: literal `Idx<n>` inner, literal offset set. None otherwise (a
+/// compound inner or a computed set has no static interior here).
+let internal haloAccessOfSurface (ctx: Ctx) (inner: TypeExpr) (offs: Expr) : (Blade.Types.HaloAccess * int) option =
+    match resolveTy ctx inner, offs.Kind with
+    | TyIdx { Kind = ExprKind.ExprLit (LitInt n) }, ExprKind.ExprArrayLit os when not os.IsEmpty ->
+        let lits = os |> List.map literalOffsetOf
+        if lits |> List.forall Option.isSome then
+            Some (Blade.Types.haloAccessOf "" (lits |> List.map Option.get) false, int n)
+        else None
+    | _ -> None
+
+/// A map whose ONE loop operand is a halo, looked at through `pure` /
+/// `compute` (materialization barriers with no value content): the inner
+/// index, the offset expression and the kernel.
+let internal soleHaloOfWith (resolve: string -> Expr option) (e: Expr) : (TypeExpr * Expr * Expr) option =
+    let rec peel (x: Expr) =
+        match x.Kind with
+        | ExprKind.ExprCompute i | ExprKind.ExprPure i -> peel i
+        | _ -> x
+    match peel e with
+    | MapApplyWith resolve mv ->
+        (match mv.Ops with
+         | [ { Kind = ExprKind.ExprHalo (inner, offs) } ] -> Some (inner, offs, mv.Kern)
+         | _ -> None)
+    | _ -> None
+
+let internal soleHaloOf (e: Expr) : (TypeExpr * Expr * Expr) option = soleHaloOfWith noLoopResolve e
+
 /// The head every subset refusal shares -- what differentiated code DOES
 /// support, said once.
 let internal subsetHead =
@@ -480,7 +526,11 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
     // taint sees them; virtual halo/range operands have nothing to visit)
     // and the kernel BODY; kernel params are bound by the lambda, and the
     // tangent rule substitutes indexed reads for them.
-    | { Kind = ExprKind.ExprBinOp (_, OpApply, lo2, kn) } when errMode.Value = "jvp"
+    // In reverse mode every map has been lowered before this walk runs --
+    // except a sole-halo stencil map the gather route KEEPS (route G,
+    // GradNormalize.haloGatherPlan), which is admitted here on the same
+    // terms as the forward-mode map.
+    | { Kind = ExprKind.ExprBinOp (_, OpApply, lo2, kn) } when (errMode.Value = "jvp" || (soleHaloOf e).IsSome)
             && (match lo2.Kind with ExprKind.ExprMethodFor _ | ExprKind.ExprObjectFor _ | ExprKind.ExprVar _ -> true | _ -> false) ->
         // Both spellings decompose the same way. A VAR loop side does not
         // resolve here (this walk has no loop-binding environment): the name
@@ -1322,22 +1372,16 @@ let rec internal staticExtentOf (ctx: Ctx) (env: Map<string, int>) (e: Expr) : i
         parts |> List.fold (fun acc p ->
             acc |> Option.bind (fun tot -> staticExtentOf ctx env p |> Option.map (fun n -> tot + n)))
             (Some 0)
-    // A halo traversal's extent is the SHRUNK interior: N - (max - min)
-    // over its literal offsets (shrink is the only boundary policy).
-    | ExprKind.ExprHalo (inner, { Kind = ExprKind.ExprArrayLit offs }) ->
-        (match resolveTy ctx inner with
-         | TyIdx { Kind = ExprKind.ExprLit (LitInt n) } ->
-             let lits =
-                 offs |> List.map (fun o ->
-                     match o.Kind with
-                     | ExprKind.ExprLit (LitInt k) -> Some (int k)
-                     | ExprKind.ExprUnaryOp (OpNeg, { Kind = ExprKind.ExprLit (LitInt k) }) -> Some (-(int k))
-                     | _ -> None)
-             if not lits.IsEmpty && lits |> List.forall Option.isSome then
-                 let vs = lits |> List.map Option.get
-                 Some (int n - (List.max vs - List.min vs))
-             else None
-         | _ -> None)
+    // A halo traversal's extent is the SHRUNK interior, N - Shrink, read
+    // off the same access record the checker and the runtime guards use
+    // (docs/plans/structural/02, 2.1). This arm used to compute
+    // `max - min` over the DECLARED offsets, which is only the shrink when
+    // 0 is among them: for a one-sided lag set like `[-2, -4]` (loops/078)
+    // it said 6 of 8 where the interior is 4 of 8 -- the centre is always
+    // in the reach -- and both AD lanes' reduce loops over the map ran two
+    // cells past its buffer (ASan-caught by tests/AccessTests.fs).
+    | ExprKind.ExprHalo (inner, offs) ->
+        haloAccessOfSurface ctx inner offs |> Option.map (fun (h, n) -> n - int h.Shrink)
     // a loop side the decomposition above could not read (an unrecorded name,
     // or the `>>@`-composed object of a DECLINED fusion): the right side is
     // then the operand list, and its leading operand is the extent
@@ -1373,9 +1417,58 @@ let rec internal staticExtentOf (ctx: Ctx) (env: Map<string, int>) (e: Expr) : i
 /// exactly the ones `adjointOfInit` has a reverse flow for -- adding a shape
 /// to this table without adding its flow only moves the refusal, it does not
 /// remove one.
+/// Rewrite the window reads of a halo kernel body: `w(k)` becomes
+/// `idx + (Start + k)` -- the interior ordinal `idx` plus the static offset
+/// into the inner space -- for a literal k (refused when outside the
+/// declared reach, the checker's BL4019 rule), and `idx + (Start + e)` for a
+/// computed offset e (never refused here: the declared reach is a runtime
+/// property of e, as the checker also holds). The window itself may not be
+/// passed on, and the walk covers the forms a stencil kernel is made of:
+/// literals, names, arithmetic, calls, `if`, tuples, annotations. Anything
+/// else that mentions the window is declined -- never silently kept.
+let internal substWindowReads (fname: string) (wname: string) (h: Blade.Types.HaloAccess) (idx: Expr) (body: Expr) : Result<Expr, string> =
+    let rec go (e: Expr) : Result<Expr, string> =
+        let re (k: ExprKind) = inheritSpan e k
+        match e.Kind with
+        | ExprKind.ExprLit _ -> Ok e
+        | ExprKind.ExprVar n when n = wname ->
+            err fname $"the halo window '{wname}' may only be read through, as `{wname}(o)`; passing the window itself on is not differentiable in reverse mode (v1)"
+        | ExprKind.ExprVar _ -> Ok e
+        | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar n }, [ off ]) when n = wname ->
+            (match literalOffsetOf off with
+             | Some k when not (Blade.Types.haloOffsetInReach h k) ->
+                 let reach = h.Offsets |> List.map string |> String.concat ", "
+                 err fname $"the window read `{wname}({k})` is outside the declared halo reach [{reach}]"
+             | Some k -> Ok (add idx (iLit (h.Start + int64 k)))
+             | None -> go off |> Result.map (fun off' -> add idx (add (iLit h.Start) off')))
+        | ExprKind.ExprApp (f, args) ->
+            go f |> Result.bind (fun f' ->
+            traverseR go args |> Result.map (fun args' -> re (ExprApp (f', args'))))
+        | ExprKind.ExprBinOp (m, op, l, r) ->
+            go l |> Result.bind (fun l' -> go r |> Result.map (fun r' -> re (ExprBinOp (m, op, l', r'))))
+        | ExprKind.ExprUnaryOp (op, x) -> go x |> Result.map (fun x' -> re (ExprUnaryOp (op, x')))
+        | ExprKind.ExprTyped (x, t) -> go x |> Result.map (fun x' -> re (ExprTyped (x', t)))
+        | ExprKind.ExprIf (c, t, f) ->
+            go c |> Result.bind (fun c' -> go t |> Result.bind (fun t' -> go f |> Result.map (fun f' -> re (ExprIf (c', t', f')))))
+        | ExprKind.ExprTuple es -> traverseR go es |> Result.map (fun es' -> re (ExprTuple es'))
+        | _ ->
+            if mentionsVar wname e then
+                err fname $"this kernel form reads the halo window '{wname}' in a way reverse mode does not support (v1): the window may be read as `{wname}(o)` inside arithmetic, intrinsic calls, array reads, `if` and tuples"
+            else Ok e
+    go body
+
 let rec internal staticDimsOf (ctx: Ctx) (denv: Map<string, int list>) (e: Expr) : int list option =
     match e with
     | ConstFill ({ Kind = ExprKind.ExprLit (LitInt n) }, _) -> Some [int n]
+    // A sole-halo stencil map kept as a local by the reverse gather route:
+    // its shape is the shrunk interior N - Shrink, from the surface
+    // literals. Its FLOW is GradSweeps.adjointOfInit's gather arm (the
+    // shape is only offered where that flow exists: reverse mode).
+    | _ when errMode.Value = "grad" && (soleHaloOf e).IsSome ->
+        (match soleHaloOf e with
+         | Some (inner, offs, _) ->
+             haloAccessOfSurface ctx inner offs |> Option.map (fun (h, n) -> [ n - int h.Shrink ])
+         | None -> None)
     | _ ->
     match e.Kind with
     | ExprKind.ExprVar n -> Map.tryFind n denv

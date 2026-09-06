@@ -1,0 +1,21 @@
+// TEST: AD Reverse Halo Stencil, One-Sided Lag Set
+import ad as ad
+// ============================================================================
+// A one-sided offset set without 0 in it (`[-2, -4]`): the reach is still
+// {-4, ..., 0} -- the centre is always readable -- so the interior starts at
+// ordinal 4 and has 4 cells. The kernel reads the centre and the lag-2 cell;
+// the gather's two loops are offset by 4 and by 2 into the input.
+// a = 1..8: d = a4*a2 + a5*a3 + a6*a4 + a7*a5 = 15 + 24 + 35 + 48 = 122;
+// d/da(j) = a(j-2) for j in 4..7 (as the centre) + a(j+2) for j in 2..5
+//         = [0, 0, 5, 6, 3+7, 4+8, 5, 6].
+// ============================================================================
+type T = Idx<8>
+function f(a: Array<Float like T>) -> Float = {
+    let d = method_for(halo<T, [-2, -4]>) <@> lambda(w) -> a(w(0)) * a(w(-2)) |> compute
+    reduce(d, (+))
+}
+let a0: Array<Float like T> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let mut da: Array<Float like T> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let fv = ad.grad(f)(a0, da)
+// EXPECT: fv = 122
+// EXPECT: da = [0, 0, 5, 6, 10, 12, 5, 6]

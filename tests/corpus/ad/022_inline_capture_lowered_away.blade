@@ -29,7 +29,10 @@ function helper(p: Float, arr: Array<Float like I>) -> Float = {
     reduce(scaled, (+))
 }
 function loss(y: Float, arr: Array<Float like I>) -> Float = helper(y, arr)
-// WARN: BL4003
+// (The lowered read `arr(__mi)` used to draw a BL4003 untagged-index note
+// pointing at a subscript the author never wrote; a subscript that mentions
+// a compiler-reserved `__` name is now recognized as synthesized, like a
+// `__` buffer, and the note is not raised.)
 let mut darr = [0.0, 0.0, 0.0]
 let (lv, dly) = ad.grad(loss)(2.0, [1.0, 2.0, 3.0], darr)
 // EXPECT: lv = 12

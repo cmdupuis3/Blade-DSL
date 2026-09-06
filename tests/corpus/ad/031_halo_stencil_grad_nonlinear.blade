@@ -1,0 +1,20 @@
+// TEST: AD Reverse Halo Stencil, Product Of Neighbours
+import ad as ad
+// ============================================================================
+// A NONLINEAR stencil kernel: the product of the two outer neighbours. Each
+// input cell is read by up to two windows at different offsets, so its
+// gradient is the sum of the OTHER neighbour in each -- the gather's per-
+// offset loops overlap on the interior cells and must add, not overwrite.
+// a = [1, 2, 4, 8, 16]: d = a2*a0 + a3*a1 + a4*a2 = 4 + 16 + 64 = 84;
+// d/da = [a2, a3, a0 + a4, a1, a2] = [4, 8, 17, 2, 4].
+// ============================================================================
+type H = Idx<5>
+function f(a: Array<Float like H>) -> Float = {
+    let d = method_for(halo<H, [-1, 0, 1]>) <@> lambda(w) -> a(w(1)) * a(w(-1)) |> compute
+    reduce(d, (+))
+}
+let a0: Array<Float like H> = [1.0, 2.0, 4.0, 8.0, 16.0]
+let mut da: Array<Float like H> = [0.0, 0.0, 0.0, 0.0, 0.0]
+let fv = ad.grad(f)(a0, da)
+// EXPECT: fv = 84
+// EXPECT: da = [4, 8, 17, 2, 4]

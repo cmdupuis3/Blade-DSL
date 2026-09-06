@@ -21,7 +21,6 @@ function f(a: Array<Float like I>, b: Array<Float like I>) -> Float = {
     reduce(r1, (+)) + reduce(r2, (+))
 }
 
-// WARN: BL4003
 // Both loops seeded: 2*a(0)*1 + 2*b(2)*1 = 2 + 60 = 62 (first-wins gave 4).
 let (p, t) = ad.jvp(f)([1.0, 2.0, 3.0], [10.0, 20.0, 30.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])
 // EXPECT: p = 1414

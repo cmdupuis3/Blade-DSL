@@ -1,7 +1,42 @@
 # 02 — Share access descriptions across demand, adjoints, and ownership
 
-Status: DESIGN 2026-09-06 — nothing built. Elaborates item 2 of
+Status: BUILT 2026-09-06 — P1a and P1b landed on `feat/halo-cotangents`; the first gate
+(§4) PASSED and neither STOP condition (§4.3) fired. Elaborates item 2 of
 [plan-structural-performance-opportunities.md](../plan-structural-performance-opportunities.md).
+
+What landed (the design below is unchanged; this paragraph records the outcome):
+
+- **The record.** `Blade.Types.HaloAccess` (`src/Types.fs`, beside the `HaloWinTag`
+  parser) with `haloAccessOf`/`haloAccessOfTag`, `haloReach`, `haloOffsetInReach`,
+  `haloDemand` and `haloContributors` (§2.1-2.3); the two tag helpers are now
+  projections of it. The checker's BL4019 reach test and its extent guard, the codegen
+  and interpreter BL8009 guards, and the reverse lanes' static extent all read it.
+- **One matcher.** `src/IRAccess.fs` (`windowReadsOf`, `denseHaloTagOf`, §3.1.2): the
+  carousel scan and both BL8009 guards consume it; the three private scanners are gone.
+- **Route S** (§3.2): `expandEagerMap` lowers a halo slot to the interior `[0, N - Shrink)`
+  and `GradExpand.substWindowReads` rewrites `w(k)` to `idx + (Start + k)` (computed
+  offsets to `idx + (Start + e)`); the construction loop's adjoint scatters.
+- **Route G** (§3.3, the default): `GradNormalize.haloGatherPlan` keeps a sole-halo map
+  whose kernel reads the window only as `x(w(lit))`; `GradSweeps.adjointOfInit` emits one
+  loop per (array, K) in descending K, guarded by `0 <= i && i < M`, the `else` leaving
+  the cell untouched. `BLADE_AD_HALO_GATHER=0` selects S.
+- **The gate.** `tests/corpus/ad/030-033`, `tests/corpus/ad-jvp-comb/108`, and
+  `tests/AccessTests.fs` (`blade test access`): record pins, route-emission pins, and the
+  S-vs-G comparison byte-for-byte on six programs (5, 8, 9, 11 and 127 cells; a captured
+  scalar; two windowed arrays; the 127-cell case has an analytically zero interior
+  gradient, so what agrees there is roundoff order), each gather executable also run
+  under AddressSanitizer.
+- **Found by the gate, fixed:** the tangent lane's static halo extent used `max - min`
+  over the *declared* offsets (§1.4's ninth re-derivation), which is the shrink only when
+  0 is among them; for `[-2, -4]` it said 6 of 8 where the interior is 4, and both lanes'
+  reduce over the map read two cells past its buffer. The printed values were right
+  (fresh heap), the sanitizer leg caught it, and the arm now reads the record.
+- **Also:** the BL4003 untagged-index note is no longer raised on a subscript that
+  mentions a compiler-reserved `__` name (the sweep's own loop ordinal into the user's
+  named-tag array); 23 corpus files carried pins of exactly that noise and lost them.
+
+Deferred, as §6 recommends: P1c (the streamed ring on the same record), compact
+reconstruction (§2.5), ownership and revision propagation (§3.5).
 Source snapshot: master at `e7abf38` (working tree clean under `src/`, `tests/`).
 Every `file:line` below was read at that snapshot; every emitted-C++ claim comes
 from `Blade.exe emit`/`run` in a private temp directory. Claims marked

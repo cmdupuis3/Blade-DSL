@@ -20,7 +20,6 @@ function fintr(a: Array<Float like I>) -> Float = {
     reduce(m, (+))
 }
 
-// WARN: BL4003
 let (vn, tn) = ad.jvp(fnamed)([1.0, 2.0, 3.0], [1.0, 1.0, 1.0])
 let (vi, ti) = ad.jvp(fintr)([1.0, 4.0, 9.0], [1.0, 1.0, 1.0])
 // EXPECT: vn = 14

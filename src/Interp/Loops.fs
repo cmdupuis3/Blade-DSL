@@ -850,8 +850,8 @@ and private materializeApply (st: InterpState) (env: Env) (info0: ApplyInfo) (wr
         |> List.choose (fun ix ->
             match ix.Tag with
             | Some tag when tag.StartsWith (haloWinTagPrefix + "d:") ->
-                (match ix.Extent, haloShrinkOfTag tag with
-                 | IRLit (IRLitInt shrunk), Some shrink -> Some (tag, shrunk + shrink)
+                (match ix.Extent, haloAccessOfTag tag with
+                 | IRLit (IRLitInt shrunk), Some h -> Some (tag, snd (haloDemand h (0L, shrunk)))
                  | _ -> None)
             | _ -> None)
         // Same-tag ambiguity rule as the compiled guard: equal-offset anonymous
@@ -863,28 +863,19 @@ and private materializeApply (st: InterpState) (env: Env) (info0: ApplyInfo) (wr
             | _ -> None)
         |> Map.ofList
      if not (Map.isEmpty haloDecl) then
-        let haloTagOfIdx (e: IRExpr) =
-            match e with
-            | IRBinOp (_, IRAdd, IRVar (_, IRTIdxTagged (_, IRefNamed t)), _)
-            | IRBinOp (_, IRAdd, IRParam (_, _, IRTIdxTagged (_, IRefNamed t)), _)
-                when t.StartsWith (haloWinTagPrefix + "d:") -> Some t
-            | _ -> None
-        mapIRExpr (fun e ->
-            (match e with
-             | IRIndex (IRVar (tid, _), idxs, _) ->
-                 idxs |> List.iteri (fun d ix ->
-                     match haloTagOfIdx ix |> Option.bind (fun t -> Map.tryFind t haloDecl) with
-                     | Some declared ->
-                         (match envTryFind env tid with
-                          | Some cell ->
-                              (match force st env cell.V with
-                               | VArray a when d < a.Extents.Length && a.Extents.[d] <> declared ->
-                                   raise (InterpPanic ("BL8009", "halo extent mismatch", None, 0))
-                               | _ -> ())
-                          | None -> ())
-                     | None -> ())
-             | _ -> ())
-            e) cg.KernelExpr |> ignore)
+        // The same shared scan the compiled guard consumes
+        // (IRAccess.windowReadsOf): one matcher, two callers.
+        for r in Blade.IRAccess.windowReadsOf (fun wv -> (Blade.IRAccess.denseHaloTagOf wv).IsSome) cg.KernelExpr do
+            match Blade.IRAccess.denseHaloTagOf r.Window |> Option.bind (fun t -> Map.tryFind t haloDecl) with
+            | Some declared ->
+                (match envTryFind env r.ArrayId with
+                 | Some cell ->
+                     (match force st env cell.V with
+                      | VArray a when r.Dim < a.Extents.Length && a.Extents.[r.Dim] <> declared ->
+                          raise (InterpPanic ("BL8009", "halo extent mismatch", None, 0))
+                      | _ -> ())
+                 | None -> ())
+            | None -> ())
     // Symmetric/antisymmetric/Hermitian output storage (compact) and Reynolds
     // kernels (permutation sum) are interpreted -- see the ArrayElem arm's
     // compact allocation and interpretNest's Reynolds path. Fused-joint output

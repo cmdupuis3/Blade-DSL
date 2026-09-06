@@ -286,22 +286,78 @@ let (|HaloWinTag|_|) (tag: string) : (bool * string * int list) option =
             else None
         | _ -> None
 
-/// The center's first valid ordinal for a halo slot: max(0, -min(offsets union {0})).
-/// The loop over the SHRUNK slot starts at 0; adding this to the loop index
-/// yields the true center ordinal in the inner index's space.
-let haloStartOffsetOfTag (tag: string) : int64 option =
+/// The halo ACCESS DESCRIPTION (docs/plans/structural/02, section 2.1): which
+/// input ordinals one output ordinal's window may read. Parsed ONCE from the
+/// slot tag (or built from the surface literals by the AD lane), and read by
+/// every consumer -- the checker's offset and extent guards, the codegen and
+/// interpreter BL8009 guards, the halo carousel, the reverse-mode gather --
+/// rather than re-derived from the tag at each. The tag stays the CARRIER:
+/// it already survives every index-record rewrite.
+///
+/// Reach = Offsets union {0}: the centre is always readable. `Start` is the
+/// centre's first valid ordinal in the inner space (the shrunk loop begins at
+/// 0), `Shrink` the interior lost to the reach on both sides; the output
+/// extent M of a slot over an inner extent N is N - Shrink.
+type HaloAccess = {
+    /// The wrapped index alias ("" when anonymous or surface-built).
+    Inner: string
+    /// The DECLARED offset set, as written.
+    Offsets: int list
+    /// max 0 (-(min 0 (min Offsets)))
+    Start: int64
+    /// (-(min 0 (min Offsets))) + max 0 (max Offsets)
+    Shrink: int64
+    /// A "c:" tag: ordinals walk the PRESENT cells of a compound inner.
+    IsCompound: bool
+}
+
+let haloAccessOf (inner: string) (offsets: int list) (isCompound: bool) : HaloAccess =
+    let lo = min 0 (List.min offsets)
+    let hi = max 0 (List.max offsets)
+    { Inner = inner; Offsets = offsets
+      Start = int64 (-lo); Shrink = int64 (hi - lo); IsCompound = isCompound }
+
+/// Parse a slot tag into its access record. Total: None for a non-halo tag.
+let haloAccessOfTag (tag: string) : HaloAccess option =
     match tag with
-    | HaloWinTag (_, _, offs) -> Some (int64 (max 0 (- (min 0 (List.min offs)))))
+    | HaloWinTag (isC, inner, offs) -> Some (haloAccessOf inner offs isC)
     | _ -> None
 
-/// Interior loss of a halo slot: (-min(offsets union {0})) + max(offsets union {0}).
-/// Dense slots fold this into the extent at typecheck; compound slots (whose
-/// extent is the runtime mask cardinality) subtract it at the loop bound.
+/// The reach, sorted: the declared offsets and 0.
+let haloReach (h: HaloAccess) : int list = (0 :: h.Offsets) |> List.distinct |> List.sort
+
+/// Is a literal offset inside the reach the interior was shrunk for?
+let haloOffsetInReach (h: HaloAccess) (o: int) : bool =
+    let r = haloReach h
+    o >= List.min r && o <= List.max r
+
+/// FORWARD DEMAND: the input window [lo', hi') an output tile [lo, hi) reads.
+/// Over the whole output [0, M) this is [0, M + Shrink) = [0, N): the extent
+/// guards' "declared inner extent" is `snd (haloDemand h (0, M))`.
+let haloDemand (h: HaloAccess) (lo: int64, hi: int64) : int64 * int64 =
+    let r = haloReach h
+    (lo + h.Start + int64 (List.min r), hi - 1L + h.Start + int64 (List.max r) + 1L)
+
+/// TRANSPOSE: the (offset, output ordinal) pairs that read input ordinal `j`
+/// -- the boundary is ZeroOutside (an output ordinal outside [0, M) does not
+/// exist, so it contributes nothing). Every j in [0, N) has at least one
+/// contributor because 0 is in the reach.
+let haloContributors (h: HaloAccess) (outExtent: int64) (j: int64) : (int * int64) list =
+    haloReach h
+    |> List.map (fun o -> (o, j - h.Start - int64 o))
+    |> List.filter (fun (_, i) -> 0L <= i && i < outExtent)
+
+/// The center's first valid ordinal for a halo slot (a projection of the
+/// record; kept for its call sites).
+let haloStartOffsetOfTag (tag: string) : int64 option =
+    haloAccessOfTag tag |> Option.map (fun h -> h.Start)
+
+/// Interior loss of a halo slot (a projection of the record; kept for its
+/// call sites). Dense slots fold this into the extent at typecheck; compound
+/// slots (whose extent is the runtime mask cardinality) subtract it at the
+/// loop bound.
 let haloShrinkOfTag (tag: string) : int64 option =
-    match tag with
-    | HaloWinTag (_, _, offs) ->
-        Some (int64 ((- (min 0 (List.min offs))) + (max 0 (List.max offs))))
-    | _ -> None
+    haloAccessOfTag tag |> Option.map (fun h -> h.Shrink)
 
 // Provider PACKED-POOL provenance tags (icechunk plan section 5.3).
 //

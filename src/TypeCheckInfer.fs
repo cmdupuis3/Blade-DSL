@@ -4151,7 +4151,7 @@ and inferTupleIndex (env: TypeEnv) tuple index : TypeResult<TypedExpr> =
                             // including its synthesized-buffer suppression, so
                             // the one-bracket spelling cannot drift from the
                             // call spelling on a desugarer's own scratch array.
-                            if not (isSynthesizedBuffer tT) then
+                            if not (isSynthesizedBuffer tT) && not (isSynthesizedIndex tI) then
                                 emitWarning env "BL4003" tI.Span ($"Array indexed with untagged integer where slot expects tag '{tagName}'. Consider an explicit cast like `(expr : {tagName})` or iterate via `range<{tagName}>` to flow the tag automatically.")
                             None
                         | _ -> None
@@ -8684,8 +8684,10 @@ and buildApplyInfo (env: TypeEnv)
                 |> List.choose (fun ix ->
                     match ix.Tag with
                     | Some tag when tag.StartsWith (haloWinTagPrefix + "d:") ->
-                        (match tryEvalIntIR ix.Extent, haloShrinkOfTag tag with
-                         | Some shrunk, Some shrink -> Some (tag, shrunk + shrink)
+                        // N = the window's forward demand over the whole
+                        // shrunk output, M + Shrink.
+                        (match tryEvalIntIR ix.Extent, haloAccessOfTag tag with
+                         | Some shrunk, Some h -> Some (tag, snd (haloDemand h (0L, shrunk)))
                          | _ -> None)
                     | _ -> None)
                 // The tag encodes inner NAME + offsets, not the extent, so two
@@ -8755,12 +8757,11 @@ and buildApplyInfo (env: TypeEnv)
                                 // the same family as the non-static offset
                                 // set (loops/075).
                                 let outside =
-                                    match lit, tag with
-                                    | Some o, HaloWinTag (_, _, offs)
-                                            when o < min 0 (List.min offs) || o > max 0 (List.max offs) ->
-                                        Some (HaloOffsetOutsideSet (o, offs, targetName))
-                                    | None, HaloWinTag (true, _, offs) ->
-                                        let set = offs |> List.map string |> String.concat ", "
+                                    match lit, haloAccessOfTag tag with
+                                    | Some o, Some h when not (haloOffsetInReach h o) ->
+                                        Some (HaloOffsetOutsideSet (o, h.Offsets, targetName))
+                                    | None, Some h when h.IsCompound ->
+                                        let set = h.Offsets |> List.map string |> String.concat ", "
                                         Some (Other $"halo window read over a masked domain: the offset must be an integer literal (one of [{set}], e.g. w(0)). Over a CompoundIdx inner the window walks the PRESENT cells, so the neighbor's coordinate is looked up in the rank table -- a runtime offset cannot be shown to stay inside the interior the way a dense ordinal can.")
                                     | _ -> None
                                 match outside with

@@ -1281,26 +1281,16 @@ let internal planHaloCarousel
             let rec varIdsOf (e: IRExpr) : Set<int> =
                 let self = match e with IRVar (id, _) -> Set.singleton id | _ -> Set.empty
                 childrenOf e |> List.fold (fun acc c -> Set.union acc (varIdsOf c)) self
-            // Static signed offset of a window-read subscript: w(k) lowers to
-            // Add(w, Lit k) for k >= 0 and Add(w, Neg(Lit k)) for negatives.
-            let offOf = function
-                | IRLit (IRLitInt k) -> Some (int k)
-                | IRUnaryOp (IRNeg, IRLit (IRLitInt k)) -> Some (int -k)
-                | _ -> None
-            // Collect window reads by NODE REFERENCE (the SubstMap contract).
-            let mutable found : (IRExpr * int * IRExpr list * int) list = []   // node, arrId, prefix, k
-            let rec scan (e: IRExpr) =
-                (match e with
-                 | IRIndex (IRVar (aid, _), idxs, _) when not (List.isEmpty idxs) ->
-                     (match List.last idxs with
-                      | IRBinOp (IRElementwise, IRAdd, IRVar (vid, _), offExpr) when vid = wid ->
-                          (match offOf offExpr with
-                           | Some k -> found <- (e, aid, (idxs |> List.take (idxs.Length - 1)), k) :: found
-                           | None -> ())
-                      | _ -> ())
-                 | _ -> ())
-                childrenOf e |> List.iter scan
-            scan codeGen.KernelExpr
+            // Window reads by NODE REFERENCE (the SubstMap contract), from
+            // the one shared scan (IRAccess.windowReadsOf): this ring serves
+            // reads on the LAST axis with a static offset; anything else
+            // simply stays a direct read.
+            let found : (IRExpr * int * IRExpr list * int) list =   // node, arrId, prefix, k
+                Blade.IRAccess.windowReadsOf (function IRVar (vid, _) -> vid = wid | _ -> false) codeGen.KernelExpr
+                |> List.choose (fun r ->
+                    match r.Offset with
+                    | Some k when r.Dim = r.Rank - 1 -> Some (r.Node, r.ArrayId, r.Prefix, k)
+                    | _ -> None)
             // Groups: same array + identically-rendered prefix (outer-window
             // reads etc. -- invariant across the innermost run by the wid check).
             let renderable (aid: int) (prefix: IRExpr list) =

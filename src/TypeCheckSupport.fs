@@ -1163,6 +1163,27 @@ let internal isSynthesizedBuffer (tArr: TypedExpr) : bool =
     | TExprVar (name, _, _) -> name.StartsWith "__"
     | _ -> false
 
+/// The INDEX twin of `isSynthesizedBuffer`: a subscript that mentions a
+/// compiler-reserved `__` name -- a desugarer's loop ordinal, possibly plus
+/// the author's own offset arithmetic -- into a USER array. The reverse-mode
+/// sweep reads the user's `Array<Float like H>` at `__hi3 + 2L` (or at
+/// `__mi7 + (1L + one)`, when the author's window offset was a name) in a
+/// loop it built itself; the author wrote neither the loop nor the
+/// subscript, and the cast the note recommends has no source position to
+/// land on. The surface grammar reserves `__` names for the compiler, so a
+/// subscript mentioning one is never the author's. Only the advisory
+/// warning is affected; the ERROR arms (a differently-tagged index) are not.
+let internal isSynthesizedIndex (tArg: TypedExpr) : bool =
+    let rec mentionsReserved (e: TypedExpr) : bool =
+        match e.Kind with
+        | TExprVar (name, _, _) -> name.StartsWith "__"
+        | TExprBinOp (_, _, l, r) -> mentionsReserved l || mentionsReserved r
+        | TExprUnaryOp (_, x) -> mentionsReserved x
+        | TExprApp (f, args) -> mentionsReserved f || args |> List.exists mentionsReserved
+        | TExprIf (c, t, f) -> mentionsReserved c || mentionsReserved t || mentionsReserved f
+        | _ -> false
+    mentionsReserved tArg
+
 let internal checkArrayIndexTags (env: TypeEnv) (tArr: TypedExpr) (arrTy: IRArrayType) (tArgs: TypedExpr list) : TypeResult<unit> =
     let synthetic = isSynthesizedBuffer tArr
     let slots = slotPerArg arrTy
@@ -1188,7 +1209,7 @@ let internal checkArrayIndexTags (env: TypeEnv) (tArr: TypedExpr) (arrTy: IRArra
                     // BL4003 (index type violation) -- the warning twin of this
                     // very site: the ERROR branch two cases up raises
                     // IndexTagMismatchNamed, which is already BL4003.
-                    if not synthetic then
+                    if not synthetic && not (isSynthesizedIndex tArg) then
                         emitWarning env "BL4003" tArg.Span ($"Array indexed with untagged integer where slot expects tag '{tagName}'. Consider an explicit cast like `(expr : {tagName})` or iterate via `range<{tagName}>` to flow the tag automatically.")
                     None
                 | _ -> None
