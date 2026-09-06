@@ -1,11 +1,14 @@
 # Beyond symmetry, round two: make scientific computations compose safely
 
-Status: PLANNING, 2026-09-05; the three CORRECTNESS items LANDED the same day on
-`fix/fortran-killer-2-p0-repairs` (Claude review of this audit): section 3 step 1
-(freeze recognition declines every non-intrinsic callee), appendix A (the freeze
-miscompile), appendix B (the Poisson collapse) and section 7's NetCDF read safety
-prerequisite (BL8012). Each carries a "Landed" note below with its tests. Every
-FEATURE proposal (P0 steps 2-5, both P1s, P2, P3) remains planning only.
+Status: IN PROGRESS. 2026-09-05: the three CORRECTNESS items LANDED on master
+(section 3 step 1, appendix A, appendix B, section 7's NetCDF prerequisite BL8012).
+2026-09-06, on `feat/fortran-killer-2`: P0 steps 2-5 (Blade.Effects summaries, the
+decision record, `blade plan`), P1 destination passing gate 1 (dense provider
+writes alias the pool), and P2 6.1 (units on reverse-mode cotangents) LANDED; each
+carries a "Landed" note below with its tests. Still planning only: P1 indexed RNG,
+6.2 factor-once, 6.3 matrix-free linearization, 7's manifests / run records /
+restartable state -- each waits on a surface decision listed in
+[plan-structural-synthesis.md](plan-structural-synthesis.md) section 3 or here.
 Source snapshot: master at `7d1053e`. Two Sol/medium agents reviewed numerical
 operators and storage/data workflows; the parent reviewed optimization contracts,
 random generation, and the first audit's comparative claims.
@@ -105,6 +108,25 @@ promoted to a universal proof merely because it returns a Boolean called `IsPure
    view. This is diagnostic data, not permission to branch in Blade on inferred
    symmetry/equivariance or optimizer outcomes.
 
+**Landed (2026-09-06), steps 2-5 in their first form.** `src/Effects.fs` holds the
+summary lattice (`Mutates`, `EmitsOutput`, `ReadsExternal`, `MayFail`, `Unknown`; the
+REPEATABLE / MOVABLE distinction of step 3) and the decision record.
+`TypeCheckSupport.effectsOfBody` computes one summary per function declaration from
+the TYPED body with callees resolved through `TypeEnv.FuncEffects` (declaration
+order; a function's own recursive calls read as pure, a lambda-valued head or a
+missing summary is Unknown), the typed declaration and the IR callable carry it, and
+two consumers read it: freeze recognition (a guard may call any REPEATABLE declared
+function -- the pure-helper and pure-shadowing cases the step-1 allowlist declined
+are admitted, effectful and transitively effectful helpers still decline; pinned in
+`tests/OptimizeTests.fs` and `tests/corpus/recursive-arrays/021`) and the fusion
+pass (`IRMono.pureBody` takes a repeatable summary as proof and walks only unmarked
+callees). Both passes record a `Blade.Effects.Decision` -- rule, version, subject,
+span, applied or declined with the first reason, evidence -- into a per-flow
+collector; `blade plan <file> [--json]` installs it, lowers, and prints the record.
+Not done: the IDE-protocol exposure (the protocol package is shared with external
+clients and a new message is a surface decision), CSE / destination-reuse consumers,
+and callee purity for lambdas (they stay Unknown; fusion's IR walk still covers them).
+
 The equivalence registry should be ordered and bounded, with stable tie breaking.
 An explicit greedy ordering is a useful v1; an unrestricted e-graph or exhaustive
 search is not required. Separate **legality** from **estimated profitability**.
@@ -155,6 +177,17 @@ provider staging buffer. Second pass: recycle a dead, nonescaping allocation onl
 after all data views and borrowed extent/side-table pointers are dead. Compatibility
 includes element type, capacity, alignment, layout, and ownership of metadata.
 Do not equate distinct index names with disjoint storage.
+
+**Landed (2026-09-06), gate 1 for the write terminal.** A dense provider write no
+longer flattens: `allocate<>` places every scalar of a nested array in one
+contiguous pool in DFS (row-major) order -- exactly the Horner index the copy loop
+computed -- so `genProviderWriteBinding` aliases `pool_base(src.data)` as the
+writer's buffer and emits no allocation, copy, or free (`src/CodeGenBinding.fs`).
+Gated on plain dense index kinds; compound / sparse / ragged / packed / wreath
+sources keep their copies. `tests/NetcdfTests.fs` pins the emission and round-trips
+a 2 x 3 literal through libnetcdf. Gate 2 (scratch reuse across barriers) is not
+started; it needs the effect summaries above plus escape facts, as the paragraphs
+say.
 
 The planner should report peak live bytes, unavoidable barriers, and why each
 candidate pool is retained. Optimize whole-function lifetimes before attempting
@@ -264,6 +297,27 @@ before taking a norm or comparing to a dimensionless tolerance. Units cannot cho
 scientifically meaningful scales or fix ill-conditioning. If unit resolution must
 move earlier than AD expansion, plan that pipeline change explicitly; do not retain
 today's parameter-type buffer as an approximation. Affine units remain separate.
+
+**Landed (2026-09-06).** Reverse mode accepts unit-carrying parameters and losses.
+The gradient ABI declares each cotangent as <loss>/<parameter> on the parameter's
+own index domain (`Grad.cotangentTy`: scalar returns, mutable array buffers, and the
+scalar cotangent locals), the seed stays dimensionless (it is d(loss)/d(loss)), and
+the cotangents of INTERMEDIATE locals are ascribed <loss>/<value> from a symbolic
+element-unit walk over the normalized body (`Grad.unitGuessOfBody`, mirroring the
+checker's rules on the forms the AD subset admits; anything it does not know leaves
+that cotangent bare, which the checker then refuses loudly in a chain rather than
+accepting wrongly). Unit resolution did NOT move earlier: the ordinary checker
+resolves the surface unit expressions, scale included, and holds every `+=` to
+them -- the derivative code is unit-checked for free. Two things are refused because
+the transform cannot see a conversion factor: a `+`/`-` join between magnitudes of
+one dimension inside the synthesized body (the `__ad_body` conjunct, registered in
+`Constraints.fs`, makes `convertScaleTo` refuse instead of inserting the factor) and
+a unit-annotated `let` inside the differentiated body (its annotation would not
+survive normalization). Demonstrated in `tests/corpus/ad/025` (a meter-valued
+objective differentiated by a meters/second parameter yields seconds; a two-level
+chain through an m2 intermediate to an m4 loss; a dimensionless ratio) and refused in
+`ad/017` and `ad/026`. Scaled units are otherwise supported (the same magnitude
+throughout is fine); the affine case remains separate.
 
 ### 6.2 Factor once, solve and differentiate repeatedly
 
