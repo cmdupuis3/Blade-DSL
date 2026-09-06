@@ -461,7 +461,11 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
                 | _ -> None
             match staticOff with
             | Some o -> IRHaloUnhash (f, o)
-            | None -> failwith "halo window read over a masked domain: the offset must be an integer literal (e.g. w(-1), w(0), w(1))"
+            // Unreachable from a checked program: TypeCheck's window-read
+            // walk (haloExtentClash's checkSite) refuses a non-literal
+            // offset over a compound inner with a spanned diagnostic. Kept
+            // as the invariant it now is.
+            | None -> failwith "internal: halo window read over a masked domain reached lowering with a non-literal offset (TypeCheck.checkSite should have refused it)"
         else
             IRBinOp (IRElementwise, IRAdd, f, lowerTypedExpr env offArg)
 

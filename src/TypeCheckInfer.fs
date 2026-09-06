@@ -8659,13 +8659,25 @@ and buildApplyInfo (env: TypeEnv)
         // genApplyCombinator's haloExtentGuards instead.
         //
         // A window read is `A(w(o))`: the index arg is an application whose
-        // HEAD carries the "__halowin|d:" tag (the same shape Lowering's
+        // HEAD carries a "__halowin|" tag (the same shape Lowering's
         // window-read arm keys on). The declared extent is recovered from the
         // operand slot: the slot's extent is the interior-SHRUNK one, so
         // original = shrunk + shrink, with the shrink re-derived from the
-        // tag's offset set (haloShrinkOfTag). Compound-inner halos ("c:") are
-        // skipped -- their extent is a runtime mask cardinality.
+        // tag's offset set (haloShrinkOfTag). Compound-inner halos ("c:") get
+        // NO extent entry -- their extent is a runtime mask cardinality -- but
+        // they are still walked, for the offset checks that do not need one.
         let haloExtentClash : TypeError option =
+            // Is there any halo slot at all? The extent map below is
+            // dense-only, so gating the walk on it would skip a
+            // compound-only kernel entirely -- which is what let an
+            // out-of-reach compound read through.
+            let anyHalo =
+                arrayTypes
+                |> List.collect (_.IndexTypes)
+                |> List.exists (fun ix ->
+                    match ix.Tag with
+                    | Some tag -> tag.StartsWith haloWinTagPrefix
+                    | None -> false)
             let haloDeclared =
                 arrayTypes
                 |> List.collect (_.IndexTypes)
@@ -8686,15 +8698,22 @@ and buildApplyInfo (env: TypeEnv)
                     | [ n ] -> Some (tag, n)
                     | _ -> None)
                 |> Map.ofList
-            if Map.isEmpty haloDeclared then None
+            if not anyHalo then None
             else
                 // A window read's tag and, when the offset is a literal
-                // (`w(1)`, `w(-1)`), the offset itself.
+                // (`w(1)`, `w(-1)`), the offset itself. BOTH inner kinds:
+                // dense ("d:") and compound ("c:"). The reach check below
+                // applies to each -- over a compound inner the ordinal walks
+                // the PRESENT cells, and the interior is shrunk by the same
+                // reach, so an out-of-reach offset runs off the rank table
+                // exactly as the dense one runs off the pool. The two
+                // literal shapes are the ones Lowering recognizes
+                // (src/Lowering.fs, the window-read arm).
                 let haloReadOfArg (arg: TypedExpr) : (string * int option) option =
                     match arg.Kind with
                     | TExprApp (f, offArgs) ->
                         (match env.Subst.Resolve f.Type with
-                         | IRTIdxTagged (_, IRefNamed t) when t.StartsWith (haloWinTagPrefix + "d:") ->
+                         | IRTIdxTagged (_, IRefNamed t) when t.StartsWith haloWinTagPrefix ->
                              let lit =
                                  match offArgs with
                                  | [ { Kind = TExprLit (LitInt k) } ] -> Some (int k)
@@ -8724,11 +8743,25 @@ and buildApplyInfo (env: TypeEnv)
                                 // (haloShrinkOfTag), so an unlisted offset
                                 // INSIDE it (`w(1)` under `[-2, 0, 2]`, `w(0)`
                                 // under `[-2, -1]`) is safe and stays legal.
+                                //
+                                // A COMPOUND inner additionally needs its
+                                // offset to be a literal at all: the neighbor
+                                // is the (center + o)-th PRESENT cell, whose
+                                // coordinate comes from the rank table, and
+                                // nothing proves a runtime offset in reach.
+                                // Lowering used to discover that with a bare
+                                // `failwith` (an internal-error shape for a
+                                // user mistake); refuse it here instead, in
+                                // the same family as the non-static offset
+                                // set (loops/075).
                                 let outside =
                                     match lit, tag with
                                     | Some o, HaloWinTag (_, _, offs)
                                             when o < min 0 (List.min offs) || o > max 0 (List.max offs) ->
                                         Some (HaloOffsetOutsideSet (o, offs, targetName))
+                                    | None, HaloWinTag (true, _, offs) ->
+                                        let set = offs |> List.map string |> String.concat ", "
+                                        Some (Other $"halo window read over a masked domain: the offset must be an integer literal (one of [{set}], e.g. w(0)). Over a CompoundIdx inner the window walks the PRESENT cells, so the neighbor's coordinate is looked up in the rank table -- a runtime offset cannot be shown to stay inside the interior the way a dense ordinal can.")
                                     | _ -> None
                                 match outside with
                                 | Some e -> Some e
