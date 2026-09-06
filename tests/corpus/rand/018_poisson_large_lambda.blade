@@ -3,23 +3,27 @@
 // uniforms compares a running product against e^-lam, and both underflow to
 // +0 past lam ~745: the old single route returned the SAME draws for lam =
 // 1000 and lam = 10000 (the underflow step count, ~740-780), a confirmed
-// wrong answer (plan-fortran-killer-2.md appendix B). Above the split
-// (kPoissonKnuthMaxLam = 500 in cpp/rand_runtime.hpp) draws now come from
-// Hormann's PTRS transformed rejection, mirrored in Interp/RandMirror.fs.
+// wrong answer (plan-fortran-killer-2.md appendix B). At and above the split
+// (kPoissonKnuthMaxLam = 10 in cpp/rand_runtime.hpp -- Hormann's stated
+// domain and numpy's crossover) draws now come from Hormann's PTRS
+// transformed rejection, mirrored in Interp/RandMirror.fs.
 //
 // Both moments are checked against lam because Poisson is equidispersed:
 // SE(mean) = sqrt(lam/n), so 2.5 at lam = 1000 and 8 at lam = 10000 are ~5 SE;
 // SD(sample var) ~ lam*sqrt(2/n) = 22 and 221, so 120 and 1200 are ~5.4 SD.
 // The collapse signature -- equal means at unequal lam -- is pinned directly.
-// `head` and `far` pin the first draws: integers print without a decimal
-// point, so they double as the integrality assertion, and the interpreter
-// lane (`blade test interp rand`) has to reproduce them bit for bit. `edge`
-// sits on the Knuth side of the split, so its draws are the ones the old
-// route produced -- the split preserves every pinned stream below it.
+// `head`, `far`, `edge` and `hi` pin the first PTRS draws: integers print
+// without a decimal point, so they double as the integrality assertion, and
+// the interpreter lane (`blade test interp rand`) has to reproduce them bit
+// for bit. `lo` and `hi` straddle the split from the same key: 9.5 is the
+// last Knuth lambda, 10.0 the first PTRS one (rand/009 pins the Knuth route
+// at 4.0, untouched by the split).
 import rand as r
 let head = r.poisson(7, 1000.0, 4)
 let far = r.poisson(7, 10000.0, 4)
 let edge = r.poisson(5, 500.0, 3)
+let lo = r.poisson(5, 9.5, 3)
+let hi = r.poisson(5, 10.0, 3)
 let a = r.poisson(41, 1000.0, 4096)
 let b = r.poisson(43, 10000.0, 4096)
 let mean_a = reduce(a, (+)) / 4096.0
@@ -44,4 +48,6 @@ let allCounts = nonIntegral < 0.5
 // EXPECT: allCounts = true
 // EXPECT: head = [1036, 965, 971, 1017]
 // EXPECT: far = [10114, 9891, 9908, 10053]
-// EXPECT: edge = [538, 546, 507]
+// EXPECT: edge = [524, 513, 494]
+// EXPECT: lo = [10, 13, 12]
+// EXPECT: hi = [13, 12, 9]

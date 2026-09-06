@@ -22,8 +22,8 @@
 ///                NOT cached, see `nextNormal`)
 ///   exponential  1 uniform
 ///   bernoulli    1 uniform
-///   poisson      lam <= 500: lam+1 uniforms in expectation (Knuth, data-
-///                dependent); lam > 500: 2 uniforms per PTRS iteration (U
+///   poisson      lam < 10: lam+1 uniforms in expectation (Knuth, data-
+///                dependent); lam >= 10: 2 uniforms per PTRS iteration (U
 ///                then V), ~2.2 per draw. The split constant and both routes
 ///                are mirrored (`poissonKnuthMaxLam`, `nextPoissonKnuth`,
 ///                `nextPoissonPtrs`).
@@ -149,11 +149,10 @@ let private nextGamma (g: Mt19937_64) (shape: float) (rate: float) : float =
     else
         nextGammaGe1 g shape / rate
 
-/// rand_runtime.hpp `kPoissonKnuthMaxLam`: the lam above which `next_poisson`
-/// takes the PTRS route. The header's comment carries the derivation (the
-/// product route's underflow sits 11 sigma out at lam = 500) and the reason
-/// it is not numpy's 10 (moving it changes pinned draws).
-let private poissonKnuthMaxLam = 500.0
+/// rand_runtime.hpp `kPoissonKnuthMaxLam`: the lam at and above which
+/// `next_poisson` takes the PTRS route -- Hormann's stated domain (mu >= 10)
+/// and numpy's crossover; the header's comment carries the cost argument.
+let private poissonKnuthMaxLam = 10.0
 
 /// rand_runtime.hpp `next_poisson_knuth`: Knuth's product-of-uniforms.
 /// Consumes lam+1 uniforms in expectation; the count is returned as a float,
@@ -200,7 +199,7 @@ let private poissonLoggam (x: float) : float =
             x0 <- x0 - 1.0
         gl
 
-/// rand_runtime.hpp `next_poisson_ptrs`: Hormann's PTRS for lam > 500. Each
+/// rand_runtime.hpp `next_poisson_ptrs`: Hormann's PTRS for lam >= 10. Each
 /// iteration draws U THEN V and decides in the header's order -- squeeze
 /// accept, k < 0 / tiny-us reject, exact log test -- so the two streams stay
 /// in step through every rejection. `us` = 0 (a zero uniform) gives k = -inf
@@ -232,7 +231,7 @@ let private nextPoissonPtrs (g: Mt19937_64) (lam: float) : float =
 
 /// rand_runtime.hpp `next_poisson`: the split, nothing else.
 let private nextPoisson (g: Mt19937_64) (lam: float) : float =
-    if lam > poissonKnuthMaxLam then nextPoissonPtrs g lam
+    if lam >= poissonKnuthMaxLam then nextPoissonPtrs g lam
     else nextPoissonKnuth g lam
 
 /// rand_runtime.hpp `next_bernoulli`: ONE uniform, 1.0 iff u < p.

@@ -503,20 +503,21 @@ for this probe. A safe supported-domain refusal is a reasonable first repair whi
 a numerically suitable large-parameter sampler is planned.
 
 **Fixed (2026-09-05), with a sampler rather than a refusal.** `next_poisson` now
-splits at `kPoissonKnuthMaxLam = 500`: at or below it the product route runs
-unchanged (every pinned draw preserved -- at lambda = 500 the product's underflow
-sits 11 sigma above the mean), above it Hormann's PTRS transformed rejection
-(numpy's constants and test order, with a self-contained `loggam`) draws two
-uniforms per iteration. Both routes and the split are mirrored in `RandMirror.fs`,
-and the PTRS functions carry a no-contraction attribute so g++'s FMA licence cannot
-desynchronize the mirror at a floor/compare knife edge. The split is placed at the
-product route's numerical breakdown, not at numpy's cost crossover of 10, because
-moving it changes pinned draws for every lambda in between; the constant is the one
-place to move it, in lockstep with the mirror. Post-fix: lambda = 1000 gives
+splits at `kPoissonKnuthMaxLam = 10`: below it the product route runs unchanged,
+at and above it Hormann's PTRS transformed rejection (numpy's constants and test
+order, with a self-contained `loggam`) draws two uniforms per iteration. Both routes
+and the split are mirrored in `RandMirror.fs`, and the PTRS functions carry a
+no-contraction attribute so g++'s FMA licence cannot desynchronize the mirror at a
+floor/compare knife edge. The split sits at Hormann's stated domain (mu >= 10) and
+numpy's cost crossover: below 10 Knuth costs at most ~11 uniforms and no libm call,
+above it PTRS costs ~2.2 uniforms whatever lambda is. It was first placed at 500 to
+preserve every then-pinned draw; on 2026-09-06 the pins were re-evaluated instead
+(no corpus pin used a lambda in [10, 500)). Post-fix: lambda = 1000 gives
 `[1036, 965, 971, 1017]`, lambda = 10000 gives `[10114, 9891, 9908, 10053]`; both
-moments agree with lambda at n = 4096 and the interpreter lane reproduces the draws
-bit for bit (`tests/corpus/rand/018_poisson_large_lambda.blade`, `blade test interp
-rand`). NaN and negative lambda keep their pre-existing behaviour.
+moments agree with lambda at n = 4096, `lo`/`hi` pins straddle the split, and the
+interpreter lane reproduces the draws bit for bit
+(`tests/corpus/rand/018_poisson_large_lambda.blade`, `blade test interp rand`). NaN
+and negative lambda keep their pre-existing behaviour.
 
 Probe binary identification: `bin/Release/net10.0/Blade.dll` SHA256
 `D2721D07A7B84371D9303B02F76DBD24EF3D27D5ED20CFF0F5F791665B36F71A`.

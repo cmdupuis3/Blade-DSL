@@ -137,11 +137,11 @@ inline double next_gamma(std::mt19937_64& g, double shape, double rate) {
 
 // Poisson(lam): two routes, split at kPoissonKnuthMaxLam.
 //
-//   lam <= kPoissonKnuthMaxLam  Knuth's product-of-uniforms (next_poisson_knuth):
+//   lam <  kPoissonKnuthMaxLam  Knuth's product-of-uniforms (next_poisson_knuth):
 //                               multiply U[0,1) draws until the running product
 //                               drops to or below e^-lam; the number of
 //                               multiplications after the first is the variate.
-//   lam >  kPoissonKnuthMaxLam  Hormann's PTRS transformed rejection
+//   lam >= kPoissonKnuthMaxLam  Hormann's PTRS transformed rejection
 //                               (next_poisson_ptrs).
 //
 // WHY TWO ROUTES. Knuth's comparison `p <= L` is exact-in-distribution only
@@ -153,21 +153,22 @@ inline double next_gamma(std::mt19937_64& g, double shape, double rate) {
 // route is kept for the lam it serves correctly and the rejection route
 // covers the rest.
 //
-// WHY THE SPLIT SITS AT 500, NOT AT numpy's 10. At lam = 500 the product
-// first underflows at k ~745, which is 11 standard deviations above the mean
-// (P ~ 1e-27): the route is exact in practice there, and every lam below it
-// is safer still. numpy switches to PTRS at lam >= 10 for COST -- Knuth is
-// O(lam) uniforms per draw -- but moving the split changes every pinned draw
-// between the two thresholds, and this header's contract is that a pinned
-// stream never changes under it (RandMirror.fs mirrors both routes and the
-// split). Cost, not correctness, is what a lower split would buy; the
-// constant is the one place to move it, in lockstep with the mirror.
+// WHY THE SPLIT SITS AT 10. Hormann derived the PTRS constants for mu >= 10
+// (the paper's stated domain), and numpy switches at exactly that bound. Below
+// it Knuth costs at most ~11 uniforms per draw with no libm call, so it is the
+// cheaper route AND exact; above it PTRS costs ~2.2 uniforms plus a sqrt and
+// two logs of setup per fill, independent of lam, where Knuth's O(lam) product
+// would already be paying more. The split was first placed at 500 to keep
+// every then-pinned draw; the pins were re-evaluated instead (2026-09-06) so
+// the cost crossover wins. The constant is the one place to move it, in
+// lockstep with the mirror.
 //
-// TERMINATION of the product route: for lam <= 500, L is a normal double and
+// TERMINATION of the product route: for lam < 10, L is a normal double and
 // `p <= L` fires after finitely many steps with probability 1. lam == 0
 // gives L == 1.0 and terminates on the first draw with k == 0, which is
-// correct.
-constexpr double kPoissonKnuthMaxLam = 500.0;
+// correct. The route is never entered for the lam where its product would
+// underflow (that needs lam in the hundreds).
+constexpr double kPoissonKnuthMaxLam = 10.0;
 
 inline double next_poisson_knuth(std::mt19937_64& g, double lam) {
     const double L = std::exp(-lam);
@@ -233,14 +234,15 @@ BLADE_RAND_NO_CONTRACT inline double poisson_loggam(double x) {
     return gl;
 }
 
-// Poisson(lam) for lam > kPoissonKnuthMaxLam by PTRS -- Hormann, "The
+// Poisson(lam) for lam >= kPoissonKnuthMaxLam by PTRS -- Hormann, "The
 // transformed rejection method for generating Poisson random variables",
 // Insurance: Mathematics and Economics 12 (1993) 39-45; constants and test
 // order as in numpy's random_poisson_ptrs. Each iteration consumes exactly
 // TWO uniforms (U then V) and decides accept / reject / continue in the order
 // written: the cheap squeeze accepts most candidates, the k < 0 and tiny-us
 // tests reject without a log, and the exact test runs last. Acceptance is
-// ~0.9+ at these lam, so a draw costs ~2.2 uniforms whatever lam is. Draw
+// high across the domain (lowest near lam = 10, where the squeeze still
+// accepts most candidates), so a draw costs ~2.2 uniforms whatever lam is. Draw
 // order and branch order are the mirror contract; RandMirror.fs reproduces
 // them statement for statement. `us` can be exactly 0 when U == -0.5 (a
 // zero uniform): 2a/us is then +inf, k is -inf, and the k < 0 branch
@@ -268,7 +270,7 @@ BLADE_RAND_NO_CONTRACT inline double next_poisson_ptrs(std::mt19937_64& g, doubl
 
 // The dispatcher every `poisson` fill calls: the split above, nothing else.
 inline double next_poisson(std::mt19937_64& g, double lam) {
-    if (lam > kPoissonKnuthMaxLam) return next_poisson_ptrs(g, lam);
+    if (lam >= kPoissonKnuthMaxLam) return next_poisson_ptrs(g, lam);
     return next_poisson_knuth(g, lam);
 }
 
