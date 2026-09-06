@@ -22,7 +22,11 @@
 ///                NOT cached, see `nextNormal`)
 ///   exponential  1 uniform
 ///   bernoulli    1 uniform
-///   poisson      lam+1 uniforms in expectation (Knuth, data-dependent)
+///   poisson      lam <= 500: lam+1 uniforms in expectation (Knuth, data-
+///                dependent); lam > 500: 2 uniforms per PTRS iteration (U
+///                then V), ~2.2 per draw. The split constant and both routes
+///                are mirrored (`poissonKnuthMaxLam`, `nextPoissonKnuth`,
+///                `nextPoissonPtrs`).
 ///   gamma        per Marsaglia-Tsang iteration: 1 normal, plus 1 uniform when
 ///                the iteration is not rejected at v <= 0; plus 1 more uniform
 ///                for the shape<1 boost. Data-dependent -- so every branch
@@ -145,10 +149,16 @@ let private nextGamma (g: Mt19937_64) (shape: float) (rate: float) : float =
     else
         nextGammaGe1 g shape / rate
 
-/// rand_runtime.hpp `next_poisson`: Knuth's product-of-uniforms. Consumes
-/// lam+1 uniforms in expectation; the count is returned as a float, matching
-/// the header's `double k`.
-let private nextPoisson (g: Mt19937_64) (lam: float) : float =
+/// rand_runtime.hpp `kPoissonKnuthMaxLam`: the lam above which `next_poisson`
+/// takes the PTRS route. The header's comment carries the derivation (the
+/// product route's underflow sits 11 sigma out at lam = 500) and the reason
+/// it is not numpy's 10 (moving it changes pinned draws).
+let private poissonKnuthMaxLam = 500.0
+
+/// rand_runtime.hpp `next_poisson_knuth`: Knuth's product-of-uniforms.
+/// Consumes lam+1 uniforms in expectation; the count is returned as a float,
+/// matching the header's `double k`.
+let private nextPoissonKnuth (g: Mt19937_64) (lam: float) : float =
     let L = exp (-lam)
     let mutable p = 1.0
     let mutable k = 0.0
@@ -158,6 +168,72 @@ let private nextPoisson (g: Mt19937_64) (lam: float) : float =
         if p <= L then go <- false
         else k <- k + 1.0
     k
+
+/// rand_runtime.hpp `poisson_loggam`: log(Gamma(x)) for x >= 1 (numpy's
+/// `loggam`, Zhang & Jin section 3.1.2) -- shift to x0 >= 7, ten-term
+/// Stirling series, shift back. Same constants, same association, same
+/// literal 0.9189385332046727 for log(2 pi)/2. `int (7.0 - x)` truncates
+/// toward zero exactly as the header's static_cast<int>.
+let private poissonLoggamCoeffs =
+    [| 8.333333333333333e-02; -2.777777777777778e-03
+       7.936507936507937e-04; -5.952380952380952e-04
+       8.417508417508418e-04; -1.917526917526918e-03
+       6.410256410256410e-03; -2.955065359477124e-02
+       1.796443723688307e-01; -1.39243221690590e+00 |]
+
+let private poissonLoggam (x: float) : float =
+    if x = 1.0 || x = 2.0 then 0.0
+    else
+        let a = poissonLoggamCoeffs
+        let mutable x0 = x
+        let mutable n = 0
+        if x <= 7.0 then
+            n <- int (7.0 - x)
+            x0 <- x + float n
+        let x2 = 1.0 / (x0 * x0)
+        let mutable gl0 = a.[9]
+        for k in 8 .. -1 .. 0 do
+            gl0 <- gl0 * x2 + a.[k]
+        let mutable gl = gl0 / x0 + 0.9189385332046727 + (x0 - 0.5) * log x0 - x0
+        for _ in 1 .. n do
+            gl <- gl - log (x0 - 1.0)
+            x0 <- x0 - 1.0
+        gl
+
+/// rand_runtime.hpp `next_poisson_ptrs`: Hormann's PTRS for lam > 500. Each
+/// iteration draws U THEN V and decides in the header's order -- squeeze
+/// accept, k < 0 / tiny-us reject, exact log test -- so the two streams stay
+/// in step through every rejection. `us` = 0 (a zero uniform) gives k = -inf
+/// and the k < 0 reject, on both sides, without a trap.
+let private nextPoissonPtrs (g: Mt19937_64) (lam: float) : float =
+    let slam = sqrt lam
+    let loglam = log lam
+    let b = 0.931 + 2.53 * slam
+    let a = -0.059 + 0.02483 * b
+    let invalpha = 1.1239 + 1.1328 / (b - 3.4)
+    let vr = 0.9277 - 3.6224 / (b - 2.0)
+    let mutable result = 0.0
+    let mutable accepted = false
+    while not accepted do
+        let U = nextUniform g - 0.5
+        let V = nextUniform g
+        let us = 0.5 - abs U
+        let k = floor ((2.0 * a / us + b) * U + lam + 0.43)
+        if us >= 0.07 && V <= vr then
+            result <- k
+            accepted <- true
+        elif k < 0.0 || (us < 0.013 && V > us) then
+            ()
+        elif log V + log invalpha - log (a / (us * us) + b)
+             <= -lam + k * loglam - poissonLoggam (k + 1.0) then
+            result <- k
+            accepted <- true
+    result
+
+/// rand_runtime.hpp `next_poisson`: the split, nothing else.
+let private nextPoisson (g: Mt19937_64) (lam: float) : float =
+    if lam > poissonKnuthMaxLam then nextPoissonPtrs g lam
+    else nextPoissonKnuth g lam
 
 /// rand_runtime.hpp `next_bernoulli`: ONE uniform, 1.0 iff u < p.
 let private nextBernoulli (g: Mt19937_64) (p: float) : float =

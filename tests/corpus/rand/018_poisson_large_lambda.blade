@@ -1,0 +1,47 @@
+// TEST: Rand Poisson Large Lambda
+// Poisson(lam) for lam above the product route's reach. Knuth's product of
+// uniforms compares a running product against e^-lam, and both underflow to
+// +0 past lam ~745: the old single route returned the SAME draws for lam =
+// 1000 and lam = 10000 (the underflow step count, ~740-780), a confirmed
+// wrong answer (plan-fortran-killer-2.md appendix B). Above the split
+// (kPoissonKnuthMaxLam = 500 in cpp/rand_runtime.hpp) draws now come from
+// Hormann's PTRS transformed rejection, mirrored in Interp/RandMirror.fs.
+//
+// Both moments are checked against lam because Poisson is equidispersed:
+// SE(mean) = sqrt(lam/n), so 2.5 at lam = 1000 and 8 at lam = 10000 are ~5 SE;
+// SD(sample var) ~ lam*sqrt(2/n) = 22 and 221, so 120 and 1200 are ~5.4 SD.
+// The collapse signature -- equal means at unequal lam -- is pinned directly.
+// `head` and `far` pin the first draws: integers print without a decimal
+// point, so they double as the integrality assertion, and the interpreter
+// lane (`blade test interp rand`) has to reproduce them bit for bit. `edge`
+// sits on the Knuth side of the split, so its draws are the ones the old
+// route produced -- the split preserves every pinned stream below it.
+import rand as r
+let head = r.poisson(7, 1000.0, 4)
+let far = r.poisson(7, 10000.0, 4)
+let edge = r.poisson(5, 500.0, 3)
+let a = r.poisson(41, 1000.0, 4096)
+let b = r.poisson(43, 10000.0, 4096)
+let mean_a = reduce(a, (+)) / 4096.0
+let mean_b = reduce(b, (+)) / 4096.0
+let sq_a = method_for(a) <@> lambda(q) -> q * q |> compute
+let sq_b = method_for(b) <@> lambda(q) -> q * q |> compute
+let var_a = reduce(sq_a, (+)) / 4096.0 - mean_a * mean_a
+let var_b = reduce(sq_b, (+)) / 4096.0 - mean_b * mean_b
+let meanAOk = abs(mean_a - 1000.0) < 2.5
+let meanBOk = abs(mean_b - 10000.0) < 8.0
+let varAOk = abs(var_a - 1000.0) < 120.0
+let varBOk = abs(var_b - 10000.0) < 1200.0
+let distinctMeans = abs(mean_a - mean_b) > 5000.0
+let frac = method_for(a) <@> lambda(q) -> if floor(q) == q && q >= 0.0 then 0.0 else 1.0 |> compute
+let nonIntegral = reduce(frac, (+))
+let allCounts = nonIntegral < 0.5
+// EXPECT: meanAOk = true
+// EXPECT: meanBOk = true
+// EXPECT: varAOk = true
+// EXPECT: varBOk = true
+// EXPECT: distinctMeans = true
+// EXPECT: allCounts = true
+// EXPECT: head = [1036, 965, 971, 1017]
+// EXPECT: far = [10114, 9891, 9908, 10053]
+// EXPECT: edge = [538, 546, 507]

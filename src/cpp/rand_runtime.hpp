@@ -135,22 +135,41 @@ inline double next_gamma(std::mt19937_64& g, double shape, double rate) {
     return next_gamma_ge1(g, shape) / rate;
 }
 
-// Poisson(lam) by Knuth's product-of-uniforms: multiply U[0,1) draws until the
-// running product drops to or below e^-lam; the number of multiplications after
-// the first is the variate.
+// Poisson(lam): two routes, split at kPoissonKnuthMaxLam.
 //
-// COST: the expected number of uniforms is lam + 1, i.e. O(lam) per draw, so an
-// `n`-element fill is O(n * lam). This is fine for the moderate lam the P2
-// surface targets and is intentionally the simplest algorithm with an exactly
-// reproducible stream. For large lam a PTRS/transformed-rejection method would
-// be needed -- and would be a separate, separately-mirrored function, since
-// swapping the algorithm changes every pinned draw.
+//   lam <= kPoissonKnuthMaxLam  Knuth's product-of-uniforms (next_poisson_knuth):
+//                               multiply U[0,1) draws until the running product
+//                               drops to or below e^-lam; the number of
+//                               multiplications after the first is the variate.
+//   lam >  kPoissonKnuthMaxLam  Hormann's PTRS transformed rejection
+//                               (next_poisson_ptrs).
 //
-// TERMINATION at large lam: e^-lam underflows to +0 for lam > ~745, but the
-// product of uniforms also underflows to exactly +0 in finitely many steps, so
-// `p <= L` still fires; the loop cannot spin forever. lam == 0 gives L == 1.0
-// and terminates on the first draw with k == 0, which is correct.
-inline double next_poisson(std::mt19937_64& g, double lam) {
+// WHY TWO ROUTES. Knuth's comparison `p <= L` is exact-in-distribution only
+// while p and L = e^-lam are NORMAL doubles. e^-lam is subnormal past lam ~708
+// and exactly +0 past ~745, and the running product reaches +0 after ~745
+// multiplications whatever lam is -- so for lam = 1000 and lam = 10000 the old
+// single route returned the SAME draws (~740-780, the underflow step count), a
+// confirmed wrong answer (plan-fortran-killer-2.md appendix B). The product
+// route is kept for the lam it serves correctly and the rejection route
+// covers the rest.
+//
+// WHY THE SPLIT SITS AT 500, NOT AT numpy's 10. At lam = 500 the product
+// first underflows at k ~745, which is 11 standard deviations above the mean
+// (P ~ 1e-27): the route is exact in practice there, and every lam below it
+// is safer still. numpy switches to PTRS at lam >= 10 for COST -- Knuth is
+// O(lam) uniforms per draw -- but moving the split changes every pinned draw
+// between the two thresholds, and this header's contract is that a pinned
+// stream never changes under it (RandMirror.fs mirrors both routes and the
+// split). Cost, not correctness, is what a lower split would buy; the
+// constant is the one place to move it, in lockstep with the mirror.
+//
+// TERMINATION of the product route: for lam <= 500, L is a normal double and
+// `p <= L` fires after finitely many steps with probability 1. lam == 0
+// gives L == 1.0 and terminates on the first draw with k == 0, which is
+// correct.
+constexpr double kPoissonKnuthMaxLam = 500.0;
+
+inline double next_poisson_knuth(std::mt19937_64& g, double lam) {
     const double L = std::exp(-lam);
     double p = 1.0;
     double k = 0.0;
@@ -159,6 +178,98 @@ inline double next_poisson(std::mt19937_64& g, double lam) {
         if (p <= L) return k;
         k += 1.0;
     }
+}
+
+// The PTRS route's arithmetic has `a * b + c` shapes (the k formula, the
+// loggam series) that g++ would contract into FMAs under the shipping
+// `-ffp-contract=fast`. RyuJIT never contracts, so a fused multiply-add here
+// would desynchronize the interpreter mirror at a floor()/comparison knife
+// edge -- rare, but the contract is byte identity, not "usually". GCC carries
+// the override as a function attribute (blade_portability.hpp's BLADE_REPRO_FN
+// uses the same mechanism; noinline because GCC will not inline across
+// differing optimize options anyway). Clang honours the standard pragma
+// inside the bodies below; MSVC's default is no contraction.
+#if defined(__GNUC__) && !defined(__clang__)
+  #define BLADE_RAND_NO_CONTRACT __attribute__((noinline, optimize("-ffp-contract=off")))
+#else
+  #define BLADE_RAND_NO_CONTRACT
+#endif
+#if defined(__clang__)
+  #define BLADE_RAND_FP_CONTRACT_OFF_BODY _Pragma("STDC FP_CONTRACT OFF")
+#else
+  #define BLADE_RAND_FP_CONTRACT_OFF_BODY
+#endif
+
+// log(Gamma(x)) for the PTRS acceptance test, x >= 1. numpy's `loggam`
+// (Zhang & Jin, Computation of Special Functions, section 3.1.2): shift x up
+// to >= 7, Stirling series with ten Bernoulli terms, shift back down.
+// Written out in plain sequential arithmetic -- NOT std::lgamma, whose mingw
+// and ucrt implementations are different functions (see blade_runtime.hpp's
+// lgamma note) -- so RandMirror.fs can run the identical statements.
+// 0.9189385332046727 = log(2*pi) / 2, a literal on both sides.
+BLADE_RAND_NO_CONTRACT inline double poisson_loggam(double x) {
+    BLADE_RAND_FP_CONTRACT_OFF_BODY
+    static const double a[10] = {
+        8.333333333333333e-02, -2.777777777777778e-03,
+        7.936507936507937e-04, -5.952380952380952e-04,
+        8.417508417508418e-04, -1.917526917526918e-03,
+        6.410256410256410e-03, -2.955065359477124e-02,
+        1.796443723688307e-01, -1.39243221690590e+00 };
+    if (x == 1.0 || x == 2.0) return 0.0;
+    double x0 = x;
+    int n = 0;
+    if (x <= 7.0) {
+        n = static_cast<int>(7.0 - x);
+        x0 = x + static_cast<double>(n);
+    }
+    const double x2 = 1.0 / (x0 * x0);
+    double gl0 = a[9];
+    for (int k = 8; k >= 0; --k) gl0 = gl0 * x2 + a[k];
+    double gl = gl0 / x0 + 0.9189385332046727 + (x0 - 0.5) * std::log(x0) - x0;
+    for (int k = 1; k <= n; ++k) {
+        gl -= std::log(x0 - 1.0);
+        x0 -= 1.0;
+    }
+    return gl;
+}
+
+// Poisson(lam) for lam > kPoissonKnuthMaxLam by PTRS -- Hormann, "The
+// transformed rejection method for generating Poisson random variables",
+// Insurance: Mathematics and Economics 12 (1993) 39-45; constants and test
+// order as in numpy's random_poisson_ptrs. Each iteration consumes exactly
+// TWO uniforms (U then V) and decides accept / reject / continue in the order
+// written: the cheap squeeze accepts most candidates, the k < 0 and tiny-us
+// tests reject without a log, and the exact test runs last. Acceptance is
+// ~0.9+ at these lam, so a draw costs ~2.2 uniforms whatever lam is. Draw
+// order and branch order are the mirror contract; RandMirror.fs reproduces
+// them statement for statement. `us` can be exactly 0 when U == -0.5 (a
+// zero uniform): 2a/us is then +inf, k is -inf, and the k < 0 branch
+// rejects -- no trap, same on both sides.
+BLADE_RAND_NO_CONTRACT inline double next_poisson_ptrs(std::mt19937_64& g, double lam) {
+    BLADE_RAND_FP_CONTRACT_OFF_BODY
+    const double slam = std::sqrt(lam);
+    const double loglam = std::log(lam);
+    const double b = 0.931 + 2.53 * slam;
+    const double a = -0.059 + 0.02483 * b;
+    const double invalpha = 1.1239 + 1.1328 / (b - 3.4);
+    const double vr = 0.9277 - 3.6224 / (b - 2.0);
+    for (;;) {
+        const double U = next_uniform(g) - 0.5;
+        const double V = next_uniform(g);
+        const double us = 0.5 - std::fabs(U);
+        const double k = std::floor((2.0 * a / us + b) * U + lam + 0.43);
+        if (us >= 0.07 && V <= vr) return k;
+        if (k < 0.0 || (us < 0.013 && V > us)) continue;
+        if (std::log(V) + std::log(invalpha) - std::log(a / (us * us) + b)
+                <= -lam + k * loglam - poisson_loggam(k + 1.0))
+            return k;
+    }
+}
+
+// The dispatcher every `poisson` fill calls: the split above, nothing else.
+inline double next_poisson(std::mt19937_64& g, double lam) {
+    if (lam > kPoissonKnuthMaxLam) return next_poisson_ptrs(g, lam);
+    return next_poisson_knuth(g, lam);
 }
 
 // Bernoulli(p): ONE uniform, 1.0 iff u < p. Returned as a double (see the
