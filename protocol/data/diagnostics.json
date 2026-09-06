@@ -843,6 +843,15 @@
         "docs/formalism.md"
       ]
     },
+    "BL8011": {
+      "title": "co-iteration extent mismatch",
+      "explanation": "Two operands walked together in one loop nest -- `a + b`, `zip(a, b)`, `method_for(zip(...))`, or gram's contracted axis -- disagree on the runtime extent of a shared axis. The nest is bounded by its first operand, so the shorter one would be read past its end. The compile-time twin is BL3016, which compares literal extents at the call site; inside a function over `T^k` parameters the extents belong to the caller, and a curried or let-bound partial application never reaches the call-site check, so this guard runs once before the nest on both the compiled and interpreted lanes.",
+      "fix": "Pass operands of equal extent on every shared axis, or declare the parameters with named index types (`Array<Float like I>`) so the disagreement is refused at the call site instead of at runtime.",
+      "examples": [
+        "tests/corpus/functions/128_curried_extent_mismatch_aborts.blade"
+      ],
+      "docs": []
+    },
     "BL9001": {
       "title": "internal compiler error",
       "explanation": "An invariant inside the compiler broke, or an unexpected exception escaped to the CLI boundary. This is a bug in Blade, not in the program being compiled.",

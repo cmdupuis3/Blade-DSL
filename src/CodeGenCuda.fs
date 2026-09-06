@@ -2904,6 +2904,68 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                     { codeGen with KernelExpr = IRApp (IRVar (rk.Callable.Id, IRTUnit), args, rk.Callable.RetType) }
                 | None -> codeGen
 
+        // CO-ITERATION EXTENT GUARD (BL8011; the runtime half of TypeCheck's
+        // extent agreement, BL3016/coIterClash). A co-iteration level is
+        // bounded by its FIRST operand's extent and peels EVERY operand at
+        // that level, so a shorter later operand is read past its end. The
+        // checker compares literal extents at the call site, but inside a
+        // function over `T^k` parameters the extents are the caller's, and
+        // a curried call (`f(a)(b)`, `let h = f(a); h(b)`) or an inner-axis
+        // disagreement (`T^2 + T^2` with equal leading extents) reached the
+        // nest unchecked -- `[5, 7, <garbage>]` for a 3-vector plus a
+        // 2-vector. One comparison per (level, later operand), emitted ONCE
+        // before the nest, only for REAL arrays whose records are dense or
+        // symmetry-packed (`Array<T, R>` with `.extents`; a range is bounded
+        // by its own record, a compound/ragged operand has no `.extents`).
+        //
+        // WHEN LITERALS ARE TRUSTED: two equal literals on NON-parameter
+        // arrays are the checker's business and the allocation's truth, so
+        // the guard is skipped there (no emitted-text change for the common
+        // fully-static nest). A PARAMETER's literal is not a statement about
+        // the runtime array -- shape monomorphization pins a `T^k` parameter
+        // from one argument and the body's unification copies it onto the
+        // other (`f_HM_..._e3` typed `b` at 3 while the call passed 2), so a
+        // parameter operand is always compared at runtime. Mirrored by the
+        // interpreter's materializeApply, which reads runtime extents anyway.
+        (let isParamOperand (pos: int) =
+            match List.tryItem pos info.Arrays with
+            | Some (IRVar (id, _)) -> Set.contains id ctx.ParamIds
+            | _ -> false
+         let hasExtents (pos: int) =
+            match List.tryItem pos info.ArrayTypes with
+            | Some at -> at.IndexTypes |> List.forall (fun ix -> match ix with IxDense | IxSymmetryLike -> true | _ -> false)
+            | None -> false
+         let guardLines =
+            codeGen.Bindings
+            |> List.collect (fun b ->
+                match b.FusedRank, b.Elements with
+                | None, e0 :: rest when not rest.IsEmpty
+                                        && (match e0.Virtual with RealArray -> true | _ -> false)
+                                        && hasExtents e0.ArrayPosition ->
+                    let litOf (e: ElementBinding) =
+                        match List.tryItem e.ArrayPosition info.ArrayTypes with
+                        | Some at -> literalExtentOfArray at e.DimIndex
+                        | None -> None
+                    let lit0 = litOf e0
+                    let param0 = isParamOperand e0.ArrayPosition
+                    let boundText =
+                        match lit0 with
+                        | Some n when not param0 -> $"{n}LL"
+                        | _ -> $"(int64_t)({e0.ArrayName}.extents[{e0.DimIndex}])"
+                    rest |> List.collect (fun e ->
+                        let trusted =
+                            not param0 && not (isParamOperand e.ArrayPosition)
+                            && lit0.IsSome && litOf e = lit0
+                        match e.Virtual with
+                        | RealArray when hasExtents e.ArrayPosition && not trusted ->
+                            [ $$"""{{ind}}if ((int64_t)({{e.ArrayName}}.extents[{{e.DimIndex}}]) != {{boundText}}) {"""
+                              $"{ind}    std::cerr << \"Blade runtime: co-iteration over '{e0.ArrayName}' and '{e.ArrayName}' needs equal extents on axis {e.DimIndex}, but '{e0.ArrayName}' has \" << {e0.ArrayName}.extents[{e0.DimIndex}] << \" and '{e.ArrayName}' has \" << {e.ArrayName}.extents[{e.DimIndex}] << \" -- the walk is bounded by the first operand, so the shorter one would be read past its end\" << std::endl;"
+                              $"{ind}    blade_rt::panic(\"BL8011\", \"co-iteration extent mismatch\", nullptr, 0);"
+                              $"{ind}}}" ]
+                        | _ -> [])
+                | _ -> [])
+         if not guardLines.IsEmpty then preCode <- preCode @ guardLines)
+
         // STREAMED provider inputs (`alias.stream`): no materialized arrays
         // exist -- the nest inlines per-fiber reads at the S/T boundary.
         // Pre-allocate one destination buffer per streamed fiber binding (a

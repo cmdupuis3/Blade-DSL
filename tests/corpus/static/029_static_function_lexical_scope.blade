@@ -1,0 +1,15 @@
+// TEST: Static Function Lexical Scope
+// ============================================================================
+// A `static function` closes over the MODULE's statics, not its caller's
+// bindings. `f` reads the module-level `a`; `g` has a parameter spelled `a`.
+// Static invocation used to extend the caller's environment with g's
+// parameter, so `g(99)` folded to 99 at compile time and 10 at runtime --
+// one call, two answers. Both lanes now read the module's `a`.
+let static a = 10
+static function f() = a
+static function g(a: Int64) = f()
+let static z = g(99)
+let runtime = g(99)
+// EXPECT: a = 10
+// EXPECT: z = 10
+// EXPECT: runtime = 10

@@ -251,6 +251,13 @@ type TypeError =
     /// they evaluate left-to-right at call entry with just the required
     /// arguments bound.
     | DefaultParamScope of func: string * param: string * referenced: string
+    /// BL3012, call site. A default is spliced into the call as surface
+    /// syntax, and a free name it reads resolves THERE -- so when the caller
+    /// has a parameter or local of the same spelling, the default silently
+    /// read that instead of the declaration-site binding (`function f(x =
+    /// k)` from `function g(k) = f()` returned g's argument). The splice
+    /// compares binding identities (TypeEnv.FuncDefaultCaptures) and refuses.
+    | DefaultParamShadowed of func: string * param: string * name: string
     // Factory quantity slots
     /// BL3013 (declaration): two DEFAULTED params of one function carry the
     /// SAME quantity nominal. By-nominal argument routing needs each quantity

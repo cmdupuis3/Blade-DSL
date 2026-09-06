@@ -2451,10 +2451,21 @@ and materializeGramForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
         // complex is detected on the stripped type
         let isComplexElem (t: IRType) =
             match stripUnits t with IRTScalar (ETComplex64 | ETComplex128) -> true | _ -> false
+        // The joined element type, mirroring inferGram: `promoteElemType`
+        // on the bare scalars (Float32 x Float64 -> Float64, Complex64 x
+        // Float64 -> Complex128), the old "complex one, else left" rule only
+        // when a side is not a bare scalar. The typed binding was allocated
+        // at this join, so the accumulator and the pool must use it too.
         let outElem =
-            if isComplexElem la.ElemType then la.ElemType
-            elif isComplexElem ra.ElemType then ra.ElemType
-            else la.ElemType
+            match stripUnits la.ElemType, stripUnits ra.ElemType with
+            | IRTScalar le, IRTScalar re when le <> re ->
+                (match IR.promoteElemType le re with
+                 | Some j -> IRTScalar j
+                 | None -> la.ElemType)
+            | _ ->
+                if isComplexElem la.ElemType then la.ElemType
+                elif isComplexElem ra.ElemType then ra.ElemType
+                else la.ElemType
         let outElemStr = irTypeToCpp outElem
         // The contracted-axis extent comes from A's trailing dim: a LITERAL when
         // the operand's own index record carries one (shape monomorphization
@@ -2496,8 +2507,17 @@ and materializeGramForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
         // conj_scalar). Use conj_scalar to keep one spelling for real/complex.
         // Reads go through the hoisted rows; the multiplication, its operand
         // order and its conjugation are untouched.
-        let mulTerm lRow rRow =
-            $"{lRow}[__gk] * nested_array_utilities::conj_scalar({rRow}[__gk])"
+        // A mixed-width pair is cast to the join on BOTH sides, so
+        // `complex<float> * double` (no overload) and `float += float *
+        // double` (float-conversion) never reach g++; same-type operands
+        // keep the bare spelling, byte-identical to before.
+        let castTo (opElem: IRType) (read: string) =
+            if irTypeToCpp opElem = outElemStr then read
+            else $"static_cast<{outElemStr}>({read})"
+        let mulTerm (lRow: string) (rRow: string) =
+            let lRead = castTo la.ElemType (lRow + "[__gk]")
+            let rRead = castTo ra.ElemType (rRow + "[__gk]")
+            $"{lRead} * nested_array_utilities::conj_scalar({rRead})"
         // The dispatch decision is NOT made here. LinAlgPatterns classifies the
         // node and `shimEntryPoint` applies the BLAS availability gate; a
         // routed call emits ONE `blade_linalg::` call, and NO route emits the
@@ -2609,6 +2629,25 @@ and materializeGramForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
             // dense m x p
             let (extentDecl, ownedExtents) =
                 emitExtentsTable "" extentsName 2 [mDim; pDim]
+            // CONTRACTED-DIM RUNTIME GUARD (BL8011). The checker refuses a
+            // literal disagreement between A's and B's trailing extents
+            // (inferGram); inside a function over `T^2` parameters the
+            // extents are the caller's and the k-loop runs to A's `n`, so a
+            // shorter B was read past its row end (`[[3]]` for a 1x3 against
+            // a 1x2, where the interpreter threw). Emitted only when the two
+            // are not the same literal, ahead of both the shim and the
+            // native loops; the same-array arm has nothing to compare.
+            // BLOCK-free lines: this list may be space-joined into an IIFE.
+            let contractGuard =
+                match literalExtentOfArray la 1, literalExtentOfArray ra 1 with
+                | Some a, Some b when a = b -> []
+                | _ ->
+                    let rInner = literalOrRuntimeExtentOfArray ra rName 1
+                    [ $$"""if ((int64_t)({{nExtent}}) != (int64_t)({{rInner}})) {"""
+                      $"    std::cerr << \"Blade runtime: gram(A, B) contracts over A's trailing axis (\" << {nExtent} << \") and B's trailing axis (\" << {rInner} << \"), which must be equal\" << std::endl;"
+                      "    blade_rt::panic(\"BL8011\", \"co-iteration extent mismatch\", nullptr, 0);"
+                      "}" ]
+            let extentDecl = extentDecl @ contractGuard
             let allocDecl =
                 $"Array<{outElemStr}, 2> {varName} = {{ allocate<typename promote<{outElemStr}, 2>::type, nullptr>({extentsName}), {extentsName} }};"
             let loop =

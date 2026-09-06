@@ -598,16 +598,78 @@ let genComposeApply
             kn.IsSome || (resolveCallable k).IsSome
         match kernelName1, kernelName2 with
         | Some k1, Some k2 ->
-            // Both kernels are named C++ lambdas - direct call loops
+            // Both kernels are named C++ lambdas - direct call loops.
+            //
+            // THE NAME THAT IS CALLED. A stage whose kernel is a NAMED
+            // FUNCTION arrives as its lifted eta-wrapper (`__lambda_16(k) =
+            // add_global(k)`), and calling the wrapper by name is not always
+            // possible: a wrapper over a function that captures a main-local
+            // binding (`function add_global(x) = x + scale` over a
+            // module-level `let scale`) is itself a main-local
+            // `std::function`, emitted in IRId order AFTER the function whose
+            // body names it -- "'__lambda_16' was not declared in this
+            // scope" the moment fusion declines (hygiene) and the staged path
+            // is the one that runs. The single-stage nest never has this
+            // problem because it inlines the wrapper's body; the same is
+            // done here for the one shape a wrapper has, a call of the named
+            // function on the parameter, by calling that function directly.
+            let directName (kn: string) (k: IRExpr) : string =
+                match resolveCallable k with
+                | Some c ->
+                    (match c.Params, c.Body with
+                     | [ p ], IRApp (IRVar (fid, _), [ IRVar (pid, _) ], _) when pid = p.VarId ->
+                         (match Map.tryFind fid ctx.VarNames with
+                          | Some fname -> fname
+                          | None -> kn)
+                     | _ -> kn)
+                | None -> kn
+            //
+            // EACH STAGE'S STORE CARRIES THAT STAGE'S RESULT TYPE, and the
+            // sweep covers EVERY axis. Both used to be borrowed from the
+            // input: `half(Int64) -> Float64 >>@ double_it` allocated the
+            // intermediate as Int64 (g++: float-conversion), and a rank-2
+            // input got ONE loop that handed row pointers to scalar kernels
+            // (g++: cannot convert double*). The result type is the resolved
+            // callable's return type (its body's, when declared `-> infer`);
+            // a stage that does not resolve, or returns an array (a row map,
+            // which this two-loop shape does not express), keeps the input's
+            // element type as before.
+            let stageElemOf (k: IRExpr) (fallback: string) : string =
+                match resolveCallable k with
+                | Some c ->
+                    let ret =
+                        match c.RetType with
+                        | IRTInfer _ -> inferExprType c.Body
+                        | t -> t
+                    (match ret with
+                     | ArrayElem _ | IRTUnit -> fallback
+                     | t -> elemTypeToCpp t)
+                | None -> fallback
+            let s1Elem = stageElemOf kernel1 elemType
+            let s2Elem = stageElemOf kernel2 s1Elem
+            /// `for` over every axis of `src`, applying `kn` cell by cell into
+            /// `dst`. Axis 0 takes the shared literal-or-runtime bound; the
+            /// inner axes read the source's own runtime extents.
+            let stageSweep (src: string) (dst: string) (kn: string) : string list =
+                let pad (d: int) = String.replicate d "    "
+                let subs = [ for d in 0 .. arrRank - 1 -> $"[__i{d}]" ] |> String.concat ""
+                let opens =
+                    [ for d in 0 .. arrRank - 1 ->
+                        let p = pad d
+                        let bound = if d = 0 then stageBoundOf src else $"{src}.extents[{d}]"
+                        $"{ind}{p}for (size_t __i{d} = 0; __i{d} < {bound}; __i{d}++) {{" ]
+                let bodyPad = pad arrRank
+                let closes =
+                    [ for d in arrRank - 1 .. -1 .. 0 ->
+                        let p = pad d
+                        $"{ind}{p}}}" ]
+                opens @ [ $"{ind}{bodyPad}{dst}{subs} = {kn}({src}{subs});" ] @ closes
             let s1Name = $"{name}__s1"
-            let s1Code = [
-                $"{ind}const size_t* {s1Name}_extents = {arrName}.extents;"
-                arrayAlloc { Ind = ind; Elem = elemType; Rank = arrRank; Name = s1Name
-                             Symm = "nullptr"; Strict = None; Extents = s1Name + "_extents" }
-                forLoop ind "__i0" (stageBoundOf arrName)
-                $"{ind}    {s1Name}[__i0] = {k1}({arrName}[__i0]);"
-                $"{ind}}}"
-            ]
+            let s1Code =
+                [ $"{ind}const size_t* {s1Name}_extents = {arrName}.extents;"
+                  arrayAlloc { Ind = ind; Elem = s1Elem; Rank = arrRank; Name = s1Name
+                               Symm = "nullptr"; Strict = None; Extents = s1Name + "_extents" } ]
+                @ stageSweep arrName s1Name (directName k1 kernel1)
             // Deterministic deallocation, site 5e: the `>>@` two-stage pipeline.
             // Both stages allocate dense/nullptr under a borrowed extents pointer
             // (`s1` aliases the input's, `name` aliases `s1`'s), so neither owns
@@ -616,17 +678,14 @@ let genComposeApply
             // `arrRank`/`arrName` are only meaningful for the single-array case.
             let singleArray = match arrays with [_] -> true | _ -> false
             if singleArray then
-                registerPoolAlloc AllocDense elemType arrRank "nullptr" (s1Name + "_extents") s1Name None
-            let s2Code = [
-                $"{ind}const size_t* {name}_extents = {s1Name}.extents;"
-                arrayAlloc { Ind = ind; Elem = elemType; Rank = arrRank; Name = name
-                             Symm = "nullptr"; Strict = None; Extents = name + "_extents" }
-                forLoop ind "__i0" (stageBoundOf s1Name)
-                $"{ind}    {name}[__i0] = {k2}({s1Name}[__i0]);"
-                $"{ind}}}"
-            ]
+                registerPoolAlloc AllocDense s1Elem arrRank "nullptr" (s1Name + "_extents") s1Name None
+            let s2Code =
+                [ $"{ind}const size_t* {name}_extents = {s1Name}.extents;"
+                  arrayAlloc { Ind = ind; Elem = s2Elem; Rank = arrRank; Name = name
+                               Symm = "nullptr"; Strict = None; Extents = name + "_extents" } ]
+                @ stageSweep s1Name name (directName k2 kernel2)
             if singleArray then
-                registerPoolAlloc AllocDense elemType arrRank "nullptr" (name + "_extents") name None
+                registerPoolAlloc AllocDense s2Elem arrRank "nullptr" (name + "_extents") name None
             (elemTypeErrCode @ s1Code @ [""] @ s2Code, ctx)
         | _ when not (stageEmittable kernelName1 kernel1 && stageEmittable kernelName2 kernel2) ->
             // STAGED EMISSION IS TWO-STAGE (v1), and `IRComposeObj` NESTS. A

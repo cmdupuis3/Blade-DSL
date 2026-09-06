@@ -1,0 +1,11 @@
+// TEST: Pipeline Second Stage Annotation (rejects)
+// ERROR: BL3001
+// ============================================================================
+// The second stage's parameter annotation is a constraint on what flows
+// into it. Fusion substituted the first stage's value for the parameter and
+// the annotation simply vanished, so this pipeline accepted an Int64 into a
+// `y: Bool` stage that the direct application `object_for(lambda(y: Bool)
+// -> y) <@> A` refuses. The fused body now carries the annotation as an
+// ascription check.
+let A = [1, 2, 3]
+let result = (object_for(lambda(x: Int64) -> x) >>@ object_for(lambda(y: Bool) -> y)) <@> A |> compute

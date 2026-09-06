@@ -1309,7 +1309,10 @@ let genFuncDef (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFuncDef) :
             match groupedCaptureGkOf cap with
             | Some gkId ->
                 { c with GroupedArrays = Map.add cap.Name (gkSidecarStem ctx.VarNames gkId) c.GroupedArrays }
-            | None -> c) ctx
+            | None -> c)
+            // The body's parameters, for the co-iteration extent guard
+            // (CodeGenContext.ParamIds).
+            { ctx with ParamIds = funcDef.Params |> List.map (fun p -> p.VarId) |> Set.ofList }
     // `where repro`: the body emits inside the routing veto scope (no
     // BLAS/LAPACK/cuBLAS classification while depth > 0), and the definition
     // carries BLADE_REPRO_FN (noinline + fp-contract off on GCC). try/finally
@@ -2847,12 +2850,40 @@ let getCudaFileContent () : string option =
             @ [ "" ]
         Some ((header @ defs) |> String.concat "\n")
 
+/// MODULE IDENTITY SURVIVES THE MERGE. Two file modules may each declare an
+/// `f`; the checker keeps them apart (a qualified import binds `a.f` and
+/// `b.f` to distinct VarIds) but the C++ TU is one namespace, and both used
+/// to emit as `int64_t f(int64_t)` -- a g++ redefinition. A function whose
+/// name another module also declares is emitted as `<module>__<name>`
+/// unless it belongs to the LAST module (the program's main module keeps
+/// its spelling). Call sites resolve through the Id-keyed VarNames map, so
+/// the rename is total by construction; nothing emits a function by its
+/// string name. Shared by both multi-module assembly sites.
+let private disambiguateModuleFunctions (modules: IRModule list) : IRModule list =
+    let nameCounts =
+        modules
+        |> List.collect (fun m -> m.Functions |> List.map (fun f -> f.Name))
+        |> List.countBy id
+        |> Map.ofList
+    let lastIdx = modules.Length - 1
+    modules |> List.mapi (fun i m ->
+        if i = lastIdx then m
+        else
+            let prefix = (if m.Name = "" then $"m{i}" else m.Name).Replace('.', '_')
+            { m with
+                Functions =
+                    m.Functions |> List.map (fun f ->
+                        match Map.tryFind f.Name nameCounts with
+                        | Some n when n > 1 -> { f with Name = $"{prefix}__{f.Name}" }
+                        | _ -> f) })
+
 /// Generate a complete C++ program from an IR program (all modules)
 let genProgramFromIR (program: IRProgram) (testName: string) : string =
     match program.Modules with
     | [] -> "// Empty program\nint main() { return 0; }\n"
     | [modul] -> genMainProgram modul testName
     | modules ->
+        let modules = disambiguateModuleFunctions modules
         let merged = {
             Name = "merged"
             Types = modules |> List.collect (_.Types)
@@ -3098,6 +3129,7 @@ let genSelfContainedProgramFromIR (program: IRProgram) (testName: string) : stri
         | modules ->
             // Multi-module: merge all modules into one for code generation
             // Functions and bindings from earlier modules come first
+            let modules = disambiguateModuleFunctions modules
             let merged = {
                 Name = "merged"
                 Types = modules |> List.collect (_.Types)

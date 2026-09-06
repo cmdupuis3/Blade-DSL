@@ -41,6 +41,16 @@ let internal panicSpanArgs (span: Blade.Ast.Span) : string =
 type CodeGenContext = {
     /// Map from IR variable IDs to C++ variable names
     VarNames: Map<IRId, string>
+    /// The VarIds of the PARAMETERS of the function body being emitted
+    /// (empty at module level). A parameter's array type may carry a LITERAL
+    /// extent that is not a statement about the runtime array: shape
+    /// monomorphization pins a `T^k` parameter from one argument, and a
+    /// co-iterating body unifies the parameters' records, so a curried or
+    /// let-bound partial application leaves a second parameter typed at the
+    /// first one's extent. The co-iteration extent guard (BL8011) therefore
+    /// compares runtime extents whenever a parameter is involved, and trusts
+    /// equal literals only between non-parameter (allocated) arrays.
+    ParamIds: Set<IRId>
     /// Current indentation level
     Indent: int
     /// Generated static declarations (symmetry vectors, extents)
@@ -1092,6 +1102,7 @@ let isUnitExpr (expr: IRExpr) : bool =
 
 let emptyContext () = {
     VarNames = Map.empty
+    ParamIds = Set.empty
     Indent = 0
     StaticDecls = []
     TupleChildren = Map.empty

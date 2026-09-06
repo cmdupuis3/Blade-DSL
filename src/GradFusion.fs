@@ -132,7 +132,21 @@ let internal fuseKernels (ctx: Ctx) (at: Expr) (k1: Expr) (k2: Expr) : Result<Ex
         let b1' =
             renames |> List.fold (fun acc (p, newN) ->
                 acc |> Option.bind (substKern p.Name (inheritSpan k1 (ExprVar newN)))) (Some b1)
-        match b1' |> Option.bind (fun b -> substKern p2.Name b b2) with
+        // The SECOND stage's parameter annotation is a constraint on what
+        // flows into it, exactly like the first stage's (carried below onto
+        // the fused lambda's params). Its parameter is substituted away, so
+        // the constraint rides the substituted value as an ascription --
+        // `(b1 : T)` is a bidirectional CHECK, not a cast (inferExpr's
+        // ExprTyped arm) -- and `lambda(y: Bool)` after an Int64 stage is
+        // refused with the same BL3001 the unfused application gives.
+        // Without this the annotation simply vanished: the fused pipeline
+        // accepted what the direct application refused.
+        let stage1Value =
+            b1' |> Option.map (fun b ->
+                match p2.Type with
+                | Some ty -> inheritSpan k2 (ExprTyped (b, ty))
+                | None -> b)
+        match stage1Value |> Option.bind (fun b -> substKern p2.Name b b2) with
         | None ->
             Error ($"fusing a pipeline cannot substitute through the stage kernels {(kernName k1)} and {(kernName k2)} (a binder or an unsupported form stands between the stages)")
         | Some body ->
@@ -267,15 +281,33 @@ and internal stmtContainsPipelineOp (s: Stmt) : bool =
     | StmtForIn (_, r, body) ->
         containsPipelineOp r || (body |> List.exists stmtContainsPipelineOp)
 
+/// Binding-site bookkeeping for the fusion HYGIENE check. `Locals` stamps
+/// every name bound inside the body being rewritten -- the function's
+/// parameters, lambda parameters, block lets -- with a fresh number per
+/// binding, so two bindings of one spelling are told apart. `DefLocals`
+/// remembers, for each env entry bound inside this body, the `Locals` in
+/// force where it was bound. A module-level entry has no `DefLocals` entry
+/// and reads as the empty map: module scope binds none of this body's locals.
+type internal FuseScope = { Locals: Map<string, int>; DefLocals: Map<string, Map<string, int>> }
+
 /// The rewrite. Bottom-up over one body, threading `env` (names bound to
 /// loop objects, computations, compose values and kernel lambdas -- whatever
-/// a pipeline operand might hide behind) and `arrays` (names known to hold
-/// materialized arrays). Returns the rewritten expression and the DECLINE
-/// reasons for pipeline nodes it left alone.
-let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set<string>)
-                             (body: Expr) : Expr * string list =
+/// a pipeline operand might hide behind), `arrays` (names known to hold
+/// materialized arrays) and the hygiene scope. `params0` are the enclosing
+/// function's parameter names (empty for a module-level binding). Returns
+/// the rewritten expression and the DECLINE reasons for pipeline nodes it
+/// left alone.
+let internal fusePipelinesEnvIn (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set<string>)
+                               (params0: string list) (body: Expr) : Expr * string list =
     let declines = ResizeArray<string>()
     let decline (m: string) = if not (declines.Contains m) then declines.Add m
+    let stampCounter = ref 0
+    let stamp () =
+        stampCounter.Value <- stampCounter.Value + 1
+        stampCounter.Value
+    let bindLocals (names: string list) (sc: FuseScope) : FuseScope =
+        { sc with Locals = names |> List.fold (fun m n -> Map.add n (stamp ()) m) sc.Locals }
+    let scope0 = bindLocals params0 { Locals = Map.empty; DefLocals = Map.empty }
     /// Chase a name to the value it was bound to (depth-capped: `let x = x`
     /// is someone else's error, not a hang).
     let rec resolve (env: Map<string, Expr>) (d: int) (x: Expr) : Expr =
@@ -305,9 +337,72 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
              | Some ({ Kind = ExprKind.ExprLambda _ | ExprKind.ExprReynolds _ } as b) -> b
              | _ -> k)
         | _ -> k
-    let rec go (env: Map<string, Expr>) (arrays: Set<string>) (e: Expr) : Expr =
+    /// The `Locals` in force where an operand was WRITTEN: a name resolved
+    /// through the env was bound earlier in this body (its DefLocals entry)
+    /// or at module level (none of this body's locals); a same-module
+    /// `function` is module-level too; anything else is inline, i.e. here.
+    let originLocals (env: Map<string, Expr>) (sc: FuseScope) (x: Expr) : Map<string, int> =
+        match x.Kind with
+        | ExprKind.ExprVar n when Map.containsKey n env ->
+            Map.tryFind n sc.DefLocals |> Option.defaultValue Map.empty
+        | ExprKind.ExprVar n when Map.containsKey n ctx.Decls -> Map.empty
+        | _ -> sc.Locals
+    /// Where a KERNEL was written, given the operand it was found in: a
+    /// kernel named by a variable has its own origin (the let that bound the
+    /// lambda, or module scope for a `function`); an inline lambda shares
+    /// its operand's.
+    let kernOrigin (env: Map<string, Expr>) (sc: FuseScope) (operand: Expr) (k: Expr) : Map<string, int> =
+        match k.Kind with
+        | ExprKind.ExprVar n when Map.containsKey n ctx.Decls -> Map.empty
+        | ExprKind.ExprVar n when Map.containsKey n env ->
+            Map.tryFind n sc.DefLocals |> Option.defaultValue Map.empty
+        | ExprKind.ExprVar _ -> sc.Locals   // an intrinsic: no free names
+        | _ -> originLocals env sc operand
+    /// HYGIENE. A kernel that reaches the fusion site by NAME was written
+    /// somewhere else, and a free name in its body means the binding
+    /// visible THERE. Substituting that body into a lambda at this site makes
+    /// every free name resolve HERE instead, and when the two scopes bind
+    /// the name differently the fusion changes what the program computes:
+    /// `function add_global(x) = x + scale` fused inside `function
+    /// piped(scale) = ...` read the PARAMETER `scale` (101 where 11 was
+    /// meant), on both backends, because the rewrite runs ahead of both.
+    /// The check compares each free name's binding stamp at the site with
+    /// its stamp at the kernel's origin; a difference is a decline (the
+    /// pipeline then stays an ordinary staged application, which calls the
+    /// kernel by name and keeps its scope). `allVarsDeep` over-reports inner
+    /// binders, which can only add declines -- the safe direction.
+    let captureClash (sc: FuseScope) (origin: Map<string, int>) (kOrig: Expr) (k: Expr) : string option =
+        if origin = sc.Locals then None else
+        let kernelNameRebound =
+            match kOrig.Kind with
+            | ExprKind.ExprVar n when Map.tryFind n sc.Locals <> Map.tryFind n origin -> Some n
+            | _ -> None
+        match kernelNameRebound with
+        | Some n -> Some n
+        | None ->
+        match asKernelLambda ctx k with
+        | Ok (ps, _, kb, _) ->
+            let own = ps |> List.map _.Name |> Set.ofList
+            allVarsDeep kb
+            |> Set.toList
+            |> List.tryFind (fun v ->
+                not (Set.contains v own) && Map.tryFind v sc.Locals <> Map.tryFind v origin)
+        | Error _ -> None
+    /// `fuseKernels` behind the hygiene check. `o1`/`o2` are the origins of
+    /// the kernels as found (`kernOrigin`), `k1o`/`k2o` the kernel exprs
+    /// before env resolution.
+    let fuseChecked (sc: FuseScope) (at: Expr)
+                    (o1: Map<string, int>) (k1o: Expr) (k1: Expr)
+                    (o2: Map<string, int>) (k2o: Expr) (k2: Expr) : Result<Expr, string> =
+        match captureClash sc o1 k1o k1, captureClash sc o2 k2o k2 with
+        | Some v, _ ->
+            Error ($"fusing a pipeline would change what '{v}' means: stage kernel {(kernName k1o)} reads '{v}' from the scope it was written in, and this site binds a different '{v}' (a parameter or local); the stages are left as separate applications")
+        | _, Some v ->
+            Error ($"fusing a pipeline would change what '{v}' means: stage kernel {(kernName k2o)} reads '{v}' from the scope it was written in, and this site binds a different '{v}' (a parameter or local); the stages are left as separate applications")
+        | None, None -> fuseKernels ctx at k1 k2
+    let rec go (env: Map<string, Expr>) (arrays: Set<string>) (sc: FuseScope) (e: Expr) : Expr =
         let re k = inheritSpan e k
-        let g x = go env arrays x
+        let g x = go env arrays sc x
         let gl xs = xs |> List.map g
         match e.Kind with
         // ---- `>>@`: compose two kernel OBJECTS; the LEFT stage runs first
@@ -316,7 +411,9 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
             let r' = g r
             (match (resolve env 0 l').Kind, (resolve env 0 r').Kind with
              | ExprKind.ExprObjectFor k1, ExprKind.ExprObjectFor k2 ->
-                 (match fuseKernels ctx e (resolveKern env k1) (resolveKern env k2) with
+                 let o1 = kernOrigin env sc l' k1
+                 let o2 = kernOrigin env sc r' k2
+                 (match fuseChecked sc e o1 k1 (resolveKern env k1) o2 k2 (resolveKern env k2) with
                   | Ok fk -> re (ExprObjectFor fk)
                   | Error msg -> decline msg; re (ExprBinOp (m0, OpComposeObj, l', r')))
              | _ ->
@@ -330,7 +427,9 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
              | MapApply m1, MapApply m2 ->
                  (match loopKey m1.Ops, loopKey m2.Ops with
                   | Some a, Some b when a = b ->
-                      (match fuseKernels ctx e (resolveKern env m1.Kern) (resolveKern env m2.Kern) with
+                      let o1 = kernOrigin env sc c1' m1.Kern
+                      let o2 = kernOrigin env sc c2' m2.Kern
+                      (match fuseChecked sc e o1 m1.Kern (resolveKern env m1.Kern) o2 m2.Kern (resolveKern env m2.Kern) with
                        | Ok fk -> m1.Rebuild fk
                        | Error msg -> decline msg; re (ExprBinOp (m0, OpComposeMeth, c1', c2')))
                   | _ ->
@@ -346,7 +445,9 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
             let rc = resolve env 0 c'
             (match rc with
              | MapApply m1 ->
-                 (match fuseKernels ctx e (resolveKern env m1.Kern) (resolveKern env kf') with
+                 let o1 = kernOrigin env sc c' m1.Kern
+                 let o2 = kernOrigin env sc kf' kf'
+                 (match fuseChecked sc e o1 m1.Kern (resolveKern env m1.Kern) o2 kf' (resolveKern env kf') with
                   | Ok fk -> m1.Rebuild fk
                   | Error msg -> decline msg; re (ExprBinOp (m0, OpFunctor, kf', c')))
              | _ when isArrayish arrays rc c' ->
@@ -355,7 +456,16 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
                  // the compose arms resolve theirs: a module-level
                  // `let k = lambda(...)` is not a `function`, so nothing
                  // downstream can see it as a kernel unless fusion inlines it.
-                 re (ExprBinOp (Elementwise, OpApply, re (ExprMethodFor [c']), resolveKern env kf'))
+                 // Same hygiene rule: an inlined let-bound lambda keeps its
+                 // own scope only when this site binds its free names the
+                 // same way; otherwise the name is left for the checker.
+                 let kfR = resolveKern env kf'
+                 (match captureClash sc (kernOrigin env sc kf' kf') kf' kfR with
+                  | Some v ->
+                      decline ($"inlining the `<$>` kernel {(kernName kf')} would change what '{v}' means at this site")
+                      re (ExprBinOp (Elementwise, OpApply, re (ExprMethodFor [c']), kf'))
+                  | None ->
+                      re (ExprBinOp (Elementwise, OpApply, re (ExprMethodFor [c']), kfR)))
              | _ ->
                  decline "differentiating `<$>` requires its right operand to resolve to a map application or to a named array"
                  re (ExprBinOp (m0, OpFunctor, kf', c')))
@@ -385,7 +495,7 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
             let names = ps |> List.map _.Name
             let env2 = names |> List.fold (fun (m: Map<string, Expr>) n -> Map.remove n m) env
             let arr2 = names |> List.fold (fun s n -> Set.remove n s) arrays
-            re (ExprLambda (ps, wc, go env2 arr2 b))
+            re (ExprLambda (ps, wc, go env2 arr2 (bindLocals names sc) b))
         // NOTE for anyone adding arms below: every remaining BINDER form
         // (`ExprLet`, `ExprMatch`, `ExprFor`, `ExprRecArray`) falls to the
         // catch-all and is returned UNCHANGED. That forgoes fusion inside them,
@@ -393,14 +503,21 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
         // form's binders from `env`/`arrays` would resolve a shadowed name to an
         // outer binding, which is a wrong answer. Shadow first, then descend.
         | ExprKind.ExprBlock (ss, fe) ->
-            let env2, arr2, ss' =
-                ss |> List.fold (fun (en, ar, acc) s ->
-                    match unwrapStmt s with
+            let env2, arr2, sc2, ss' =
+                ss |> List.fold (fun (en, ar, s, acc) st ->
+                    match unwrapStmt st with
                     | StmtLet ({ Pattern = { Kind = PatternKind.PatVar nm } } as b) ->
-                        let v2 = go en ar b.Value
+                        let v2 = go en ar s b.Value
                         let en2 = if bindsPipelineValue v2 then Map.add nm v2 en else Map.remove nm en
                         let ar2 = if isArrayish ar (resolve en 0 v2) v2 then Set.add nm ar else Set.remove nm ar
-                        (en2, ar2, StmtLet { b with Value = v2 } :: acc)
+                        // The value was written under `s.Locals` (a let is
+                        // not recursive: `nm` itself is not in scope there).
+                        let s2 =
+                            { bindLocals [nm] s with
+                                DefLocals =
+                                    if bindsPipelineValue v2 then Map.add nm s.Locals s.DefLocals
+                                    else Map.remove nm s.DefLocals }
+                        (en2, ar2, s2, StmtLet { b with Value = v2 } :: acc)
                     // A NON-PatVar pattern still BINDS: `let (inc, dec) = ...`
                     // shadows a module-level `inc` for the rest of the block.
                     // Threading the env untouched left the stale binding
@@ -410,17 +527,25 @@ let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set
                     // bound to, so the names are simply dropped from both maps.
                     | StmtLet b ->
                         let bound = patternBoundNames b.Pattern
-                        let v2 = go en ar b.Value
+                        let v2 = go en ar s b.Value
                         let en2 = bound |> List.fold (fun (m: Map<string, Expr>) n -> Map.remove n m) en
-                        let ar2 = bound |> List.fold (fun s n -> Set.remove n s) ar
-                        (en2, ar2, StmtLet { b with Value = v2 } :: acc)
-                    | StmtExpr ex -> (en, ar, StmtExpr (go en ar ex) :: acc)
-                    | StmtAssign (l, o, r) -> (en, ar, StmtAssign (l, o, go en ar r) :: acc)
-                    | other -> (en, ar, other :: acc)) (env, arrays, [])
-            re (ExprBlock (List.rev ss', fe |> Option.map (go env2 arr2)))
+                        let ar2 = bound |> List.fold (fun st n -> Set.remove n st) ar
+                        let s2 =
+                            { bindLocals bound s with
+                                DefLocals = bound |> List.fold (fun (m: Map<string, Map<string, int>>) n -> Map.remove n m) s.DefLocals }
+                        (en2, ar2, s2, StmtLet { b with Value = v2 } :: acc)
+                    | StmtExpr ex -> (en, ar, s, StmtExpr (go en ar s ex) :: acc)
+                    | StmtAssign (l, o, r) -> (en, ar, s, StmtAssign (l, o, go en ar s r) :: acc)
+                    | other -> (en, ar, s, other :: acc)) (env, arrays, sc, [])
+            re (ExprBlock (List.rev ss', fe |> Option.map (go env2 arr2 sc2)))
         | _ -> e
-    let out = go env0 arrays0 body
+    let out = go env0 arrays0 scope0 body
     (out, List.ofSeq declines)
+
+/// `fusePipelinesEnvIn` for a MODULE-LEVEL body: no enclosing parameters.
+let internal fusePipelinesEnv (ctx: Ctx) (env0: Map<string, Expr>) (arrays0: Set<string>)
+                             (body: Expr) : Expr * string list =
+    fusePipelinesEnvIn ctx env0 arrays0 [] body
 
 /// Fuse the pipelines in one function's body, seeded from the module scope:
 /// module-level bindings are visible inside every body, except where a
@@ -446,7 +571,8 @@ let internal fuseFunctionBody (ctx: Ctx) (fd: FunctionDecl) : Expr * string list
             | None -> false)
         |> List.map _.Name
         |> Set.ofList
-    fusePipelinesEnv ctx env (Set.union (Set.difference moduleArrays paramNames) paramArrays) fd.Body
+    fusePipelinesEnvIn ctx env (Set.union (Set.difference moduleArrays paramNames) paramArrays)
+                       (fd.Params |> List.map _.Name) fd.Body
 
 // ---------------------------------------------------------------------------
 // Auto-lowered grouped peels

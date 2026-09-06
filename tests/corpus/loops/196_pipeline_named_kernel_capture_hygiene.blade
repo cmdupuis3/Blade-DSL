@@ -1,0 +1,20 @@
+// TEST: Pipeline Named Kernel Capture Hygiene
+// ============================================================================
+// `add_global` reads the module-level `scale`. Fusing it into a pipeline
+// INSIDE `piped`, whose parameter is also spelled `scale`, substituted its
+// body into a lambda at the call site, where `scale` is the parameter:
+// `[101, 102]` on both backends, because the rewrite runs ahead of both.
+// Fusion now declines when an inlined kernel's free name is bound
+// differently at the site, and the staged application keeps the kernel's
+// own scope.
+let scale = 10.0
+function add_global(x: Float64) -> Float64 = x + scale
+function piped(scale: Float64) = {
+    let a = [1.0, 2.0]
+    (object_for(add_global) >>@ object_for(lambda(y) -> y)) <@> a |> compute
+}
+let result = piped(100.0)
+let direct = add_global(1.0)
+// EXPECT: scale = 10
+// EXPECT: result = [11, 12]
+// EXPECT: direct = 11

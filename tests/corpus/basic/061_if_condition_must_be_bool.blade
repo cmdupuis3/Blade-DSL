@@ -1,0 +1,8 @@
+// TEST: If Condition Must Be Bool (rejects)
+// ERROR: BL3001
+// ============================================================================
+// Every other predicate position (guards, `while`, the static evaluator)
+// requires Bool; `if` accepted anything and compiled `if 1` through C++
+// truthiness (and an ARRAY condition reached the emitter, which has no rule
+// for it).
+let x = if 1 then 10 else 20

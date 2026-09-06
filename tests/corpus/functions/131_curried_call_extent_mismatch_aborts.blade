@@ -1,0 +1,13 @@
+// TEST: Curried Call Extent Mismatch Aborts (aborts)
+// ============================================================================
+// The curried spelling of diagnostics/075: `f(a)(b)`. The inner `f(a)` is
+// desugared to a partial-application lambda BEFORE the call-site obligation
+// seam sees it, and inside that lambda `b`'s slot is still an open
+// parameter, so the literal-extent check (BL3016) has nothing to compare.
+// The runtime guard in `f`'s body (BL8011) is the effective check for every
+// partial-application spelling.
+function f(a: T^1, b: T^1) = a + b
+let a = [1.0, 2.0, 3.0]
+let b = [4.0, 5.0]
+let out = f(a)(b)
+// ABORT: BL8011

@@ -231,6 +231,18 @@ let checkProgram (program: Program) : TypedProgram * IRBuilder * CompileError li
             Units = finalEnv.Units
             StaticFunctions = finalEnv.StaticFunctions |> Map.filter (fun k _ -> not (k.Contains(".")))
             StaticValues = finalEnv.StaticValues |> Map.filter (fun k _ -> not (k.Contains(".")))
+            // Snapshot NOW: the tables are shared by reference and name-keyed,
+            // so the next module's `f` would overwrite this module's entry.
+            Defaults =
+                finalEnv.FuncDefaults
+                |> Seq.filter (fun kv -> not (kv.Key.Contains(".")) && Map.containsKey kv.Key finalEnv.Variables)
+                |> Seq.map (fun kv -> (kv.Key, kv.Value))
+                |> Map.ofSeq
+            DefaultCaptures =
+                finalEnv.FuncDefaultCaptures
+                |> Seq.filter (fun kv -> not (kv.Key.Contains(".")) && Map.containsKey kv.Key finalEnv.Variables)
+                |> Seq.map (fun kv -> (kv.Key, kv.Value))
+                |> Map.ofSeq
         }
         moduleExports <- Map.add moduleName export moduleExports
     // env.Warnings is shared by reference across all envWithExports updates

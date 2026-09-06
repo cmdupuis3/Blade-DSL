@@ -373,11 +373,39 @@ let allocCompact (elemTy: IRType) (idxTys: IRIndexType list) (extents: int64[])
 /// compact-read helpers below because the wreath read needs it first.
 let zeroOfElemTy (elemTy: IRType) : Value =
     match elemThrough elemTy with
-    | Some (ETFloat64 | ETFloat32) -> VFloat 0.0
-    | Some (ETInt64 | ETInt32) -> VInt 0L
+    // WIDTH-EXACT ZEROS. A fold seeded with a double zero stays double: the
+    // binop promotion rule takes the wider operand, so `gram` over Float32
+    // operands accumulated every step in Float64 and rounded once at the
+    // store, while the compiled loop rounds after every product and every
+    // add (`float __gacc += float * float`). On cancellation-sensitive data
+    // (16777216 + 1 - 16777216) the two answered 1 and 0.
+    | Some ETFloat64 -> VFloat 0.0
+    | Some ETFloat32 -> VFloat32 0.0f
+    | Some ETInt64 -> VInt 0L
+    | Some ETInt32 -> VInt32 0
     | Some (ETComplex64 | ETComplex128) -> VComplex (0.0, 0.0)
     | Some ETBool -> VBool false
     | _ -> VFloat 0.0
+
+/// Round a value to the WIDTH of an element type: Float32 to a `VFloat32`,
+/// Complex64 to a complex with single-precision parts (the interpreter has
+/// no single-precision complex value, so the parts are rounded through
+/// float32 and carried as doubles); everything else is returned as is.
+/// The stores are double-backed and `readCell` yields doubles, so a fold
+/// that must match a compiled `float` accumulation narrows every operand
+/// and every partial result through this (gramArray, matmulArray).
+let narrowToElem (elemTy: IRType) : Value -> Value =
+    match elemThrough elemTy with
+    | Some ETFloat32 ->
+        (fun v ->
+            match v with
+            | VFloat32 _ -> v
+            | _ -> VFloat32 (float32 (toF64v v)))
+    | Some ETComplex64 ->
+        (fun v ->
+            let (r, im) = toComplexv v
+            VComplex (float (float32 r), float (float32 im)))
+    | _ -> id
 
 /// True iff any slot of this record list is a depth >= 2 OrbIdx class.
 let hasWreath (idxTys: IRIndexType list) : bool =
@@ -1072,13 +1100,28 @@ let gramArray (left: BladeArray) (right: BladeArray) (outType: IRType) : BladeAr
         let m = if left.Extents.Length >= 1 then left.Extents.[0] else 0L
         let nn = if left.Extents.Length >= 2 then left.Extents.[1] else 0L
         let p = if right.Extents.Length >= 1 then right.Extents.[0] else 0L
+        // Contracted-dim guard (BL8011), the twin of materializeGramForm's:
+        // the k-fold runs to A's trailing extent and reads B's row at the
+        // same k, so B's trailing extent must be equal. The checker refuses
+        // literal disagreements; this covers the extents it cannot see.
+        let rn = if right.Extents.Length >= 2 then right.Extents.[1] else 0L
+        if rn <> nn then
+            raise (InterpPanic ("BL8011", "co-iteration extent mismatch", None, 0))
         let zero = zeroOfElemTy outElem
+        // WIDTH-EXACT FOLD. The store is double-backed (`SFloat of float[]`)
+        // and readCell hands back a double whatever the array's element
+        // type, so a Float32 contraction accumulated every step in Float64
+        // and rounded once at the store -- 1 where the compiled `float
+        // __gacc += float * float` (a rounding after every product and every
+        // add) answers 0 on 16777216 + 1 - 16777216. Every read, product and
+        // partial sum is narrowed to the element width first.
+        let narrow = narrowToElem outElem
         let dot (i: int64) (j: int64) : Value =
             let mutable acc = zero
             for k in 0L .. nn - 1L do
-                let lv = readCell left [ i; k ]
-                let rv = N.evalUnaryOp IRConj (readCell right [ j; k ])
-                acc <- N.evalBinOp IRAdd acc (N.evalBinOp IRMul lv rv)
+                let lv = narrow (readCell left [ i; k ])
+                let rv = narrow (N.evalUnaryOp IRConj (readCell right [ j; k ]))
+                acc <- narrow (N.evalBinOp IRAdd acc (narrow (N.evalBinOp IRMul lv rv)))
             acc
         let (osym, ostrict) = buildSymmVecWithStrict outType
         if hasRealSymmetry osym then
@@ -1113,15 +1156,17 @@ let matmulArray (left: BladeArray) (right: BladeArray) (outType: IRType) : Blade
         let kk = if left.Extents.Length >= 2 then left.Extents.[1] else 0L
         let n = if right.Extents.Length >= 2 then right.Extents.[1] else 0L
         let zero = zeroOfElemTy outElem
+        // Width-exact, as gramArray's fold (see narrowToElem).
+        let narrow = narrowToElem outElem
         let extents = [| m; n |]
         let out = allocDense outElem outArr.IndexTypes extents
         for i in 0L .. m - 1L do
             for j in 0L .. n - 1L do
                 let mutable acc = zero
                 for t in 0L .. kk - 1L do
-                    let lv = readCell left [ i; t ]
-                    let rv = readCell right [ t; j ]
-                    acc <- N.evalBinOp IRAdd acc (N.evalBinOp IRMul lv rv)
+                    let lv = narrow (readCell left [ i; t ])
+                    let rv = narrow (readCell right [ t; j ])
+                    acc <- narrow (N.evalBinOp IRAdd acc (narrow (N.evalBinOp IRMul lv rv)))
                 writeCell out [ i; j ] acc
         out
     | _ -> raise (ArrayOpUnsupported "matmul: output type is not an array")

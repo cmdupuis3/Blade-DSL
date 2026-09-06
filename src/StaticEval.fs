@@ -53,6 +53,17 @@ type StructStaticInfo = {
 /// Environment for static evaluation
 type StaticEnv = {
     Values: Map<string, StaticValue>
+    /// The MODULE-LEVEL static values -- the lexical environment every
+    /// `static function` body closes over. `Values` grows with call-frame
+    /// parameters and block-local lets as evaluation descends; a static
+    /// function's body must NOT see those (it was declared at module scope),
+    /// so a call evaluates its body in `Globals` plus its own parameters.
+    /// Before this split a callee read the CALLER's bindings: `static
+    /// function f() = a` invoked from `static function g(a) = f()` returned
+    /// g's argument at compile time and the module's `a` at runtime.
+    /// `resolveStatics` keeps it equal to the top-level `Values` as statics
+    /// fold; every other constructor seeds it with its `Values`.
+    Globals: Map<string, StaticValue>
     Functions: Map<string, StaticFuncDef>
     /// Accumulates names of functions called during evaluation
     CalledFunctions: ref<Set<string>>
@@ -438,6 +449,27 @@ let rec private evalCore (env: StaticEnv) (fuel: Fuel) (depth: int) (expr: Expr)
             // Could be a static function used as a value (shouldn't happen normally)
             Error $"Static evaluation: undefined variable '{name}'"
 
+    // `&&` / `||` SHORT-CIRCUIT, exactly as the runtime does (the interpreter's
+    // IRAnd/IROr arms and C++ `&&`/`||`): the right operand is not visited
+    // when the left one decides. Evaluating both meant `false && (1 / 0 == 1)`
+    // was a static division-by-zero error while the same text at runtime is
+    // simply `false` -- a guard changed meaning by being moved into a
+    // `let static`.
+    | ExprKind.ExprBinOp (_, OpAnd, l, r) ->
+        evalCore env fuel (depth + 1) l |> Result.bind (fun lv ->
+            match lv with
+            | SVBool false -> Ok (SVBool false)
+            | SVBool true ->
+                evalCore env fuel (depth + 1) r |> Result.bind (fun rv -> evalBinOp OpAnd lv rv)
+            | _ -> Error (sprintf "Static evaluation: cannot apply %A to %A" OpAnd lv))
+    | ExprKind.ExprBinOp (_, OpOr, l, r) ->
+        evalCore env fuel (depth + 1) l |> Result.bind (fun lv ->
+            match lv with
+            | SVBool true -> Ok (SVBool true)
+            | SVBool false ->
+                evalCore env fuel (depth + 1) r |> Result.bind (fun rv -> evalBinOp OpOr lv rv)
+            | _ -> Error (sprintf "Static evaluation: cannot apply %A to %A" OpOr lv))
+
     | ExprKind.ExprBinOp (_, op, l, r) ->
         // Both operands are visited at depth + 1 and BOTH draw from the same
         // step pool. Under the old `fuel - 1`-per-child threading they each
@@ -469,10 +501,15 @@ let rec private evalCore (env: StaticEnv) (fuel: Fuel) (depth: int) (expr: Expr)
                 if argVals.Length <> funcDef.Params.Length then
                     Error ($"Static function '{fname}' expects {funcDef.Params.Length} args, got {argVals.Length}")
                 else
+                    // DEFINITION-SITE ENVIRONMENT: the body sees the module's
+                    // statics (`Globals`) and its own parameters -- never the
+                    // caller's parameters or block-locals, which `env.Values`
+                    // also holds at this point. See `StaticEnv.Globals`.
                     let bodyEnv =
                         (funcDef.Params, argVals) ||> List.zip
                         |> List.fold (fun e (p, v) ->
-                            { e with Values = Map.add p v e.Values }) env
+                            { e with Values = Map.add p v e.Values })
+                            { env with Values = env.Globals }
                     // A CALLEE'S BODY IS A CHILD FOR DEPTH PURPOSES even
                     // though it is not one syntactically: it is entered from
                     // this frame and returns to it, so the stack grows exactly
@@ -958,10 +995,30 @@ let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailur
 
     // Phase 2: Dependency graph over bound names -- a destructured decl's
     // names share the decl's dependencies -- and topological sort.
+    // A static CALLEE'S body is part of the initializer's dependency set: `let
+    // static a = f()` with `static function f() = z` needs `z` folded before
+    // `a`, and nothing about the call text names `z`. Walked transitively
+    // (f may call g may read z) with a visited set, so a self- or mutually-
+    // recursive static function terminates rather than looping; the callee's
+    // own parameters are its locals and are subtracted, never dependencies.
+    let rec namesThroughStaticCallees (visited: Set<string>) (names: Set<string>) : Set<string> =
+        let callees =
+            names |> Set.filter (fun n -> Map.containsKey n staticFuncs && not (Set.contains n visited))
+        if Set.isEmpty callees then names
+        else
+            let visited' = Set.union visited callees
+            let fromBodies =
+                callees
+                |> Set.toList
+                |> List.map (fun f ->
+                    let fd = staticFuncs.[f]
+                    Set.difference (collectFreeNames fd.Body) (Set.ofList fd.Params))
+                |> Set.unionMany
+            namesThroughStaticCallees visited' (Set.union names fromBodies)
     let deps =
         pending
         |> List.collect (fun pd ->
-            let direct = collectFreeNames pd.Expr
+            let direct = namesThroughStaticCallees Set.empty (collectFreeNames pd.Expr)
             // NAMING A STRUCT PULLS IN THE STRUCT'S OWN STATICS: a static
             // expression that mentions a struct TYPE by name (`idx_card(R)`)
             // is going to fold that struct's field bounds and conjuncts,
@@ -1014,7 +1071,7 @@ let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailur
             |> List.collect (fun pd -> pd.Names |> List.map (fun n -> (n, pd)))
             |> Map.ofList
         let calledRef = ref Set.empty
-        let mutable env = { Values = Map.empty; Functions = staticFuncs; CalledFunctions = calledRef; ProviderRoots = providerRoots; Structs = structInfos }
+        let mutable env = { Values = Map.empty; Globals = Map.empty; Functions = staticFuncs; CalledFunctions = calledRef; ProviderRoots = providerRoots; Structs = structInfos }
         let mutable failures : StaticFailure list = []
         let mutable evaluated = Set.empty
 
@@ -1027,7 +1084,10 @@ let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailur
                 else
                     match evalExpr env maxSteps pd.Expr with
                     | Ok value ->
-                        env <- bindPattern env pd.Pattern value
+                        // Top level: every folded static is a module global,
+                        // so `Globals` tracks `Values` exactly here.
+                        let bound = bindPattern env pd.Pattern value
+                        env <- { bound with Globals = bound.Values }
                     | Error reason ->
                         failures <- failures @ [{ Names = pd.Names; Reason = reason; Span = pd.Span }]
             | _ -> ()

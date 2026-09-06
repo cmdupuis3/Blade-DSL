@@ -75,6 +75,7 @@ let staticEnvOf (env: TypeEnv) : StaticEval.StaticEnv =
             staticFuncProjCache <- Some (box src, p)
             p
     { Values = env.StaticValues
+      Globals = env.StaticValues
       Functions = projected
       CalledFunctions = ref Set.empty
       ProviderRoots = Map.empty

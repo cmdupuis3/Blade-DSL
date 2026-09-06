@@ -743,9 +743,10 @@ let fuseProgram (program: Program) : Program =
                         |> List.map _.Name
                         |> Set.ofList
                     let body, _ =
-                        fusePipelinesEnv ctx
+                        fusePipelinesEnvIn ctx
                             (env |> Map.filter (fun n _ -> not (Set.contains n ps)))
                             (Set.union (Set.difference arrays ps) paramArrays)
+                            (fd.Params |> List.map _.Name)
                             fd.Body
                     { d with Value = DeclFunction { fd with Body = body } }
                 // `noteBinding` runs either way: the env has to stay accurate

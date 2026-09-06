@@ -860,6 +860,24 @@ let rec checkPattern (env: TypeEnv) (expected: IRType) (pat: Pattern)
         match Map.tryFind tag env.VariantTags with
         | Some (parentName, payloadTy) ->
             let isEnum = isEnumType env parentName
+            // THE CONSTRUCTOR'S PARENT TYPE MUST BE THE SCRUTINEE'S. Nothing
+            // used to relate the two: `match One with | Three -> ...` (One of
+            // `type A`, Three of `type B`) checked clean and matched at
+            // runtime, because emission compares constructor ORDINALS and
+            // both are zero. A concrete nominal disagreement is refused here;
+            // an open scrutinee type is bound to the parent so it flows.
+            // Anything else (an enum-index scrutinee typed through its tag,
+            // an alias) keeps the historical acceptance.
+            let nominalClash =
+                match env.Subst.Resolve expected with
+                | IRTNamed other when other <> parentName -> Some other
+                | _ -> None
+            match nominalClash with
+            | Some _ -> Error (PatternTypeMismatch (tag, expected))
+            | None ->
+            (match env.Subst.Resolve expected with
+             | IRTInfer _ -> unify env.Subst (IRTNamed parentName) expected |> ignore
+             | _ -> ())
             match payloadPat, payloadTy with
             | Some p, Some ty ->
                 checkPattern env ty p |> Result.map (fun tPayload ->
@@ -891,6 +909,23 @@ let rec checkPattern (env: TypeEnv) (expected: IRType) (pat: Pattern)
             | Some (TDIStruct (_, _, fields, _)) ->
                 fields |> List.map (fun (n, t) -> (n, t)) |> Map.ofList
             | _ -> Map.empty
+        // Same nominal rule as the variant arm: a struct pattern names a
+        // TYPE, and a value of another struct type with the same field
+        // spelling (`A { x = 12 }` against `B { x }`) is not an instance of
+        // it. Refused on a concrete disagreement; an open scrutinee is bound.
+        let nominalClash =
+            if Map.isEmpty fieldTypes then None
+            else
+                match env.Subst.Resolve expected with
+                | IRTNamed other when other <> typeName -> Some other
+                | _ -> None
+        match nominalClash with
+        | Some _ -> Error (PatternTypeMismatch ($"{typeName} {{ ... }}", expected))
+        | None ->
+        (if not (Map.isEmpty fieldTypes) then
+            match env.Subst.Resolve expected with
+            | IRTInfer _ -> unify env.Subst (IRTNamed typeName) expected |> ignore
+            | _ -> ())
         fieldPats |> List.map (fun (fname, fpat) ->
             let fTy = Map.tryFind fname fieldTypes |> Option.defaultValue (env.Subst.Fresh())
             checkPattern env fTy fpat |> Result.map (fun tp -> (fname, tp)))
@@ -2041,12 +2076,42 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
                 else
                     Ok (mkTyped (TExprIndex (tFunc, tArgs, identity))
                                 (mkArrayLike { arrTy with IndexTypes = finalSlots }))
-            elif tArgs.Length = arrTy.IndexTypes.Length then
-                Ok (mkTyped (TExprIndex (tFunc, tArgs, identity)) arrTy.ElemType)
             else
-                let remaining = arrTy.IndexTypes |> List.skip tArgs.Length
-                Ok (mkTyped (TExprIndex (tFunc, tArgs, identity))
-                            (mkArrayLike { arrTy with IndexTypes = remaining })))))
+                // COORDINATES, NOT RECORDS. A compact group (`SymIdx<2, n>`,
+                // AntisymIdx, HermitianIdx) is ONE record spanning `Rank`
+                // coordinates, so the supplied count is walked through the
+                // records in flat coordinate order rather than one per
+                // record: `S(1)` over a rank-2 symmetric result used to count
+                // one argument against one record and answer "scalar", and
+                // the emitted `double x = S[1L]` was a row pointer. A count
+                // that lands INSIDE a group has no residual class (the same
+                // refusal the wildcard arm above gives); one that lands on a
+                // record boundary keeps the records after it as the view.
+                let rec walk (coords: int) (recs: IRIndexType list) : Result<IRIndexType list, IRIndexType> =
+                    match recs with
+                    | [] -> Ok []
+                    | _ when coords = 0 -> Ok recs
+                    | ix :: rest ->
+                        let compact =
+                            ix.Rank >= 2 &&
+                            (match ix.Symmetry with
+                             | SymSymmetric | SymAntisymmetric | SymHermitian -> true
+                             | SymNone | SymWreath -> false)
+                        // Only a compact group spans several coordinates
+                        // here; every other record keeps the one-argument-
+                        // per-record accounting it always had (wreath
+                        // partial reads are refused by their own arm above).
+                        let span = if compact then ix.Rank else 1
+                        if coords >= span then walk (coords - span) rest
+                        else Error ix
+                match walk tArgs.Length arrTy.IndexTypes with
+                | Error ix ->
+                    Error (Other (sprintf "a partial read of a compact (SymIdx / AntisymIdx / HermitianIdx) group has no residual class: %d coordinate(s) were supplied but the group spans %d. Supply every coordinate of the group, or decompact(A, d) first and read the freed axis there." tArgs.Length ix.Rank))
+                | Ok [] ->
+                    Ok (mkTyped (TExprIndex (tFunc, tArgs, identity)) arrTy.ElemType)
+                | Ok remaining ->
+                    Ok (mkTyped (TExprIndex (tFunc, tArgs, identity))
+                                (mkArrayLike { arrTy with IndexTypes = remaining })))))
     | FuncElem (paramTys, retTy) ->
         // WIDTH SCHEMA first, so every check below (and the arity accounting,
         // and the emitted TExprApp) sees the regrouped list: `g(b, c)` against
@@ -2335,19 +2400,37 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
             | Some (fname, offset) ->
                 (match env.FuncCoIterObligations.TryGetValue fname with
                  | true, obs ->
+                     // THE WHOLE APPLICATION SPINE. When a multi-group
+                     // application reaches this seam as `TExprApp(TExprApp(f,
+                     // [a]), [b])`, the obligation relates a position in the
+                     // EARLIER group to one in this group, and rebasing the
+                     // positions into this group alone dropped the earlier
+                     // arguments. The earlier arguments are recovered from the
+                     // spine and declared positions index the flattened list.
+                     // NOTE the surface curried call `f(a)(b)` does NOT arrive
+                     // this way: the partial application `f(a)` is desugared
+                     // to a lambda before this seam, and inside it `b`'s slot
+                     // is still an open parameter, so -- like the let-bound
+                     // `let h = f(a); h(b)` -- it is the runtime guard's
+                     // (BL8011, functions/128 and /131).
+                     let rec spineArgs (t: TypedExpr) : TypedExpr list =
+                         match t.Kind with
+                         | TExprApp (f, args) -> spineArgs f @ args
+                         | _ -> []
+                     let allArgs = spineArgs tFunc @ tArgs
                      // Leading-axis extent of an argument, when it is a literal.
                      let leadExtent (i: int) =
-                         match env.Subst.Resolve (List.item i tArgs).Type with
+                         match env.Subst.Resolve (List.item i allArgs).Type with
                          | ArrayElem aa ->
                              aa.IndexTypes |> List.tryHead |> Option.bind (fun ix -> tryEvalIntIR ix.Extent)
                          | _ -> None
+                     // The span to blame is an argument of THIS group; a
+                     // clash partner in an earlier group is named by its
+                     // declared position in the message only.
+                     let hereIdx (declPos: int) = max 0 (declPos - offset)
                      obs |> List.tryPick (fun (ps, lits) ->
-                         // Declared positions rebased into THIS argument group;
-                         // a position an earlier group already consumed drops
-                         // out rather than being blamed at the wrong index.
                          let known =
-                             ps |> List.map (fun declPos -> declPos - offset)
-                                |> List.filter (fun i -> i >= 0 && i < tArgs.Length)
+                             ps |> List.filter (fun declPos -> declPos >= 0 && declPos < allArgs.Length)
                                 |> List.choose (fun i -> leadExtent i |> Option.map (fun e -> (i, e)))
                          match known with
                          | [] -> None
@@ -2356,13 +2439,13 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
                              // named as call-site positions, which is the more
                              // actionable report.
                              match rest |> List.tryFind (fun (_, e) -> e <> e0) with
-                             | Some (j, ej) -> Some (j, fname, i0 + 1, Some (j + 1), e0, ej)
+                             | Some (j, ej) -> Some (hereIdx j, fname, i0 + 1, Some (j + 1), e0, ej)
                              | None ->
                                  // Then argument vs a literal extent the BODY
                                  // fixes (a parameter zipped with a concrete
                                  // array), which has no second position.
                                  match lits |> List.tryFind (fun l -> l <> e0) with
-                                 | Some l -> Some (i0, fname, i0 + 1, None, e0, l)
+                                 | Some l -> Some (hereIdx i0, fname, i0 + 1, None, e0, l)
                                  | None -> None)
                  | _ -> None)
             | None -> None
@@ -3174,34 +3257,63 @@ let rec internal unitAnnoError (env: TypeEnv) (ty: TypeExpr) : TypeError option 
 /// defaults, full-arity in declared order, fewer than required args, or a
 /// `_` placeholder -- partial application owns those); Some (Error e) when
 /// routing itself is invalid.
+/// The binding identity of every free name a parameter-default list reads in
+/// the scope it is DECLARED in: free name -> VarId. Recorded next to
+/// `FuncDefaults` (TypeEnv.FuncDefaultCaptures) so `tryFillDefaultArgs` can
+/// refuse a splice whose call site binds one of those names differently.
+/// The callable's own parameters are excluded -- a default may read the
+/// REQUIRED ones, and those are bound by the splice itself -- and a name with
+/// no binding here (an intrinsic, a function registered outside `Variables`)
+/// records nothing, so it is never checked.
+let internal defaultCaptureIdentities (env: TypeEnv) (parms: (string * Expr option) list) : Map<string, IRId> =
+    let own = parms |> List.map fst |> Set.ofList
+    parms
+    |> List.choose snd
+    |> List.map (collectFreeVars own)
+    |> List.fold Set.union Set.empty
+    |> Set.toList
+    |> List.choose (fun n ->
+        match Map.tryFind n env.Variables with
+        | Some vi -> Some (n, vi.VarId)
+        | None -> None)
+    |> Map.ofList
+
 let internal tryFillDefaultArgs (env: TypeEnv) (callSpan: Span) (func: Expr) (args: Expr list) : TypeResult<Expr> option =
     let calleeName =
         match func.Kind with
         | ExprKind.ExprVar n -> n
         | ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, fname) -> alias + "." + fname
         | _ -> "lambda"
+    // (lookup key, param infos). FuncDefaultCaptures is consulted under the
+    // same key, so the two tables cannot disagree about which declaration a
+    // call resolved to.
     let paramInfos =
         match func.Kind with
         | ExprKind.ExprVar name ->
             (match env.FuncDefaults.TryGetValue name with
-             | true, ps -> Some ps
+             | true, ps -> Some (name, ps)
              | _ -> None)
-        // Module-QUALIFIED callee (`plot.contourf(...)`): declarations inside
-        // an imported module registered their defaults under the BARE
-        // function name (checkFunctionDecl runs inside that module), so the
-        // field name is the lookup key. Shares FuncDefaults' documented
-        // name-keyed shadowing weakness.
-        | ExprKind.ExprField ({ Kind = ExprKind.ExprVar _ }, fname) ->
-            (match env.FuncDefaults.TryGetValue fname with
-             | true, ps -> Some ps
-             | _ -> None)
+        // Module-QUALIFIED callee (`a.f(...)`): a qualified import registers
+        // the module's defaults under `alias.name` (checkDecl's DeclImport
+        // arm), consulted FIRST -- two imported modules each declaring `f`
+        // with different defaults used to share one bare-name entry, and
+        // both calls got whichever module was checked last. The bare field
+        // name stays as the fallback for callees with no module export
+        // behind them (a provider alias, a let-bound lambda).
+        | ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, fname) ->
+            (match env.FuncDefaults.TryGetValue (alias + "." + fname) with
+             | true, ps -> Some (alias + "." + fname, ps)
+             | _ ->
+                 match env.FuncDefaults.TryGetValue fname with
+                 | true, ps -> Some (fname, ps)
+                 | _ -> None)
         // Immediately-applied lambda literal: its params are right here.
         | ExprKind.ExprLambda (parms, _, _) when parms |> List.exists (_.Default.IsSome) ->
-            Some (parms |> List.map (fun p -> (p.Name, p.Type, p.Default)))
+            Some ("lambda", parms |> List.map (fun p -> (p.Name, p.Type, p.Default)))
         | _ -> None
     match paramInfos with
     | None -> None
-    | Some ps ->
+    | Some (defaultsKey, ps) ->
         let total = ps.Length
         let required = ps |> List.takeWhile (fun (_, _, d) -> Option.isNone d) |> List.length
         let k = args.Length
@@ -3317,6 +3429,33 @@ let internal tryFillDefaultArgs (env: TypeEnv) (callSpan: Span) (func: Expr) (ar
         let fills = slotExprsAndFills |> List.filter snd |> List.map fst
         let requiredArgs = args |> List.truncate required
         let requiredNames = ps |> List.truncate required |> List.map (fun (n, _, _) -> n)
+        // DECLARATION-SITE MEANING. A filled default is re-inferred HERE, so
+        // a free name it reads resolves in the caller's scope. That is only
+        // the declaration's meaning when the caller binds that name to the
+        // SAME thing; a caller parameter or local of the same spelling
+        // (`function g(k) = f()` against `function f(x = k)`) is a different
+        // binding, and the splice used to read it silently. Identities were
+        // recorded when the callable was declared (FuncDefaultCaptures);
+        // required-parameter references are the splice's own business and
+        // are excluded, exactly as the recording excluded them.
+        let shadowed =
+            match env.FuncDefaultCaptures.TryGetValue defaultsKey with
+            | true, captures when not (Map.isEmpty captures) ->
+                List.zip trailingSlots slotAssign
+                |> List.tryPick (fun ((slotName, _, dflt), assigned) ->
+                    match assigned, dflt with
+                    | None, Some d ->
+                        collectFreeVars (Set.ofList requiredNames) d
+                        |> Set.toList
+                        |> List.tryPick (fun n ->
+                            match Map.tryFind n captures, Map.tryFind n env.Variables with
+                            | Some declId, Some vi when vi.VarId <> declId -> Some (slotName, n)
+                            | _ -> None)
+                    | _ -> None)
+            | _ -> None
+        match shadowed with
+        | Some (slotName, n) -> Some (Error (DefaultParamShadowed (calleeName, slotName, n)))
+        | None ->
         // Only fills can reference params, and only REQUIRED ones (scope rule).
         let referencedNames =
             let free =
@@ -3369,9 +3508,11 @@ let internal tryFlattenFactoryChain (env: TypeEnv) (func: Expr) (args: Expr list
         let isDefaultsCallee =
             match baseFn.Kind with
             | ExprKind.ExprVar name -> env.FuncDefaults.ContainsKey name
-            // Module-qualified base (`plot.contourf(...)(...)`): defaults are
-            // registered under the bare name (see tryFillDefaultArgs).
-            | ExprKind.ExprField ({ Kind = ExprKind.ExprVar _ }, fname) -> env.FuncDefaults.ContainsKey fname
+            // Module-qualified base (`plot.contourf(...)(...)`): the
+            // `alias.name` entry a qualified import registers, else the bare
+            // name (see tryFillDefaultArgs).
+            | ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, fname) ->
+                env.FuncDefaults.ContainsKey (alias + "." + fname) || env.FuncDefaults.ContainsKey fname
             | _ -> false
         if not isDefaultsCallee then None
         else

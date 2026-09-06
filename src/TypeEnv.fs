@@ -118,6 +118,15 @@ type TypeModuleExport = {
     /// rewriteImportedStaticRefs seed these under "alias.name" (qualified) or
     /// "name" (selective) ahead of StaticEval.resolveStatics.
     StaticValues: Map<string, StaticEval.StaticValue>
+    /// This module's defaults-carrying callables (bare names), snapshotted
+    /// from the shared `FuncDefaults` table when the module's check ends --
+    /// BEFORE a later module can overwrite the bare-name entry with its own
+    /// `f`. A qualified import re-registers them as `alias.name` and a
+    /// selective one as `name`, so a call resolves the defaults of the
+    /// module it actually named.
+    Defaults: Map<string, (string * TypeExpr option * Expr option) list>
+    /// The matching FuncDefaultCaptures entries (see TypeEnv.FuncDefaultCaptures).
+    DefaultCaptures: Map<string, Map<string, IRId>>
 }
 
 /// Type checking environment
@@ -221,6 +230,16 @@ type TypeEnv = {
     /// default at the call site). Name-keyed like FuncConstraints, and shares
     /// its known shadowing weakness. Shared by reference.
     FuncDefaults: System.Collections.Generic.Dictionary<string, (string * TypeExpr option * Expr option) list>
+    /// The BINDING IDENTITY of every free name a default expression reads
+    /// from its declaration scope: callee name -> (free name -> VarId at the
+    /// declaration). A default is spliced into the CALL SITE as surface
+    /// syntax and re-inferred there, so a name it reads resolves in the
+    /// caller's scope -- `function f(x = k)` called from `function g(k) =
+    /// f()` used to read g's parameter. The splice compares each free name's
+    /// call-site binding against the identity recorded here and refuses on
+    /// disagreement (BL3012). Keyed exactly like FuncDefaults, including the
+    /// `alias.name` entries a qualified import registers. Shared by reference.
+    FuncDefaultCaptures: System.Collections.Generic.Dictionary<string, Map<string, IRId>>
     /// Mutually constrained alias groups: groupId -> group info.
     MutualGroups: Map<string, MutualGroupInfo>
     /// Member alias name -> owning groupId, for annotation scanning.
@@ -406,6 +425,7 @@ let emptyEnv () = {
     Provenance = System.Collections.Generic.Dictionary<IRId, Set<string>>()
     FuncConstraints = System.Collections.Generic.Dictionary<string, string list * (string * string list) list>()
     FuncDefaults = System.Collections.Generic.Dictionary<string, (string * TypeExpr option * Expr option) list>()
+    FuncDefaultCaptures = System.Collections.Generic.Dictionary<string, Map<string, IRId>>()
     MutualGroups = Map.empty
     MutualMembers = Map.empty
     MutualReturnFuncs = System.Collections.Generic.Dictionary<string, string>()
@@ -722,6 +742,8 @@ class IS implemented, and the dense result folds like any other array." op level
         $"{func}: parameter '{requiredParam}' has no default but follows the defaulted parameter '{defaultedParam}'. Defaults are TRAILING: once a parameter has a default, every later parameter needs one too (otherwise an omitted-argument call is ambiguous). Reorder the parameters or give '{requiredParam}' a default."
     | DefaultParamScope (func, param, referenced) ->
         $"{func}: the default for parameter '{param}' references '{referenced}', which is itself a defaulted parameter. A default may reference the REQUIRED parameters only -- defaults evaluate left-to-right at call entry with just the required arguments bound, so another default's value is not available."
+    | DefaultParamShadowed (func, param, name) ->
+        $"{func}: the default for parameter '{param}' reads '{name}' from the scope where the function was declared, but at this call site '{name}' is a different binding (a parameter or local that shadows it). A default keeps its declaration-site meaning, so it cannot be filled in here: pass the argument explicitly, or rename the local '{name}'."
     | FactoryDupQuantityDecl (func, quantity, param1, param2) ->
         $"{func}: defaulted parameters '{param1}' and '{param2}' both carry the quantity '{quantity}'. By-nominal argument routing (`f(x, 3 : {quantity})`) needs each quantity to name exactly ONE defaulted slot -- give the second slot a distinct quantity, or make it a plain (non-quantity) parameter."
     | FactoryDupFill (callee, quantity, slot) ->
@@ -916,7 +938,7 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             | CoIterArgExtentMismatch _ | CoIterBodyExtentMismatch _ -> "BL3016"
             | ProviderReadExtentMismatch _ -> "BL3016"
             | QuantityTerminal _ -> "BL3011"
-            | DefaultParamOrder _ | DefaultParamScope _ -> "BL3012"
+            | DefaultParamOrder _ | DefaultParamScope _ | DefaultParamShadowed _ -> "BL3012"
             | FactoryDupQuantityDecl _ -> "BL3013"
             | FactoryDupFill _ | FactoryUnknownTag _ | FactoryAmbiguousMix _ -> "BL3014"
             | UnknownUnitName _ -> "BL3015"

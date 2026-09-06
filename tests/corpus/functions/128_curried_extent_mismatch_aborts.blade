@@ -1,0 +1,15 @@
+// TEST: Curried Extent Mismatch Aborts (aborts)
+// ============================================================================
+// `f(a: T^1, b: T^1) = a + b` co-iterates its two parameters. The call-site
+// extent check (BL3016) sees `f(a, b)`; a LET-BOUND partial application
+// `let h = f(a); h(b)` never reaches it -- `h` is just a function-typed
+// name -- and shape monomorphization then types `b` at `a`'s extent. The
+// walk is bounded by the first operand, so the 2-vector was read past its
+// end: `[5, 7, <garbage>]`. The runtime guard (BL8011) inside the body
+// compares the parameters' RUNTIME extents and aborts instead.
+function f(a: T^1, b: T^1) = a + b
+let a = [1.0, 2.0, 3.0]
+let b = [4.0, 5.0]
+let h = f(a)
+let out = h(b)
+// ABORT: BL8011

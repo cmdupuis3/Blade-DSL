@@ -677,10 +677,34 @@ and private materializeComposeApply (st: InterpState) (env: Env) (cinfo: Compose
                 else
                     for i in 0L .. src.Extents.[level] - 1L do walk src dst call (level + 1) (i :: acc)
             // Stage 1 then stage 2, each its own pass (matching CodeGen's two
-            // loops); both stores carry the INPUT element type.
-            let s1 = A.allocDense a.ElemType a.IndexTypes a.Extents
+            // loops). Each store carries ITS STAGE'S result type -- the twin
+            // of genComposeApply's `stageElemOf`: an Int64 input through
+            // `half(Int64) -> Float64` used to allocate the intermediate as
+            // Int64 and truncate every cell (`[0, 2, 2]` for `[1, 2, 3]`).
+            // A stage that does not resolve, or returns an array, keeps the
+            // element type flowing into it, as the compiled lane does.
+            let stageElemOf (k: IRExpr) (fallback: IRType) : IRType =
+                match resolveKernel k with
+                | Some rk ->
+                    let ret =
+                        match rk.Callable.RetType with
+                        | IRTInfer _ -> typeOf rk.Callable.Body
+                        | t -> t
+                    (match ret with
+                     | ArrayElem _ | IRTUnit | IRTInfer _ -> fallback
+                     | t -> t)
+                | None -> fallback
+            let s1Elem = stageElemOf (kernelOf o1) a.ElemType
+            let s2Elem = stageElemOf (kernelOf o2) s1Elem
+            // The trailing wrappers run after stage 2 into the same store.
+            let outElem =
+                wrappers |> List.fold (fun acc w ->
+                    match w with
+                    | IRCompose _ -> acc
+                    | _ -> stageElemOf w acc) s2Elem
+            let s1 = A.allocDense s1Elem a.IndexTypes a.Extents
             walk a s1 call1 0 []
-            let out = A.allocDense a.ElemType a.IndexTypes a.Extents
+            let out = A.allocDense outElem a.IndexTypes a.Extents
             walk s1 out call2Wrapped 0 []
             VArray out
         | _ -> raise (InterpUnsupported "compose-apply with multiple input arrays (M2.3)")
@@ -892,6 +916,21 @@ and private materializeApply (st: InterpState) (env: Env) (info0: ApplyInfo) (wr
             match inputs.TryGetValue pos with
             | true, SReal a -> a.Extents.[b.ExtentDimRef]
             | _ -> toI64 (Core.evalExpr st env b.Extent)
+    // CO-ITERATION EXTENT GUARD (BL8011) -- the interpreter twin of
+    // genApplyCombinator's guard, checked ONCE before the nest: every REAL
+    // operand peeled at a co-iteration level must have the level's extent
+    // (the first operand's) on the axis it is peeled along, or the walk
+    // reads the shorter one past its end.
+    for b in cg.Bindings do
+        match b.FusedRank, b.Elements with
+        | None, e0 :: rest when not rest.IsEmpty && (match e0.Virtual with RealArray -> true | _ -> false) ->
+            let bound = levelExtent b
+            for e in rest do
+                match e.Virtual, inputs.TryGetValue e.ArrayPosition with
+                | RealArray, (true, SReal a) when a.Extents.[e.DimIndex] <> bound ->
+                    raise (InterpPanic ("BL8011", "co-iteration extent mismatch", None, 0))
+                | _ -> ()
+        | _ -> ()
     match cg.OutputType with
     | IRTScalar et ->
         let acc = { V = zeroOfElem et }

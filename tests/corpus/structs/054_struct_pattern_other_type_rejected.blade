@@ -1,0 +1,9 @@
+// TEST: Struct Pattern Of Another Type (rejects)
+// ERROR: BL3004
+// ============================================================================
+// A struct pattern names a TYPE. A value of another struct type with the
+// same field spelling is not an instance of it, however the fields line up.
+struct A { x: Int64 }
+struct B { x: Int64 }
+let a = A { x = 12 }
+let x = match a with | B { x } -> x

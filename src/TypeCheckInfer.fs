@@ -1242,10 +1242,71 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
     // ---- If-then-else ----
     | ExprKind.ExprIf (cond, thenBr, elseBr) ->
         inferExpr env cond |> Result.bind (fun tCond ->
+        // The condition IS a Bool -- the rule every other predicate position
+        // (guards, `while`, the static evaluator) already enforces. Left
+        // unchecked, `if 1 then ...` compiled through C++ truthiness and an
+        // ARRAY condition reached the emitter as an IRArrayLit it has no
+        // rule for. ONE exemption: the recursive-array desugar's stop-ordinal
+        // update `if __grd_x then n else stop` conditions on the `while`
+        // guard's value, and inferRecArray's own check of that value owns
+        // the diagnostic (it names the array and says what a guard is);
+        // checking here first would replace it with a bare type mismatch.
+        let isRecArrayGuardVar =
+            match cond.Kind with
+            | ExprKind.ExprVar n -> n.StartsWith "__grd_"
+            | _ -> false
+        (if isRecArrayGuardVar then Ok ()
+         else unify env.Subst (IRTScalar ETBool) tCond.Type) |> Result.bind (fun () ->
         inferExpr env thenBr |> Result.bind (fun tThen ->
         inferExpr env elseBr |> Result.bind (fun tElse ->
-            let _ = unify env.Subst tThen.Type tElse.Type
-            Ok (mkTyped (TExprIf (tCond, tThen, tElse)) tThen.Type))))
+            // The branches agree, SYMMETRICALLY. `unify` is directional for
+            // numeric widths (a Float64 slot accepts an Int64 literal, not
+            // the reverse), so a failed first try is retried the other way
+            // round and the result takes the accepting branch's type --
+            // otherwise `if c then 10 else 2.5` depended on branch order,
+            // and the losing order was not refused at all: the discarded
+            // unify failure left the node typed Int64 over a 2.5, which g++
+            // rejected as a narrowing conversion.
+            match unify env.Subst tThen.Type tElse.Type with
+            | Ok () -> Ok (mkTyped (TExprIf (tCond, tThen, tElse)) tThen.Type)
+            | Error e1 ->
+                match unify env.Subst tElse.Type tThen.Type with
+                | Ok () -> Ok (mkTyped (TExprIf (tCond, tThen, tElse)) tElse.Type)
+                | Error _ ->
+                    // NUMERIC BRANCHES PROMOTE the way `+`'s operands do
+                    // (inferArithType's join; BL3020 for a converted
+                    // NON-literal, silence for a literal), and the converted
+                    // branch becomes an EXPLICIT cast node so both lanes
+                    // widen it identically rather than the C++ ternary
+                    // doing so behind the interpreter's back. Anything else
+                    // -- a unit-carrying branch, an array, two ints of
+                    // different width -- keeps the refusal.
+                    let scalarElem (t: TypedExpr) =
+                        match env.Subst.Resolve t.Type with
+                        | IRTScalar et -> Some et
+                        | _ -> None
+                    let numeric = function
+                        | ETInt32 | ETInt64 | ETFloat32 | ETFloat64 | ETComplex64 | ETComplex128 -> true
+                        | _ -> false
+                    let isInt = function ETInt32 | ETInt64 -> true | _ -> false
+                    match scalarElem tThen, scalarElem tElse with
+                    | Some te, Some ee when numeric te && numeric ee && not (isInt te && isInt ee) ->
+                        let join =
+                            match IR.promoteElemType te ee with
+                            | Some (ETComplex64 | ETComplex128 as c) -> Some c
+                            | _ ->
+                                if te = ETFloat64 || ee = ETFloat64 then Some ETFloat64
+                                elif te = ETFloat32 || ee = ETFloat32 then Some ETFloat32
+                                else None
+                        (match join with
+                         | Some j ->
+                             warnImplicitNumericMix env thenBr.Span elseBr.Span tThen tElse
+                             let widen (t: TypedExpr) (et: ElemType) =
+                                 if et = j then t
+                                 else mkTyped (TExprUnaryOp (OpCast (castNameOf j), t)) (IRTScalar j)
+                             Ok (mkTyped (TExprIf (tCond, widen tThen te, widen tElse ee)) (IRTScalar j))
+                         | None -> Error e1)
+                    | _ -> Error e1))))
 
     // ---- Tuple ----
     | ExprKind.ExprTuple exprs ->
@@ -3328,22 +3389,52 @@ and inferGram (env: TypeEnv) leftE rightE : TypeResult<TypedExpr> =
                 if innerMismatch then
                     Error (Other "gram(A, B): the contracted (trailing) dimensions of A and B must match.")
                 else
-                    // Element type join: complex if either operand is complex.
-                    // Units ride an IRTUnitAnnotated wrapper, so complex is
-                    // detected on the STRIPPED type; the contraction
-                    // sum_k A[i][k]*conj(B[j][k]) is multiplicative, so the
-                    // result signature follows `*`'s rule (unitMul when both
-                    // sides carry one, nominal dropped one-sided; conj never
-                    // changes a unit) and is re-attached to the joined bare
-                    // type.
-                    let isComplexElem (t: IRType) =
-                        match stripUnits t with
-                        | IRTScalar (ETComplex64 | ETComplex128) -> true
-                        | _ -> false
+                // ONE element type for the contraction, by PROMOTION -- the
+                // same table `*` uses (IR.promoteElemType), with the same
+                // BL3020 warning mixed arithmetic gives a converted operand.
+                // The old join picked "the complex one, else the left one",
+                // a choice of RESULT width that converted nothing: Complex64
+                // against Float64 checked clean and failed in g++
+                // (`complex<float> * double` has no overload), and Float32
+                // against Float64 accumulated a double product into a float
+                // (g++: float-conversion). Now the operands are cast to the
+                // join in the emitted loop (materializeGramForm's mulTerm)
+                // and the interpreter narrows through the joined width.
+                // Units are stripped first -- they combine through
+                // `unitRulesForOp` below -- and an open element variable is
+                // simply bound (a `T^2` pair stays generic). A pair the table
+                // cannot join (a Bool, a struct) keeps the unify refusal.
+                let isComplexElem (t: IRType) =
+                    match stripUnits t with
+                    | IRTScalar (ETComplex64 | ETComplex128) -> true
+                    | _ -> false
+                let lBare = env.Subst.Resolve (stripUnits lTy.ElemType)
+                let rBare = env.Subst.Resolve (stripUnits rTy.ElemType)
+                let promoted =
+                    match unify env.Subst lBare rBare with
+                    | Ok () -> Ok None
+                    | Error e ->
+                        match lBare, rBare with
+                        | IRTScalar le, IRTScalar re ->
+                            (match IR.promoteElemType le re with
+                             | Some j -> Ok (Some j)
+                             | None -> Error e)
+                        | _ -> Error e
+                match promoted with
+                | Error e -> Error e
+                | Ok promotedElem ->
+                    (match promotedElem with
+                     | Some _ -> warnImplicitNumericMix env leftE.Span rightE.Span tL tR
+                     | None -> ())
+                    // The contraction sum_k A[i][k]*conj(B[j][k]) is
+                    // multiplicative, so the result's unit signature follows
+                    // `*`'s rule (unitMul when both sides carry one, nominal
+                    // dropped one-sided; conj never changes a unit) and is
+                    // re-attached to the joined bare type.
                     let outBare =
-                        if isComplexElem lTy.ElemType then stripUnits lTy.ElemType
-                        elif isComplexElem rTy.ElemType then stripUnits rTy.ElemType
-                        else stripUnits lTy.ElemType
+                        match promotedElem with
+                        | Some j -> IRTScalar j
+                        | None -> env.Subst.Resolve (stripUnits lTy.ElemType)
                     let isComplex = isComplexElem outBare
                     unitRulesForOp OpMul (getUnits lTy.ElemType) (getUnits rTy.ElemType) |> Result.bind (fun outUnit ->
                     let outElem =
@@ -4022,6 +4113,7 @@ and inferReplicate (env: TypeEnv) count body : TypeResult<TypedExpr> =
             | _ ->
                 let staticEnv : StaticEval.StaticEnv =
                     { Values = env.StaticValues
+                      Globals = env.StaticValues
                       Functions =
                         env.StaticFunctions
                         |> Map.map (fun _ (fd: FunctionDecl) ->
@@ -10024,6 +10116,10 @@ and inferLetBindingValue (env: TypeEnv) (binding: Binding) : TypeResult<TypedExp
      | PatVar name, ExprKind.ExprLambda (parms, _, _)
             when parms |> List.exists (_.Default.IsSome) ->
          env.FuncDefaults.[name] <- (parms |> List.map (fun p -> (p.Name, p.Type, p.Default)))
+         // Same identity record checkFunctionDecl keeps for a named function
+         // (TypeEnv.FuncDefaultCaptures): the splice compares against it.
+         env.FuncDefaultCaptures.[name] <-
+             defaultCaptureIdentities env (parms |> List.map (fun p -> (p.Name, p.Default)))
      | _ -> ())
     // REDUCTION JOIN, Form 2: an array literal bound to a name is a candidate
     // LEG LIST for `reduce(name, (<&!>))`. Recorded unconditionally and read
@@ -10251,10 +10347,20 @@ and inferRecArray (env: TypeEnv) (annot: TypeExpr) (annotTy: IRType) (def: RecAr
         // Element zero expression for the buffer pre-fill: Float/Int
         // literals, complex(0, 0) for complex elements. (Record/tuple
         // slices land with the IR-level alloc.)
+        // The zero is ASCRIBED to the declared element type: a bare `0` types
+        // Int64, and the zero-history `if` that alternates it with an Int32
+        // buffer read used to pass only because the `if` arm discarded its
+        // branch-unification failure (the C++ ternary widened silently). The
+        // arm now checks its branches, so the zero has to say which width it
+        // is.
+        let ascribeElem (lit: Expr) =
+            match annot with
+            | TyArray (elemT, _) -> synAt (ExprTyped (lit, elemT))
+            | _ -> lit
         let zeroElem () =
             match env.Subst.Resolve at.ElemType with
-            | IRTScalar ETFloat64 | IRTScalar ETFloat32 -> Ok (synAt (ExprLit (LitFloat 0.0)))
-            | IRTScalar ETInt64 | IRTScalar ETInt32 -> Ok (synAt (ExprLit (LitInt 0L)))
+            | IRTScalar ETFloat64 | IRTScalar ETFloat32 -> Ok (ascribeElem (synAt (ExprLit (LitFloat 0.0))))
+            | IRTScalar ETInt64 | IRTScalar ETInt32 -> Ok (ascribeElem (synAt (ExprLit (LitInt 0L))))
             | IRTScalar ETComplex128 | IRTScalar ETComplex64 ->
                 Ok (synAt (ExprApp (synAt (ExprVar "complex"),
                                     [synAt (ExprLit (LitFloat 0.0)); synAt (ExprLit (LitFloat 0.0))])))
@@ -10427,10 +10533,60 @@ and inferRecArray (env: TypeEnv) (annot: TypeExpr) (annotTy: IRType) (def: RecAr
                             else Some (guardWrap needsLo needsHi idx read zed)
                     | _ -> None) slice
             slice'
+        // ALIASES OF THE PREFIX ARE INLINED FIRST. `let history = prefix`
+        // followed by `history(n - 2)` is a prefix READ, and the rewrite
+        // above recognizes reads by the callee's spelling; left as an alias,
+        // the read fell through `substBuf` to the raw buffer with no bounds
+        // discipline, and `history(n - 2)` at n = 1 read cell -1 (an
+        // uninitialized double where the zero-history rule says 0). The
+        // alias binding is dropped and its name substituted through its
+        // scope (shadowing-aware, via substFree's binder threading); a
+        // WHOLE-ARRAY use of `prefix` needs no rewrite, because the buffer
+        // is zero beyond the built prefix by construction (`zerosValue`).
+        let isPrefixAlias (b: Binding) =
+            match b.Pattern.Kind, b.Value.Kind with
+            | PatVar _, ExprKind.ExprVar p -> p = def.PrefixVar
+            | _ -> false
+        let aliasName (b: Binding) = match b.Pattern.Kind with PatVar v -> v | _ -> ""
+        let rec inlinePrefixAliases (e: Expr) : Expr =
+            let rec mapStmt (s: Stmt) : Stmt =
+                match s with
+                | StmtSpanned (i, sp) -> StmtSpanned (mapStmt i, sp)
+                | StmtLet b -> StmtLet { b with Value = inlinePrefixAliases b.Value }
+                | StmtExpr x -> StmtExpr (inlinePrefixAliases x)
+                | StmtAssign (l, op, r) -> StmtAssign (l, op, inlinePrefixAliases r)
+                | StmtForIn (v, r, body) -> StmtForIn (v, inlinePrefixAliases r, body |> List.map mapStmt)
+            let rec unwrap (s: Stmt) = match s with StmtSpanned (i, _) -> unwrap i | _ -> s
+            Blade.Unfold.mapExprPre (fun x ->
+                match x.Kind with
+                // An inner binder of the prefix name shadows it: that scope
+                // is left alone.
+                | ExprKind.ExprLambda (ps, _, _) when ps |> List.exists (fun p -> p.Name = def.PrefixVar) -> Some x
+                | ExprKind.ExprLet (b, body) when isPrefixAlias b ->
+                    let sub = Blade.Unfold.substFree (Map.ofList [ aliasName b, synAt (ExprVar def.PrefixVar) ])
+                    Some (inlinePrefixAliases (sub body))
+                | ExprKind.ExprBlock (stmts, fin) ->
+                    // Statements bind sequentially: an alias let is dropped
+                    // and its name substituted through the REST of the block
+                    // (substFree threads statement binders the same way).
+                    let rec go (acc: Stmt list) (rest: Stmt list) (fin: Expr option) =
+                        match rest with
+                        | [] -> (List.rev acc, fin)
+                        | s :: tail ->
+                            match unwrap s with
+                            | StmtLet b when isPrefixAlias b ->
+                                let sub = Blade.Unfold.substFree (Map.ofList [ aliasName b, synAt (ExprVar def.PrefixVar) ])
+                                (match (sub (synAt (ExprBlock (tail, fin)))).Kind with
+                                 | ExprKind.ExprBlock (tail', fin') -> go acc tail' fin'
+                                 | _ -> go acc tail fin)
+                            | _ -> go (s :: acc) tail fin
+                    let stmts', fin' = go [] stmts fin
+                    Some { x with Kind = ExprBlock (stmts' |> List.map mapStmt, fin' |> Option.map inlinePrefixAliases) }
+                | _ -> None) e
         // Inductive arm: for n in start..N, prefix reads become buffer reads
         // (partials via hoisted row-view lets, scalars in place).
-        let sliceHoisted = rewritePrefixReads def.SliceExpr
-        let guardHoisted = def.Guard |> Option.map rewritePrefixReads
+        let sliceHoisted = rewritePrefixReads (inlinePrefixAliases def.SliceExpr)
+        let guardHoisted = def.Guard |> Option.map (inlinePrefixAliases >> rewritePrefixReads)
         let substBuf = Blade.Unfold.substFree (Map.ofList [def.PrefixVar, bufVar])
         let slice' = substBuf sliceHoisted
         let guard' = guardHoisted |> Option.map substBuf
@@ -12925,6 +13081,16 @@ and checkDecl (env: TypeEnv) (decl: Decl) : TypeResult<TypedDecl * TypeEnv> =
                     for kv in exports.StaticFunctions do
                         let qualName = $"{alias}.{kv.Key}"
                         e <- { e with StaticFunctions = Map.add qualName kv.Value e.StaticFunctions }
+                    // Defaults under `alias.name`, so `a.f()` fills a's
+                    // defaults even when another imported module also
+                    // declares an `f` (tryFillDefaultArgs consults this key
+                    // first). Captures ride along under the same key.
+                    for kv in exports.Defaults do
+                        let qualName = $"{alias}.{kv.Key}"
+                        e.FuncDefaults.[qualName] <- kv.Value
+                        match Map.tryFind kv.Key exports.DefaultCaptures with
+                        | Some caps -> e.FuncDefaultCaptures.[qualName] <- caps
+                        | None -> ()
                     e
                 | ImportSelective names ->
                     let mutable e = env
@@ -12938,6 +13104,17 @@ and checkDecl (env: TypeEnv) (decl: Decl) : TypeResult<TypedDecl * TypeEnv> =
                         match Map.tryFind name exports.StaticFunctions with
                         | Some fd ->
                             e <- { e with StaticFunctions = Map.add name fd e.StaticFunctions }
+                        | None -> ()
+                        // The bare name now denotes THIS module's `name`, so
+                        // its defaults (and their capture identities) win
+                        // over whatever bare-name entry a later-checked
+                        // module left in the shared table.
+                        match Map.tryFind name exports.Defaults with
+                        | Some ps ->
+                            e.FuncDefaults.[name] <- ps
+                            match Map.tryFind name exports.DefaultCaptures with
+                            | Some caps -> e.FuncDefaultCaptures.[name] <- caps
+                            | None -> e.FuncDefaultCaptures.Remove name |> ignore
                         | None -> ()
                         // Units, the same way the QUALIFIED arm above imports
                         // them (unit names have no qualified spelling -- an
@@ -13238,6 +13415,14 @@ and checkFunctionDecl (env: TypeEnv) (funcDecl: FunctionDecl) : TypeResult<Typed
     // so recursive calls inside the body may omit them too.
     if funcDecl.Params |> List.exists (_.Default.IsSome) then
         env.FuncDefaults.[funcDecl.Name] <- (funcDecl.Params |> List.map (fun p -> (p.Name, p.Type, p.Default)))
+        // Binding identity of every free name the defaults read HERE, so the
+        // call-site splice can tell the declaration-site `k` from a caller's
+        // parameter of the same spelling (TypeEnv.FuncDefaultCaptures). Own
+        // parameters are excluded (they are the required args, bound at the
+        // splice); a name with no binding here (a function registered
+        // elsewhere, an intrinsic) records nothing and is not checked.
+        env.FuncDefaultCaptures.[funcDecl.Name] <-
+            defaultCaptureIdentities env (funcDecl.Params |> List.map (fun p -> (p.Name, p.Default)))
 
     // Register which parameter positions are `mut`, for the call-site write
     // -permission check (dispatchAppOrIndex's FuncElem arm). Registered here,

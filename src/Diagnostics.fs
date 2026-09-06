@@ -408,6 +408,17 @@ module Codes =
             // check (an IRConstraintCheck after the recursion loop) and
             // mirrored by the interpreter through the same node.
             "BL8010", "recursion budget exhausted"
+            // Two operands co-iterated in one loop nest (`a + b`, `zip(a, b)`,
+            // gram's contracted axis) disagree on the RUNTIME extent of a
+            // shared axis. The compile-time twin is BL3016 / coIterClash,
+            // which sees literal extents only; inside a function over `T^k`
+            // parameters the extents are the caller's, and a curried or
+            // let-bound partial application never reaches the call-site
+            // check at all. Emitted once before the nest by
+            // genApplyCombinator (and by materializeGramForm for the
+            // contracted axis), mirrored by the interpreter's materializeApply
+            // and gramArray.
+            "BL8011", "co-iteration extent mismatch"
             // BL9xxx: internal compiler errors
             "BL9001", "internal compiler error"
             "BL9002", "internal codegen invariant violated"

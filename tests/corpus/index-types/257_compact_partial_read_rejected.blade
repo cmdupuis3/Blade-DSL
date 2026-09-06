@@ -1,0 +1,13 @@
+// TEST: Compact Partial Read (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: partial read of a compact
+// ============================================================================
+// `S` is a rank-2 symmetric result: ONE compact record spanning TWO
+// coordinates. Counting one argument against one record classified `S(1)`
+// as a full scalar read, and the emitted `double x = S[1L]` was a row
+// pointer. Coordinates are walked through the records in flat order; a
+// count that lands inside a compact group has no residual class, the same
+// refusal the wildcard form gives.
+let A = [1.0, 2.0, 3.0]
+let S = method_for(A, A) <@> (+) |> compute
+let x = S(1)

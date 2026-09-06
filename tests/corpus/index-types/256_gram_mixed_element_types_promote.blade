@@ -1,0 +1,19 @@
+// TEST: Gram Mixed Element Types Promote
+// WARN: BL3020
+// ============================================================================
+// gram over operands of different width promotes like `*` does: the joined
+// element type (Complex64 x Float64 -> Complex128 here, Float32 x Float64
+// -> Float64), explicit casts on both operands in the emitted contraction,
+// and BL3020 for the converted operand. The old join picked a RESULT width
+// without converting anything: this pair checked clean and then failed in
+// g++ (`complex<float> * double` has no overload), and a Float32 left
+// operand against a Float64 right one accumulated a double product into a
+// float (float-conversion error).
+let A: Array<Complex64 like Idx<1>, Idx<1>> = [[complex(1.0, 1.0)]]
+let B: Array<Float64 like Idx<1>, Idx<1>> = [[1.0]]
+let G = gram(A, B)
+let C: Array<Float32 like Idx<1>, Idx<2>> = [[1.0, 2.0]]
+let D: Array<Float64 like Idx<1>, Idx<2>> = [[3.0, 4.0]]
+let H = gram(C, D)
+// EXPECT: G = [[(1,1)]]
+// EXPECT: H = [[11]]

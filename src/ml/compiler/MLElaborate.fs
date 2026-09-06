@@ -1922,7 +1922,7 @@ let private expandModule (decls: Located<Decl> list) : Result<Located<Decl> list
                 | _ -> d)
         let st = { Counter = 0; Made = Map.empty; Decls = []; SigmoidName = None }
         let emptyStatics : StaticEnv =
-            { Values = Map.empty; Functions = Map.empty
+            { Values = Map.empty; Globals = Map.empty; Functions = Map.empty
               CalledFunctions = ref Set.empty; ProviderRoots = Map.empty
               Structs = Map.empty }
         // Run rewriteExpr over every expression-bearing decl.
