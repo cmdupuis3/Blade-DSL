@@ -43,6 +43,10 @@ type ProcessStartInfo = System.Diagnostics.ProcessStartInfo
 // of the differential gates, not of user builds.
 //   unset  -> `fast` (default: FMA on)
 //   other  -> `-ffp-contract=<value>` verbatim (`fast` | `on` | `off`)
+// The `fma(a, b, c)` intrinsic is the explicit, lane-identical form: it is its
+// own IR node rendered std::fma / Math.FusedMultiplyAdd / llvm.fma.f64, so it
+// fuses under `off` and cannot be unfused under `fast` -- write it where the
+// single rounding IS the algorithm (error-free transformations, double-double).
 //
 // `-fno-math-errno` is unconditional and is a VECTORIZATION flag, not a
 // fast-math one. Without it GCC must treat `sqrt` (and fabs/floor/ceil/trunc/

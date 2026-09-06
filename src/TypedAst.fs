@@ -172,6 +172,14 @@ and TypedExprKind =
     // scalar nature: runtime layout is two floats (std::complex<double>),
     // typed as scalar IRTScalar ETComplex64/128. Lowering routes to IRLitComplex.
     | TExprComplexLit of re: TypedExpr * im: TypedExpr
+
+    // Fused multiply-add `fma(a, b, c)` = a*b + c with ONE rounding. A
+    // dedicated node rather than a binop chain because the fusion is the
+    // semantics: an IR pass that saw `a*b` and `+ c` as separate nodes could
+    // legally split them, and a split fma is not an fma (TwoProd's error
+    // term would come out exactly 0). All three operands Float64; lowers to
+    // IRFma, rendered std::fma / Math.FusedMultiplyAdd / llvm.fma.f64.
+    | TExprFma of a: TypedExpr * b: TypedExpr * c: TypedExpr
     
     // Array literal
     | TExprArrayLit of elems: TypedExpr list * arrayType: IRArrayType

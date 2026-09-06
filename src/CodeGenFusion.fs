@@ -1152,7 +1152,7 @@ let tupleLeafRanges (ty: IRType) : (int * int) list =
 /// spelling, decided here. `sanitizeCppName` is idempotent, so the second
 /// application inside `addVarName` is a no-op.
 let bindingCppName (binding: IRBinding) : string =
-    if binding.Name = "_" then $"__tup_{binding.Id}" else sanitizeCppName binding.Name
+    if binding.Name.StartsWith "_(" then $"__tup_{binding.Id}" else sanitizeCppName binding.Name
 
 /// Generate C++ code for an IR binding: the DISPATCHER.
 /// Each binding shape's emission lives in its own named `genXxxBinding`
@@ -1292,6 +1292,7 @@ let collectDeferredPositionalReads (ctx: CodeGenContext) (root: IRExpr) : IRId l
         | IRTuple es | IRArrayLit (es, _) | IRStack es | IRZip es -> List.iter walk es
         | IRJoin (es, _) -> List.iter walk es
         | IRComplex (re, im) -> walk re; walk im
+        | IRFma (a, b, c) -> walk a; walk b; walk c
         | IRFieldAccess (o, _) -> walk o
         | IRTupleProj (x, _, _) -> walk x
         | IRTupleCons (h, t) -> walk h; walk t

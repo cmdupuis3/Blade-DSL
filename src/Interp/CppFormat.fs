@@ -96,6 +96,60 @@ let formatFloat15 (x: float) : string =
         let digits = mantStr.Replace(".", "")   // exactly 15 significant digits
         assemble sign digits x10
 
+/// Layout of the shortest-digit rendering: "%.17g" conventions (fixed notation
+/// for decimal exponents in [-4, 17), scientific otherwise) applied to a digit
+/// string that may be SHORTER than 17 digits, so the fixed branch pads with
+/// zeros where the integer part outruns the digits.
+let private assembleShortest (sign: string) (digits: string) (x: int) : string =
+    if x < -4 || x >= 17 then
+        let lead = digits.Substring(0, 1)
+        let frac = digits.Substring(1)
+        let mant = if frac.Length = 0 then lead else lead + "." + frac
+        let esign = if x < 0 then "-" else "+"
+        let eabs = abs x
+        let edig = if eabs < 10 then "0" + string eabs else string eabs
+        sign + mant + "e" + esign + edig
+    elif x >= 0 then
+        let intLen = x + 1
+        let padded = if digits.Length < intLen then digits.PadRight(intLen, '0') else digits
+        let intPart = padded.Substring(0, intLen)
+        let frac = padded.Substring(intLen)
+        if frac.Length = 0 then sign + intPart else sign + intPart + "." + frac
+    else
+        sign + "0." + String('0', (-x) - 1) + digits
+
+/// Shortest round-trip rendering of a double: the fewest significant digits
+/// that parse back to the same double (.NET "R"; C++ std::to_chars), laid out
+/// by assembleShortest. This is the display-frame JSON rule -- EXACT where
+/// setprecision(15) quantized every Float64 to 15 digits (which collided the
+/// zoom lens's axis samples a decade before Float64 itself ran out) and never
+/// longer than the value needs. blade_display::jsonfloat (Frame.cppRuntime) is
+/// its byte-exact C++ mirror; the differential gate pins the two lanes together.
+let formatFloatShortest (x: float) : string =
+    if Double.IsNaN x then "nan"
+    elif Double.IsPositiveInfinity x then "inf"
+    elif Double.IsNegativeInfinity x then "-inf"
+    elif x = 0.0 then
+        if Double.IsNegative x then "-0" else "0"
+    else
+        let sign = if x < 0.0 then "-" else ""
+        // "R" is shortest-round-trip on .NET Core 3.0+, in either fixed
+        // ("123.456", "0.0001") or scientific ("1E-05", "1.2345E+19") form;
+        // both reduce to (leading nonzero digit string, decimal exponent).
+        let s = (abs x).ToString("R", inv)
+        let eidx = s.IndexOf('E')
+        let mant = if eidx < 0 then s else s.Substring(0, eidx)
+        let e10 =
+            if eidx < 0 then 0
+            else Int32.Parse(s.Substring(eidx + 1), NumberStyles.AllowLeadingSign, inv)
+        let pidx = mant.IndexOf('.')
+        let intLen = if pidx < 0 then mant.Length else pidx
+        let raw = mant.Replace(".", "")
+        let trimmed = raw.TrimStart('0')
+        let digits = trimmed.TrimEnd('0')
+        let x10 = intLen - 1 - (raw.Length - trimmed.Length) + e10
+        assembleShortest sign digits x10
+
 /// Byte-exact mirror of `cout << setprecision(15) << f` for a 32-bit float.
 /// iostreams promotes the float to double before formatting, so this is simply
 /// the 15-significant-digit rendering of the float's exact double value.

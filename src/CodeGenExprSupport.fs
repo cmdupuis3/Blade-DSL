@@ -328,6 +328,8 @@ let rec exprToCppSimple (names: Map<IRId, string>) (expr: IRExpr) : string =
         | IRCaret -> $"pow({lStr}, {rStr})"
         | IRMath2 name -> renderMath2 name lStr rStr
         | _ -> emitBinOpWithComplexCoercion op l r lStr rStr inferExprType binOpToCpp
+    | IRFma (a, b, c) ->
+        $"std::fma({(exprToCppSimple names a)}, {(exprToCppSimple names b)}, {(exprToCppSimple names c)})"
     | IRUnaryOp (IRConj, e) ->
         let inner = exprToCppSimple names e
         if isComplexType (inferExprType e) then $"""{(complexFnName "conj")}({inner})"""

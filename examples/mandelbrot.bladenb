@@ -147,10 +147,17 @@ p_wide
 // that is continuous across the count boundaries (in-set pixels report 0).
 // Second, the square 256×256 canvas and the machinery become functions of the
 // camera, so every frame below is one call. Third, the iteration cap becomes
-// a function of *depth*: boundary detail needs more iterations per octave of
+// a function of *depth*: boundary detail needs more iterations per decade of
 // magnification, so `view_kmax` grows with $\log_{10}(1.5/r)$ — zooming
-// automatically buys the iterations the new depth needs, capped where the
-// interpreter's step budget lives.
+// automatically buys the iterations the new depth needs. The slope was
+// *measured*, not guessed, and it has a knee: ~45 iterations per decade
+// until $r = 10^{-6}$, then ~1200 per decade, because the filaments the lens
+// is chasing at depth take thousands of steps to escape. There is no clamp.
+// The first version of this notebook clamped it at 560 to fit the
+// interpreter's step budget, and that clamp — not floating point — was the
+// zoom floor: past $r \approx 10^{-8}$ every pixel rode to the cap and the
+// window went black six decades before Float64 ran out of numbers (the
+// frontiers section pins that).
 //
 // Every grid kernel below also carries `where omp(i: 1)` — the parallelism
 // license. The pixel sweep is already a parallel loop object; the clause is
@@ -199,12 +206,18 @@ function zoom_xs(cx: Float64, r: Float64) -> Array<Float64 like Zx> =
 function zoom_ys(cy: Float64, r: Float64) -> Array<Float64 like Zy> =
     (method_for(range<Zy>) <@> lambda(i) -> cy - r + (2.0 * r / 256.0) * Float64(i)) |> compute
 
-/// Iterations the depth r deserves: ~45 more per decade of magnification,
-/// capped where a 256x256 frame still fits one interpreter cell's step
-/// budget (see the frontiers section).
+/// Iterations the depth r deserves. Measured at the seahorse point on a
+/// 64x64 window (fraction of pixels still unescaped): ~45 more per decade of
+/// magnification down to r = 1e-6, then ~1200 per decade -- at r = 1e-8 a
+/// cap of 560 paints the whole window black while ~2000 resolves it, 1e-10
+/// wants ~4000, 1e-12 ~6000, 1e-14 ~10000. No clamp: a deep window is the
+/// compiled render lane's (256^2 at kmax 10000 is a third of a second there),
+/// and the frontiers section says where the interpreter's budget stops.
 function view_kmax(r: Float64) -> Float64 = {
-    let wanted = 116.0 + 45.0 * log(1.5 / r) / log(10.0)
-    if wanted > 560.0 then 560.0 else wanted
+    let knee = 1.0e-6
+    let shallow = 116.0 + 45.0 * log(1.5 / r) / log(10.0)
+    let at_knee = 116.0 + 45.0 * log(1.5 / knee) / log(10.0)
+    if r >= knee then shallow else at_knee + 1200.0 * log(knee / r) / log(10.0)
 }
 
 // Min/max fold kernels: no min/max intrinsic fold exists, and a custom
@@ -239,9 +252,11 @@ function field_range(g: Array<Float64 like Idx<nr>, Idx<nc>>, kmax: Float64) -> 
 // spells its decimation budgets: one helper per rung, a runtime if picking
 // the call. Each rung computes the smooth field for the camera's window,
 // emits it as FILLED CONTOURS under the one stable id, and returns the
-// field's sum -- the pinnable scalar. 320 is the interactive ceiling: one
-// rung further would not fit a deep window inside the interpreter's step
-// budget (the frontiers section).
+// field's sum -- the pinnable scalar. 320 is the interactive ceiling: the
+// gesture lane renders compiled, where the rung costs little, but a session
+// evaluation of the same frame runs interpreted, and one rung further would
+// not fit the shallow camera inside that lane's step budget (the frontiers
+// section).
 
 type V192 = Idx<192>
 type V256 = Idx<256>
@@ -453,16 +468,52 @@ frame_sum
 // variable, not a rewrite. Every numeric pin in this file is the strict
 // value.
 //
+// **The iteration bill.** Depth costs iterations before it costs digits.
+// The next cell takes a 32² window at r = 10⁻¹⁰ — a ten-billion-fold
+// magnification, still four decades above the Float64 floor — and counts the
+// pixels that never escape under two caps: the 560 this notebook once
+// clamped `view_kmax` at, and the ~4600 the measured slope now grants that
+// depth. Under the clamp *every* pixel is unescaped: the window is solid
+// black, and the picture looks exactly like precision failure. It isn't —
+// the same coordinates under the honest cap resolve the whole window. That
+// is the floor most zoom renderers actually hit, and it is a budget, not a
+// number format.
+//
+// %%
+type Px = Idx<32>
+
+/// Pixels of the 32x32 window at (cx, cy, r) that report the in-set sentinel.
+function unescaped(cx: Float64, cy: Float64, r: Float64, kmax: Float64) -> Int64 = {
+    let x0 = cx - r
+    let y0 = cy - r
+    let h = 2.0 * r / 32.0
+    let g = (method_for(range<Px, Px>) <@> lambda(i, j) where omp(i: 1) ->
+        if mandel_smooth(x0 + h * Float64(j), y0 + h * Float64(i), kmax) == 0.0 then 1 else 0) |> compute
+    reduce(g, (+), axes = 2)
+}
+
+let bill_r = 1.0e-10
+let black_clamped = unescaped(tour_cx, tour_cy, bill_r, 560.0)
+let black_honest = unescaped(tour_cx, tour_cy, bill_r, view_kmax(bill_r))
+let bill = [black_clamped, black_honest]
+bill
+// EXPECT: bill = [1024, 0]
+
+// %% [markdown]
 // **The step budget.** Notebook cells evaluate in Blade's interpreter, which
 // charges one step per IR reduction and refuses runaway cells at 10⁹ steps
-// (`BL8005`). That is why the zoom view is 256² with `view_kmax` capped at
-// 560: near the Float64 floor the cap is ~9M pixel-iterations, and one frame
-// stays a single in-budget cell (a boundary-hugging window can still
-// occasionally trip the refusal — the panel simply keeps the previous frame,
-// and the failing cell disturbs nothing). The *language* doesn't care:
-// `blade run` compiles these same cells and renders frames at any kmax in
-// well under a second. Depth is a compute question, and the compiled lane
-// answers it.
+// (`BL8005`) — roughly 25 million pixel-iterations a cell. The shallow
+// camera above (r = 0.004, kmax ≈ 232 on 256²) spends 15 million and fits;
+// so does the cell you just ran. But `view_kmax` at r = 10⁻⁸ on 256² asks
+// for 180 million, and no resolution rung of the ladder brings that inside
+// the budget. So the deep windows belong to the *compiled* lane: a zoom
+// gesture takes `ide serve`'s render fast path, which runs these same cells
+// as an executable with no step budget (256² at kmax 10,000 measures a
+// third of a second on this notebook's kernel). What the interpreter cannot
+// do is re-run the frame cell at such a camera: a session evaluation after a
+// deep gesture refuses that one cell with `BL8005`, the panel keeps the
+// frame the render lane drew, and nothing else in the notebook is
+// disturbed. Depth is a compute question, and the compiled lane answers it.
 //
 // **The Float64 floor.** The camera cannot outrun its own coordinates. Near
 // Re(c) ≈ −0.74 a double's unit of last place is ~1.1 × 10⁻¹⁶. Ask the 256-pixel
@@ -471,10 +522,14 @@ frame_sum
 // actually delivers: adjacent axis samples that either jump a whole ulp or
 // collide exactly. Below r ≈ 10⁻¹⁴ (a 10¹⁴× magnification), re-evaluation
 // returns columns of duplicates — not because the set ran out of structure,
-// but because the coordinates ran out of numbers. The classic unlock is
-// perturbation theory: iterate one orbit at high precision and every other
-// pixel as a Float64 *delta* off it. The delta grid is exactly the kind of
-// structure this language likes; that notebook is future work.
+// but because the coordinates ran out of numbers. (The panel sees exactly
+// what Float64 computed: display frames carry every float at its shortest
+// round-trip digits, so the axis the plot draws is the axis the grid used —
+// a fixed 15-digit rendering would have collided the samples a decade
+// earlier.) The classic unlock is perturbation theory: iterate one orbit at
+// high precision and every other pixel as a Float64 *delta* off it. The
+// delta grid is exactly the kind of structure this language likes, and it
+// is the next section.
 //
 // %%
 let deep_r = 1.0e-14
@@ -490,17 +545,335 @@ collided
 // EXPECT: collided = true
 
 // %% [markdown]
+// ## Past the floor: the perturbation lens
+//
+// The floor is a property of *coordinates*, not of arithmetic. A double has
+// eleven exponent bits — it reaches 10⁻³⁰⁸ without complaint — and
+// fifty-three significand bits, which is sixteen digits *relative to
+// wherever the number sits*. The set lives at |c| ≈ 1, so an absolute
+// coordinate there is quantized at 10⁻¹⁶ whatever the exponent range says.
+// But an *offset* of 10⁻²⁰ is a small number carrying its own sixteen
+// digits, because doubles near 10⁻²⁰ are spaced 10⁻³⁶ apart. Perturbation
+// theory is the reformulation that exploits exactly this. Write every pixel
+// as $c = C + \delta c$ and its orbit as $z_n = Z_n + \delta z_n$, where
+// $(C, Z_n)$ is one *reference* orbit. Subtracting the reference's own
+// recurrence from the pixel's gives
+//
+// $$\delta z_{n+1} = 2 Z_n\, \delta z_n + \delta z_n^2 + \delta c$$
+//
+// — an iteration on the small quantities alone. Only $C$ and $Z_n$ need
+// absolute precision, and there is exactly one of them per frame.
+//
+// Three pieces, each a few lines of Blade:
+//
+// - **Double-double arithmetic** for the reference: a number is a pair
+//   $(hi, lo)$ of doubles with $hi + lo$ exact to ~32 digits. Its primitives
+//   are the *error-free transformations*: `two_sum` recovers the rounding
+//   error of an addition from the operands alone, and `two_prod` recovers
+//   the error of a product with ONE fused multiply-add —
+//   $e = \mathrm{fma}(a, b, -p)$ is exactly $ab - p$, which is the reason
+//   `fma` is an intrinsic. It is the one arithmetic node whose value is
+//   bit-identical on every lane by construction: the compiled program calls
+//   `std::fma`, the interpreter `Math.FusedMultiplyAdd`, the LLVM lane
+//   `llvm.fma.f64`, all correctly rounded, whatever `BLADE_FP_CONTRACT`
+//   the build chose. The other multiply-adds in `dd_mul` are spelled with
+//   it too, so the whole reference orbit is lane-identical.
+// - **The reference orbit as a recursive array.** $Z_{n+1} = Z_n^2 + C$
+//   in double-double is one `let rec` over a 32768-step axis, each row the
+//   four doubles $(\Re hi, \Re lo, \Im hi, \Im lo)$ — sequential structure
+//   spelled the way this language spells it, computed once per frame.
+// - **The pixel as a delta.** `esc_pert` iterates $\delta z$ in plain
+//   Float64, reading $Z_n$ from the reference buffer, and *rebases* onto
+//   $Z_0 = 0$ (setting $\delta z := z$, which is exact) whenever the delta
+//   outgrows the orbit it is riding — Zhuoran's criterion $|z| < |\delta z|$
+//   — or the reference runs out. That one rule is what makes the method
+//   glitch-free without the classic per-pixel validity tests.
+//
+// One shape constraint worth knowing: `esc_pert` binds nothing. A `let` in a
+// self-recursive body is emitted as a nested closure, and a self-call inside
+// it is no longer a tail call — at seventeen thousand steps that is a stack
+// overflow, not a slowdown. Written as a tail expression over pure helpers,
+// g++ turns the recursion into a register loop, as it does for `esc`.
+//
+// %%
+/// (s, e) with s + e == a + b exactly (Knuth).
+function two_sum(a: Float64, b: Float64) -> (Float64, Float64) = {
+    let s = a + b
+    let bb = s - a
+    (s, (a - (s - bb)) + (b - bb))
+}
+/// two_sum when |a| >= |b| is already known.
+function quick_two_sum(a: Float64, b: Float64) -> (Float64, Float64) = {
+    let s = a + b
+    (s, b - (s - a))
+}
+/// (p, e) with p + e == a * b exactly: the fma recovers the product's
+/// rounding error in one correctly-rounded operation.
+function two_prod(a: Float64, b: Float64) -> (Float64, Float64) = {
+    let p = a * b
+    (p, fma(a, b, 0.0 - p))
+}
+/// Double-double sum and product of (ah, al) and (bh, bl). Every
+/// multiply-add is an explicit fma, so no lane's contraction choice can
+/// touch a bit of the result.
+function dd_add(ah: Float64, al: Float64, bh: Float64, bl: Float64) -> (Float64, Float64) = {
+    let (s, e) = two_sum(ah, bh)
+    quick_two_sum(s, (e + al) + bl)
+}
+function dd_mul(ah: Float64, al: Float64, bh: Float64, bl: Float64) -> (Float64, Float64) = {
+    let (p, e) = two_prod(ah, bh)
+    quick_two_sum(p, e + fma(ah, bl, al * bh))
+}
+
+// 0.1 x 10 is not 1 in binary; the product's exact residual is what the
+// fused multiply-add exposes, and what plain arithmetic rounds away to 0.
+let (dd_hi, dd_lo) = dd_mul(0.1, 0.0, 10.0, 0.0)
+let dd_hi_is_one = dd_hi == 1.0
+// EXPECT: dd_hi_is_one = true
+dd_lo
+// EXPECT: dd_lo = 5.55111512312578e-17
+
+// %%
+/// One reference step Z -> Z^2 + C in double-double on a row
+/// (Re hi, Re lo, Im hi, Im lo); frozen once |Z| > 4, so an escaped
+/// reference never overflows the buffer behind it.
+function ref_step(z: Array<Float64 like Idx<4>>, crh: Float64, crl: Float64, cih: Float64, cil: Float64) -> Array<Float64 like Idx<4>> = {
+    let zrh = z(0)
+    let zrl = z(1)
+    let zih = z(2)
+    let zil = z(3)
+    let frozen = zrh * zrh + zih * zih > 16.0
+    let (rrh, rrl) = dd_mul(zrh, zrl, zrh, zrl)
+    let (iih, iil) = dd_mul(zih, zil, zih, zil)
+    let (rih, ril) = dd_mul(zrh, zrl, zih, zil)
+    let (ar, al) = dd_add(rrh, rrl, 0.0 - iih, 0.0 - iil)
+    let (nrh, nrl) = dd_add(ar, al, crh, crl)
+    let (nih, nil) = dd_add(2.0 * rih, 2.0 * ril, cih, cil)
+    let row = [nrh, nrl, nih, nil]
+    if frozen then z else row
+}
+
+/// |Z_m + dz|^2 -- the pixel's current orbit point, from the reference row m.
+function pert_zz(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Float64 = {
+    let zr = ref(m, 0) + dzr
+    let zi = ref(m, 2) + dzi
+    zr * zr + zi * zi
+}
+/// Rebase onto Z_0 = 0 when the delta has outgrown the orbit it rides
+/// (|z| < |dz|), when the reference itself has escaped, or when the
+/// reference buffer would run out.
+function pert_rebase(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Bool = {
+    let zr0 = ref(m, 0)
+    let zi0 = ref(m, 2)
+    let zr = zr0 + dzr
+    let zi = zi0 + dzi
+    zr * zr + zi * zi < dzr * dzr + dzi * dzi || zr0 * zr0 + zi0 * zi0 > 4.0 || m + 1 >= 32767
+}
+function pert_next_m(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Int64 =
+    if pert_rebase(m, dzr, dzi, ref) then 1 else m + 1
+/// dz' = 2 Z dz + dz^2 + dc, real and imaginary parts, after the optional rebase.
+function pert_next_r(m: Int64, dzr: Float64, dzi: Float64, dcr: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Float64 = {
+    let rb = pert_rebase(m, dzr, dzi, ref)
+    let rr = if rb then 0.0 else ref(m, 0)
+    let ri = if rb then 0.0 else ref(m, 2)
+    let wr = if rb then ref(m, 0) + dzr else dzr
+    let wi = if rb then ref(m, 2) + dzi else dzi
+    2.0 * (rr * wr - ri * wi) + (wr * wr - wi * wi) + dcr
+}
+function pert_next_i(m: Int64, dzr: Float64, dzi: Float64, dci: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Float64 = {
+    let rb = pert_rebase(m, dzr, dzi, ref)
+    let rr = if rb then 0.0 else ref(m, 0)
+    let ri = if rb then 0.0 else ref(m, 2)
+    let wr = if rb then ref(m, 0) + dzr else dzr
+    let wi = if rb then ref(m, 2) + dzi else dzi
+    2.0 * (rr * wi + ri * wr) + 2.0 * wr * wi + dci
+}
+/// Smooth escape time of the pixel at C + dc, iterated as a Float64 delta
+/// off the double-double reference orbit. A tail recursion that binds
+/// nothing (see the prose above): g++ compiles it to a loop.
+function esc_pert(n: Float64, m: Int64, dzr: Float64, dzi: Float64, dcr: Float64, dci: Float64,
+                  ref: Array<Float64 like Idx<32768>, Idx<4>>, kmax: Float64) -> Float64 =
+    if n >= kmax then 0.0 else (
+    if pert_zz(m, dzr, dzi, ref) > 4.0 then
+        n + 1.0 - log(0.5 * log(pert_zz(m, dzr, dzi, ref)) / log(2.0)) / log(2.0) else
+    esc_pert(n + 1.0, pert_next_m(m, dzr, dzi, ref), pert_next_r(m, dzr, dzi, dcr, ref),
+             pert_next_i(m, dzr, dzi, dci, ref), dcr, dci, ref, kmax))
+
+/// The deep lens: smooth escape grid of the window of half-width r around
+/// the reference's own center, on an N x N canvas whose coordinates are
+/// OFFSETS IN UNITS OF r -- the panel is Float64 too, so the axis it draws
+/// is [-1, 1] and the camera carries the absolute position.
+function deep_grid32(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Array<Float64 like Idx<32>, Idx<32>> = {
+    let h = 2.0 * r / 32.0
+    (method_for(range<Idx<32>, Idx<32>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+}
+
+// %% [markdown]
+// ## A window no double can address
+//
+// The demonstration needs a center known to more digits than a double
+// holds, and there is a classical one that costs nothing: $c = i$. Its
+// orbit is $0, i, -1+i, -i, -1+i, -i, \ldots$ — eventually periodic, so $i$
+// is a *Misiurewicz point*, on the boundary, exactly representable, and
+// with a repelling cycle whose multiplier is about 2.4 per step. That last
+// fact is what makes it cheap: a pixel $\delta$ away from a filament
+// escapes after about $\log(1/\delta)/\log 2.4$ steps, so at
+// $r = 10^{-20}$ the whole window resolves in fifty to eighty iterations
+// and the honest cap of 17,193 is spent only on the filament itself.
+//
+// The next cell renders the $32^2$ window of half-width $10^{-20}$ around
+// $i$ twice. Through the perturbation lens it is a picture: one unescaped
+// pixel where the filament passes, escape times spread over twenty-five
+// iterations. Through Float64 it is nothing: every pixel's $c$ rounds to
+// exactly $i$, every orbit is the same periodic orbit, and all 1024 pixels
+// ride to the cap. The pixel step asked for is $6 \times 10^{-22}$; the
+// nearest doubles to $i$ are $2 \times 10^{-16}$ apart. Then the same lens
+// at $10^{-30}$, where a double-double center still has two digits to
+// spare.
+//
+// %%
+let misi_cx_hi = 0.0
+let misi_cx_lo = 0.0
+let misi_cy_hi = 1.0
+let misi_cy_lo = 0.0
+
+let rec misi_ref: Array<Float64 like Idx<32768>, Idx<4>> =
+    match misi_ref with
+    | zero -> zero
+    | zero :: s -> zero :: [0.0, 0.0, 0.0, 0.0]
+    | prefix :: n -> prefix :: ref_step(prefix(n - 1), misi_cx_hi, misi_cx_lo, misi_cy_hi, misi_cy_lo)
+
+/// Unescaped-pixel count and the escaped band's (lo, hi) of a 32^2 field.
+function deep_stats(g: Array<Float64 like Idx<32>, Idx<32>>) -> (Int64, Float64, Float64) = {
+    let black = reduce(reduce((method_for(g) <@> lambda(v) -> if v == 0.0 then 1 else 0) |> compute, (+)), (+))
+    let masked = (method_for(g) <@> lambda(v) -> if v == 0.0 then 1.0e300 else v) |> compute
+    let lo = reduce(reduce(masked, fmin, 1.0e300), fmin, 1.0e300)
+    let hi = reduce(reduce(g, fmax, 0.0), fmax, 0.0)
+    (black, lo, hi)
+}
+
+let misi_r = 1.0e-20
+let misi_kmax = floor(view_kmax(misi_r))
+let misi20 = deep_grid32(misi_ref, misi_r, misi_kmax)
+let (misi_black, misi_lo, misi_hi) = deep_stats(misi20)
+// EXPECT: misi_black = 1
+let misi_pins = [misi_lo, misi_hi, reduce(reduce(misi20, (+)), (+))]
+misi_pins
+// EXPECT: misi_pins = [54.8242565164583, 79.4250710711826, 58943.7086962343]
+
+// Float64 at the same window: every c rounds to i, every orbit is the
+// reference orbit, nothing escapes (a cap of 200 is plenty to show that).
+let misi_direct = (method_for(range<Idx<32>, Idx<32>>) <@> lambda(i, j) where omp(i: 1) ->
+    mandel_smooth(misi_cx_hi + (0.0 - misi_r + (2.0 * misi_r / 32.0) * Float64(j)),
+                  misi_cy_hi + (0.0 - misi_r + (2.0 * misi_r / 32.0) * Float64(i)), 200.0)) |> compute
+let (direct_black, direct_lo, direct_hi) = deep_stats(misi_direct)
+direct_black
+// EXPECT: direct_black = 1024
+
+let misi30 = deep_grid32(misi_ref, 1.0e-30, floor(view_kmax(1.0e-30)))
+let (misi30_black, misi30_lo, misi30_hi) = deep_stats(misi30)
+// EXPECT: misi30_black = 1
+let misi30_pins = [misi30_lo, misi30_hi]
+misi30_pins
+// EXPECT: misi30_pins = [80.9547641848568, 101.300938565955]
+
+let (misi_zlo, misi_zhi) = field_range(misi20, misi_kmax)
+let misi_axis = (method_for(range<Idx<32>>) <@> lambda(j) -> -1.0 + (2.0 / 32.0) * Float64(j)) |> compute
+let p_misi = plot.heatmap(misi_axis, misi_axis, misi20, 5: cmap, 1: smoothing, misi_zlo: zmin, misi_zhi: zmax,
+    "c = i, r = 1e-20: the window Float64 cannot address": title,
+    "Re(c - i) / r": xlabel, "Im(c - i) / r": ylabel)
+// EXPECT: p_misi = true
+
+// %% [markdown]
+// ## The deep camera
+//
+// The interactive camera for the lens is five bindings: the center as two
+// double-double pairs, and the radius. The plot's axes are offsets in units
+// of the radius, so a drag on the panel is a gesture in $[-1, 1]^2$; the
+// editor's zoom hook folds it into the center with the same two-sum the
+// cell above uses (JavaScript doubles are IEEE doubles), rewrites these
+// five lines, and takes the render fast path — the camera is erased out of
+// the compiled program into a run-time read, so a gesture at $10^{-25}$
+// costs what a gesture at $10^{-2}$ costs. The reference buffer is 32768
+// steps, which covers the honest cap down to $r \approx 10^{-32}$; the
+// double-double center runs out of digits at about the same depth. Past
+// that, quad-double by the same pattern.
+//
+// %%
+let lens_cx_hi = 0.0
+let lens_cx_lo = 0.0
+let lens_cy_hi = 1.0
+let lens_cy_lo = 0.0
+let lens_r = 1.0e-20
+let lens_px = 96
+
+// %%
+let rec lens_ref: Array<Float64 like Idx<32768>, Idx<4>> =
+    match lens_ref with
+    | zero -> zero
+    | zero :: s -> zero :: [0.0, 0.0, 0.0, 0.0]
+    | prefix :: n -> prefix :: ref_step(prefix(n - 1), lens_cx_hi, lens_cx_lo, lens_cy_hi, lens_cy_lo)
+
+function __deep96(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Float64 = {
+    let h = 2.0 * r / 96.0
+    let g = (method_for(range<Idx<96>, Idx<96>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+    let ax = (method_for(range<Idx<96>>) <@> lambda(j) -> -1.0 + (2.0 / 96.0) * Float64(j)) |> compute
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+        "The deep lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-deep": plotid, "lens_cx_hi,lens_cx_lo,lens_cy_hi,lens_cy_lo,lens_r": camera)
+    reduce(reduce(g, (+)), (+))
+}
+function __deep192(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Float64 = {
+    let h = 2.0 * r / 192.0
+    let g = (method_for(range<Idx<192>, Idx<192>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+    let ax = (method_for(range<Idx<192>>) <@> lambda(j) -> -1.0 + (2.0 / 192.0) * Float64(j)) |> compute
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+        "The deep lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-deep": plotid, "lens_cx_hi,lens_cx_lo,lens_cy_hi,lens_cy_lo,lens_r": camera)
+    reduce(reduce(g, (+)), (+))
+}
+function __deep256(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Float64 = {
+    let h = 2.0 * r / 256.0
+    let g = (method_for(range<Idx<256>, Idx<256>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+    let ax = (method_for(range<Idx<256>>) <@> lambda(j) -> -1.0 + (2.0 / 256.0) * Float64(j)) |> compute
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+        "The deep lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-deep": plotid, "lens_cx_hi,lens_cx_lo,lens_cy_hi,lens_cy_lo,lens_r": camera)
+    reduce(reduce(g, (+)), (+))
+}
+/// One camera, one call: iterations from depth, canvas from the px knob.
+function render_deep(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, px: Int64) -> Float64 = {
+    let kmax = floor(view_kmax(r))
+    if px >= 256 then __deep256(ref, r, kmax) else (
+    if px >= 192 then __deep192(ref, r, kmax) else
+    __deep96(ref, r, kmax))
+}
+
+let lens_sum = render_deep(lens_ref, lens_r, lens_px)
+lens_sum
+// EXPECT: lens_sum = 530715.372732371
+
+// %% [markdown]
 // ## What the compiler knew
 //
 // A Mandelbrot renderer with no loops: the orbit is a recursion, the image is
 // a loop object over a typed index space, the axes are data, and the plot
 // module's budget ladder keeps every frame bounded. The camera is a cell, so
-// zooming is re-evaluation — full resolution at every depth until Float64
-// itself quantizes, at a pinned, predictable radius.
+// zooming is re-evaluation — full resolution at every depth, with the
+// iteration cap following the depth at a measured slope, until Float64
+// itself quantizes, at a pinned, predictable radius — and past that, the
+// perturbation lens: one double-double orbit built on `fma`, every pixel a
+// Float64 delta, a camera of five bindings, and the same gesture.
 //
 // To keep diving: drag-zoom the seahorse plot (with the extension's zoom
 // branch, the gesture rewrites the camera cell and re-runs it), or make that
 // edit by hand — same operation, same result. For frames past the
 // interactive step budget, `blade run` on this file's cells renders them
-// compiled, in milliseconds. Past the Float64 floor, the perturbation
-// notebook is waiting to be written.
+// compiled, in milliseconds. Past the Float64 floor, drag the deep lens.

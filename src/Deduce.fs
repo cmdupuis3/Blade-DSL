@@ -243,6 +243,7 @@ let rec private exprSize (e: TypedExpr) : int =
     | TExprIndex (a, idxs, _) -> 1 + exprSize a + sum idxs
     | TExprTuple es | TExprSequence es | TExprStack es | TExprZip es -> 1 + sum es
     | TExprComplexLit (re, im) -> 1 + exprSize re + exprSize im
+    | TExprFma (a, b, c) -> 1 + exprSize a + exprSize b + exprSize c
     | TExprIf (c, t, f) -> 1 + exprSize c + exprSize t + exprSize f
     | TExprReduce (a, k, i) ->
         1 + exprSize a + exprSize k + (match i with Some x -> exprSize x | None -> 0)
@@ -270,6 +271,7 @@ let rec private countVar (v: IRId) (e: TypedExpr) : int =
     | TExprTuple es | TExprSequence es | TExprStack es | TExprZip es -> sum es
     | TExprArrayLit (es, _) -> sum es
     | TExprComplexLit (re, im) -> c re + c im
+    | TExprFma (x, y, z) -> c x + c y + c z
     | TExprIf (cond, t, f) -> c cond + c t + c f
     | TExprReduce (a, k, i) -> c a + c k + (match i with Some x -> c x | None -> 0)
     | TExprLet (_, _, value, body) -> c value + c body
@@ -331,6 +333,10 @@ let rec private substVar (v: IRId) (repl: TypedExpr) (e: TypedExpr) : TypedExpr 
     | TExprComplexLit (re, im) ->
         (match sub re, sub im with
          | Some a, Some b -> ok (TExprComplexLit (a, b))
+         | _ -> None)
+    | TExprFma (x, y, z) ->
+        (match sub x, sub y, sub z with
+         | Some a, Some b, Some c -> ok (TExprFma (a, b, c))
          | _ -> None)
     | TExprIf (cond, t, f) ->
         (match sub cond, sub t, sub f with
@@ -475,6 +481,7 @@ let rec private flattenBindings (e: TypedExpr) : TypedExpr =
         | TExprZip es -> k (TExprZip (fs es))
         | TExprArrayLit (es, aty) -> k (TExprArrayLit (fs es, aty))
         | TExprComplexLit (re, im) -> k (TExprComplexLit (f re, f im))
+        | TExprFma (a, b, c) -> k (TExprFma (f a, f b, f c))
         | TExprIf (c, t, el) -> k (TExprIf (f c, f t, f el))
         | TExprReduce (a, kern, i) -> k (TExprReduce (f a, f kern, Option.map f i))
         | TExprLet (n, vid, value, body) -> k (TExprLet (n, vid, f value, f body))

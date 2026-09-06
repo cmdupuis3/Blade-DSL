@@ -1029,6 +1029,8 @@ let rec canonicalKey (nameMap: Map<int, string>) (expr: IRExpr) : string =
         $"(tuple {ek})"
     | IRComplex (re, im) ->
         $"(complex {(canonicalKey nameMap re)} {(canonicalKey nameMap im)})"
+    | IRFma (a, b, c) ->
+        $"(fma {(canonicalKey nameMap a)} {(canonicalKey nameMap b)} {(canonicalKey nameMap c)})"
     | IRFieldAccess (obj, field) ->
         $"(field {(canonicalKey nameMap obj)} {field})"
     | IRStructLit (name, fields) ->

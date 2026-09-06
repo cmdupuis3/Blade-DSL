@@ -75,6 +75,12 @@ type IRExpr =
     // is a scalar throughout the IR. Components are arbitrary float-typed
     // IRExpr, not just literals -- supports `complex(x, y)` for x, y: Float64.
     | IRComplex of re: IRExpr * im: IRExpr
+    /// Fused multiply-add a*b + c, ONE rounding (std::fma / Math.FusedMultiplyAdd
+    /// / llvm.fma.f64). Lowered from TExprFma; a scalar Float64 node. The
+    /// fusion is the meaning, which is why it is a node and not an IRBinOp
+    /// pair: it is bit-identical on every lane REGARDLESS of BLADE_FP_CONTRACT,
+    /// where a*b + c is not (see the header of Build.fs).
+    | IRFma of a: IRExpr * b: IRExpr * c: IRExpr
     | IRTupleProj of IRExpr * int * bool  // expr, index, isFlat (true=flat leaf index, false=structural type index)
     | IRTupleCons of head: IRExpr * tail: IRExpr
     | IRTupleDecons of tuple: IRExpr
@@ -1902,6 +1908,7 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
 
     // -- Three children -------------------------------------------------------
     | IRIf (c, t, e) -> [c; t; e], (function [c'; t'; e'] -> IRIf (c', t', e') | _ -> badChildren "IRIf")
+    | IRFma (a, b, c) -> [a; b; c], (function [a'; b'; c'] -> IRFma (a', b', c') | _ -> badChildren "IRFma")
     | IRSlice (arr, d, s, e) -> [arr; s; e], (function [arr'; s'; e'] -> IRSlice (arr', d, s', e') | _ -> badChildren "IRSlice")
     | IRSubset (arr, d, s, len) -> [arr; s; len], (function [arr'; s'; len'] -> IRSubset (arr', d, s', len') | _ -> badChildren "IRSubset")
     | IRForRange (vid, lo, hi, body) -> [lo; hi; body], (function [lo'; hi'; b'] -> IRForRange (vid, lo', hi', b') | _ -> badChildren "IRForRange")
@@ -2515,6 +2522,7 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
          // A cast's type is its target, whatever the operand resolved to.
          | IRCast et -> IRTScalar et)
     | IRTuple exprs -> IRTTuple (exprs |> List.map typeOf)
+    | IRFma _ -> IRTScalar ETFloat64
     | IRComplex (re, _) ->
         // Complex type derived from component width: Float32 -> Complex64,
         // Float64 -> Complex128. Reports as a scalar (NOT a tuple) -- that's

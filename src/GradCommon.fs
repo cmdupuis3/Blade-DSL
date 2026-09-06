@@ -76,6 +76,19 @@ let binaryMathIntrinsics : Set<string> =
 
 let isBinaryMathIntrinsic (name: string) : bool = Set.contains name binaryMathIntrinsics
 
+/// TERNARY math intrinsics: `fma(a, b, c)` = a*b + c rounded once. TypeCheck
+/// types it as its own TExprFma node (never a binop chain, so no pass can
+/// split the fusion). For AD it is exactly a*b + c: d/da = b, d/db = a,
+/// d/dc = 1 -- the sweeps below differentiate it through those partials,
+/// and the derivative code is ordinary (unfused) arithmetic, which is the
+/// right call: a gradient does not need the single rounding, the forward
+/// value does. Keep in sync with StaticEval.evalBuiltin's fma arm and the
+/// ide `surface` census.
+let ternaryMathIntrinsics : Set<string> =
+    Set.ofList [ "fma" ]
+
+let isTernaryMathIntrinsic (name: string) : bool = Set.contains name ternaryMathIntrinsics
+
 /// Subset of the intrinsics that have std::complex overloads in <complex>
 /// and so are permitted on complex operands (result is complex, same
 /// width). exp/log/sqrt and the trig/hyperbolic families qualify; floor/

@@ -84,6 +84,8 @@ let mathIntrinsics = GradCommon.mathIntrinsics
 let isMathIntrinsic = GradCommon.isMathIntrinsic
 let binaryMathIntrinsics = GradCommon.binaryMathIntrinsics
 let isBinaryMathIntrinsic = GradCommon.isBinaryMathIntrinsic
+let ternaryMathIntrinsics = GradCommon.ternaryMathIntrinsics
+let isTernaryMathIntrinsic = GradCommon.isTernaryMathIntrinsic
 let complexMathIntrinsics = GradCommon.complexMathIntrinsics
 let isComplexMathIntrinsic = GradCommon.isComplexMathIntrinsic
 

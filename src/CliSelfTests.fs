@@ -830,7 +830,7 @@ let private runSurfaceTests () : TH.BlockResult =
     let coreBuiltins =
         [ "exp"; "log"; "log10"; "sqrt"; "sin"; "cos"; "tan"
           "sinh"; "cosh"; "tanh"; "asin"; "acos"; "atan"
-          "floor"; "ceil"; "atan2"; "log_base"
+          "floor"; "ceil"; "atan2"; "log_base"; "fma"
           "abs"; "min"; "max"; "length"; "prodsum" ]
     let name = "every list is present, ordered from its source of truth, and complete"
     let failures =
@@ -843,6 +843,8 @@ let private runSurfaceTests () : TH.BlockResult =
             yield $"{operators.Length} operators, {Blade.Lexer.operatorEntries.Length} entries"
           if mathIntrinsic "binary" <> ["atan2"; "log_base"] then
             yield sprintf "binary intrinsics = %A" (mathIntrinsic "binary")
+          if mathIntrinsic "ternary" <> ["fma"] then
+            yield sprintf "ternary intrinsics = %A" (mathIntrinsic "ternary")
           if mathIntrinsic "unary" |> List.isEmpty then yield "unary intrinsics empty"
           if mathIntrinsic "complex" |> List.isEmpty then yield "complex intrinsics empty"
           if scalarTypes.Length <> 16 then yield $"{scalarTypes.Length} scalar types"
@@ -1090,6 +1092,34 @@ let private runIdeEvalTests () : TH.BlockResult =
         | [_; _; rebind; after] when code = 0
                                      && rebind.Contains "\"kept\":true"
                                      && after.Contains "\"value\":\"456.0\"" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        // 3c. DESTRUCTURING lets across cells. Every top-level `let (a, b) =`
+        // used to lower to a binding named `_`, and the interpreter's session
+        // memo is keyed by binding NAME -- so the second cell's destructure
+        // adopted the FIRST cell's cached tuple ([1.5, 3.0] for pair(10.0)),
+        // and a rebind of the same leaves, which the splice did not recognise
+        // as a declaration, was appended and adopted the stale value too.
+        // Now the binding is `_(a,b)`, the splice keys the cell by it, and the
+        // memo drops it AND its leaves on a rebind. Three answers pin the three
+        // fixes: the second pair, the rebound pair, and a dependent (17 = 7 + 10).
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "function pair(x: Float64) -> (Float64, Float64) = (x, x * 2.0)"
+                    evalReq 2 "nb" "let (a, b) = pair(1.5)"
+                    evalReq 3 "nb" "let (c, d) = pair(10.0)
+[c, d]"
+                    evalReq 4 "nb" "let s = a + c"
+                    evalReq 5 "nb" "// the pair
+let (a, b) = pair(7.0)
+[a, b]"
+                    evalReq 6 "nb" "s"; shutdownReq ]
+        let name = "destructuring lets are distinct across cells and rebind in place"
+        match responses with
+        | [_; _; second; _; rebound; after] when code = 0
+                                                 && second.Contains "\"value\":\"[10.0, 20.0]\""
+                                                 && rebound.Contains "\"value\":\"[7.0, 14.0]\""
+                                                 && after.Contains "\"value\":\"17.0\"" ->
             record name TH.Pass ""
         | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
 

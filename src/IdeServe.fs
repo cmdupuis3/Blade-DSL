@@ -42,7 +42,7 @@
 //
 //   -> {"id":N,"cmd":"surface"}
 //   <- {"id":N,"version":1,"compilerVersion":"..","keywords":[{"word","token"}],
-//       "operators":[..],"mathIntrinsics":{"unary","binary","complex"},
+//       "operators":[..],"mathIntrinsics":{"unary","binary","ternary","complex"},
 //       "builtins":[..],"scalarTypes":[..],"builtinCalls":[..],
 //       "diagnostics":[{"code","title","phase"}]}
 //

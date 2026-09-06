@@ -178,6 +178,14 @@ let rec internal adjointOf (rc: RevCtx) (e: Expr) (cot: Expr) : Result<NStmt lis
         let (dA, dB) = binaryDerivRule name a b
         adjointOf rc a (mul c dA) |> Result.bind (fun sa ->
         adjointOf rc b (mul c dB) |> Result.map (fun sb -> pre @ sa @ sb))
+    // fma(a, b, c) = a*b + c: partials b, a, 1. The adjoint arithmetic is
+    // unfused on purpose (see GradCommon.ternaryMathIntrinsics).
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar name }, [a; b; cc]) when isTernaryMathIntrinsic name
+                                       && not (Map.containsKey name rc.Ctx.Decls) ->
+        let pre, c = bindCot rc cot
+        adjointOf rc a (mul c b) |> Result.bind (fun sa ->
+        adjointOf rc b (mul c a) |> Result.bind (fun sb ->
+        adjointOf rc cc c |> Result.map (fun sc -> pre @ sa @ sb @ sc)))
     // A same-module user call the statement-level inliner did not reach.
     // `hoistCalls` walks only the arithmetic fragment, so a call wrapped in
     // `pure`/`compute`/`guard` (all of which the adjoint DOES walk through)
@@ -573,6 +581,12 @@ let rec internal tangentOfExpr (rc: RevCtx) (e: Expr) : Result<Expr, string> =
         let (dA, dB) = binaryDerivRule name a b
         tangentOfExpr rc a |> Result.bind (fun ta ->
         tangentOfExpr rc b |> Result.map (fun tb -> addZ (mulZ dA ta) (mulZ dB tb)))
+    | { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar name }, [a; b; cc]) } when isTernaryMathIntrinsic name
+                                       && not (Map.containsKey name rc.Ctx.Decls) ->
+        // fma: tangent = b*ta + a*tb + tc (unfused, see GradCommon).
+        tangentOfExpr rc a |> Result.bind (fun ta ->
+        tangentOfExpr rc b |> Result.bind (fun tb ->
+        tangentOfExpr rc cc |> Result.map (fun tc -> addZ (addZ (mulZ b ta) (mulZ a tb)) tc)))
     // A same-module user call the statement-level inliner did not reach --
     // the shape a KERNEL BODY produces, since `hoistCalls` stops at a lambda.
     // See `kernelCallBody`: substitute, then differentiate the result.

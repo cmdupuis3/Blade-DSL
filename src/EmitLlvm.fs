@@ -1933,6 +1933,19 @@ and private emitRaw (c: Ctx) (e: IRExpr) : Val =
 
     | IRUnaryOp (op, x) -> emitUnary c op x
 
+    // fma(a, b, c) -> llvm.fma.f64: the fused op is the semantics, so it is
+    // emitted as the intrinsic (not fmul+fadd with `contract`), and it
+    // carries NO fast-math flags -- correctly rounded on every lane.
+    | IRFma (a, b, cc) ->
+        need c "declare double @llvm.fma.f64(double, double, double)"
+        let va = coerce c ScF64 (emitExpr c a)
+        let vb = coerce c ScF64 (emitExpr c b)
+        let vc = coerce c ScF64 (emitExpr c cc)
+        let dest = freshReg c
+        ln c (renderCall { Dest = Some dest; RetTy = ScF64; Callee = "@llvm.fma.f64"
+                           Args = [ ScF64, va.Reg; ScF64, vb.Reg; ScF64, vc.Reg ] })
+        { Reg = dest; Ty = ScF64 }
+
     | IRIf (cond, tb, fb) ->
         let resTy = requireScalar "an if-expression" (typeOf e)
         let cv = coerce c ScBool (emitExpr c cond)

@@ -250,6 +250,8 @@ let rec ppIRExprWithNames (names: Map<int, string>) indent (expr: IRExpr) =
         $"""({(es |> List.map pp |> String.concat ", ")})"""
     | IRComplex (re, im) ->
         $"complex({pp re}, {pp im})"
+    | IRFma (a, b, c) ->
+        $"fma({pp a}, {pp b}, {pp c})"
     | IRTupleProj (e, i, _) ->
         $"{pp e}.{i}"
     | IRIf (c, t, e) ->

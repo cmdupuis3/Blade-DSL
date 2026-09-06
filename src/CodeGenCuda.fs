@@ -259,6 +259,7 @@ let rec internal cudaScalarNodeOk (e: IRExpr) : bool =
     | IRBinOp (IRElementwise, _, l, r) -> cudaScalarNodeOk l && cudaScalarNodeOk r
     | IRUnaryOp (_, x) -> cudaScalarNodeOk x
     | IRComplex (re, im) -> cudaScalarNodeOk re && cudaScalarNodeOk im
+    | IRFma (a, b, c) -> cudaScalarNodeOk a && cudaScalarNodeOk b && cudaScalarNodeOk c  // device fma()
     | IRIf (c, t, f) -> cudaScalarNodeOk c && cudaScalarNodeOk t && cudaScalarNodeOk f
     | _ -> false
 

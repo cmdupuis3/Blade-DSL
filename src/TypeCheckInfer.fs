@@ -627,6 +627,27 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
                         (if name = "atan2" then "atan2(y, x) is the quadrant-correct angle of the point (x, y)"
                          else "log_base(x, b) is log x / log b")))
 
+    // ---- fma(a, b, c): fused multiply-add ----
+    // a*b + c rounded ONCE. Plain-call intrinsic, shadowable like abs/complex.
+    // Float64 scalars only (checkExpr against Float64, so a unit-carrying or
+    // integer operand is refused rather than promoted): this is the
+    // building block of the error-free transformations (TwoProd:
+    // `e = fma(a, b, -(a*b))` is the exact rounding error of a*b) that
+    // double-double arithmetic is made of, and those are written on plain
+    // doubles. Its own node (TExprFma -> IRFma) so no pass can split the
+    // fusion; the interpreter's Math.FusedMultiplyAdd and the emitted
+    // std::fma are both correctly rounded, so the lanes agree bit for bit
+    // whatever -ffp-contract the build chose.
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "fma" }, [aExpr; bExpr; cExpr]) when (lookupVar "fma" env).IsNone ->
+        let f64 = IRTScalar ETFloat64
+        checkExpr env f64 aExpr |> Result.bind (fun tA ->
+        checkExpr env f64 bExpr |> Result.bind (fun tB ->
+        checkExpr env f64 cExpr |> Result.map (fun tC ->
+            mkTyped (TExprFma (tA, tB, tC)) f64)))
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "fma" }, args) when (lookupVar "fma" env).IsNone ->
+        Error (Other (sprintf "fma takes exactly 3 arguments (got %d): fma(a, b, c) is a*b + c rounded once"
+                        args.Length))
+
     // ---- complex(re, im): complex literal constructor ----
     // The one way to construct a complex value. As a plain call this
     // composes under any operator without the precedence trap a 2-tuple
@@ -5894,6 +5915,12 @@ and kernelBodyUnits (env: TypeEnv) (bound: Map<IRId, UnitSig option>) (e: TypedE
     let errorsOnly sub = kernelBodyUnits env bound sub |> Result.map ignore
     match e.Kind with
     | TExprLit _ | TExprComplexLit _ -> Ok None
+    | TExprFma (a, b, c) ->
+        // Dimensionless by construction (inference checks all three against
+        // plain Float64); walk the operands for their own errors only.
+        errorsOnly a |> Result.bind (fun () -> errorsOnly b)
+                     |> Result.bind (fun () -> errorsOnly c)
+                     |> Result.map (fun () -> None)
     | TExprVar (_, varId, _) ->
         match Map.tryFind varId bound with
         | Some u -> Ok u
@@ -11140,7 +11167,20 @@ and inferBlock env stmts finalExpr (expectedFinal: IRType option) : TypeResult<T
                                     SelfBinding = Some (n, id) }
                             ({ tValue0 with Kind = TExprLambda info' }, id)
                         | _ -> (tValue0, curEnv.Builder.FreshId())
-                    let name = match binding.Pattern.Kind with PatternKind.PatVar n -> n | _ -> "_"
+                    // A destructuring binding's own name is synthesized from its leaves,
+                    // `_(a,b)`: the interpreter's session memo is keyed by binding NAME,
+                    // and the old placeholder `_` made every top-level destructure in a
+                    // session share one key -- the second cell's `let (c, d) = ...`
+                    // adopted the FIRST cell's cached tuple (measured: every later
+                    // destructure echoed the first one's values). The leaf set is what
+                    // identifies the binding to the session (a rebind of the same
+                    // leaves supersedes by name exactly as a plain `let` does). `(`
+                    // cannot occur in a user name, so `_(` is the recognizer codegen
+                    // and the interpreter use to give the parent its `__tup_N` C++ name.
+                    let name =
+                        match binding.Pattern.Kind with
+                        | PatternKind.PatVar n -> n
+                        | _ -> "_(" + String.concat "," (patternNames binding.Pattern) + ")"
                     let identity = match binding.Pattern.Kind with PatternKind.PatVar n -> Some (AIDVariable n) | _ -> None
                     let assign = assignOfBindingMut binding.Mutability
                     curEnv <- bindVarFull name varId tValue.Type identity assign (Some tValue) curEnv
@@ -12294,16 +12334,29 @@ and checkDecl (env: TypeEnv) (decl: Decl) : TypeResult<TypedDecl * TypeEnv> =
         // that we surface destructured sub-vars to Lowering and wrap in a
         // TypedBinding rather than recursing into a body expression.
         inferLetBindingValue env binding |> Result.bind (fun tValue ->
-            let name = match binding.Pattern.Kind with PatternKind.PatVar n -> n | _ -> "_"
-            // Provider load (e.g. `let sample = NetCDF.load("f.nc")`): resolve the
-            // module's real struct type at compile time by reading the file
-            // metadata, then register the dims/vars structs plus a top-level
-            // module struct so field access like `sample.vars.temp` resolves to
-            // the variable's real Array type rather than a fresh type var. This
-            // mirrors the metadata read that Lowering.tryInvokeProvider performs;
-            // the typed value SHAPE is left intact so the lowering-side provider
-            // detection still fires. Ordinary (opaque) inference is the fallback
-            // when the receiver is not a provider alias or the file can't be read.
+            // A destructuring binding's own name is synthesized from its leaves,
+            // `_(a,b)`: the interpreter's session memo is keyed by binding NAME,
+            // and the old placeholder `_` made every top-level destructure in a
+            // session share one key -- the second cell's `let (c, d) = ...`
+            // adopted the FIRST cell's cached tuple (measured: every later
+            // destructure echoed the first one's values). The leaf set is what
+            // identifies the binding to the session (a rebind of the same
+            // leaves supersedes by name exactly as a plain `let` does). `(`
+            // cannot occur in a user name, so `_(` is the recognizer codegen
+            // and the interpreter use to give the parent its `__tup_N` C++ name.
+            let name =
+                match binding.Pattern.Kind with
+                | PatternKind.PatVar n -> n
+                | _ -> "_(" + String.concat "," (patternNames binding.Pattern) + ")"
+        // Provider load (e.g. `let sample = NetCDF.load("f.nc")`): resolve the
+        // module's real struct type at compile time by reading the file
+        // metadata, then register the dims/vars structs plus a top-level
+        // module struct so field access like `sample.vars.temp` resolves to
+        // the variable's real Array type rather than a fresh type var. This
+        // mirrors the metadata read that Lowering.tryInvokeProvider performs;
+        // the typed value SHAPE is left intact so the lowering-side provider
+        // detection still fires. Ordinary (opaque) inference is the fallback
+        // when the receiver is not a provider alias or the file can't be read.
             let mutable providerLoadError : TypeError option = None
             let (env, tValue) =
                 match binding.Value.Kind with
@@ -12565,18 +12618,31 @@ and checkDecl (env: TypeEnv) (decl: Decl) : TypeResult<TypedDecl * TypeEnv> =
             | Some tv -> Ok tv
             | None -> inferLetBindingValue env binding
         inferred |> Result.bind (fun tValue ->
-            let name = match binding.Pattern.Kind with PatternKind.PatVar n -> n | _ -> "_"
-            // Reuse the pre-pass varId if pre-registered -- but ONLY for a
-            // plain `let static x = ...`. checkModule's pre-pass registers
-            // static values with placeholder types so a FORWARD reference
-            // resolves (`let static a = b + 1` before `let static b = 2`
-            // needs `b` bound at a placeholder varId the real decl adopts),
-            // keyed by pattern (PatVar -> real name, else synthetic "_").
-            // For a DESTRUCTURING static, reusing that entry is wrong: every
-            // destructured static registers under the SAME key "_", so a
-            // second one's `lookupVar "_"` would find the FIRST one's varId,
-            // the two would share one IRId, and `unify` below would weld
-            // their unrelated types together. Fresh id whenever destructured.
+            // A destructuring binding's own name is synthesized from its leaves,
+            // `_(a,b)`: the interpreter's session memo is keyed by binding NAME,
+            // and the old placeholder `_` made every top-level destructure in a
+            // session share one key -- the second cell's `let (c, d) = ...`
+            // adopted the FIRST cell's cached tuple (measured: every later
+            // destructure echoed the first one's values). The leaf set is what
+            // identifies the binding to the session (a rebind of the same
+            // leaves supersedes by name exactly as a plain `let` does). `(`
+            // cannot occur in a user name, so `_(` is the recognizer codegen
+            // and the interpreter use to give the parent its `__tup_N` C++ name.
+            let name =
+                match binding.Pattern.Kind with
+                | PatternKind.PatVar n -> n
+                | _ -> "_(" + String.concat "," (patternNames binding.Pattern) + ")"
+        // Reuse the pre-pass varId if pre-registered -- but ONLY for a
+        // plain `let static x = ...`. checkModule's pre-pass registers
+        // static values with placeholder types so a FORWARD reference
+        // resolves (`let static a = b + 1` before `let static b = 2`
+        // needs `b` bound at a placeholder varId the real decl adopts),
+        // keyed by pattern (PatVar -> real name, else synthetic "_").
+        // For a DESTRUCTURING static, reusing that entry is wrong: every
+        // destructured static registers under the SAME key "_", so a
+        // second one's `lookupVar "_"` would find the FIRST one's varId,
+        // the two would share one IRId, and `unify` below would weld
+        // their unrelated types together. Fresh id whenever destructured.
             let preRegistered =
                 match binding.Pattern.Kind with
                 | PatternKind.PatVar _ -> lookupVar name env

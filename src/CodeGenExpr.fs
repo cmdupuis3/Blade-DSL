@@ -88,6 +88,12 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
         $"({(exprToCppCore subst names cond)} ? {(exprToCppCore subst names thenBr)} : {(exprToCppCore subst names elseBr)})"
     | IRTuple exprs ->
         $"""std::make_tuple({(exprs |> List.map (exprToCppCore subst names) |> String.concat ", ")})"""
+    | IRFma (a, b, c) ->
+        // std::fma is correctly rounded on every libm Blade links (and a
+        // single vfmadd on any -march with FMA), so it is bit-identical to
+        // the interpreter's Math.FusedMultiplyAdd under any -ffp-contract --
+        // contraction only ever fuses SEPARATE nodes, never unfuses this one.
+        $"std::fma({(exprToCppCore subst names a)}, {(exprToCppCore subst names b)}, {(exprToCppCore subst names c)})"
     | IRComplex (re, im) ->
         // Determine width from the component type. checkExpr enforces
         // that Complex128 components are Float64 and Complex64 are
@@ -331,9 +337,10 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
             (escapeStringLit metaTail)
             (exprToCppCore subst names idExpr)
     | IRDisplayJson (rank, dataExpr) ->
-        // JSON text of a rank-1/rank-2 numeric array. The helper streams with
-        // setprecision(15) -- the print block's own rule -- so the
-        // interpreter's CppFormat.formatFloat15 mirror gives byte parity.
+        // JSON text of a rank-1/rank-2 numeric array. The helper renders each
+        // float at its shortest round-trip digits (blade_display::jsonfloat),
+        // and the interpreter's CppFormat.formatFloatShortest mirror gives
+        // byte parity.
         $"blade_display::json{rank}({(exprToCppCore subst names dataExpr)})"
     | IRDisplayNum dataExpr ->
         $"blade_display::jsonnum({(exprToCppCore subst names dataExpr)})"

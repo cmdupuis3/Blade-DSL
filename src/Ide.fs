@@ -786,6 +786,7 @@ let private builtinCallOf (te: TypedExpr) : (string * TypedExpr list) option =
     | TExprSequence es -> Some ("sequence", es)
     | TExprReplicate (c, b) -> Some ("replicate", [c; b])
     | TExprComplexLit (re, im) -> Some ("complex", [re; im])
+    | TExprFma (a, b, c) -> Some ("fma", [a; b; c])
     | TExprProdSum args -> Some ("prodsum", args)
     | TExprFillRandom m -> Some ("fill_random", [m])
     | TExprUnaryOp (OpMath name, a) -> Some (name, [a])
@@ -2196,6 +2197,8 @@ let renderSurfaceWith (id: int option) (compilerVersion: string) : string =
     appendNameArray sb "unary" Blade.Grad.mathIntrinsics
     sb.Append ',' |> ignore
     appendNameArray sb "binary" Blade.Grad.binaryMathIntrinsics
+    sb.Append ',' |> ignore
+    appendNameArray sb "ternary" Blade.Grad.ternaryMathIntrinsics
     sb.Append ',' |> ignore
     appendNameArray sb "complex" Blade.Grad.complexMathIntrinsics
     sb.Append "}," |> ignore

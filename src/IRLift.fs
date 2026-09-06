@@ -771,6 +771,14 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
         match esFinal with
         | [reF; imF] -> wrapLets binds (IRComplex (reF, imF))
         | _ -> wrapLets binds (IRComplex (re', im'))  // unreachable; defensive
+    | IRFma (a, b, c) ->
+        let a' = liftExpr builder a
+        let b' = liftExpr builder b
+        let c' = liftExpr builder c
+        let (binds, esFinal) = liftChildren builder [a'; b'; c']
+        match esFinal with
+        | [aF; bF; cF] -> wrapLets binds (IRFma (aF, bF, cF))
+        | _ -> wrapLets binds (IRFma (a', b', c'))  // unreachable; defensive
     | IRArrayLit (es, ty) ->
         // Peel any IRLet chains from element results
         // (descendant lifts) and re-wrap them at THIS level. Don't lift an

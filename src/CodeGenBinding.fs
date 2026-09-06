@@ -210,7 +210,7 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genVarAliasBinding ctx binding builder srcId
     | IRBind (comp, cont) ->
         genBindChainBinding ctx binding builder comp cont
-    | IRTuple _ | IRComplex _ | IRFieldAccess _ | IRLit _ | IRBinOp _ | IRUnaryOp _ | IRIf _ | IRApp _ | IRParam _ | IRMatch _
+    | IRTuple _ | IRComplex _ | IRFma _ | IRFieldAccess _ | IRLit _ | IRBinOp _ | IRUnaryOp _ | IRIf _ | IRApp _ | IRParam _ | IRMatch _
     // display.emit is a Bool-valued scalar like the rest of this group -- the
     // frame write is a side effect of evaluating it, and it lands in main()'s
     // BODY, ahead of the timing line and the print block. That position is what
@@ -699,6 +699,7 @@ and genComputeBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                         | IRIndex (a, idxs, ty) -> IRIndex (subst a, idxs |> List.map subst, ty)
                         | IRTuple es -> IRTuple (es |> List.map subst)
                         | IRComplex (re, im) -> IRComplex (subst re, subst im)
+                        | IRFma (a, b, c) -> IRFma (subst a, subst b, subst c)
                         | IRTupleProj (e, i, flat) -> IRTupleProj (subst e, i, flat)
                         | IRFieldAccess (e, f) -> IRFieldAccess (subst e, f)
                         | IRLet (id, v, b) -> IRLet (id, subst v, subst b)

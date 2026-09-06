@@ -251,7 +251,7 @@ let knownBuiltinNames () : Set<string> =
     let core =
         [ "exp"; "log"; "log10"; "sqrt"; "sin"; "cos"; "tan"
           "sinh"; "cosh"; "tanh"; "asin"; "acos"; "atan"
-          "floor"; "ceil"; "atan2"; "log_base"
+          "floor"; "ceil"; "atan2"; "log_base"; "fma"
           "abs"; "min"; "max"; "length"; "prodsum" ]
     Set.unionMany [ Set.ofList core
                     externalBuiltins.Keys |> Set.ofSeq
@@ -764,6 +764,10 @@ and private evalBuiltin env fuel depth (name: string) (args: Expr list) : Result
             Ok (SVFloat (mathFns.[name] (asFloat v).Value))
         | _, [a; b] when (Map.containsKey name mathFns2) && (asFloat a).IsSome && (asFloat b).IsSome ->
             Ok (SVFloat (mathFns2.[name] (asFloat a).Value (asFloat b).Value))
+        // fma: the same correctly-rounded FusedMultiplyAdd the interpreter
+        // evaluates, so a static fold and a runtime evaluation agree.
+        | "fma", [a; b; c] when (asFloat a).IsSome && (asFloat b).IsSome && (asFloat c).IsSome ->
+            Ok (SVFloat (System.Math.FusedMultiplyAdd ((asFloat a).Value, (asFloat b).Value, (asFloat c).Value)))
         | "abs", [SVInt n] -> Ok (SVInt (abs n))
         | "abs", [SVFloat f] -> Ok (SVFloat (abs f))
         | "min", [SVInt a; SVInt b] -> Ok (SVInt (min a b))

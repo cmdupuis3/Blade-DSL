@@ -528,6 +528,9 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
         // reshape it as part of the surrounding rank, producing wrong-rank
         // arrays.
         IRComplex (lowerTypedExpr env re, lowerTypedExpr env im)
+
+    | TExprFma (a, b, c) ->
+        IRFma (lowerTypedExpr env a, lowerTypedExpr env b, lowerTypedExpr env c)
     
     | TExprArrayLit (elems, arrTy) ->
         let es = elems |> List.map (lowerTypedExpr env)

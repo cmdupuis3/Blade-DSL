@@ -489,6 +489,17 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let i = toF64 (evalExpr st env im)
         VComplex (r, i)
 
+    // fma(a, b, c): ONE rounding. Math.FusedMultiplyAdd is the hardware fma
+    // where the CPU has it and a correctly-rounded software fma otherwise,
+    // which is exactly the contract of the std::fma the compiled lane calls
+    // -- so this node is bit-identical across lanes under ANY BLADE_FP_CONTRACT
+    // (the one arithmetic node for which that is true by construction).
+    | IRFma (a, b, c) ->
+        let x = toF64 (evalExpr st env a)
+        let y = toF64 (evalExpr st env b)
+        let z = toF64 (evalExpr st env c)
+        VFloat (System.Math.FusedMultiplyAdd (x, y, z))
+
     // `&&` / `||` short-circuit exactly like the emitted C++ (CodeGen.fs:782):
     // the right operand is not evaluated when the left decides the result.
     | IRBinOp (_, IRAnd, l, r) ->
@@ -729,20 +740,20 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
 
     // ---- display.json_array / display.json_num: JSON text of a numeric
     //      array / scalar. Formatting parity is the contract:
-    //      CppFormat.formatFloat15 is the byte-exact mirror of the C++
-    //      helpers' `setprecision(15)` stream (blade_display::json1/json2 in
-    //      Blade.Display.Frame.cppRuntime), so the differential gate pins
+    //      CppFormat.formatFloatShortest is the byte-exact mirror of the C++
+    //      helpers' shortest round-trip rendering (blade_display::jsonfloat
+    //      in Blade.Display.Frame.cppRuntime), so the differential gate pins
     //      the two lanes together exactly as it does for prints.
     | IRDisplayJson (rank, dataExpr) ->
         (match forceValue st env (evalExpr st env dataExpr) with
          | VArray ba ->
              // Frame.jsonNumber is the non-finite guard -- NaN/+-Inf go out as
-             // `null`, everything else as the 15-significant-digit rendering.
+             // `null`, everything else as the shortest round-trip rendering.
              // Its C++ mirror is blade_display::jsonval.
              let jsonF (x: float) =
-                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat15 x) x
+                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest x) x
              let jsonF32 (x: float32) =
-                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat32 x) (float x)
+                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest (float x)) (float x)
              let elemStr (store: Store) (i: int) : string =
                  match store with
                  | SFloat a -> jsonF a.[i]
@@ -795,8 +806,8 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
 
     | IRDisplayNum dataExpr ->
         (match forceValue st env (evalExpr st env dataExpr) with
-         | VFloat f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat15 f) f)
-         | VFloat32 f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat32 f) (float f))
+         | VFloat f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest f) f)
+         | VFloat32 f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest (float f)) (float f))
          | VInt n -> VString (string n)
          | VInt32 n -> VString (string n)
          | _ -> raise (InterpUnsupported "display.json_num: operand did not evaluate to a numeric scalar"))
@@ -1229,7 +1240,7 @@ let evalBinding (st: InterpState) (env: Env) (b: IRBinding) : Value =
         // too, not a silently mis-shaped array (func-arrays T12 abort probe).
         (match b.Value, value with
          | IRArrayLit (elements, arrType), VArray arr ->
-             let cppName = if b.Name = "_" then $"__tup_{b.Id}" else b.Name
+             let cppName = if b.Name.StartsWith "_(" then $"__tup_{b.Id}" else b.Name
              checkArrayLitRowExtents cppName elements arrType arr
          | _ -> ())
         // Copy semantics for assignable top-level array bindings whose

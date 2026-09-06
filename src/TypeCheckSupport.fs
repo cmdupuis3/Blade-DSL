@@ -2533,6 +2533,7 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprSequence es -> es
         | TExprJoin (es, _) -> es
         | TExprComplexLit (re, im) -> [re; im]
+        | TExprFma (a, b, c) -> [a; b; c]
         | TExprMethodFor info -> info.Arrays
         | TExprObjectFor info -> [info.Kernel]
         | TExprApply info -> info.Loop :: info.Kernel :: info.Arrays

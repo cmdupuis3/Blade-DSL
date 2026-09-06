@@ -222,6 +222,7 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         // Collections
         | TExprTuple es -> TExprTuple (zs es)
         | TExprComplexLit (re, im) -> TExprComplexLit (z re, z im)
+        | TExprFma (a, b, c) -> TExprFma (z a, z b, z c)
         // THE LITERAL'S OWN ARRAY TYPE TOO, for TExprApply's reason (see its
         // ArrayTypes note below). `inferArrayLitType` snapshots the ELEMENT
         // type off `exprs.[0].Type` at the moment the literal is inferred, so

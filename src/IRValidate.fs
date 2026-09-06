@@ -314,6 +314,7 @@ let validateModule (externalIds: Set<IRId>) (modul: IRModule) : IRValidationErro
         | IRIf (c, t, e) -> checkScope scope ctx c; checkScope scope ctx t; checkScope scope ctx e
         | IRTuple es -> es |> List.iter (checkScope scope ctx)
         | IRComplex (re, im) -> checkScope scope ctx re; checkScope scope ctx im
+        | IRFma (a, b, c) -> checkScope scope ctx a; checkScope scope ctx b; checkScope scope ctx c
         | IRTupleProj (e, _, _) -> checkScope scope ctx e
         | IRArrayLit (es, _) -> es |> List.iter (checkScope scope ctx)
         | IRIndex (arr, idxs, _) -> checkScope scope ctx arr; idxs |> List.iter (checkScope scope ctx)
