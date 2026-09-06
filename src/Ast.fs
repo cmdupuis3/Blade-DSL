@@ -253,6 +253,14 @@ type TypeExpr =
     | TyOrbIdx of levels: (int * bool) list * baseIdx: SymIdxBase
     | TyBoundedIdx of lower: Expr * upper: Expr
     | TyCompoundIdx of mask: Expr
+    // Chunked<I, spec>: I's own axis, SEGMENTED (docs/plans/structural/07).
+    // `spec` is a literal edge (a regular chunk grid over I), `store` (the
+    // provider's grid for a provider axis), or `[[s1, f1], [s2, f2], ..]`
+    // (stores tiling I in order, each with its own chunking). The alias IS
+    // still I -- same record, same identity; the segmentation lives beside
+    // the type definition (TypeEnv.Segmentations) and is read by
+    // `segments(Alias)`.
+    | TyChunked of inner: TypeExpr * spec: Expr
     // SparseIdx<keys>: explicit valid-tuple enumeration (formalism 3.5).
     // `keys` is a rank-1 array of Nat tuples (edge lists, CG triples); rank
     // is implicit from the tuple arity. Keys keep their given order (never

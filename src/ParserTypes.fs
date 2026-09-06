@@ -154,6 +154,9 @@ and parseTypeAtom (tokens: Token list) : ParseResult<TypeExpr> =
     | Some (TokKeyword KwCompoundIdx) ->
         parseIndexType tokens
 
+    | Some (TokKeyword KwChunked) ->
+        parseIndexType tokens
+
     | Some (TokKeyword KwSparseIdx) ->
         parseIndexType tokens
 
@@ -551,6 +554,18 @@ and parseIndexType (tokens: Token list) : ParseResult<TypeExpr> =
         parseSimpleExpr afterLt >>= fun extent afterExtent ->
         expectGt afterExtent >>= fun _ remaining ->
         success (TyHermitianIdx extent) remaining
+
+    // Chunked<I, spec>: I segmented (docs/plans/structural/07 §2.1). The
+    // inner is any type expression naming an axis; the spec is a simple
+    // expression -- a literal edge, the identifier `store`, or a list of
+    // `[store, chunking]` pairs -- judged at type registration.
+    | Some (TokKeyword KwChunked) ->
+        advance tokens |> expect (TokOp "<") >>= fun _ afterLt ->
+        parseTypeExpr afterLt >>= fun inner afterInner ->
+        expect TokComma afterInner >>= fun _ afterComma ->
+        parseSimpleExpr afterComma >>= fun spec afterSpec ->
+        expectGt afterSpec >>= fun _ remaining ->
+        success (TyChunked (inner, spec)) remaining
 
     // CompoundIdx<mask>: masked product space (formalism 4.5). Mask is a
     // runtime array expression whose rank determines the compound's arity,

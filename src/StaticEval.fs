@@ -76,6 +76,12 @@ type StaticEnv = {
     /// Constrained-struct registry for fold-time conjunct checks. Empty in
     /// contexts that never fold user struct literals (angle-bracket args).
     Structs: Map<string, StructStaticInfo>
+    /// `type A = Chunked<I, K>` declarations in scope, by alias: the run
+    /// boundaries `[0; ..; N]` (docs/plans/structural/07, decision D2:
+    /// `segments(A)` is statically evaluable). Literal `Idx<n>` inners with
+    /// a literal edge only; anything else is absent here and stays a
+    /// runtime grouping.
+    Segments: Map<string, int64 list>
 }
 
 // Dependency Analysis
@@ -932,6 +938,44 @@ let rec private isLambdaExpr (expr: Expr) : bool =
 /// bind their leaf names) plus one StaticFailure per `let static` whose
 /// right-hand side did not evaluate. The Error case is reserved for a
 /// circular dependency among static values.
+/// The static segment tables of a module's `type A = Chunked<I, K>`
+/// declarations: I a `type I = Idx<n>` alias with a literal n (or a literal
+/// `Idx<n>` inline), K a literal edge. Offsets `[0; K; 2K; ..; n]`.
+let segmentTables (decls: Located<Decl> list) : Map<string, int64 list> =
+    let idxExtents =
+        decls |> List.choose (fun d ->
+            match d.Value with
+            | DeclType (TyDeclAlias (name, _, TyIdx { Kind = ExprKind.ExprLit (LitInt n) })) -> Some (name, n)
+            | _ -> None)
+        |> Map.ofList
+    decls |> List.choose (fun d ->
+        match d.Value with
+        | DeclType (TyDeclAlias (name, _, TyChunked (inner, { Kind = ExprKind.ExprLit (LitInt k) }))) when k >= 1L ->
+            let extent =
+                match inner with
+                | TyNamed (i, []) -> Map.tryFind i idxExtents
+                | TyIdx { Kind = ExprKind.ExprLit (LitInt n) } -> Some n
+                | _ -> None
+            extent |> Option.map (fun n ->
+                let cuts = [ for b in 0L .. k .. n - 1L -> b ] @ [ n ]
+                (name, cuts))
+        | _ -> None)
+    |> Map.ofList
+
+/// `segments(A)` in a static position evaluates to the tuple of GROUP SIZES
+/// (what `extents(gk)` answers at run time), so `length(segments(A))` is the
+/// segment count and its sum the axis extent. Registered as a syntactic
+/// builtin: the argument names a type, not a value.
+do registerSyntacticStaticBuiltin "segments" (fun env _ args ->
+    match args with
+    | [ { Kind = ExprKind.ExprVar alias } ] ->
+        (match Map.tryFind alias env.Segments with
+         | Some offsets ->
+             let sizes = offsets |> List.pairwise |> List.map (fun (lo, hi) -> SVInt (hi - lo))
+             Ok (SVTuple sizes)
+         | None -> Error $"Static evaluation: segments({alias}): '{alias}' is not a `Chunked<Idx<n>, k>` alias with literal extent and edge")
+    | _ -> Error "Static evaluation: segments takes one argument, the name of a `Chunked<..>` alias")
+
 let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailure list, string> =
     // Phase 1: Collect static function definitions and static value decls
     let mutable staticFuncs : Map<string, StaticFuncDef> = Map.empty
@@ -1071,7 +1115,7 @@ let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailur
             |> List.collect (fun pd -> pd.Names |> List.map (fun n -> (n, pd)))
             |> Map.ofList
         let calledRef = ref Set.empty
-        let mutable env = { Values = Map.empty; Globals = Map.empty; Functions = staticFuncs; CalledFunctions = calledRef; ProviderRoots = providerRoots; Structs = structInfos }
+        let mutable env = { Values = Map.empty; Globals = Map.empty; Functions = staticFuncs; CalledFunctions = calledRef; ProviderRoots = providerRoots; Structs = structInfos; Segments = segmentTables decls }
         let mutable failures : StaticFailure list = []
         let mutable evaluated = Set.empty
 

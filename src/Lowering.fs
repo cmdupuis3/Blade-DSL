@@ -785,6 +785,12 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
 
     | TExprGroupBucket grouping ->
         IRGroupBucket (lowerTypedExpr env grouping)
+
+    | TExprSegments (_, offsets, labels) ->
+        IRSegments (offsets, labels)
+
+    | TExprUngroup (grouped, source) ->
+        IRUngroup (lowerTypedExpr env grouped, source)
     
     | TExprSort (array, key) ->
         IRSort (lowerTypedExpr env array, lowerTypedExpr env key)

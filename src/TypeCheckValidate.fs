@@ -370,7 +370,9 @@ let internal declWriteRoots (decl: TypedDecl) : (bool * TypedExpr) list =
 /// is an alias, and the alias is exactly the bug.
 let internal groupKeysLetRhs (b: TypedBinding) : string option * TypedExpr =
     match b.Value.Kind with
-    | TExprGroupKeys _ when List.isEmpty b.SubBindings -> (None, b.Value)
+    // `segments(A)` is a grouping on the same name-keyed terms as group_keys
+    // (docs/plans/structural/07 §3.2): its locals are suffixed off the binding.
+    | TExprGroupKeys _ | TExprSegments _ when List.isEmpty b.SubBindings -> (None, b.Value)
     | _ -> (Some "as another binding's value", b.Value)
 
 let rec internal collectGroupKeysEscapes (subst: Subst) (pos: string option) (expr: TypedExpr) : CompileError list =
@@ -378,6 +380,7 @@ let rec internal collectGroupKeysEscapes (subst: Subst) (pos: string option) (ex
     let describe (e: TypedExpr) =
         match e.Kind with
         | TExprGroupKeys _ -> "a `group_keys(...)` call"
+        | TExprSegments _ -> "a `segments(...)` call"
         | TExprVar (n, _, _) -> $"the group_keys binding '{n}'"
         | _ -> "a group_keys result"
     // A block is TRANSPARENT here: its type is its final expression's, and its

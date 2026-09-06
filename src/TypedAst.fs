@@ -296,6 +296,15 @@ and TypedExprKind =
     | TExprGroupKeys of keys: TypedExpr list
     /// group_bucket(gk): row -> bucket over the grouping's source index space.
     | TExprGroupBucket of grouping: TypedExpr
+    /// segments(A): the STRUCTURAL grouping of a `Chunked` axis
+    /// (docs/plans/structural/07 §2.2) -- a GroupKeys whose partition is
+    /// the segment table: `offsets` are the run boundaries `[0; ..; N]`,
+    /// `labels` the file labels of a file-segmented axis. No key array,
+    /// no CSR: the permutation is the identity.
+    | TExprSegments of alias: string * offsets: int64 list * labels: string list option
+    /// ungroup(G): the inverse of `group_by(_, segments(A))` -- G's rows
+    /// reassembled over the SOURCE axis `source` (§2.3, §3.3).
+    | TExprUngroup of grouped: TypedExpr * source: IRIndexType
     | TExprSort of array: TypedExpr * key: TypedExpr
     | TExprReduce of array: TypedExpr * kernel: TypedExpr * init: TypedExpr option
     | TExprProdSum of args: TypedExpr list  // prodsum(x1..xk): fused sum_t prod_l x_l(t) over rank-1 arrays

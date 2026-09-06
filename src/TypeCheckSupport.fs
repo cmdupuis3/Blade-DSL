@@ -2673,6 +2673,8 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprDisplayStr d -> [d]
         | TExprGroupKeys keys -> keys
         | TExprGroupBucket gk -> [gk]
+        | TExprSegments _ -> []
+        | TExprUngroup (g, _) -> [g]
         | TExprStruct (_, fields) -> fields |> List.map snd
         | TExprIndex (arr, idxs, _) -> arr :: idxs
         | TExprBlock (stmts, final) ->

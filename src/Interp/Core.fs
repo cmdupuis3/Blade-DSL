@@ -534,6 +534,7 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
             | IRGroupKeys keys ->
                 let ty = groupKeysTypeInScope id body |> Option.defaultValue IRTUnit
                 buildGroupKeysValue st env keys ty
+            | IRSegments (offsets, _) -> segmentsValue offsets
             | _ -> evalExpr st env value
         // Copy semantics for assignable array lets initialized from an
         // existing array (`let mut a = Z` -- st.MutableArrayLets): deep-copy
@@ -841,6 +842,11 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     | IRGroupBucket _ ->
         evalArrayNode st env expr
 
+    // ---- ungroup(G) -> the rows of a segment-grouped array over the source
+    //      axis (docs/plans/structural/07 §3.3). Same backend route.
+    | IRUngroup _ ->
+        evalArrayNode st env expr
+
     // ---- extents(gk) -> a dense rank-1 Int64 array of per-group sizes.
     | IRGroupSizes _ ->
         evalArrayNode st env expr
@@ -1132,6 +1138,13 @@ and evalAssign (st: InterpState) (env: Env) (target: IRExpr) (v: Value) : unit =
 /// the twin of what genFuncBodyScoped's group_keys arm does. Either way an
 /// IRTUnit (nothing found) lands on dynamic discovery, which is also what every
 /// un-annotated key array gets.
+/// The structural grouping's value: offsets are the run boundaries, the
+/// member permutation is the identity over the source extent.
+and private segmentsValue (offsets: int64 list) : Value =
+    let offs = Array.ofList offsets
+    let n = int (Array.last offs)
+    VGroupKeys { Offsets = offs; Members = Array.init n int64 }
+
 and private buildGroupKeysValue (st: InterpState) (env: Env) (keys: IRExpr list) (ty: IRType) : Value =
     let keyArrs =
         keys |> List.map (fun k ->
@@ -1223,6 +1236,9 @@ let evalBinding (st: InterpState) (env: Env) (b: IRBinding) : Value =
     // the bare IRGroupKeys node does not carry.
     | IRGroupKeys keys ->
         buildGroupKeysValue st env keys b.Type
+    // segments(A): the structural grouping -- static offsets, identity
+    // members (docs/plans/structural/07 §3.2; genSegmentsBinding's twin).
+    | IRSegments (offsets, _) -> segmentsValue offsets
     | v when shouldDeferBinding env b.Type v ->
         VDeferred (b.Value, env)
     | _ ->

@@ -1,0 +1,8 @@
+// TEST: A Segments Binding Is Name-Keyed Like Every Grouping (rejects)
+// ERROR: BL3017
+type I = Idx<10>
+type CI = Chunked<I, 4>
+let a: Array<Float like I> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+let seg = segments(CI)
+let seg2 = seg
+let g = group_by(a, seg2)

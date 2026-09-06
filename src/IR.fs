@@ -146,6 +146,8 @@ type IRExpr =
     | IRGroupBy of values: IRExpr * grouping: IRExpr  // group_by(vals, gk) - apply grouping
     | IRGroupKeys of keys: IRExpr list               // group_keys(keys1, keys2, ...) - CSR grouping; multi-key => compound dispatch
     | IRGroupBucket of grouping: IRExpr              // group_bucket(gk) - row -> bucket over the source index space, -1 for dropped rows
+    | IRSegments of offsets: int64 list * labels: string list option  // segments(A): structural grouping, run boundaries [0; ..; N], identity permutation
+    | IRUngroup of grouped: IRExpr * source: IRIndexTypeG<IRExpr>  // ungroup(G): rows of a segment-grouped array reassembled over the source axis
     | IRGroupSizes of grouping: IRExpr               // extents(gk) - per-group sizes over the group axis; no gather
     | IRSort of array: IRExpr * key: IRExpr          // sort(arr, key) - stable ascending sort by key
     | IRReduce of array: IRExpr * kernel: IRExpr * init: IRExpr option  // reduce(arr, op[, init]) - fold innermost dim; init seeds the fold and defines the empty result
@@ -1902,6 +1904,8 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRDisplayStr d -> [d], (function [d'] -> IRDisplayStr d' | _ -> badChildren "IRDisplayStr")
     | IRGroupBy (v, k) -> [v; k], (function [v'; k'] -> IRGroupBy (v', k') | _ -> badChildren "IRGroupBy")
     | IRGroupBucket gk -> [gk], (function [gk'] -> IRGroupBucket gk' | _ -> badChildren "IRGroupBucket")
+    | IRSegments _ -> [], (fun _ -> expr)
+    | IRUngroup (g, src) -> [g], (function [g'] -> IRUngroup (g', src) | _ -> badChildren "IRUngroup")
     | IRGroupSizes gk -> [gk], (function [gk'] -> IRGroupSizes gk' | _ -> badChildren "IRGroupSizes")
     | IRSort (a, k) -> [a; k], (function [a'; k'] -> IRSort (a', k') | _ -> badChildren "IRSort")
     | IRReduce (a, k, None) -> [a; k], (function [a'; k'] -> IRReduce (a', k', None) | _ -> badChildren "IRReduce")
@@ -2688,6 +2692,13 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
              // that was previously satisfied stays satisfied.
              valsTy)
     | IRGroupKeys _ -> IRTUnit  // GroupKeys is an opaque structure, not a runtime value with a simple type
+    | IRSegments _ -> IRTUnit   // the structural grouping: same opaque sentinel as group_keys
+    | IRUngroup (g, src) ->
+        // The grouped operand is [outer; member; rest...] over elem; the
+        // result is [source; rest...] over elem.
+        (match typeOf g with
+         | IRTArrow (slots, res, x) when slots.Length >= 2 -> IRTArrow (SIdx src :: List.skip 2 slots, res, x)
+         | other -> other)
     | IRGroupBucket gk ->
         // Rank-1 Int64 over the grouping's SOURCE index space -- the same slot
         // the key array was indexed by, so `bucket` co-iterates with the values

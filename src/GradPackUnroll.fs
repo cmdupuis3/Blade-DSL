@@ -129,6 +129,7 @@ let rec internal substArityInTy (resolve: Ident -> int option) (unresolved: Resi
     | TyOrbIdx (levels, b) -> TyOrbIdx (levels, sb b)
     | TyBoundedIdx (lo, hi) -> TyBoundedIdx (ex lo, ex hi)
     | TyCompoundIdx m -> TyCompoundIdx (ex m)
+    | TyChunked (t, s) -> TyChunked (ty t, ex s)
     | TySparseIdx k -> TySparseIdx (ex k)
     | TyEquivIdx (d, g, r) -> TyEquivIdx (ex d, ty g, ty r)
     | TyHermitianIdx e -> TyHermitianIdx (ex e)

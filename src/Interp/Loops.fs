@@ -2034,6 +2034,22 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let idxTys = match typeOf expr with ArrayElem at -> at.IndexTypes | _ -> []
         VArray (A.buildGroupBy idxTys gk vals)
 
+    // -- ungroup(G): the rows of a segment-grouped array written back over the
+    //    source axis (genUngroupBinding's twin).
+    | IRUngroup (gExpr, src) ->
+        let g = forceInputArray st env gExpr
+        (match g.Data with
+         | SRagged (rows, lens, _) ->
+             let cells =
+                 [| for r in 0 .. rows.Length - 1 do
+                        for k in 0L .. lens.[r] - 1L do
+                            yield A.readCell g [ int64 r; k ] |]
+             VArray { ElemType = g.ElemType
+                      IndexTypes = [ src ]
+                      Extents = [| int64 cells.Length |]
+                      Data = A.storeOfValues g.ElemType cells }
+         | _ -> raise (InterpUnsupported "ungroup: operand is not a ragged (grouped) array"))
+
     // -- group_bucket(gk): the CSR pair inverted into a dense row -> bucket map
     //    (genGroupBucketBinding). Same VGroupKeys operand as group_by; typecheck
     //    has already refused anything but a bare gk name.

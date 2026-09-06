@@ -638,6 +638,19 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
     // fusion; the interpreter's Math.FusedMultiplyAdd and the emitted
     // std::fma are both correctly rounded, so the lanes agree bit for bit
     // whatever -ffp-contract the build chose.
+    // segments(A) / ungroup(G[, A]) -- the structural grouping of a Chunked
+    // axis and its inverse (docs/plans/structural/07 §2.2, §3.3). By-name
+    // intrinsics: a user binding of the same name shadows them.
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, [ { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "segments" env).IsNone ->
+        inferSegments env alias
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, _) when (lookupVar "segments" env).IsNone ->
+        Error (Other "segments takes exactly one argument: the name of a `Chunked<..>` index alias")
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "ungroup" }, [ g ]) when (lookupVar "ungroup" env).IsNone ->
+        inferUngroup env g None
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "ungroup" }, [ g; { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "ungroup" env).IsNone ->
+        inferUngroup env g (Some alias)
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "ungroup" }, _) when (lookupVar "ungroup" env).IsNone ->
+        Error (Other "ungroup takes a segment-grouped array, optionally followed by the name of its `Chunked<..>` axis: ungroup(G) or ungroup(G, A)")
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "fma" }, [aExpr; bExpr; cExpr]) when (lookupVar "fma" env).IsNone ->
         let f64 = IRTScalar ETFloat64
         checkExpr env f64 aExpr |> Result.bind (fun tA ->
@@ -3887,7 +3900,15 @@ and inferGroupBy (env: TypeEnv) values grouping : TypeResult<TypedExpr> =
                         Symmetry = SymNone; Tag = Some "__group_member"; IxKind = IxKGroupMember
                         Kind = SDimension; Dependencies = []
                     }
-                    ({ outer with Id = env.Builder.FreshId(); Tag = Some "__group_outer"; IxKind = IxKGroupOuter }, member_)
+                    let outer' = { outer with Id = env.Builder.FreshId(); Tag = Some "__group_outer"; IxKind = IxKGroupOuter }
+                    // A STRUCTURAL grouping (`segments(A)`, docs/plans/
+                    // structural/07): remember which axis this outer slot
+                    // partitions, so `ungroup(G)` can restore it.
+                    (match outer.Tag with
+                     | Some t when t.StartsWith "__segments|" ->
+                         env.SegmentedOuters.[outer'.Id] <- t.Substring "__segments|".Length
+                     | _ -> ())
+                    (outer', member_)
                 | _ ->
                     // Fallback: treat second arg as raw key array (backward compat)
                     let outer = {
@@ -4043,6 +4064,69 @@ and requireGroupingName (env: TypeEnv) (intrinsic: string) (grouping: Expr)
             | _ -> Error (GroupBucketNotGrouping name))
     | _ -> Error (GroupingNeedsName (intrinsic, describe grouping))
 
+/// segments(A): the STRUCTURAL grouping of the `Chunked` axis A
+/// (docs/plans/structural/07 §2.2). A GroupKeys over A's own record whose
+/// partition is the segment table -- no key array, no CSR, identity
+/// permutation. The outer slot is `Idx<G>` (or the file-label `EnumIdx` of a
+/// file-segmented axis) and carries the `__segments|A` tag, which is how
+/// `inferGroupBy` recognizes a structural grouping and records the alias for
+/// `ungroup`. Name-keyed like every grouping (sql.md §7): bind it with `let`.
+and inferSegments (env: TypeEnv) (alias: string) : TypeResult<TypedExpr> =
+    match Map.tryFind alias env.Segmentations with
+    | None ->
+        (match Map.tryFind alias env.TypeDefs with
+         | Some (TDIIndexType _) ->
+             Error (Other $"segments({alias}): '{alias}' is an index type but not a `Chunked<..>` one; declare `type {alias}2 = Chunked<{alias}, edge>` and take segments of that")
+         | _ -> Error (Other $"segments({alias}): '{alias}' is not a `Chunked<..>` index alias in scope"))
+    | Some seg ->
+        let offsets = segmentationOffsets seg
+        let labels = segmentationLabels seg
+        let g = int64 (offsets.Length - 1)
+        let outer = {
+            Id = env.Builder.FreshId(); Rank = 1
+            Extent = IRLit (IRLitInt g)
+            Symmetry = SymNone; Tag = Some ("__segments|" + alias); IxKind = IxKPlain
+            Kind = SDimension; Dependencies = []
+        }
+        let enumValues = labels |> Option.map (List.map EVString)
+        let gkType = IRTGroupKeys (outer, seg.Source, enumValues)
+        Ok (mkTyped (TExprSegments (alias, offsets, labels)) gkType)
+
+/// ungroup(G[, A]): rows of a segment-grouped array reassembled over the
+/// source axis (§2.3, §3.3) -- the only materializing operation of the
+/// design, and the inverse of `group_by(_, segments(A))`. G's outer slot
+/// must be the outer of such a grouping (its id was recorded by
+/// inferGroupBy); when the outer slot was minted by a transform that did not
+/// keep the id, the two-argument form names the axis explicitly.
+and inferUngroup (env: TypeEnv) (grouped: Expr) (aliasOpt: string option) : TypeResult<TypedExpr> =
+    inferExpr env grouped |> Result.bind (fun tG ->
+        match env.Subst.Resolve(tG.Type) with
+        | ArrayElem arrTy when arrTy.IndexTypes.Length >= 2 ->
+            let outer = arrTy.IndexTypes.[0]
+            let member_ = arrTy.IndexTypes.[1]
+            let alias =
+                match aliasOpt with
+                | Some a -> Ok a
+                | None ->
+                    match env.SegmentedOuters.TryGetValue outer.Id with
+                    | true, a -> Ok a
+                    | _ -> Error (Other "ungroup(G): G is not (directly) the result of `group_by(_, segments(A))`; if it derives from one, name the axis: ungroup(G, A)")
+            alias |> Result.bind (fun a ->
+                match Map.tryFind a env.Segmentations with
+                | None -> Error (Other $"ungroup(_, {a}): '{a}' is not a `Chunked<..>` index alias in scope")
+                | Some seg ->
+                    let g = int64 (List.length (segmentationOffsets seg) - 1)
+                    let outerOk = (match outer.Extent with IRLit (IRLitInt n) -> n = g | _ -> true)
+                    if not outerOk then
+                        Error (Other $"ungroup: the outer slot has {outer.Extent} groups but '{a}' has {g} segments")
+                    elif member_.IxKind <> IxKGroupMember && member_.IxKind <> IxKRagged && member_.IxKind <> IxKRaggedInline then
+                        Error (Other "ungroup: the second slot must be the ragged member slot of a group_by result")
+                    else
+                        let rest = arrTy.IndexTypes |> List.skip 2
+                        let resultType = mkArrayArrow (seg.Source :: rest) arrTy.ElemType None
+                        Ok (mkTyped (TExprUngroup (tG, seg.Source)) resultType))
+        | _ -> Error (Other "ungroup expects a segment-grouped array (rank >= 2: groups x members)"))
+
 and inferGroupBucket (env: TypeEnv) (grouping: Expr) : TypeResult<TypedExpr> =
     requireGroupingName env "group_bucket" grouping
     |> Result.map (fun (tGk, _, sourceIdx) ->
@@ -4080,6 +4164,7 @@ and inferReplicate (env: TypeEnv) count body : TypeResult<TypedExpr> =
                               StaticEval.Body = fd.Body })
                       CalledFunctions = ref Set.empty
                       ProviderRoots = Map.empty
+                      Segments = Map.empty
                       Structs = Map.empty }
                 match StaticEval.evalExpr staticEnv StaticEval.maxSteps count with
                 | Ok (StaticEval.SVInt v) -> Some (int v)
@@ -13947,8 +14032,56 @@ and registerTypeDecl (env: TypeEnv) (typeDecl: TypeDecl) : TypeResult<TypeEnv> =
                            | Some t -> isProviderAxisTag t
                            | None -> false) -> r
             | _ -> lowerIndexType env 0 bodyTy
+        // `type A = Chunked<I, spec>` (docs/plans/structural/07 §2.1, §3.1):
+        // A IS I -- the alias adopts I's record verbatim, so `Nat<A>` and
+        // `Nat<I>` unify and every plain-axis walker is untouched -- and the
+        // SEGMENTATION is registered beside it (env.Segmentations), read only
+        // by `segments(A)`. The spec is judged here, once:
+        //   - a literal edge K: a regular grid over I's static extent;
+        //   - `store`: the provider's own grid (a later piece; refused with
+        //     a steer today);
+        //   - `[[s, f], ..]`: stores tiling I (the file level; a later piece;
+        //     refused with a steer today).
+        let chunked : TypeResult<(IRIndexType * Segmentation) option> =
+            match chasedBody with
+            | TyChunked (inner, spec) ->
+                let innerRecord =
+                    match inner with
+                    | TyNamed (n, []) ->
+                        (match Map.tryFind n env.TypeDefs with
+                         | Some (TDIIndexType (_, idx, _)) -> Ok idx
+                         | _ -> Error (Other $"Chunked<{n}, ..>: '{n}' is not a registered index type; declare it first (`type {n} = Idx<n>` or a store axis)"))
+                    | TyIdx _ -> Ok (lowerIndexType env 0 inner)
+                    | _ -> Error (Other "Chunked<I, ..>: the inner type must name an index type (an `Idx<n>` alias or a store axis)")
+                innerRecord |> Result.bind (fun idx ->
+                    let extent =
+                        match idx.Extent with
+                        | IRLit (IRLitInt n) -> Some n
+                        | e -> tryEvalIntIR e
+                    match extent with
+                    | None ->
+                        Error (Other $"Chunked<..>: the axis '{name}' segments must have a static extent; its extent is not known at compile time")
+                    | Some n ->
+                        let levels =
+                            match spec.Kind with
+                            | ExprKind.ExprLit (LitInt k) when k >= 1L && k <= n -> Ok [ SegRegular k ]
+                            | ExprKind.ExprLit (LitInt k) ->
+                                Error (Other $"Chunked<.., {k}>: the chunk edge must be between 1 and the axis extent {n}")
+                            | ExprKind.ExprVar "store" ->
+                                Error (Other "Chunked<I, store> (the provider's own chunk grid) is not supported yet; write the edge as a literal for now")
+                            | ExprKind.ExprArrayLit _ ->
+                                Error (Other "Chunked<I, [[store, chunking], ..]> (a file-segmented axis) is not supported yet; write a single regular edge for now")
+                            | _ -> Error (Other "Chunked<I, spec>: the spec must be a literal chunk edge, `store`, or a list of [store, chunking] pairs")
+                        levels |> Result.map (fun lv ->
+                            Some (idx, { Alias = name; Source = idx; Extent = n; Levels = lv })))
+            | _ -> Ok None
         let defInfoResult =
             match chasedBody with
+            | TyChunked (inner, _) ->
+                chunked |> Result.map (fun r ->
+                    match r with
+                    | Some (idx, _) -> TDIIndexType (name, idx, inner)
+                    | None -> TDIAlias (lowerTypeExpr env chasedBody))
             | TyIdx _ | TySymIdx _ | TyAntisymIdx _ | TyOrbIdx _ | TyHermitianIdx _ | TyBoundedIdx _ ->
                 let idx = indexRecordFor env chasedBody
                 // Nominative-alias rule: the alias name BECOMES the identity
@@ -14110,7 +14243,12 @@ and registerTypeDecl (env: TypeEnv) (typeDecl: TypeDecl) : TypeResult<TypeEnv> =
                 match boundedAggregateError env $"type alias '{name}'" body with
                 | Some e -> Error e
                 | None -> Ok (TDIAlias (lowerTypeExpr env body))
-        defInfoResult |> Result.map (fun defInfo -> registerTypeDef name defInfo env)
+        defInfoResult |> Result.bind (fun defInfo ->
+            chunked |> Result.map (fun seg ->
+                let env' = registerTypeDef name defInfo env
+                match seg with
+                | Some (_, s) -> { env' with Segmentations = Map.add name s env'.Segmentations }
+                | None -> env'))
 
     | TyDeclStruct (name, typeParams, fields, constraints, isStatic) ->
         // Mutual member types are forbidden as field types -- alias

@@ -1924,7 +1924,7 @@ let private expandModule (decls: Located<Decl> list) : Result<Located<Decl> list
         let emptyStatics : StaticEnv =
             { Values = Map.empty; Globals = Map.empty; Functions = Map.empty
               CalledFunctions = ref Set.empty; ProviderRoots = Map.empty
-              Structs = Map.empty }
+              Structs = Map.empty; Segments = Map.empty }
         // Run rewriteExpr over every expression-bearing decl.
         let mapDecls (statics: StaticEnv) (opsEnabled: bool) (ds: Located<Decl> list) =
             ds |> List.fold (fun acc d ->

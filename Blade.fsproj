@@ -459,6 +459,7 @@
     <Compile Include="tests/Test_Combinators.fs" />
     <Compile Include="tests/Test_Tuples.fs" />
     <Compile Include="tests/Test_RecursiveArrays.fs" />
+    <Compile Include="tests/Test_Segments.fs" />
     <Compile Include="tests/Test_StackJoin.fs" />
     <Compile Include="tests/Test_Bracketed.fs" />
     <Compile Include="tests/Test_IndexTypes.fs" />

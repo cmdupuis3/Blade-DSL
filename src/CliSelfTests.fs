@@ -24,6 +24,7 @@ open Blade.Tests.Guards
 open Blade.Tests.Combinators
 open Blade.Tests.Tuples
 open Blade.Tests.RecursiveArrays
+open Blade.Tests.Segments
 open Blade.Tests.StackJoin
 open Blade.Tests.Bracketed
 open Blade.Tests.IndexTypes
@@ -2698,6 +2699,7 @@ let rec internal dispatchTest (rest: string list) : int =
             | "replicate" -> Some ("Replicate", replicateTests)
             | "anon-ranges" | "anonranges" -> Some ("Anonymous Ranges", anonRangeTests)
             | "recursive-arrays" | "recursivearrays" -> Some ("Recursive Arrays", recursiveArrayTests)
+            | "segments" -> Some ("Segments", segmentsTests)
             | "tuple-views" | "tupleviews" -> Some ("Tuple Views", tupleViewTests)
             | "bracketed" -> Some ("Bracketed", bracketedTests)
             // The `Tuple<N>` surface layer (docs/plan-tuples-vs-arg-packs.md

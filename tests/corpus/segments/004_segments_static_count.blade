@@ -1,0 +1,12 @@
+// TEST: Segments Are Statically Evaluable
+// `segments(CI)` in a static position is the tuple of run sizes (decision
+// D2 of docs/plans/structural/07): the segment count is a compile-time
+// value, usable as an extent.
+type I = Idx<10>
+type CI = Chunked<I, 4>
+let static nseg = length(segments(CI))
+// EXPECT: nseg = 3
+type G = Idx<nseg>
+let ones = method_for(range<G>) <@> lambda(g) -> 1 |> compute
+let total = reduce(ones, (+))
+// EXPECT: total = 3

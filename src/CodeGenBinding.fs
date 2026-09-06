@@ -50,6 +50,10 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genRangeBinding ctx binding
     | IRGroupKeys keys ->
         genGroupKeysBinding ctx binding builder keys
+    | IRSegments (offsets, _) ->
+        genSegmentsBinding ctx binding offsets
+    | IRUngroup (g, src) ->
+        genUngroupBinding ctx binding g src
     | IRGroupBy (vals, gk) ->
         genGroupByBinding ctx binding builder vals gk
     | IRGroupBucket gk ->
@@ -439,6 +443,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
                       $"{ind}}}"
                       $"{ind}size_t {name}__nsrc = {keysBound}; // source rows (>= offsets[ngroups]; negative keys drop)"
                       $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+                      $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
                       $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm" ]
                 ]
                 let ctx' = addVarName binding.Id name ctx
@@ -467,6 +472,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
                       $"{ind}}}"
                       $"{ind}size_t {name}__nsrc = {keysBound}; // source rows (>= offsets[ngroups]; negative keys drop)"
                       $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+                      $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
                       $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm" ]
                 ]
                 let ctx' = addVarName binding.Id name ctx
@@ -521,6 +527,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
                     $"{ind}}}"
                     $"{ind}size_t {name}__nsrc = {keysBound}; // source rows (EnumIdx keys never drop, so == offsets[ngroups])"
                     $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+                    $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
                     $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm"
                 ]
                 let ctx' = addVarName binding.Id name ctx
@@ -604,6 +611,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
               $"{ind}}}"
               $"{ind}size_t {name}__nsrc = {outerExtent}; // source rows (>= offsets[ngroups]; negative components drop)"
               $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+              $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
               $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm (compound)" ]
         ]
         let ctx' = addVarName binding.Id name ctx
@@ -2126,7 +2134,7 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                $"{ind}    size_t __sz = {gkName}__offsets[__g + 1] - __off;"
                $"{ind}    {name}[__g] = {name}__pool + __off;"
                $$"""{{ind}}    for (size_t __k = 0; __k < __sz; __k++) {"""
-               $"""{ind}        {name}[__g][__k] = {(valsAt (sprintf "%s__perm[__off + __k]" gkName))};"""
+               $"""{ind}        {name}[__g][__k] = {(valsAt (sprintf "%s__at(__off + __k)" gkName))};"""
                $$"""{{ind}}    }"""
                $"{ind}}}" ])
     // Owns the row table AND every per-group row (each a separate new[]).
@@ -2151,6 +2159,66 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
     (forceCode @ code, ctx')
 
 
+
+/// segments(A): the STRUCTURAL grouping (docs/plans/structural/07 §2.2, §3.2).
+/// Same name-suffix ABI as group_keys -- `__ngroups`, `__offsets`, `__nsrc`,
+/// `__at` -- but NO permutation is built: the offsets are the static run
+/// boundaries and `__at` is the identity, so a grouped read is a direct
+/// read. `__perm` is not declared at all; every consumer goes through
+/// `__at`, which is what makes the two regimes interchangeable downstream.
+and genSegmentsBinding (ctx: CodeGenContext) (binding: IRBinding) (offsets: int64 list) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let ngroups = offsets.Length - 1
+    let n = List.last offsets
+    let table = offsets |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+    let code =
+        [ $"{ind}// segments: {ngroups} runs over {n} cells, structural (static boundaries, identity permutation)"
+          $"{ind}size_t {name}__ngroups = {ngroups};"
+          $"{ind}const size_t {name}__offsets[{ngroups + 1}] = {{ {table} }};"
+          $"{ind}size_t {name}__nsrc = {n};"
+          $"{ind}auto {name}__at = [](size_t __p) {{ return __p; }};"
+          $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+          $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets (structural: no __perm)" ]
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+/// ungroup(G): the rows of a segment-grouped array written back over the
+/// source axis (§3.3). G's grouping is recovered from GroupedArrays (the
+/// same registration the grouped peel uses), so the offsets are the
+/// grouping's own; the destination is one dense buffer of the source
+/// extent, and each row lands at its run.
+and genUngroupBinding (ctx: CodeGenContext) (binding: IRBinding) (g: IRExpr) (src: IRIndexType) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let gName = exprToCppCtx ctx g
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> elemTypeToCpp at.ElemType
+        | _ -> "double"
+    match Map.tryFind gName ctx.GroupedArrays with
+    | None ->
+        let ctx' = addVarName binding.Id name ctx
+        (codegenError ctx ind $"ungroup: '{gName}' is not a group_by result this emitter can trace to its grouping (bind `let G = group_by(A, segments(X))` and ungroup that name)", ctx')
+    | Some gkName ->
+        let total =
+            match src.Extent with
+            | IRLit (IRLitInt n) -> $"{n}UL"
+            | _ -> $"{gkName}__offsets[{gkName}__ngroups]"
+        let (extentsDecl, ownedExtents) =
+            emitExtentsTable ind (name + "_extents") 1 [(total, false)]
+        let code =
+            [ $"{ind}// ungroup: rows of {gName} written back over the source axis ({total} cells)" ]
+            @ extentsDecl
+            @ [ $$"""{{ind}}Array<{{elemStr}}, 1> {{name}} = { allocate<promote<{{elemStr}}, 1>::type>({{name}}_extents), {{name}}_extents };"""
+                $$"""{{ind}}for (size_t __g = 0; __g < {{gkName}}__ngroups; __g++) {"""
+                $"{ind}    size_t __off = {gkName}__offsets[__g];"
+                $"{ind}    size_t __sz = {gkName}__offsets[__g + 1] - __off;"
+                $$"""{{ind}}    for (size_t __k = 0; __k < __sz; __k++) {{name}}[{{gkName}}__at(__off + __k)] = {{gName}}[__g][__k];"""
+                $"{ind}}}" ]
+        registerPoolAlloc AllocDense elemStr 1 "nullptr" (name + "_extents") name ownedExtents
+        let ctx' = addVarName binding.Id name ctx
+        (code, ctx')
 
 and genGroupBucketBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) (gk: IRExpr) : string list * CodeGenContext =
     let ind = indentStr ctx
@@ -2181,7 +2249,7 @@ and genGroupBucketBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: I
             $"{ind}for (size_t __i = 0; __i < {gkName}__nsrc; __i++) {name}[__i] = -1;"
             $$"""{{ind}}for (size_t __g = 0; __g < {{gkName}}__ngroups; __g++) {"""
             $$"""{{ind}}    for (size_t __p = {{gkName}}__offsets[__g]; __p < {{gkName}}__offsets[__g + 1]; __p++) {"""
-            $"{ind}        {name}[{gkName}__perm[__p]] = ({elemStr})__g;"
+            $"{ind}        {name}[{gkName}__at(__p)] = ({elemStr})__g;"
             $$"""{{ind}}    }"""
             $"{ind}}}" ]
     registerPoolAlloc AllocDense elemStr 1 "nullptr" (name + "_extents") name ownedExtents

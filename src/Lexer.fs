@@ -85,6 +85,7 @@ and Keyword =
     | KwAntisymIdx
     | KwHermitianIdx
     | KwCompoundIdx
+    | KwChunked
     | KwSparseIdx
     | KwOrbIdx
     | KwEnumIdx
@@ -205,6 +206,7 @@ let keywordEntries : (string * Keyword) list =
       "AntisymIdx", KwAntisymIdx
       "HermitianIdx", KwHermitianIdx
       "CompoundIdx", KwCompoundIdx
+      "Chunked", KwChunked
       "SparseIdx", KwSparseIdx
       "OrbIdx", KwOrbIdx
       "EnumIdx", KwEnumIdx

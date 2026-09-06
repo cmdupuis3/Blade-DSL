@@ -1,0 +1,15 @@
+// TEST: Two Arrays Grouped By One Segmentation Co-Iterate
+// One `segments` binding drives both groupings (sql.md §8: the same-keys
+// rule holds for a structural grouping exactly as for group_keys), so the
+// per-segment kernel sees both runs of the same cells at once.
+type I = Idx<10>
+type CI = Chunked<I, 3>
+let a: Array<Float like I> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+let w: Array<Float like I> = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+let seg = segments(CI)
+let ga = group_by(a, seg)
+let gw = group_by(w, seg)
+let dots = method_for(zip(ga, gw)) <@> lambda(ra, rw) -> prodsum(ra, rw) |> compute
+// EXPECT: dots = [4, 5, 16, 0]
+let counts = extents(seg)
+// EXPECT: counts = [3, 3, 3, 1]

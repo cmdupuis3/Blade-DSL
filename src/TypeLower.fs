@@ -79,6 +79,7 @@ let staticEnvOf (env: TypeEnv) : StaticEval.StaticEnv =
       Functions = projected
       CalledFunctions = ref Set.empty
       ProviderRoots = Map.empty
+      Segments = Map.empty
       Structs = Map.empty }
 
 let evalStaticIntExpr (env: TypeEnv) (expr: Expr) : int option =
@@ -679,6 +680,10 @@ let rec lowerTypeExpr (env: TypeEnv) (ty: TypeExpr) : IRType =
 
     | TyBoundedIdx _ -> IRTScalar ETInt64
 
+    // Chunked<I, _> IS I (docs/plans/structural/07 §2.1): every position
+    // lowers the inner axis; the segmentation is registered beside the
+    // alias by registerTypeDecl and read only by `segments(Alias)`.
+    | TyChunked (inner, _) -> lowerTypeExpr env inner
     | TyCompoundIdx _mask ->
         let idx = { Id = env.Builder.FreshId(); Rank = 1; Extent = IRParam ("compound", 0, IRTNat None)
                     Symmetry = SymNone; Tag = None; IxKind = IxKPlain; Kind = SDimension; Dependencies = [] }
@@ -1090,6 +1095,7 @@ and lowerIndexType env (_position: int) (ty: TypeExpr) : IRIndexType =
         | _ ->
             { Id = id; Rank = 1; Extent = IRParam (name, 0, IRTNat None); Symmetry = SymNone
               Tag = Some name; IxKind = ixKindOfTag (Some name); Kind = SDimension; Dependencies = [] }
+    | TyChunked (inner, _) -> lowerIndexType env _position inner
     | TyCompoundIdx maskExpr ->
         // CompoundIdx<mask> -- masked product space (formalism 4.5). Rank = the
         // RANK of the mask array (its number of dimensions). The mask is a runtime

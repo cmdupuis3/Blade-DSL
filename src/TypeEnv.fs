@@ -104,6 +104,61 @@ type MutualGroupInfo = {
 }
 
 /// Exported bindings from a type-checked module, for cross-module imports
+/// One level of a segmentation of one axis (docs/plans/structural/07 §2.1):
+/// a regular chunk grid, or stores tiling the axis in declaration order.
+type SegLevel =
+    | SegRegular of edge: int64
+    | SegFiles of (string * int64) list
+
+/// The segmentation registered beside a `type A = Chunked<I, spec>`: the
+/// axis it partitions (I's own record -- the alias IS I), I's static extent,
+/// and the levels, outermost first. Read by `segments(A)`; nothing else in
+/// the type system sees it, which is what keeps `Chunked<I, K>` unifying as
+/// `I` (storage is unchanged in this arc).
+type Segmentation = {
+    Alias: string
+    Source: IRIndexType
+    Extent: int64
+    Levels: SegLevel list
+}
+
+/// The run boundaries of the INNERMOST level, flattened over the whole axis:
+/// `[b_0 = 0; ...; b_G = N]`. A regular grid over a file level is applied
+/// within each file's run, so a file's last chunk may be short.
+let segmentationOffsets (s: Segmentation) : int64 list =
+    let regular (lo: int64) (hi: int64) (edge: int64) : int64 list =
+        // interior boundaries of [lo, hi) at multiples of edge from lo
+        [ for b in lo + edge .. edge .. hi - 1L -> b ]
+    let rec go (runs: (int64 * int64) list) (levels: SegLevel list) : (int64 * int64) list =
+        match levels with
+        | [] -> runs
+        | SegFiles files :: rest ->
+            let runs' =
+                runs |> List.collect (fun (lo, hi) ->
+                    let mutable at = lo
+                    [ for (_, ext) in files do
+                        let r = (at, min hi (at + ext))
+                        at <- at + ext
+                        yield r ])
+            go runs' rest
+        | SegRegular edge :: rest ->
+            let runs' =
+                runs |> List.collect (fun (lo, hi) ->
+                    let cuts = lo :: regular lo hi edge @ [ hi ]
+                    List.pairwise cuts)
+            go runs' rest
+    let runs = go [ (0L, s.Extent) ] s.Levels
+    match runs with
+    | [] -> [ 0L; s.Extent ]
+    | _ -> (runs |> List.map fst) @ [ s.Extent ]
+
+/// The labels of the OUTERMOST level when it is a file level: the
+/// `EnumIdx` states of a file-segmented axis (decision D3).
+let segmentationLabels (s: Segmentation) : string list option =
+    match s.Levels with
+    | SegFiles files :: _ -> Some (files |> List.map fst)
+    | _ -> None
+
 type TypeModuleExport = {
     Variables: Map<string, VarInfo>
     TypeDefs: Map<string, TypeDefInfo>
@@ -205,6 +260,14 @@ type TypeEnv = {
     /// synthesis needs the bound EXPRESSIONS, so it resolves alias chains
     /// through this map instead. Populated by registerTypeDecl per `type X = ...`.
     SurfaceAliases: Map<string, TypeExpr>
+    /// Segmentations registered by `type A = Chunked<I, spec>`, by alias
+    /// (docs/plans/structural/07). Read by `segments(A)`.
+    Segmentations: Map<string, Segmentation>
+    /// The OUTER slot ids of `group_by(_, segments(A))` results, by the
+    /// alias they came from: how `ungroup(G)` finds the axis to restore
+    /// when G's outer slot carries one of these ids (inferGroupBy mints the
+    /// slot fresh, so the id is the only handle that survives).
+    SegmentedOuters: System.Collections.Generic.Dictionary<IRId, string>
     /// Names declared `static struct` (the static-eligibility fence).
     /// Registration validates fields against StaticValue shapes and records
     /// the name on success, so later static structs can nest earlier ones.
@@ -412,6 +475,8 @@ type TypeEnv = {
 let emptyEnv () = {
     Variables = Map.empty
     TypeDefs = Map.empty
+    Segmentations = Map.empty
+    SegmentedOuters = System.Collections.Generic.Dictionary<IRId, string>()
     VariantTags = Map.empty
     Subst = Subst()
     Builder = IRBuilder()
