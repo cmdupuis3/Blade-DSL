@@ -1354,6 +1354,164 @@ let out = method_for(A) <@> lambda(x) -> x + x |> compute
     with ex -> unexpected "dense read" ex
 
     // ---------------------------------------------------------------
+    // Shape guard (BL8012): the dense reader's baked extents vs the file at
+    // RUN time. Lowering bakes A as xdim x ydim x zdim = 20 x 30 x 50 from
+    // sample.nc; the exe must refuse -- before nc_get_var writes anything --
+    // when the file it opens at run time declares different dimensions, and
+    // must still run clean against the unchanged fixture (no false positive).
+    // The mismatched files are generated with ncgen, from the same install
+    // as libnetcdf (NETCDF_DIR\bin, else PATH); without ncgen the negative
+    // halves SKIP. Two mismatches: a longer leading dimension (the overrun
+    // case) and a lower rank (the garbage-read case).
+    // ---------------------------------------------------------------
+    printfn "\n--- shape guard: dense read refuses a file whose dimensions changed (BL8012) ---"
+    let shapeGuardSource = """
+import netcdf as NetCDF
+
+let sample = NetCDF.load("tests/fixtures/sample.nc")
+let A = sample.vars.A |> NetCDF.read
+let out = method_for(A) <@> lambda(x) -> x + x |> compute
+"""
+    /// Run ncgen on a CDL text, producing `outNc`. None = ncgen unavailable
+    /// (SKIP); Some (Error e) = ncgen ran and failed (FAIL: the CDL is ours).
+    let tryNcgen (cdl: string) (outNc: string) : Result<unit, string> option =
+        let candidates =
+            [ match Environment.GetEnvironmentVariable "NETCDF_DIR" with
+              | null | "" -> ()
+              | d -> yield Path.Combine(d, "bin", "ncgen.exe")
+              yield "ncgen" ]
+        let cdlPath = Path.ChangeExtension(outNc, ".cdl")
+        File.WriteAllText(cdlPath, cdl)
+        let tryOne (exe: string) : Result<unit, string> option =
+            try
+                let psi = ProcessStartInfo(exe, $"-o \"{outNc}\" \"{cdlPath}\"")
+                psi.RedirectStandardOutput <- true
+                psi.RedirectStandardError <- true
+                psi.UseShellExecute <- false
+                psi.CreateNoWindow <- true
+                use p = Process.Start(psi)
+                let err = p.StandardError.ReadToEnd()
+                p.WaitForExit()
+                if p.ExitCode = 0 && File.Exists outNc then Some (Ok ())
+                else Some (Error $"ncgen exit {p.ExitCode}: {err}")
+            with
+            | :? System.ComponentModel.Win32Exception -> None   // not found: try the next
+            | ex -> Some (Error ex.Message)
+        candidates |> List.tryPick tryOne
+    try
+        match lower shapeGuardSource with
+        | Ok ir ->
+            let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "shape_guard_e2e"
+            let iRank = cppCode.IndexOf "nc_inq_varndims"
+            let iRead = cppCode.IndexOf "nc_get_var_float"
+            check "shape guard: codegen queries rank + dimension lengths BEFORE nc_get_var (BL8012)"
+                (iRank >= 0 && iRead > iRank && cppCode.Contains "nc_inq_dimlen" && cppCode.Contains "BL8012")
+                ($"varndims at {iRank}, get_var at {iRead}")
+            let sgOutDir = "./generated_cpp_tests"
+            if not (Directory.Exists sgOutDir) then Directory.CreateDirectory sgOutDir |> ignore
+            CodeGen.deployRuntimeHeaders sgOutDir
+            let sgCppFile = Path.Combine(sgOutDir, "shape_guard_e2e.cpp")
+            File.WriteAllText(sgCppFile, cppCode)
+            (match compileCpp sgCppFile sgOutDir with
+             | Ok exePath ->
+                 check "shape guard e2e: compiles and links libnetcdf" true ""
+                 Directory.CreateDirectory(Path.Combine(sgOutDir, "tests", "fixtures")) |> ignore
+                 File.Copy("tests/fixtures/sample.nc", Path.Combine(sgOutDir, "tests", "fixtures", "sample.nc"), true)
+                 (match runExecutable exePath with
+                  | Ok (0, _) -> check "shape guard e2e: the unchanged fixture still reads (exit 0, no false positive)" true ""
+                  | Ok (code, runOut) ->
+                      check "shape guard e2e: the unchanged fixture still reads (exit 0, no false positive)" false
+                          ($"exit {code}: {(runOut.Substring(0, min 300 runOut.Length))}")
+                  | Error e -> check "shape guard e2e: the unchanged fixture still reads (exit 0, no false positive)" false e)
+                 // Negative halves: the same exe against a regenerated sample.nc.
+                 let negative (label: string) (cdl: string) (wantSubstring: string) =
+                     let badDir = Path.Combine(Path.GetTempPath(), "blade_nc_shape_" + Guid.NewGuid().ToString("N"))
+                     Directory.CreateDirectory(Path.Combine(badDir, "tests", "fixtures")) |> ignore
+                     try
+                         let badNc = Path.Combine(badDir, "tests", "fixtures", "sample.nc")
+                         match tryNcgen cdl badNc with
+                         | None -> printfn "  SKIP shape guard e2e (%s): ncgen not found (NETCDF_DIR\\bin or PATH)" label
+                         | Some (Error e) -> check $"shape guard e2e ({label}): ncgen builds the mismatched fixture" false e
+                         | Some (Ok ()) ->
+                             let exeCopy = Path.Combine(badDir, Path.GetFileName exePath)
+                             File.Copy(exePath, exeCopy, true)
+                             (match runExecutable exeCopy with
+                              | Ok (code, badOut) ->
+                                  let name = $"shape guard e2e ({label}): aborts with BL8012 before reading, prints no data"
+                                  check name
+                                      (code <> 0
+                                       && badOut.Contains "error[BL8012]"
+                                       && badOut.Contains "provider shape mismatch"
+                                       && badOut.Contains wantSubstring
+                                       && not (badOut.Contains "out = "))
+                                      ($"exit {code}: {(badOut.Substring(0, min 400 badOut.Length))}")
+                              | Error e -> check $"shape guard e2e ({label}): aborts with BL8012 before reading, prints no data" false e)
+                     finally
+                         try Directory.Delete(badDir, true) with _ -> ()
+                 // xdim 20 -> 21: A grows by 1500 floats past the baked buffer.
+                 negative "longer leading dim"
+                     "netcdf sample {\ndimensions:\n zdim = 50 ;\n ydim = 30 ;\n xdim = 21 ;\nvariables:\n float A(xdim, ydim, zdim) ;\n}\n"
+                     "dimension 0 of length 21"
+                 // A loses its trailing axis: rank 2 against a rank-3 type.
+                 negative "lower rank"
+                     "netcdf sample {\ndimensions:\n ydim = 30 ;\n xdim = 20 ;\nvariables:\n float A(xdim, ydim) ;\n}\n"
+                     "has rank 2"
+             | Error e ->
+                 if isSkipError e then printfn "  SKIP shape guard e2e (compile skipped): %s" e
+                 else check "shape guard e2e: compiles and links libnetcdf" false e)
+        | Error e when nativeLibUnavailable e ->
+            printfn "  SKIP shape guard: %s" e
+        | Error e ->
+            check "shape guard: lowers (plain provider var read)" false ($"lower error: {e}")
+    with ex -> unexpected "shape guard" ex
+
+    // ---------------------------------------------------------------
+    // Shape guard, INTERPRETER lane: Run.materializeProviderRead is the twin
+    // of CppNetcdf.ncShapeGuard and must raise BL8012 on the same
+    // disagreement. The interpreter opens the file named in the IR at run
+    // time, so the block lowers against a PRIVATE copy of sample.nc, checks
+    // the copy still interprets, regenerates the copy with ncgen (a longer
+    // leading dim), and interprets the same IR again. No g++ involved.
+    // ---------------------------------------------------------------
+    printfn "\n--- shape guard, interpreter lane: BL8012 from materializeProviderRead ---"
+    let itDir = Path.Combine(Path.GetTempPath(), "blade_nc_shape_interp_" + Guid.NewGuid().ToString("N"))
+    try
+        try
+            Directory.CreateDirectory itDir |> ignore
+            let itNc = Path.Combine(itDir, "sample.nc")
+            File.Copy("tests/fixtures/sample.nc", itNc, true)
+            let itSource =
+                "import netcdf as NetCDF\n\n"
+                + "let sample = NetCDF.load(\"" + itNc.Replace('\\', '/') + "\")\n"
+                + "let A = sample.vars.A |> NetCDF.read\n"
+                + "let out = method_for(A) <@> lambda(x) -> x + x |> compute\n"
+            match lower itSource with
+            | Ok ir ->
+                let run () = Blade.Interp.Run.runProgram ir "shape_guard_interp" Blade.Interp.Value.defaultLimits
+                let good = run ()
+                check "shape guard interp: the unchanged copy interprets (exit 0, no false positive)"
+                    (good.ExitCode = 0 && good.Stdout.Contains "out = ")
+                    ($"exit {good.ExitCode}: {(good.Stderr.Substring(0, min 300 good.Stderr.Length))}")
+                (match tryNcgen
+                        "netcdf sample {\ndimensions:\n zdim = 50 ;\n ydim = 30 ;\n xdim = 21 ;\nvariables:\n float A(xdim, ydim, zdim) ;\n}\n"
+                        itNc with
+                 | None -> printfn "  SKIP shape guard interp (negative): ncgen not found (NETCDF_DIR\\bin or PATH)"
+                 | Some (Error e) -> check "shape guard interp: ncgen rebuilds the private copy" false e
+                 | Some (Ok ()) ->
+                     let bad = run ()
+                     check "shape guard interp: the regenerated copy (longer leading dim) raises BL8012, prints no data"
+                         (bad.ExitCode <> 0
+                          && bad.Stderr.Contains "BL8012"
+                          && bad.Stderr.Contains "length 21"
+                          && not (bad.Stdout.Contains "out = "))
+                         ($"exit {bad.ExitCode}: {(bad.Stderr.Substring(0, min 400 bad.Stderr.Length))}"))
+            | Error e when nativeLibUnavailable e -> printfn "  SKIP shape guard interp: %s" e
+            | Error e -> check "shape guard interp: lowers (plain provider var read)" false ($"lower error: {e}")
+        with ex -> unexpected "shape guard interp" ex
+    finally
+        try Directory.Delete(itDir, true) with _ -> ()
+
+    // ---------------------------------------------------------------
     // fill_random builtin (general codegen, hermetic -- no NetCDF): a random-fill
     // array constructor whose shape comes from the annotation. Exercises the
     // TExprFillRandom -> RandomInits -> genBinding path (allocate<> + the runtime

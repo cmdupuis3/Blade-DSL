@@ -852,6 +852,15 @@
       ],
       "docs": []
     },
+    "BL8012": {
+      "title": "provider shape mismatch",
+      "explanation": "A data file read at run time no longer has the shape the program was compiled against. `NetCDF.load(...)` bakes each variable's rank and dimension lengths into the program's types when it is compiled, and the dense readers size their buffers from those extents; libnetcdf then writes the variable's whole CURRENT extent into that buffer. A file whose dimensions grew since compilation would overrun the buffer, and one that shrank or reordered its axes would read garbage into the cells the program indexes -- both silently. The guard queries the opened variable's rank and every dimension length before the first read and aborts on any disagreement, on both the compiled and interpreted lanes.",
+      "fix": "Recompile the program against the file it will read, or read a file with the schema the program was compiled against. Equal dimension lengths are the contract this guard enforces; a different grid with the same lengths is not detected here.",
+      "examples": [
+        "tests/NetcdfTests.fs"
+      ],
+      "docs": []
+    },
     "BL9001": {
       "title": "internal compiler error",
       "explanation": "An invariant inside the compiler broke, or an unexpected exception escaped to the CLI boundary. This is a bug in Blade, not in the program being compiled.",

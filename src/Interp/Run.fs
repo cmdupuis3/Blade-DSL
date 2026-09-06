@@ -412,7 +412,32 @@ let private materializeProviderRead (state: Core.InterpState) (binding: IRBindin
                 raise (Core.InterpUnsupported $"provider read of '{spec.VarName}' from '{spec.FilePath}': {e}")
             | Ok data ->
                 let arrTy = spec.VarType
-                let extents = data.DimLengths |> List.map int64 |> Array.ofList
+                // BL8012 twin of CppNetcdf.ncShapeGuard: the file's rank and
+                // dimension lengths at RUN time must match the extents lowering
+                // baked from the compile-time file. Literal extents only -- a
+                // non-literal extent has nothing to compare, and the compiled
+                // side emits no check for it either. Before this guard the
+                // array below took its extents from the file while its TYPE
+                // kept the baked ones, so a changed file read silently.
+                let baked =
+                    arrTy.IndexTypes |> List.map (fun ix ->
+                        match ix.Extent with
+                        | IRLit (IRLitInt n) -> Some n
+                        | _ -> None)
+                let observed = data.DimLengths |> List.map int64
+                if baked.Length <> observed.Length then
+                    raise (InterpPanic ("BL8012",
+                                        $"NetCDF variable '{spec.VarName}' in '{spec.FilePath}' has rank {observed.Length} at run time; the program was compiled against rank {baked.Length}",
+                                        None, 0))
+                List.zip baked observed
+                |> List.iteri (fun d (b, o) ->
+                    match b with
+                    | Some n when n <> o ->
+                        raise (InterpPanic ("BL8012",
+                                            $"NetCDF variable '{spec.VarName}' in '{spec.FilePath}' has dimension {d} of length {o} at run time; the program was compiled against {n}",
+                                            None, 0))
+                    | _ -> ())
+                let extents = observed |> Array.ofList
                 let store =
                     match ArrayOps.elemThrough arrTy.ElemType, data.Payload with
                     | Some (ETFloat64 | ETFloat32), Blade.ProviderRegistry.PFloats xs -> SFloat xs

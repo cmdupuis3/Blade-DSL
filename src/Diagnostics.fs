@@ -419,6 +419,17 @@ module Codes =
             // contracted axis), mirrored by the interpreter's materializeApply
             // and gramArray.
             "BL8011", "co-iteration extent mismatch"
+            // A provider variable's RUNTIME shape disagrees with the extents
+            // lowering baked from the file present at compile time: a
+            // different rank, or a dimension of a different length. The dense
+            // readers hand libnetcdf a buffer sized from the baked extents and
+            // `nc_get_var_*` writes the variable's whole current extent into
+            // it, so a grown file overran the buffer and a shrunk or reordered
+            // one read garbage into indexed cells, both silently. Emitted by
+            // CppNetcdf.ncShapeGuard between `nc_inq_varid` and the read
+            // (dense, compound + mask, stream open), and mirrored by the
+            // interpreter's materializeProviderRead.
+            "BL8012", "provider shape mismatch"
             // BL9xxx: internal compiler errors
             "BL9001", "internal compiler error"
             "BL9002", "internal codegen invariant violated"
