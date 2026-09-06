@@ -17,12 +17,17 @@
 // MAX, not the pin outright: an intrinsic whose own minRank exceeds the pin
 // (gram, transpose over a `T^1`) still synthesizes minRank and still fails at
 // unify, which is the correct refusal and already names both ranks.
+//
+// The extents are Int64 (the rank-1 `extents(x)` is Int64 too, and a `-> Nat`
+// return of it is refused): a literal tuple projection now takes its
+// element's type instead of a fresh variable, which is what let `-> Nat`
+// pass here before.
 // ============================================================================
 type Row = Idx<3>
 type Col = Idx<4>
 
-function nrows(x: T^2) -> Nat = extents(x)[0]
-function ncols(x: T^2) -> Nat = extents(x)[1]
+function nrows(x: T^2) -> Int64 = extents(x)[0]
+function ncols(x: T^2) -> Int64 = extents(x)[1]
 
 // Nested peel inside one body: the outer `reduce` sees the INNER one's rank-1
 // result, so the pin has to survive the first peel as well as reach it.

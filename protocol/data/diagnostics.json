@@ -618,6 +618,15 @@
         "docs/formalism.md"
       ]
     },
+    "BL4019": {
+      "title": "halo offset outside the declared set",
+      "explanation": "A stencil kernel over `halo<I, [o1, o2, ...]>` reads its window at a LITERAL offset outside the declared REACH -- the span from the smallest to the largest declared offset, including 0 -- such as `a(w(2))` under `halo<I, [-1, 0, 1]>`. The loop's interior is shrunk for that reach only, so at the boundary the read lands one or more cells past the array's allocation: the compiled program reads garbage silently and the interpreter panics, a divergence no test would show you. An unlisted offset INSIDE the reach is safe and stays legal. Only literal offsets are judged; an offset computed from a sibling range slot is left to the runtime guards.",
+      "fix": "Add the offset to the halo's list (`halo<I, [-1, 0, 1, 2]>`), which widens the interior shrink to match, or read within the declared set.",
+      "examples": [
+        "tests/corpus/loops/202_halo_offset_outside_set_rejects.blade"
+      ],
+      "docs": []
+    },
     "BL5000": {
       "title": "ml elaboration error",
       "explanation": "The `ml` domain elaborator refused a construct: a non-static configuration where a compile-time spec is required, a gated block reached in the wrong order, a bad derivation order, or an op whose arguments do not fit its spec.",

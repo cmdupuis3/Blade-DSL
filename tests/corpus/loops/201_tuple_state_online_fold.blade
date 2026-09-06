@@ -1,0 +1,44 @@
+// TEST: Tuple-State Online Fold Matches The Two-Pass Join
+// ============================================================================
+// The one-pass online-softmax merge (docs/plans/structural/03, section 2.2):
+// the map embeds each pair as a state triple (score, 1, v), the fold merges
+// two states by rescaling both to the larger maximum, and the finalizer
+// divides. The running state is a `std::tuple<double, double, double>`
+// register triple -- nothing is materialized -- and the kernel projections
+// `s[2] / s[1]` are typed from the seed's tuple type (defect D1 of that
+// document: they used to be left untyped, and g++ refused the row map).
+// The two-pass join of loops/200 is the reference: the two spellings agree
+// to roundoff, which is the pin.
+// ============================================================================
+type I = Idx<7>
+type J = Idx<11>
+function score(a: Float64, b: Float64) -> Float64 = -(a - b) * (a - b) * 8.0
+let q = method_for(range<I>) <@> lambda(i) -> 0.3 * Float64(i) - 0.5 |> compute
+let k = method_for(range<J>) <@> lambda(j) -> 0.2 * Float64(j) - 0.4 |> compute
+let v = method_for(range<J>) <@> lambda(j) -> 1.0 + 0.1 * Float64(j) |> compute
+
+let y1 = (method_for(range<I>) <@> lambda(i) -> {
+    let qi = q(i)
+    let s = reduce(method_for(zip(k, v)) <@> lambda(b, x) -> (score(qi, b), 1.0, x),
+                   lambda(a, b) -> {
+                       let m = if a[0] > b[0] then a[0] else b[0]
+                       let ca = exp(a[0] - m)
+                       let cb = exp(b[0] - m)
+                       (m, a[1] * ca + b[1] * cb, a[2] * ca + b[2] * cb)
+                   }, (-1.0e300, 0.0, 0.0))
+    s[2] / s[1]
+}) |> compute
+
+let y2 = (method_for(range<I>) <@> lambda(i) -> {
+    let qi = q(i)
+    let m = reduce(method_for(k) <@> lambda(b) -> score(qi, b),
+                   lambda(a, b) -> if a > b then a else b, -1.0e300)
+    let e = method_for(k) <@> lambda(b) -> exp(score(qi, b) - m)
+    let z, u = object_for(<&!>) <@> (reduce(e, (+)), prodsum(e, v))
+    u / z
+}) |> compute
+
+let dev = method_for(zip(y1, y2)) <@> lambda(a, b) -> abs(a - b) |> compute
+let maxdev = reduce(dev, lambda(a, b) -> if a > b then a else b, 0.0)
+let agrees = maxdev < 1.0e-12
+// EXPECT: agrees = true

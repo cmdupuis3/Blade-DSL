@@ -188,6 +188,14 @@ type TypeError =
     /// undersized one silently emits fewer windows -- a wrong answer with no
     /// symptom. `dim` is 1-based over the indexed array's slots.
     | HaloExtentMismatch of declared: int64 * dim: int * targetName: string * actual: int64
+    /// BL4019: a window read `A(w(o))` whose LITERAL offset `o` lies outside
+    /// the halo's declared offset set (`halo<I, [-1, 0, 1]>` read at `w(2)`).
+    /// The interior is shrunk for the DECLARED reach only, so such a read
+    /// lands past the array's pool at the boundary -- silently in the
+    /// compiled lane, as a BL8003 panic in the interpreter (a latent
+    /// differential red; docs/plans/structural/02 section 1.5). A computed
+    /// offset is not judged here (fail-open, as loops/080 relies on).
+    | HaloOffsetOutsideSet of offset: int * declared: int list * targetName: string
     /// BL3016 (same family, the co-iteration twin): two operands of one
     /// elementwise zip -- `A + B`, `zip(A, B) <@> k`, `method_for(zip ..)` --
     /// carry DIFFERENT compile-time-literal extents on the shared axis. The

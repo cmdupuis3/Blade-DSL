@@ -741,6 +741,9 @@ class IS implemented, and the dense result folds like any other array." op level
         $"provider read: the annotation declares extent {annotated} on index slot {dim}, but the read's own type has extent {actual}. A provider read is typed BY THE STORE -- the annotation cannot reshape it -- while codegen allocates the store's true shape and compiles every later subscript against the ANNOTATED one, so a disagreement here is an out-of-bounds read with no runtime symptom, not a naming quarrel. Correct the annotation to the {provider} store's shape, or drop it and let the read supply the type (slice or reshape the value afterwards if a different shape is what you want)."
     | HaloExtentMismatch (declared, dim, targetName, actual) ->
         $"halo extent mismatch: the halo declares an inner extent of {declared}, but '{targetName}' (read through the window at index slot {dim}) has extent {actual}. The window walk is bounded by the DECLARED extent, so an oversized halo reads past '{targetName}''s allocation and an undersized one silently emits fewer windows. Make the halo's inner index match the array it windows over."
+    | HaloOffsetOutsideSet (offset, declared, targetName) ->
+        let set = declared |> List.map string |> String.concat ", "
+        $"halo offset outside the declared set: '{targetName}' is read at window offset {offset}, but the halo declares the offsets [{set}], whose reach is {min 0 (List.min declared)}..{max 0 (List.max declared)}. The interior is shrunk for that reach only, so this read lands past the array's allocation at the boundary. Add {offset} to the halo's offset list (which widens the reach), or read within it."
     | QuantityTerminal (quantity, declName) ->
         $"unit '{declName}': the quantity '{quantity}' cannot be used inside a unit expression. Quantities are TERMINAL -- the nominal layer is exactly one level deep -- so a quantity name can neither be composed (`Unit x = {quantity} * m`) nor re-derived from (`Unit q: {quantity}`). Compose from the structural units the quantity was declared over instead."
     | UnknownUnitName (name, declName, candidates) ->
@@ -1015,6 +1018,7 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // that the literal contradicts. The fix is to reconcile two
             // spellings of one shape, not to stop using RaggedIdx.
             | RaggedLensMismatch _ | RaggedLensNotStatic _ -> "BL4018"
+            | HaloOffsetOutsideSet _ -> "BL4019"
             | StructWhereNotBool _ | StructWhereError _ | WherePredicateUnannotated _
             | PplConstraintNeedsImport _
             | UnknownWhereConstraint _ -> "BL4001"

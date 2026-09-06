@@ -233,6 +233,27 @@ let private recarrayGradEmission () =
             resultLine Fail name ($"expected 3 counted loops, no __rk/__rm, a descending index; got {loops} loop(s), triangular={triangular}, descending={descending}")
             false
 
+/// The dense-halo carousel's tail prefetch must be guarded: on the last
+/// step it read one cell past the array (docs/plans/structural/02, 1.5).
+/// The guard compares the ordinal against the windowed array's extent.
+let private haloCarouselTailGuarded () =
+    let name = "halo_carousel_tail_guarded"
+    let src =
+        "type H = Idx<9>\n"
+        + "let a: Array<Float like H> = [1.0, 2.0, 4.0, 7.0, 11.0, 16.0, 22.0, 29.0, 37.0]\n"
+        + "let d = method_for(halo<H, [-1, 0, 1]>) <@> lambda(w) -> a(w(1)) - a(w(-1)) |> compute\n"
+    match cppOfSource name src with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        let carousel = cpp.Contains "halo carousel"
+        let guarded = System.Text.RegularExpressions.Regex.IsMatch(cpp, @"if \(\(size_t\)\([^)]*\) < a\.extents\[0\]\) __car_")
+        if carousel && guarded then
+            resultLine Pass name "carousel emitted; tail prefetch guarded by a.extents[0]"
+            true
+        else
+            resultLine Fail name ($"carousel={carousel}, guarded={guarded}")
+            false
+
 let private runCase (name: string) (src: string) (wantBreaks: int) (wantAborts: int) =
     match cppOfSource name src with
     | Error e -> resultLine Fail name e; false
@@ -275,7 +296,9 @@ let runOptimizeTests () =
           decisionCase "decision_fusion_applied" fusionChain "elementwise-fusion" applied
               "elementwise-fusion applied"
           // Reverse-mode AD of an additive recurrence is O(n): loop count pin.
-          recarrayGradEmission () ]
+          recarrayGradEmission ()
+          // The halo carousel's last-step prefetch stays inside the pool.
+          haloCarouselTailGuarded () ]
     let passed = results |> List.filter id |> List.length
     let failed = results.Length - passed
     printFooter "Optimization Layer" [$"{passed} passed"; $"{failed} failed"]

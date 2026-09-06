@@ -1355,8 +1355,14 @@ let internal planHaloCarousel
                     warmup <- warmup @
                         [ $"// halo carousel: {arrS} window [{mink}..{maxk}] -- ring of {cap}, head = {idxName}, one write/step"
                           $"""std::array {buf}{{ {(String.concat ", " inits)} }};""" ]
+                    // The tail prefetches the value the NEXT step will read at
+                    // its far edge. On the last step there is no next step, and
+                    // the ordinal is one past the array (the interior shrink
+                    // ends the walk exactly at reach): guard the load. The slot
+                    // it would fill is never read again, so skipping it is exact
+                    // (docs/plans/structural/02, section 1.5).
                     tail <- tail @
-                        [ $"{buf}[({idxName} + {span}UL) & {mask}UL] = {arrS}{prefixS}[(size_t)({wname} + {1 + maxk}L)];" ]
+                        [ $"if ((size_t)({wname} + {1 + maxk}L) < {arrS}.extents[{prefix.Length}]) {buf}[({idxName} + {span}UL) & {mask}UL] = {arrS}{prefixS}[(size_t)({wname} + {1 + maxk}L)];" ]
                     for (node, _, _, k) in reads do
                         subst <- (node, $"{buf}[({idxName} + {k - mink}UL) & {mask}UL]") :: subst)
                 Some (subst, warmup, tail)

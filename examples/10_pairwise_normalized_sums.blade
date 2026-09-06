@@ -1,0 +1,117 @@
+// 10_pairwise_normalized_sums.blade
+// ============================================================================
+// Normalized pairwise sums without the pairwise array.
+//
+// The shape shows up everywhere in scientific code: for every i, a sum over j
+// of a weight w(i, j) times a value v(j), divided by the sum of the weights.
+// Kernel smoothing (Nadaraya-Watson), softmax attention, Boltzmann averages,
+// importance-weighted estimates. The obvious spelling forms the M x N weight
+// array, folds it twice, and divides -- O(M N) storage and three passes over
+// it. None of that is needed: each output cell depends on ONE row of weights,
+// and a row is a fold.
+//
+// Blade's answer is composition, not a compiler feature (measured in
+// docs/plans/structural/03: at 3061 x 3449 the streaming spelling peaks at
+// 5 MB against 166 MB for the materialized one, and is faster serially):
+//
+//   1. a per-row kernel over `range<I>`,
+//   2. whose body NAMES the deferred producer `w = method_for(xs) <@> ...`
+//      -- naming it is the sharing declaration; it is never allocated --
+//   3. and folds it with a reduction join `object_for(<&!>) <@> (reduce(w,
+//      (+)), prodsum(w, v))`: both legs in ONE traversal of j.
+//
+// Four variants below: the bounded-kernel one-pass form (kernel smoothing),
+// the numerically stable two-pass form (softmax), the one-pass online form
+// with a tuple-valued running state, and the matrix-valued output. The
+// `agrees_*` pins are differentials against the materialized reference.
+// ============================================================================
+
+type I = Idx<23>      // query positions (rows of the output)
+type J = Idx<37>      // sample positions (the summed-over axis)
+
+let x = method_for(range<I>) <@> lambda(i) -> 0.25 * Float64(i) - 2.0 |> compute
+let xs = method_for(range<J>) <@> lambda(j) -> 0.17 * Float64(j) - 3.0 |> compute
+let ys = method_for(range<J>) <@> lambda(j) -> sin(0.5 * Float64(j)) |> compute
+let h = 0.6
+
+// ---------------------------------------------------------------------------
+// 1. Kernel-weighted mean (Nadaraya-Watson). The Gaussian kernel is bounded
+//    by 1, so no stabilization is needed and the one-pass join is the whole
+//    program: per i, ONE traversal of j, no allocation but the output.
+// ---------------------------------------------------------------------------
+let smoothed = (method_for(range<I>) <@> lambda(i) -> {
+    let xi = x(i)
+    let w = method_for(xs) <@> lambda(b) -> exp(-(xi - b) * (xi - b) / (2.0 * h * h))
+    let z, u = object_for(<&!>) <@> (reduce(w, (+)), prodsum(w, ys))
+    u / z
+}) |> compute
+
+// The materialized reference: the M x N weights, two folds, a division.
+let W = (method_for(x, xs) <@> lambda(a, b) -> exp(-(a - b) * (a - b) / (2.0 * h * h)) |> compute)
+let z_ref = reduce(W, (+))
+let u_ref = method_for(range<I>) <@> lambda(i) -> prodsum(W(i), ys) |> compute
+let smoothed_ref = u_ref / z_ref
+let dev1 = method_for(zip(smoothed, smoothed_ref)) <@> lambda(a, b) -> abs(a - b) |> compute
+let agrees_smoothing = reduce(dev1, lambda(a, b) -> if a > b then a else b, 0.0) < 1.0e-12
+// EXPECT: agrees_smoothing = true
+
+// ---------------------------------------------------------------------------
+// 2. Softmax-normalized weighted sum, two passes. The scores are not bounded,
+//    so pass 1 takes the row maximum (a lambda fold kernel needs the
+//    3-argument seed on the fused terminal) and pass 2 subtracts it before
+//    exponentiating. Still no M x N: two traversals of j per row.
+// ---------------------------------------------------------------------------
+function score(a: Float64, b: Float64) -> Float64 = -(a - b) * (a - b) * 8.0
+
+let attended = (method_for(range<I>) <@> lambda(i) -> {
+    let qi = x(i)
+    let m = reduce(method_for(xs) <@> lambda(b) -> score(qi, b),
+                   lambda(a, b) -> if a > b then a else b, -1.0e300)
+    let e = method_for(xs) <@> lambda(b) -> exp(score(qi, b) - m)
+    let z, u = object_for(<&!>) <@> (reduce(e, (+)), prodsum(e, ys))
+    u / z
+}) |> compute
+
+// ---------------------------------------------------------------------------
+// 3. The same in ONE pass: a tuple-valued running state (max, rescaled
+//    denominator, rescaled numerator) merged by rescaling both operands to
+//    the larger maximum -- the online-softmax merge. The state is a register
+//    triple; nothing is materialized. Two exponentials per pair instead of
+//    one plus a second score evaluation: cheaper when `score` is expensive.
+// ---------------------------------------------------------------------------
+let attended_online = (method_for(range<I>) <@> lambda(i) -> {
+    let qi = x(i)
+    let s = reduce(method_for(zip(xs, ys)) <@> lambda(b, y) -> (score(qi, b), 1.0, y),
+                   lambda(a, b) -> {
+                       let m = if a[0] > b[0] then a[0] else b[0]
+                       let ca = exp(a[0] - m)
+                       let cb = exp(b[0] - m)
+                       (m, a[1] * ca + b[1] * cb, a[2] * ca + b[2] * cb)
+                   }, (-1.0e300, 0.0, 0.0))
+    s[2] / s[1]
+}) |> compute
+
+let dev2 = method_for(zip(attended, attended_online)) <@> lambda(a, b) -> abs(a - b) |> compute
+let agrees_online = reduce(dev2, lambda(a, b) -> if a > b then a else b, 0.0) < 1.0e-12
+// EXPECT: agrees_online = true
+
+// ---------------------------------------------------------------------------
+// 4. Matrix-valued output: the values are rows of a J x D matrix, so each
+//    output cell is a D-vector. Per row this allocates one J-vector of
+//    weights and one D-row -- O(J + D), never M x J -- because the row
+//    kernel may return a COMPUTED rank-1 row.
+// ---------------------------------------------------------------------------
+type D = Idx<3>
+let Vt = (method_for(range<D>, range<J>) <@> lambda(d, j) -> cos(0.3 * Float64(j) + Float64(d)) |> compute)
+
+let attended_rows = (method_for(range<I>) <@> lambda(i) -> {
+    let qi = x(i)
+    let m = reduce(method_for(xs) <@> lambda(b) -> score(qi, b),
+                   lambda(a, b) -> if a > b then a else b, -1.0e300)
+    let e = (method_for(xs) <@> lambda(b) -> exp(score(qi, b) - m)) |> compute
+    let z = reduce(e, (+))
+    (method_for(Vt) <@> lambda(vrow: T^1) -> prodsum(e, vrow) / z) |> compute
+}) |> compute
+
+let row0 = attended_rows((0 : I))
+let checksum = reduce(attended, (+))

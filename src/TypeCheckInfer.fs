@@ -4167,6 +4167,17 @@ and inferTupleIndex (env: TypeEnv) tuple index : TypeResult<TypedExpr> =
                                 (mkArrayLike { arrTy with IndexTypes = remaining }))
                 else
                     Error (Other "array indexing: too many indices for array rank")
+        | IRTTuple ts when (match tI.Kind with TExprLit (LitInt k) -> k >= 0L && int k < ts.Length | _ -> false) ->
+            // A LITERAL projection of a tuple whose element types are known
+            // names that element's type. Answering a fresh variable here
+            // (the pack fallback below) left `s[2] / s[1]` in a row kernel
+            // untyped at the apply's output unification, and the emitted row
+            // map took the loop-index tag as its element type -- g++ then
+            // refused the store under -Werror=float-conversion
+            // (docs/plans/structural/03, defect D1). The pack case keeps the
+            // fallback: its leaves are flat paths codegen resolves itself.
+            let k = match tI.Kind with TExprLit (LitInt k) -> int k | _ -> 0
+            Ok (mkTyped (TExprTupleIndex (tT, tI)) ts.[k])
         | _ ->
             // Poly-pack / tuple indexing: result type is fresh -- codegen
             // resolves via std::get based on flat-leaf paths.
@@ -5808,6 +5819,16 @@ and convertScaleTo (env: TypeEnv) (context: string) (dst: UnitSig) (t: TypedExpr
     | None -> Ok t
     | Some src when not (unitCompatible src dst) ->
         Error (UnitMismatch (context, ppUnitSig dst, ppUnitSig src))
+    // Inside a synthesized derivative (Constraints.adBodyConjunct) a factor
+    // may not be inserted: the AD transform differentiated this site as
+    // identity / linear, so a conversion by k would have derivative 1
+    // instead of k. Refuse loudly; the user converts outside the
+    // differentiated function.
+    | Some src when unitCompatible src dst && not (unitSameScale src dst)
+                    && Blade.Constraints.inAdBody () ->
+        Error (Other (sprintf
+                "%s relates %s and %s inside a differentiated body (a function synthesized by ad.grad / ad.jvp): the magnitudes differ by the factor %s, and the derivative of that conversion is the factor itself, which the surface-level AD transform does not see. Convert outside the differentiated function, or declare its parameters and result in one magnitude"
+                context (ppUnitSig src) (ppUnitSig dst) (ppUnitScale (unitConversionFactor src dst))))
     | Some src when unitCompatible src dst && not (unitSameScale src dst) ->
         let factor = unitConversionFactor src dst
         let scaled et lit =
@@ -8667,30 +8688,58 @@ and buildApplyInfo (env: TypeEnv)
                 |> Map.ofList
             if Map.isEmpty haloDeclared then None
             else
-                let haloTagOfArg (arg: TypedExpr) : string option =
+                // A window read's tag and, when the offset is a literal
+                // (`w(1)`, `w(-1)`), the offset itself.
+                let haloReadOfArg (arg: TypedExpr) : (string * int option) option =
                     match arg.Kind with
-                    | TExprApp (f, _) ->
+                    | TExprApp (f, offArgs) ->
                         (match env.Subst.Resolve f.Type with
-                         | IRTIdxTagged (_, IRefNamed t) when t.StartsWith (haloWinTagPrefix + "d:") -> Some t
+                         | IRTIdxTagged (_, IRefNamed t) when t.StartsWith (haloWinTagPrefix + "d:") ->
+                             let lit =
+                                 match offArgs with
+                                 | [ { Kind = TExprLit (LitInt k) } ] -> Some (int k)
+                                 | [ { Kind = TExprUnaryOp (OpNeg, { Kind = TExprLit (LitInt k) }) } ] -> Some (int -k)
+                                 | _ -> None
+                             Some (t, lit)
                          | _ -> None)
                     | _ -> None
                 let checkSite (arr: TypedExpr) (args: TypedExpr list) : TypeError option =
+                    let targetName =
+                        match arr.Kind with
+                        | TExprVar (n, _, _) -> n
+                        | _ -> "<array>"
                     match env.Subst.Resolve arr.Type with
                     | ArrayElem at when args.Length <= at.IndexTypes.Length ->
                         args
                         |> List.mapi (fun d a -> (d, a))
                         |> List.tryPick (fun (d, a) ->
-                            match haloTagOfArg a |> Option.bind (fun t -> Map.tryFind t haloDeclared) with
-                            | Some declared ->
-                                (match tryEvalIntIR at.IndexTypes.[d].Extent with
-                                 | Some actual when actual <> declared ->
-                                     let targetName =
-                                         match arr.Kind with
-                                         | TExprVar (n, _, _) -> n
-                                         | _ -> "<array>"
-                                     Some (HaloExtentMismatch (declared, d + 1, targetName, actual))
-                                 | _ -> None)
-                            | None -> None)
+                            match haloReadOfArg a with
+                            | None -> None
+                            | Some (tag, lit) ->
+                                // BL4019 first: a literal offset outside the
+                                // declared REACH reads past the pool whatever
+                                // the extents say. The reach is [min, max]
+                                // over the declared offsets and 0 -- the
+                                // interior shrink covers that whole span
+                                // (haloShrinkOfTag), so an unlisted offset
+                                // INSIDE it (`w(1)` under `[-2, 0, 2]`, `w(0)`
+                                // under `[-2, -1]`) is safe and stays legal.
+                                let outside =
+                                    match lit, tag with
+                                    | Some o, HaloWinTag (_, _, offs)
+                                            when o < min 0 (List.min offs) || o > max 0 (List.max offs) ->
+                                        Some (HaloOffsetOutsideSet (o, offs, targetName))
+                                    | _ -> None
+                                match outside with
+                                | Some e -> Some e
+                                | None ->
+                                    match Map.tryFind tag haloDeclared with
+                                    | Some declared ->
+                                        (match tryEvalIntIR at.IndexTypes.[d].Extent with
+                                         | Some actual when actual <> declared ->
+                                             Some (HaloExtentMismatch (declared, d + 1, targetName, actual))
+                                         | _ -> None)
+                                    | None -> None)
                     | _ -> None
                 let rec walk (e: TypedExpr) : TypeError option =
                     let self =

@@ -231,6 +231,7 @@ first-class construct:
 | recurrence / time-stepping / running state | `let rec` recursive array (see below) | `let mut` + a loop |
 | iterate to convergence (trip count not known up front) | the inductive arm's `while` guard over a BUDGET extent: `\| prefix :: n while <cond> -> prefix :: <step>` — frozen once the guard goes false, runtime BL8010 if the budget runs out with it still true | a `while` loop; running the full budget unconditionally and hoping |
 | symmetric pairwise stats (covariance, comoments) | `where comm(a, b)` kernels, `reynolds(...)`, `gram(R, R)` | hand-written triangular loops |
+| normalized / weighted pairwise sums (kernel smoothing, softmax rows) | a per-row kernel over `range<I>` whose body NAMES the deferred producer and folds it with a reduction join: `let w = method_for(xs) <@> k; let z, u = object_for(<&!>) <@> (reduce(w, (+)), prodsum(w, v)); u / z` -- or a tuple-state fold for the one-pass online form (`examples/10`) | an M x N weight array then two partial folds |
 
 Pick the highest idiom rung the body admits: implicit lifting over a range
 (`x0 + dx * Float64(0..n)`) beats `method_for(range<...>) <@> lambda`, which in

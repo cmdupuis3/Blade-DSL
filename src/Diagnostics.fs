@@ -342,6 +342,13 @@ module Codes =
             // nesting and reads the annotation's lens nowhere, so both cases
             // used to be accepted and then ignored.
             "BL4018", "ragged lens contradicts the literal"
+            // BL4019: a window read `A(w(o))` whose literal offset lies
+            // outside the halo's declared offset set. The interior shrink
+            // covers the declared reach only, so the read lands past the
+            // pool at the boundary -- silently compiled, a panic
+            // interpreted. Judged for literal offsets at the apply seam
+            // (haloExtentClash's site walk); computed offsets stay fail-open.
+            "BL4019", "halo offset outside the declared set"
             // BL5xxx: elaborators
             "BL5000", "ml elaboration error"
             "BL5100", "ppl elaboration error"
