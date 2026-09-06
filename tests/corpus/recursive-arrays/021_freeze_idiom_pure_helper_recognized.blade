@@ -1,0 +1,27 @@
+// TEST: Freeze Idiom Recognized Through A Pure Helper
+// ============================================================================
+// The guard calls a user-declared helper. Recognition used to admit callees
+// by NAME (and miscompiled an effectful one -- recursive-arrays/020); it now
+// admits a callee by its EFFECT SUMMARY (Blade.Effects, computed from the
+// typed body with callees resolved): `residual` assigns nothing, prints
+// nothing, reads no file and calls only intrinsics and `sq_err`, so it is
+// repeatable and the freeze is derived exactly as for the inline guard in
+// recursive-arrays/017. Cost-only: these pins hold with recognition on or
+// off (BLADE_FREEZE_IDIOM) and in both lanes. `blade plan` on this file
+// lists the freeze-recognition decision as applied.
+
+type It = Idx<30>
+let tol = 0.000000001
+function sq_err(x: Float) -> Float = x * x - 2.0
+function residual(x: Float) -> Float = abs(sq_err(x))
+let rec xs: Array<Float like It> =
+    match xs with
+    | zero -> zero
+    | zero :: s -> zero :: 1.0
+    | prefix :: n -> prefix :: (if residual(prefix(n - 1)) > tol then (prefix(n - 1) + 2.0 / prefix(n - 1)) * 0.5 else prefix(n - 1))
+
+let root = xs((29 : It))
+// EXPECT: root = 1.41421356237469
+
+let early = xs((2 : It))
+// EXPECT: early = 1.41666666666667

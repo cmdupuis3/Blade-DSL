@@ -290,6 +290,9 @@ let typeCheck (program: Program) : Result<TypedProgram * IRBuilder * string list
     // resolveStatics pass, so every elaboration's own statics can size
     // against it.
     Blade.StructIdxSpec.install ()
+    // The `__ad_body` conjunct Grad stamps on synthesized derivatives (its
+    // body scope vetoes implicit unit-scale conversions -- Constraints.fs).
+    Blade.Constraints.registerAdBody ()
     IdePartial.reset ()
     PinSuggestions.reset ()
     WarningLog.reset ()

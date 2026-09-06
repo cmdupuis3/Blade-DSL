@@ -1,20 +1,24 @@
-// TEST: AD unit-carrying parameter rejected (rejects)
-// Before this refusal, a unit-carrying parameter classified as
-// non-differentiable SILENTLY: the function compiled and the parameter's
-// partial was simply missing from the gradient. A gradient's units are
-// <loss>/<param>, which the grad ABI (buffer type = parameter type) cannot
-// express, so the parameter refuses instead. The `Speed` alias also pins
-// that classification sees through same-module transparent type aliases.
-// ERROR: BL5500
-// ERROR-CONTAINS: unit-carrying
+// TEST: AD unit conversion inside a differentiated body rejected (rejects)
+// Unit-carrying parameters and losses differentiate in reverse mode (ad/025:
+// each cotangent is declared <loss>/<parameter>). What must NOT happen
+// silently is an implicit unit-SCALE conversion inside the differentiated
+// body: the AD transform treats `+` as linear and an annotated let as an
+// alias, so the derivative of a conversion by 1000 would come out as 1. The
+// synthesized derivative carries the `__ad_body` conjunct, and while the
+// checker is inside it the one site that inserts a factor (convertScaleTo,
+// reached here through the `x + y` join of km and meters) refuses instead.
+// An annotated let inside the body (`let y: Float<meters> = x`) is refused
+// earlier still, by the normalizer, since its annotation would not even
+// survive into the synthesized function. The `Dist` alias pins that
+// classification still sees through same-module transparent aliases.
+// ERROR-CONTAINS: differentiated body
 import ad as ad
 
-Unit mps
-type Speed = Float<mps>
+Unit meters
+Unit km = 1000 * meters
+type Dist = Float<km>
 
-function f(x: Float, v: Speed) -> Float = {
-    x * x
-}
+function f(x: Dist, y: Float<meters>) -> Float<km> = x + y
 
-let (fv, dfx) = ad.grad(f)(2.0, 3.0)
+let (fv, dfx, dfy) = ad.grad(f)(2.0, 500.0)
 fv

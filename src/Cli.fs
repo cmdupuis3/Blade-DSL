@@ -124,6 +124,10 @@ let private dispatchInner (args: string[]) : int =
 
     | [| "check"; file |] -> checkFile file strictPins
 
+    // The optimization decision record (Blade.Effects.Decisions).
+    | [| "plan"; file |] -> planFile file false
+    | [| "plan"; file; "--json" |] | [| "plan"; "--json"; file |] -> planFile file true
+
     // Native-toolchain health report (docs/plans/plan-toolchain-packaging.md).
     | [| "doctor" |] -> Blade.Doctor.runDoctor false
     | [| "doctor"; "--json" |] -> Blade.Doctor.runDoctor true

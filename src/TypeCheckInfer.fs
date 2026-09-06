@@ -10285,23 +10285,33 @@ and inferRecArray (env: TypeEnv) (annot: TypeExpr) (annotTy: IRType) (def: RecAr
     // because this is the last seam where the idiom's declarative shape
     // still exists.
     //
-    // The guard may CALL only pure scalar intrinsics the program has not
-    // shadowed -- the math table (exp/sqrt/...), abs and the complex
-    // accessors, the binary/ternary intrinsics (atan2, log_base, fma) and
-    // the numeric casts (`Float64(x)`). `lookupVar` is the same shadowing
-    // test the intrinsic arms of inferExpr apply. A user-declared helper
-    // declines: its body may mutate a `mut` argument, print, or abort, and
-    // the skipped evaluations would then not be repeats (Optimize.fs has
-    // the reproducer). Re-admitting provably pure helpers is the P0
-    // follow-up in plan-fortran-killer-2.md section 3.
-    let pureIntrinsicCallee (name: string) : bool =
-        (lookupVar name env).IsNone
-        && (isUnaryIntrinsic name
-            || isBinaryIntrinsic name
-            || Blade.GradCommon.isTernaryMathIntrinsic name
-            || (castTargetOf name).IsSome)
+    // The guard may CALL only what is REPEATABLE (Blade.Effects): an
+    // unshadowed scalar intrinsic -- the math table (exp/sqrt/...), abs and
+    // the complex accessors, atan2/log_base, fma, the numeric casts
+    // (`Float64(x)`) -- or a DECLARED function whose effect summary
+    // (FuncEffects, computed from its typed body with callees resolved) has
+    // no assignment, no display, no external read and no unknown call. A
+    // helper that mutates a `mut` argument declines: the skipped evaluations
+    // would not be repeats (Optimize.fs has the reproducer). `lookupVar` is
+    // the same shadowing test the intrinsic arms of inferExpr apply; a
+    // shadowing user FUNCTION is judged by its own summary, a shadowing
+    // local (a lambda-valued let) is unknown and declines. Returns the
+    // reason a name is refused, for the decision record.
+    let calleeAdmissible (name: string) : string option =
+        match lookupVar name env with
+        | None ->
+            if isUnaryIntrinsic name || isBinaryIntrinsic name
+               || Blade.GradCommon.isTernaryMathIntrinsic name
+               || (castTargetOf name).IsSome then None
+            else Some $"`{name}` is neither a scalar intrinsic nor a declared function"
+        | Some info when env.DeclaredFuncIds.Contains info.VarId ->
+            (match env.FuncEffects.TryGetValue info.VarId with
+             | true, eff when Blade.Effects.isRepeatable eff -> None
+             | true, eff -> Some $"`{name}` {Blade.Effects.describe eff}"
+             | _ -> Some $"`{name}` has no effect summary")
+        | Some _ -> Some $"`{name}` is a local binding (a lambda-valued let or a shadowed intrinsic), whose effects are unknown"
     let def, guardIsBestEffort =
-        match Blade.Optimize.recognizeFreezeIdiom pureIntrinsicCallee def with
+        match Blade.Optimize.recognizeFreezeIdiom calleeAdmissible def with
         | Some recognized -> recognized, true
         | None -> def, false
     let synAt k = mkExpr span k
@@ -12981,6 +12991,8 @@ and checkDecl (env: TypeEnv) (decl: Decl) : TypeResult<TypedDecl * TypeEnv> =
                                 extractCommGroups
                                     (method.Params |> List.map (fun p -> { Name = p.Name; Type = p.Type; Default = None; NameSpan = p.NameSpan } : LambdaParam))
                                     method.WhereClause
+                            let effects = effectsOfBody env' (Some funcVarId) tBody
+                            env'.FuncEffects.[funcVarId] <- effects
                             let tf : TypedFunctionDecl = {
                                 Name = mangledName; FuncId = funcVarId
                                 TypeParams = method.TypeParams
@@ -12988,6 +13000,7 @@ and checkDecl (env: TypeEnv) (decl: Decl) : TypeResult<TypedDecl * TypeEnv> =
                                 WhereClause = method.WhereClause; Body = tBody
                                 CommGroups = commGroups; IsStatic = false
                                 NameSpan = method.NameSpan
+                                Effects = effects
                             }
                             typedMethods <- typedMethods @ [tf]
                         | Error e -> methodErr <- Some e
@@ -13742,6 +13755,12 @@ and checkFunctionDecl (env: TypeEnv) (funcDecl: FunctionDecl) : TypeResult<Typed
                  | Some prop -> Blade.DeduceRep.TypedCertProposals.add prop tBody.Span
                  | None -> ())
             funcUnitTransform env funcDecl.Name resolvedParams resolvedRet tBody
+            // The effect summary (Blade.Effects): computed here, with every
+            // earlier declaration's summary in FuncEffects and this
+            // function's own recursive calls read as pure, then published
+            // for later declarations and grafted onto the IR callable.
+            let effects = effectsOfBody env (Some funcVarId) tBody
+            env.FuncEffects.[funcVarId] <- effects
             let tf : TypedFunctionDecl = {
                 Name = funcDecl.Name; FuncId = funcVarId
                 TypeParams = funcDecl.TypeParams
@@ -13749,6 +13768,7 @@ and checkFunctionDecl (env: TypeEnv) (funcDecl: FunctionDecl) : TypeResult<Typed
                 WhereClause = funcDecl.WhereClause; Body = tBody
                 CommGroups = commGroups; IsStatic = funcDecl.IsStatic
                 NameSpan = funcDecl.NameSpan
+                Effects = effects
             }
             Ok (TDeclFunction tf, envWithFunc))))
 

@@ -1098,8 +1098,17 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
                     if not (Set.contains fid visited) then
                         match callables.TryGetValue fid with
                         | true, callee ->
-                            if callee.IsStatic
-                               || not (pureBody (Set.add fid visited) callee.Body) then
+                            if callee.IsStatic then ok <- false
+                            // The typed summary (Blade.Effects, computed at
+                            // checkFunctionDecl with callees resolved) is the
+                            // shared legality fact: REPEATABLE means no
+                            // assignment, no display, no external read, no
+                            // unknown call anywhere below -- everything this
+                            // walk would check, plus callees the module-local
+                            // table cannot see. `unknown` (lambdas, clones of
+                            // unmarked callables) falls through to the walk.
+                            elif Blade.Effects.isRepeatable callee.Effects then ()
+                            elif not (pureBody (Set.add fid visited) callee.Body) then
                                 ok <- false
                         | _ -> ok <- false
                 | IRApp _ -> ok <- false
@@ -1169,19 +1178,34 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
                 | _ -> e) ik.Body
         params', body'
 
-    let tryFuse (host: ApplyInfo) : ApplyInfo option =
-        if not (plainInfo host) then None else
+    // `Error why` is the DECLINE reason, recorded by `rewrite` when the host
+    // had a fusable-looking operand (a `compute`d inner map) -- the shape a
+    // user would expect to fuse. A host with no such operand is not a
+    // decision, just a plain map, and stays silent.
+    let tryFuse (host: ApplyInfo) : Result<ApplyInfo, string> =
+        if not (plainInfo host) then Error "the host is not a plain dense map or co-iteration (structured storage, symmetry, or a non-scalar kernel)" else
         match kernelOf host with
-        | None -> None
-        | Some hk when not (plainKernel hk host.Arrays.Length
-                            && pureBody Set.empty hk.Body) -> None
+        | None -> Error "the host kernel is not a resolvable callable"
+        | Some hk when not (plainKernel hk host.Arrays.Length) ->
+            Error "the host kernel is not a plain scalar kernel (declared symmetry, parallel strategy, arity polymorphism, or a parameter-count mismatch)"
+        | Some hk when not (pureBody Set.empty hk.Body) ->
+            Error "the host kernel body is not repeatable (it assigns, emits output, or calls something whose effects are unknown)"
         | Some hk ->
+        let mutable declineWhy = "no operand is a `compute`d inner map"
         let innerEligible (inner: ApplyInfo) : IRCallable option =
-            if not (plainInfo inner) then None else
+            if not (plainInfo inner) then
+                declineWhy <- "an inner map is not a plain dense map or co-iteration"
+                None
+            else
             match kernelOf inner with
             | Some ik when plainKernel ik inner.Arrays.Length
                            && pureBody Set.empty ik.Body -> Some ik
-            | _ -> None
+            | Some _ ->
+                declineWhy <- "an inner kernel is not a plain repeatable scalar kernel"
+                None
+            | None ->
+                declineWhy <- "an inner kernel is not a resolvable callable"
+                None
         let mutable total = host.Arrays.Length
         let mutable fusedAny = false
         let mutable body = hk.Body
@@ -1198,8 +1222,11 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
                      [hk.Params.[i]])
                 match a with
                 | IRCompute (IRApplyCombinator inner) when
-                        total + inner.Arrays.Length - 1 <= maxFusedOperands
-                        && occurrences hk.Params.[i].VarId hk.Body <= maxParamOccurrences ->
+                        not (total + inner.Arrays.Length - 1 <= maxFusedOperands
+                             && occurrences hk.Params.[i].VarId hk.Body <= maxParamOccurrences) ->
+                    declineWhy <- $"the fan-in cap ({maxFusedOperands} operands) or the parameter-occurrence cap ({maxParamOccurrences}) would be exceeded"
+                    keep ()
+                | IRCompute (IRApplyCombinator inner) ->
                     (match innerEligible inner with
                      | Some ik ->
                          let ps', innerBody = freshen ik
@@ -1214,7 +1241,7 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
                           inner.TriangularLevels, inner.KernelInputRanks, ps')
                      | None -> keep ())
                 | _ -> keep ()) host.Arrays
-        if not fusedAny then None else
+        if not fusedAny then Error declineWhy else
         let newArrays     = spliced |> List.collect (fun (x, _, _, _, _, _, _, _) -> x)
         let newIdentities = spliced |> List.collect (fun (_, x, _, _, _, _, _, _) -> x)
         let newArrayTypes = spliced |> List.collect (fun (_, _, x, _, _, _, _, _) -> x)
@@ -1234,7 +1261,8 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
             if not host.SharedIndexTypes.IsEmpty then host.SharedIndexTypes
             elif newArrays.Length > 1 then sharedFromInner
             else []
-        if newArrays.Length > 1 && sharedIdx.IsEmpty then None else
+        if newArrays.Length > 1 && sharedIdx.IsEmpty then
+            Error "the fused node would read as an outer product (no shared index records to inherit)" else
         let captures =
             (hk.Captures @ List.ofSeq capts)
             |> List.fold (fun (seen, acc) (c: CaptureInfo) ->
@@ -1263,20 +1291,57 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
                     { Kernel = kernelVar; CommGroups = []
                       InputRanks = newKIR; OutputRank = 0 }
             | other -> other  // unreachable: plainInfo admits only the two above
-        Some { host with
-                 Loop = newLoop; Kernel = kernelVar
-                 Arrays = newArrays; Identities = newIdentities
-                 ArrayTypes = newArrayTypes; SharedIndexTypes = sharedIdx
-                 SymcomStates = newSymcom; TriangularLevels = newTri
-                 SDimsPerArray = newSDims; KernelInputRanks = newKIR
-                 IsCoIteration = newArrays.Length > 1 }
+        Ok { host with
+               Loop = newLoop; Kernel = kernelVar
+               Arrays = newArrays; Identities = newIdentities
+               ArrayTypes = newArrayTypes; SharedIndexTypes = sharedIdx
+               SymcomStates = newSymcom; TriangularLevels = newTri
+               SDimsPerArray = newSDims; KernelInputRanks = newKIR
+               IsCoIteration = newArrays.Length > 1 }
+
+    // Decision record (Blade.Effects.Decisions; a no-op unless `blade plan`
+    // or a test installed a collector). One record per host KERNEL: the
+    // operand tree is duplicated between info.Arrays and the Loop
+    // provenance, so the bottom-up rewrite meets some hosts twice.
+    let decided = System.Collections.Generic.HashSet<IRId>()
+    let kernelName (info: ApplyInfo) =
+        match info.Kernel with
+        | IRVar (kid, _) ->
+            (match callables.TryGetValue kid with
+             | true, k -> k.Name
+             | _ -> $"kernel#{kid}")
+        | _ -> "<inline kernel>"
+    let kernelId (info: ApplyInfo) =
+        match info.Kernel with IRVar (kid, _) -> Some kid | _ -> None
+    let hasInnerCompute (info: ApplyInfo) =
+        info.Arrays |> List.exists (function IRCompute (IRApplyCombinator _) -> true | _ -> false)
+    let record (info: ApplyInfo) (outcome: Blade.Effects.DecisionOutcome) (evidence: string list) =
+        let fresh =
+            match kernelId info with
+            | Some kid -> decided.Add kid
+            | None -> true
+        if fresh then
+            Blade.Effects.Decisions.record
+                { Blade.Effects.Rule = "elementwise-fusion"; Version = 1
+                  Span = Blade.Ast.noSpan; Subject = kernelName info
+                  Outcome = outcome; Evidence = evidence }
 
     let rewrite (e: IRExpr) : IRExpr =
         match e with
         | IRApplyCombinator info ->
             (match tryFuse info with
-             | Some fused -> IRApplyCombinator fused
-             | None -> e)
+             | Ok fused ->
+                 let inner =
+                     info.Arrays |> List.filter (function IRCompute (IRApplyCombinator _) -> true | _ -> false)
+                                 |> List.length
+                 record info Blade.Effects.Applied
+                     [ $"{inner} inner map(s) spliced into the host kernel; {info.Arrays.Length} -> {fused.Arrays.Length} operand(s), one nest"
+                       "host and inner kernels are plain repeatable scalar kernels"
+                       (if fused.IsCoIteration then "shared index records inherited" else "single-operand map") ]
+                 IRApplyCombinator fused
+             | Error why ->
+                 if hasInnerCompute info then record info (Blade.Effects.Declined why) []
+                 e)
         | _ -> e
     let rewriteExpr expr = mapIRExpr rewrite expr
     let newFunctions =
@@ -1833,6 +1898,9 @@ let specializeFunction (func: IRFuncDef) (arities: int list) (funcMap: Map<IRId,
           // The reproducibility demand survives specialization: the clone is
           // the same declared function at a concrete arity.
           IsRepro = func.IsRepro
+          // So does the effect summary: specialization changes arity, not
+          // what the body does.
+          Effects = func.Effects
           // Specialized clones inherit the original's captures verbatim;
           // arity specialization doesn't introduce new free vars.
           Captures = func.Captures

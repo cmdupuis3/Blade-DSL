@@ -47,6 +47,11 @@
          these directly. -->
     <Compile Include="src/Diagnostics.fs" />
     <Compile Include="src/Types.fs" />
+    <!-- Effect summaries + the optimization decision record (plan-fortran-
+         killer-2.md section 3, P0): needs only Ast.Span, read by IR.fs
+         (IRCallable.Effects), TypeEnv/TypeCheck (computation), IRMono and
+         Optimize (consumers), CliCommands (`blade plan`). -->
+    <Compile Include="src/Effects.fs" />
     <!-- Env-gated compiler perf counters (docs/plan-compile-speed.md Stage 5).
          Dependency-free, and deliberately in FRONT of the pipeline: its two
          instrumented consumers (IR.fs and Unify.fs) sit ~175 entries apart in

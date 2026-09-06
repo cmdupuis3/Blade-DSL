@@ -114,21 +114,27 @@ let private isPrevSliceRead (prefixVar: Ident) (stepVar: Ident) (e: Expr) : bool
 /// Guard admissibility: every read of the prefix is at lag 1, the step
 /// ordinal appears ONLY inside those lag expressions, the prefix family is
 /// never referenced bare, every ordinary call's head satisfies
-/// `calleeAdmissible` (a pure scalar intrinsic that is not user-shadowed --
-/// the caller supplies the judgment because the name table lives in
+/// `calleeAdmissible` (a REPEATABLE callee -- an unshadowed scalar intrinsic
+/// or a declared function whose effect summary allows a repeat; the caller
+/// supplies the judgment because the name and summary tables live in
 /// TypeEnv, downstream of this file), and the whole guard is built from the
 /// shapes a convergence predicate uses (literals, variables, arithmetic/
 /// comparison/boolean operators, unary ops, applications, ascriptions).
-/// Anything else -- a lambda, a block, a match, a call to a user function
-/// -- declines recognition conservatively.
-let rec private guardAdmissible (calleeAdmissible: string -> bool) (prefixVar: Ident) (stepVar: Ident) (e: Expr) : bool =
-    let ok = guardAdmissible calleeAdmissible prefixVar stepVar
+/// Anything else -- a lambda, a block, a match -- declines recognition
+/// conservatively. Returns None when admissible, else the FIRST reason it is
+/// not, which the decision record carries.
+let rec private guardInadmissible (calleeAdmissible: string -> string option)
+                                  (prefixVar: Ident) (stepVar: Ident) (e: Expr) : string option =
+    let check = guardInadmissible calleeAdmissible prefixVar stepVar
+    let firstOf (xs: Expr list) = xs |> List.tryPick check
     match e.Kind with
-    | ExprLit _ -> true
-    | ExprVar v -> v <> stepVar && v <> prefixVar
-    | ExprBinOp (_, _, l, r) -> ok l && ok r
-    | ExprUnaryOp (_, x) -> ok x
-    | ExprTyped (x, _) -> ok x
+    | ExprLit _ -> None
+    | ExprVar v when v = stepVar -> Some "the guard reads the step ordinal outside a lag-1 prefix read (not absorbing: `n < k` flips on its own)"
+    | ExprVar v when v = prefixVar -> Some "the guard references the prefix family bare"
+    | ExprVar _ -> None
+    | ExprBinOp (_, _, l, r) -> firstOf [l; r]
+    | ExprUnaryOp (_, x) -> check x
+    | ExprTyped (x, _) -> check x
     | ExprApp _ ->
         // Peel the application spine: `prefix(n-1)(j)(k)` is nested
         // ExprApps whose base head is the prefix var and whose FIRST
@@ -142,39 +148,68 @@ let rec private guardAdmissible (calleeAdmissible: string -> bool) (prefixVar: I
          | ExprVar pv when pv = prefixVar ->
              (match argLists with
               | (lagArg :: restFirst) :: deeper ->
-                  isStepMinusOne stepVar lagArg
-                  && restFirst |> List.forall ok
-                  && deeper |> List.forall (List.forall ok)
-              | _ -> false)
-         | ExprVar fn when fn <> stepVar && fn <> prefixVar && calleeAdmissible fn ->
-             // An ordinary call to a pure intrinsic (abs, sqrt, exp, a
-             // numeric cast): evaluating it again on the same inputs gives
-             // the same value and changes nothing, so the skipped
-             // evaluations really are repeats. The arguments carry the
-             // lag discipline. Any other head -- a user function, a
-             // shadowed intrinsic -- fails `calleeAdmissible` and declines.
-             argLists |> List.forall (List.forall ok)
-         | _ -> false)
-    | _ -> false
+                  if not (isStepMinusOne stepVar lagArg) then
+                      Some "the guard reads the prefix at a lag other than 1"
+                  else firstOf (restFirst @ List.concat deeper)
+              | _ -> Some "the guard references the prefix family bare")
+         | ExprVar fn when fn = stepVar -> Some "the guard applies the step ordinal"
+         | ExprVar fn ->
+             // An ordinary call. Evaluating a REPEATABLE callee again on the
+             // same inputs gives the same value and changes nothing, so the
+             // skipped evaluations really are repeats; the arguments carry
+             // the lag discipline. Anything else -- a helper that mutates a
+             // `mut` argument, prints, reads a file, or calls unknown code --
+             // is refused with the caller's reason.
+             (match calleeAdmissible fn with
+              | Some why -> Some $"the guard calls `{fn}`, which is not repeatable: {why}"
+              | None -> firstOf (List.concat argLists))
+         | _ -> Some "the guard applies something other than a name")
+    | _ -> Some "the guard contains a shape recognition does not read (a lambda, a block, or a match)"
 
 /// Recognize the freeze idiom on an UNGUARDED recursive-array definition and
 /// repartition it into the guarded best-effort form. Returns None (leave the
 /// definition alone -- it still compiles and still means the same thing) for
 /// anything that is not exactly the idiom.
 ///
-/// `calleeAdmissible name` is the caller's judgment that a plain call to
-/// `name` is pure and repeatable (TypeCheck passes "is a scalar intrinsic
-/// and not user-bound"); the guard may call nothing else.
-let recognizeFreezeIdiom (calleeAdmissible: string -> bool) (def: RecArrayDef) : RecArrayDef option =
-    if not (freezeIdiomEnabled ()) then None else
+/// `calleeAdmissible name` is the caller's judgment of a plain call to
+/// `name`: None when it is repeatable (an unshadowed scalar intrinsic, or a
+/// declared function whose Blade.Effects summary is repeatable), else the
+/// reason it is not. The guard may call nothing else.
+///
+/// Every CANDIDATE -- an unguarded inductive arm whose slice is an `if` --
+/// leaves a record in Blade.Effects.Decisions (rule `freeze-recognition`,
+/// v2: v1 admitted callees by name), applied with its discharged
+/// obligations or declined with the first reason. A slice that is not an
+/// `if` is not a candidate and records nothing.
+let recognizeFreezeIdiom (calleeAdmissible: string -> string option) (def: RecArrayDef) : RecArrayDef option =
     match def.Guard with
     | Some _ -> None
     | None ->
         match def.SliceExpr.Kind with
-        | ExprIf (g, stepExpr, elseExpr) when
-                isPrevSliceRead def.PrefixVar def.StepVar elseExpr
-                && guardAdmissible calleeAdmissible def.PrefixVar def.StepVar g ->
-            Some { def with Guard = Some g; SliceExpr = stepExpr }
+        | ExprIf (g, stepExpr, elseExpr) ->
+            let decide (outcome: Blade.Effects.DecisionOutcome) (evidence: string list) =
+                Blade.Effects.Decisions.record
+                    { Blade.Effects.Rule = "freeze-recognition"; Version = 2
+                      Span = def.SliceExpr.Span; Subject = def.Name
+                      Outcome = outcome; Evidence = evidence }
+            if not (freezeIdiomEnabled ()) then
+                decide (Blade.Effects.Declined "disabled by BLADE_FREEZE_IDIOM") []
+                None
+            elif not (isPrevSliceRead def.PrefixVar def.StepVar elseExpr) then
+                decide (Blade.Effects.Declined "the else-arm is not exactly `prefix(n - 1)` (a live arm, not a freeze)") []
+                None
+            else
+                match guardInadmissible calleeAdmissible def.PrefixVar def.StepVar g with
+                | Some why ->
+                    decide (Blade.Effects.Declined why) []
+                    None
+                | None ->
+                    decide Blade.Effects.Applied
+                        [ "else-arm is `prefix(n - 1)`"
+                          "guard reads the prefix at lag 1 only and never the step ordinal"
+                          "every callee in the guard is repeatable"
+                          "contract kept: best-effort freeze, no BL8010 budget abort" ]
+                    Some { def with Guard = Some g; SliceExpr = stepExpr }
         | _ -> None
 
 // --- Pipeline entry -------------------------------------------------------

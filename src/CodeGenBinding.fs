@@ -1548,6 +1548,26 @@ and genProviderWriteBinding (ctx: CodeGenContext) (binding: IRBinding) (builder:
         let cleanup = [ $"delete[] {baseName}_flat;" ]
         (guardProviderWrite ind (flatten @ writeCode @ cleanup), ctx)
     else
+    // DESTINATION PASSING, gate 1 (plan-fortran-killer-2.md section 4): a
+    // plain dense source already IS the flat buffer the writer wants.
+    // allocate<> places every scalar of a nested Array in ONE contiguous pool
+    // in DFS order -- row-major, which is exactly the Horner index the copy
+    // loop below used to compute -- so `<base>_flat` aliases
+    // pool_base(src.data): no allocation, no copy, no delete, one full-array
+    // temporary fewer at the pipeline's terminal. The copy stays for every
+    // storage pool_base is not defined on (compound / sparse tabulated
+    // records, ragged rows, group records) and for the packed and wreath
+    // arms above, whose pool order is not the store's dense order.
+    let plainDense =
+        rank > 0
+        && arrTy.IndexTypes |> List.forall (fun ix -> ix.IxKind = IxKPlain && ix.Symmetry = SymNone)
+    if plainDense then
+        let alias =
+            [ $"// Write {spec.VarName} to {spec.FilePath} (destination passing: the pool is the row-major buffer)"
+              $"{elemCpp}* {baseName}_flat = pool_base({srcCpp}.data);" ]
+        let writeCode = pspec.GenWriteVar spec.FilePath spec.VarName baseName arrTy spec.DimNames
+        (guardProviderWrite ind (alias @ writeCode), ctx)
+    else
     let extentNames = extentTerms |> List.mapi (fun i _ -> $"{baseName}_ext{i}")
     let extentDecls =
         List.zip extentNames extentTerms

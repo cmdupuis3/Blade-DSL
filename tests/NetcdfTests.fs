@@ -1512,6 +1512,60 @@ let out = method_for(A) <@> lambda(x) -> x + x |> compute
         try Directory.Delete(itDir, true) with _ -> ()
 
     // ---------------------------------------------------------------
+    // Destination passing (plan-fortran-killer-2.md section 4, gate 1): a
+    // dense provider write hands libnetcdf the array's own pool instead of
+    // flattening into a fresh buffer. Emission pin: the write prologue
+    // aliases `pool_base(...)` and allocates/frees no `_flat` buffer.
+    // End to end: write a 2 x 3 literal, read it back through the F#
+    // binding, compare every value -- the aliasing is only right if DFS pool
+    // order really is the store's row-major order.
+    // ---------------------------------------------------------------
+    printfn "\n--- destination passing: nc.write hands the pool to libnetcdf (no flatten copy) ---"
+    let dpSource = """
+import netcdf as nc
+type RowIdx = Idx<2>
+type ColIdx = Idx<3>
+let A: Array<Float64 like RowIdx, ColIdx> = [[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]]
+let _ = nc.write("dp_out.nc", A)
+"""
+    try
+        match lower dpSource with
+        | Ok ir ->
+            let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "dest_passing_write"
+            check "destination passing: the dense write aliases pool_base and allocates no flat copy"
+                (cppCode.Contains "_flat = pool_base(" && not (cppCode.Contains "_flat = new "))
+                (if cppCode.Contains "_flat = new " then "a `_flat = new` allocation survives" else "no pool_base alias emitted")
+            let dpOutDir = "./generated_cpp_tests"
+            if not (Directory.Exists dpOutDir) then Directory.CreateDirectory dpOutDir |> ignore
+            CodeGen.deployRuntimeHeaders dpOutDir
+            let dpCppFile = Path.Combine(dpOutDir, "dest_passing_write.cpp")
+            File.WriteAllText(dpCppFile, cppCode)
+            (match compileCpp dpCppFile dpOutDir with
+             | Ok exePath ->
+                 check "destination passing e2e: compiles and links libnetcdf" true ""
+                 let outNc = Path.Combine(Path.GetDirectoryName exePath, "dp_out.nc")
+                 (try File.Delete outNc with _ -> ())
+                 (match runExecutable exePath with
+                  | Ok (0, _) ->
+                      check "destination passing e2e: the write runs to completion (exit 0)" true ""
+                      (match NetcdfProvider.readVarData outNc "A" with
+                       | Ok { DimLengths = dims; Payload = NetcdfProvider.NcFloats got } ->
+                           let want = [| 1.5; 2.5; 3.5; 4.5; 5.5; 6.5 |]
+                           check "destination passing e2e: the file holds the array in row-major order, every value intact"
+                               (dims = [2; 3] && got = want)
+                               (sprintf "dims %A, values %A" dims got)
+                       | Ok other -> check "destination passing e2e: the file holds the array in row-major order, every value intact" false (sprintf "unexpected payload %A" other.DimLengths)
+                       | Error e -> check "destination passing e2e: the file holds the array in row-major order, every value intact" false e)
+                  | Ok (code, runOut) -> check "destination passing e2e: the write runs to completion (exit 0)" false ($"exit {code}: {(runOut.Substring(0, min 300 runOut.Length))}")
+                  | Error e -> check "destination passing e2e: the write runs to completion (exit 0)" false e)
+             | Error e ->
+                 if isSkipError e then printfn "  SKIP destination passing e2e (compile skipped): %s" e
+                 else check "destination passing e2e: compiles and links libnetcdf" false e)
+        | Error e when nativeLibUnavailable e -> printfn "  SKIP destination passing: %s" e
+        | Error e -> check "destination passing: lowers (nc.write of a dense literal)" false ($"lower error: {e}")
+    with ex -> unexpected "destination passing" ex
+
+    // ---------------------------------------------------------------
     // fill_random builtin (general codegen, hermetic -- no NetCDF): a random-fill
     // array constructor whose shape comes from the annotation. Exercises the
     // TExprFillRandom -> RandomInits -> genBinding path (allocate<> + the runtime

@@ -442,6 +442,10 @@ and TypedFunctionDecl = {
     IsStatic: bool
     /// Source span of the function's NAME TOKEN (see Ast.FunctionDecl.NameSpan).
     NameSpan: Span
+    /// Conservative effect summary of `Body` (Blade.Effects), computed by
+    /// checkFunctionDecl with callees resolved through TypeEnv.FuncEffects;
+    /// Lowering grafts it onto the IR callable.
+    Effects: Blade.Effects.EffectSummary
 }
 
 // Typed type definitions, resolved from raw TypeDecl.

@@ -10,6 +10,30 @@ open Blade.GradExpand
 open Blade.GradFusion
 open Blade.GradPackUnroll
 
+// Units
+
+/// The unit argument of a (resolved) Float type as a SURFACE unit expression:
+/// `Float<meters>` (a lone name), `Float<meters/second>` (the parser's
+/// TyUnitExpr), `Float<meters^2>` (the rank-marked type-variable spelling
+/// the parser gives `name^INT`). None for a bare Float or a non-Float.
+let internal unitArgOf (ctx: Ctx) (t: TypeExpr) : UnitExpr option =
+    match resolveTy ctx t with
+    | TyNamed (("Float" | "Float64" | "Float32"), [arg]) ->
+        (match arg with
+         | TyNamed (n, []) -> Some (UnitNamed n)
+         | TyUnitExpr ue -> Some ue
+         | TyVar (n, Some k) -> Some (UnitPow (UnitNamed n, k))
+         | _ -> None)
+    | _ -> None
+
+/// The ELEMENT unit of a scalar or array type: `Float<u>` and
+/// `Array<Float<u> like ...>` both answer `u`.
+let internal elemUnitOf (ctx: Ctx) (t: TypeExpr) : UnitExpr option =
+    match resolveTy ctx t with
+    | TyArray (elem, _) -> unitArgOf ctx elem
+    | other -> unitArgOf ctx other
+
+
 // The C2-reverse lowering: eager map pipelines, lowered pre-grad
 //
 // `plan-equivariant-nn-notebooks.md` 5.2, a scoped amendment to
@@ -372,6 +396,26 @@ let internal preNormalizeBody (fname: string) (ctx: Ctx) (fd0: FunctionDecl) : R
                 | StmtForIn (_, _, body) -> collect m body
                 | _ -> m) acc
         collect paramIdxTys stmts0
+    // A unit-carrying annotation on a let is a CONVERSION site (`let y:
+    // Float<meters> = x` with x in km multiplies by 1000 --
+    // TypeCheck.convertScaleTo), and the NStmt form the sweeps consume has no
+    // annotation slot: the conversion would vanish from the replayed primal
+    // and the derivative alike, silently. Refused up front, scanning through
+    // StmtSpanned like `idxTys` above (the fold below passes spanned
+    // statements through untouched). A dimensionless annotation converts
+    // nothing and passes.
+    let unitLetCheck : Result<unit, string> =
+        let rec scan (ss: Stmt list) : string option =
+            ss |> List.tryPick (fun s ->
+                match unwrapStmt s with
+                | StmtLet { Pattern = { Kind = PatternKind.PatVar nm }; Type = Some t }
+                        when (elemUnitOf ctx t).IsSome -> Some nm
+                | StmtForIn (_, _, body) -> scan body
+                | _ -> None)
+        match scan stmts0 with
+        | Some nm ->
+            err fname $"`let {nm}` is annotated with a unit-carrying type inside the differentiated body, which would be a unit conversion site whose factor the AD transform cannot see; convert outside the differentiated function, or drop the annotation (the value keeps the magnitude it was computed in)"
+        | None -> Ok ()
     // Materialized index arrays already in the body -- see `SortPermForm`.
     let surfaceIotas =
         let rec collect (acc: Set<string>) (ss: Stmt list) =
@@ -513,7 +557,9 @@ let internal preNormalizeBody (fname: string) (ctx: Ctx) (fd0: FunctionDecl) : R
                         ((env, denv, loopEnv), outp @ [StmtForIn (var, range, body')]))
                 | StmtSpanned _ -> Ok ((env, denv, loopEnv), outp @ [s])))
             (Ok (st0, []))
-    goStmts (paramExtents, initDims, Map.empty) stmts0 |> Result.bind (fun ((env, _, _), stmts') ->
+    unitLetCheck
+    |> Result.bind (fun () -> goStmts (paramExtents, initDims, Map.empty) stmts0)
+    |> Result.bind (fun ((env, _, _), stmts') ->
         match finalOpt with
         | Some fe ->
             noNestedSort "the returned expression" fe |> Result.bind (fun () ->
@@ -684,36 +730,31 @@ type internal ParamClass =
     | DiffScalar
     | NonDiff
 
-/// Classify one parameter. Unit-carrying Floats and complex types get
-/// EXPLICIT refusals rather than the NonDiff fall-through: silently treating
-/// `y: Float<meters>` as non-differentiable drops its partial from the
-/// gradient with no diagnostic -- the same wrong-answer class as an
-/// unknown-derivative intrinsic, and worse than refusing.
+/// Classify one parameter. Complex types get an EXPLICIT refusal rather than
+/// the NonDiff fall-through: silently treating a parameter as
+/// non-differentiable drops its partial from the gradient with no diagnostic
+/// -- the same wrong-answer class as an unknown-derivative intrinsic, and
+/// worse than refusing. Unit-carrying Floats are differentiable in BOTH
+/// modes: forward gives a tangent the primal's type, reverse declares each
+/// cotangent as <loss>/<parameter> (Grad.cotangentTy) and lets the checker
+/// hold the synthesized arithmetic to it.
 let internal classifyParam (fname: string) (ctx: Ctx) (p: ParamDecl) : Result<ParamClass, string> =
     match p.Type with
     | None -> err fname $"parameter '{p.Name}' must have a type annotation"
     | Some t0 ->
-        let refuseUnits (what: string) =
-            err fname $"parameter '{p.Name}' {what}: unit-carrying parameters are not differentiable (v1) -- a gradient's units are <loss>/<parameter>, which the grad ABI (buffer type = parameter type) cannot express; strip the unit at the call boundary or compute the unit-carrying part outside the differentiated function"
         let refuseComplex (what: string) =
             err fname $"parameter '{p.Name}' {what}: complex parameters are not differentiable (v1); complex derivatives need a holomorphic/Wirtinger convention the AD subset does not define"
         let t = resolveTy ctx t0
         match t with
         | _ when isFloatTy t -> Ok DiffScalar
-        | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) ->
-            // FORWARD mode supports units correctly for free: a tangent has
-            // the primal's type verbatim, units included. Reverse cannot --
-            // a gradient's units are <loss>/<param>, which the grad ABI
-            // (buffer type = parameter type) cannot express.
-            if errMode.Value = "jvp" then Ok DiffScalar else refuseUnits "carries units"
+        | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) -> Ok DiffScalar
         | TyComplex64 | TyComplex128 | TyNamed (("Complex64" | "Complex128"), _) -> refuseComplex "is complex"
         | TyArray (elem, _) ->
             let el = resolveTy ctx elem
             if isFloatTy el then Ok DiffArray
             else
                 (match el with
-                 | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) ->
-                     if errMode.Value = "jvp" then Ok DiffArray else refuseUnits "is an array of unit-carrying Floats"
+                 | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) -> Ok DiffArray
                  | TyComplex64 | TyComplex128 | TyNamed (("Complex64" | "Complex128"), _) -> refuseComplex "is a complex array"
                  | _ -> Ok NonDiff)
         | _ -> Ok NonDiff

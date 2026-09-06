@@ -339,6 +339,16 @@ type TypeEnv = {
     /// Keyed by BINDER ID, not name, so a local that SHADOWS a function name
     /// still captures (its VarId is a different binder).
     DeclaredFuncIds: System.Collections.Generic.HashSet<IRId>
+    /// Function BINDER ID -> the conservative effect summary of its typed
+    /// body (Blade.Effects.EffectSummary; TypeCheckSupport.effectsOfBody).
+    /// Populated by checkFunctionDecl after the body is checked, so a body
+    /// sees summaries for every function declared before it (declaration
+    /// order; mutual recursion is rejected, BL2001) and its own recursive
+    /// calls are assumed pure while its summary is being computed. Read by
+    /// inferRecArray's freeze-recognition callee test. Keyed by id like
+    /// DeclaredFuncIds: a shadowing local never borrows a summary. Shared
+    /// by reference.
+    FuncEffects: System.Collections.Generic.Dictionary<IRId, Blade.Effects.EffectSummary>
     /// CERTIFIED half of the typed equivariance lattice (FuncRepSpec below is
     /// the speculative half): per-function rep signatures for functions
     /// carrying an `__ml_equiv` conjunct (a source `where ml.equiv(G)` pin, or
@@ -437,6 +447,7 @@ let emptyEnv () = {
     FuncDeducedPairs = System.Collections.Generic.Dictionary<string, string list * Blade.Deduce.Parity list>()
     FuncSignParities = System.Collections.Generic.Dictionary<IRId, Blade.Deduce.SignParity list>()
     DeclaredFuncIds = System.Collections.Generic.HashSet<IRId>()
+    FuncEffects = System.Collections.Generic.Dictionary<IRId, Blade.Effects.EffectSummary>()
     FuncRepSigs = System.Collections.Generic.Dictionary<IRId, Blade.DeduceRep.RepSigT>()
     FuncRepSpec = Blade.DeduceRep.RepSpecTable()
     PackDeducedComm = System.Collections.Generic.Dictionary<string, string * Blade.Deduce.Parity>()

@@ -2983,6 +2983,60 @@ let isUnaryIntrinsic (name: string) : bool =
 /// own body. The canonical list lives in Grad.fs beside the adjoint rules.
 let isBinaryIntrinsic (name: string) : bool = Blade.Grad.isBinaryMathIntrinsic name
 
+/// Conservative effect summary of a TYPED body (Blade.Effects; plan-fortran-
+/// killer-2.md section 3 step 3). Every node contributes its OWN effect and
+/// the join of its children's, over `typedExprChildren` (exhaustive over the
+/// typed grammar, so no node's subtree is skipped):
+///
+///   - a call's head, peeled through a curried spine, is a declared function
+///     (FuncEffects by binder id; the function being summarized reads as pure
+///     for its own recursive calls -- assume-guarantee, sound for a join
+///     lattice), a directly applied lambda (its body), or anything else --
+///     a lambda-valued variable, a higher-order parameter, a qualified name
+///     -- which is Unknown. Intrinsic calls never reach here as TExprApp: the
+///     checker rewrites them to TExprUnaryOp / TExprBinOp / TExprFma.
+///   - an apply combinator's kernel is called per cell, so it contributes
+///     like a call head (its lambda body is also a child).
+///   - assignment statements and expressions: Mutates. Display nodes:
+///     EmitsOutput. A provider read: ReadsExternal.
+///   - MayFail: indexing (BL8006), reduce (BL8003), solve/eigh (BL8007),
+///     match (BL8002), constraint checks and guards (BL8001), lgamma/digamma
+///     (BL8008). Honest rather than useful: nearly every array body may
+///     fail, which is why REPEATABLE admits it and MOVABLE does not.
+let effectsOfBody (env: TypeEnv) (selfId: IRId option) (body: TypedExpr) : Blade.Effects.EffectSummary =
+    let rec stmtMutates (s: TypedStmt) : bool =
+        match s with
+        | TStmtAssign _ -> true
+        | TStmtForIn (_, _, _, _, inner) -> inner |> List.exists stmtMutates
+        | TStmtLet _ | TStmtExpr _ -> false
+    let rec calleeSummary (head: TypedExpr) : Blade.Effects.EffectSummary =
+        match head.Kind with
+        | TExprApp (f, _) -> calleeSummary f
+        | TExprVar (_, vid, _) when selfId = Some vid -> Blade.Effects.noEffects
+        | TExprVar (_, vid, _) when env.DeclaredFuncIds.Contains vid ->
+            (match env.FuncEffects.TryGetValue vid with
+             | true, s -> s
+             | _ -> Blade.Effects.unknown)
+        | TExprLambda info -> go info.Body
+        | _ -> Blade.Effects.unknown
+    and go (e: TypedExpr) : Blade.Effects.EffectSummary =
+        let own =
+            match e.Kind with
+            | TExprApp (f, _) -> calleeSummary f
+            | TExprApply info -> calleeSummary info.Kernel
+            | TExprObjectFor info -> calleeSummary info.Kernel
+            | TExprAssign _ -> Blade.Effects.mutates
+            | TExprBlock (stmts, _) when stmts |> List.exists stmtMutates -> Blade.Effects.mutates
+            | TExprDisplayEmit _ | TExprDisplayJson _ | TExprDisplayNum _ | TExprDisplayStr _ ->
+                Blade.Effects.emitsOutput
+            | TExprRead _ -> Blade.Effects.readsExternal
+            | TExprUnaryOp (OpMath ("lgamma" | "digamma"), _) -> Blade.Effects.mayFail
+            | TExprIndex _ | TExprTupleIndex _ | TExprReduce _ | TExprSolve _ | TExprEigh _
+            | TExprMatch _ | TExprConstraintCheck _ | TExprGuard _ -> Blade.Effects.mayFail
+            | _ -> Blade.Effects.noEffects
+        typedExprChildren e |> List.fold (fun acc c -> Blade.Effects.join acc (go c)) own
+    go body
+
 /// Rejection message shared by the two orientations of the same unimplemented
 /// shape: a `zip(...)` sitting beside other arrays in ONE operand pack
 /// (`object_for(k) <@> (A, zip(B, C))`, `method_for(A, zip(B, C)) <@> k`).

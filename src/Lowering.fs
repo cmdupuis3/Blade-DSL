@@ -1506,7 +1506,10 @@ let lowerTypedFuncDecl (env: TypedLowerEnv) (decl: TypedFunctionDecl) : IRFuncDe
                 IsRepro =
                     (match decl.WhereClause with
                      | Some wc -> wc.Repro
-                     | None -> false) }
+                     | None -> false)
+                // The effect summary, from the same typed declaration -- the
+                // shared legality fact fusion's splice reads (IRMono.pureBody).
+                Effects = decl.Effects }
 
     let env' = bindTypedVar decl.Name decl.FuncId env
     (funcDef, env')

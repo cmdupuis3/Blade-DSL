@@ -55,3 +55,39 @@ let registeredConstraintNames () : string list =
 /// in EnterBody) agree on the format without coupling to each other.
 let paramProvenanceToken (funcName: string) (paramName: string) : string =
     $"{funcName}.{paramName}"
+
+// --- `__ad_body`: the conjunct Grad stamps on every synthesized derivative ---
+//
+// `ad.grad` / `ad.jvp` synthesize `f__grad` / `f__jvp` as SURFACE source
+// (src/Grad.fs), before typecheck, so the transform never sees units. Units
+// ride the ordinary checker for free -- a tangent has the primal's type, a
+// cotangent is declared as <loss>/<parameter> -- EXCEPT where the checker
+// inserts a RUNTIME scale factor (convertScaleTo: `+`/`-`/comparison joins
+// and annotated bindings between magnitudes of one dimension). The
+// transform treats an ascription as identity and `+` as linear, so the
+// derivative of a conversion by k would come out as 1, not k: a silent
+// wrong answer. This conjunct marks the synthesized body; while the checker
+// is inside it (`EnterBody`/`ExitBody`, per async flow) convertScaleTo
+// refuses to insert a factor. Registered by the typecheck driver
+// (`registerAdBody`), idempotently, before any declaration is checked.
+let adBodyConjunct = "__ad_body"
+
+let private adBodyDepth = System.Threading.AsyncLocal<int ref>()
+let private adBodyCell () : int ref =
+    let v = adBodyDepth.Value
+    if isNull (box v) then
+        let fresh = ref 0
+        adBodyDepth.Value <- fresh
+        fresh
+    else v
+
+/// Is the checker currently inside a synthesized derivative's body?
+let inAdBody () : bool = (adBodyCell ()).Value > 0
+
+let registerAdBody () : unit =
+    registerConstraint adBodyConjunct
+        { Describe = "internal: a derivative synthesized by ad.grad / ad.jvp (no implicit unit-scale conversion inside its body)"
+          Validate = fun _ _ _ -> Ok ()
+          EnterBody = fun _ _ -> (let c = adBodyCell () in c.Value <- c.Value + 1)
+          ExitBody = fun _ _ -> (let c = adBodyCell () in c.Value <- max 0 (c.Value - 1))
+          Discharge = fun _ _ _ -> Ok () }

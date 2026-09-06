@@ -360,6 +360,15 @@ and IRCallable = {
     // the interpreter see the same values. Empty for non-kernel callables --
     // missing entries read as KspUnknown.
     SignParities: KernelSignParity list
+    // Conservative effect summary of the body (Blade.Effects), computed
+    // from the TYPED body at checkFunctionDecl with callees resolved and
+    // grafted here by Lowering.lowerTypedFuncDecl -- the one legality fact
+    // every cost-only rewrite consults (fusion's splice, freeze
+    // recognition's callee test). `unknown` for every callable built
+    // anywhere else (lambdas, synthesized kernels, specialized clones of
+    // unmarked callables), which each consumer reads as "run your own
+    // analysis or decline" -- never as pure.
+    Effects: Blade.Effects.EffectSummary
 }
 
 /// Semantic-marker alias for IRCallable naming "top-level function in
@@ -1595,6 +1604,9 @@ let mkCallable
         // it (Lowering.lowerTypedLambda, from the typechecked kernel's
         // summary); every other callable-building site carries none.
         SignParities = []
+        // Grafted by Lowering.lowerTypedFuncDecl from the typed declaration;
+        // unknown everywhere else (see the field's comment).
+        Effects = Blade.Effects.unknown
     }
 
 /// Build a fresh IRCallable for an anonymous inline lambda: synthesized

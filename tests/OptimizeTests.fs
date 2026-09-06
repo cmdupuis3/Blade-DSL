@@ -97,13 +97,11 @@ let private effectfulGuardDeclines =
     + "let last = xs((7 : It))\n"
     + "let calls = counter((0 : C))\n"
 
-/// The same shape with a PURE user helper in the guard. Semantically this
-/// freeze would be sound, but the recognizer cannot tell `residual` from
-/// `tick` by name, so it must decline here too until callee purity is
-/// discharged against the typed body (the P0 follow-up). Pinning the
-/// decline keeps that limitation visible; re-admitting it is a deliberate
-/// change to this line, not drift.
-let private pureHelperGuardDeclines =
+/// The same shape with a PURE user helper in the guard. `residual`'s effect
+/// summary (Blade.Effects, computed from its typed body) is repeatable, so
+/// recognition ADMITS the call and derives the break -- the P0 step-2
+/// re-admission. v1 declined this by name; the flip is deliberate.
+let private pureHelperGuardRecognized =
     "type It = Idx<30>\n"
     + "let tol = 0.000000001\n"
     + "function residual(x: Float) -> Float = abs(x * x - 2.0)\n"
@@ -114,10 +112,12 @@ let private pureHelperGuardDeclines =
     + "    | prefix :: n -> prefix :: (if residual(prefix(n - 1)) > tol then (prefix(n - 1) + 2.0 / prefix(n - 1)) * 0.5 else prefix(n - 1))\n"
     + "let root = xs(29)\n"
 
-/// A guard whose `abs` is SHADOWED by a user binding of the same name. The
+/// A guard whose `abs` is SHADOWED by a user FUNCTION of the same name. The
 /// intrinsic spelling no longer means the intrinsic, so the callee test must
-/// consult the scope, not the name table alone.
-let private shadowedIntrinsicGuardDeclines =
+/// consult the scope, not the name table alone -- and what it finds is a
+/// declared function with a repeatable summary, so recognition proceeds on
+/// that function's own evidence.
+let private shadowedIntrinsicPureRecognized =
     "type It = Idx<30>\n"
     + "let tol = 0.000000001\n"
     + "function abs(x: Float) -> Float = if x < 0.0 then 0.0 - x else x\n"
@@ -128,7 +128,83 @@ let private shadowedIntrinsicGuardDeclines =
     + "    | prefix :: n -> prefix :: (if abs(prefix(n - 1) * prefix(n - 1) - 2.0) > tol then (prefix(n - 1) + 2.0 / prefix(n - 1)) * 0.5 else prefix(n - 1))\n"
     + "let root = xs(29)\n"
 
+/// A guard calling a helper that LOOKS pure but calls the effectful `tick`
+/// underneath. The summary joins transitively, so the outer helper is not
+/// repeatable and recognition declines.
+let private transitiveEffectfulGuardDeclines =
+    "type C = Idx<1>\n"
+    + "type It = Idx<8>\n"
+    + "function tick(c: mut Array<Float like C>) -> Bool = {\n"
+    + "    c((0 : C)) += 1.0\n"
+    + "    c((0 : C)) > 2.0\n"
+    + "}\n"
+    + "let mut counter: Array<Float like C> = [0.0]\n"
+    + "function probe(x: Float) -> Bool = tick(counter) && x < 1000.0\n"
+    + "let rec xs: Array<Float like It> =\n"
+    + "    match xs with\n"
+    + "    | zero -> zero\n"
+    + "    | zero :: s -> zero :: 1.0\n"
+    + "    | prefix :: n -> prefix :: (if probe(prefix(n - 1)) then prefix(n - 1) + 1.0 else prefix(n - 1))\n"
+    + "let last = xs((7 : It))\n"
+
+/// A guard calling a pure helper that itself calls another pure helper: the
+/// summaries compose through the call chain, so recognition proceeds.
+let private transitivePureGuardRecognized =
+    "type It = Idx<30>\n"
+    + "let tol = 0.000000001\n"
+    + "function sq_err(x: Float) -> Float = x * x - 2.0\n"
+    + "function residual(x: Float) -> Float = abs(sq_err(x))\n"
+    + "let rec xs: Array<Float like It> =\n"
+    + "    match xs with\n"
+    + "    | zero -> zero\n"
+    + "    | zero :: s -> zero :: 1.0\n"
+    + "    | prefix :: n -> prefix :: (if residual(prefix(n - 1)) > tol then (prefix(n - 1) + 2.0 / prefix(n - 1)) * 0.5 else prefix(n - 1))\n"
+    + "let root = xs(29)\n"
+
+/// An elementwise chain the fusion pass fuses into one nest (plan-fortran-
+/// killer.md arc 1): the decision record must say so.
+let private fusionChain =
+    "type I = Idx<5>\n"
+    + "let a: Array<Float like I> = [1.0, 2.0, 3.0, 4.0, 5.0]\n"
+    + "let b: Array<Float like I> = [2.0, 3.0, 4.0, 5.0, 6.0]\n"
+    + "let c: Array<Float like I> = [0.5, 0.5, 0.5, 0.5, 0.5]\n"
+    + "let d: Array<Float like I> = [1.0, 1.0, 1.0, 1.0, 1.0]\n"
+    + "let y = a + b * c - d\n"
+    + "let total = reduce(y, (+))\n"
+
 // ---------------------------------------------------------------------------
+
+/// The decision record for a source: install a collector, lower, drain.
+let private decisionsOf (src: string) : Result<Blade.Effects.Decision list, string> =
+    Blade.Effects.Decisions.start ()
+    let r =
+        match lower src with
+        | Error e -> Error ($"lower: {e}")
+        | Ok _ -> Ok (Blade.Effects.Decisions.drain ())
+    Blade.Effects.Decisions.drain () |> ignore
+    r
+
+let private decisionCase (name: string) (src: string) (rule: string)
+                         (want: Blade.Effects.Decision -> bool) (describe: string) =
+    match decisionsOf src with
+    | Error e -> resultLine Fail name e; false
+    | Ok ds ->
+        let mine = ds |> List.filter (fun d -> d.Rule = rule)
+        if mine |> List.exists want then
+            resultLine Pass name ($"{mine.Length} `{rule}` decision(s); {describe}")
+            true
+        else
+            let seen = mine |> List.map Blade.Effects.Decisions.render |> String.concat " | "
+            let shown = if seen = "" then "no decisions" else seen
+            resultLine Fail name ($"wanted {describe}; saw: {shown}")
+            false
+
+let private applied (d: Blade.Effects.Decision) =
+    match d.Outcome with Blade.Effects.Applied -> true | _ -> false
+let private declinedMentioning (needle: string) (d: Blade.Effects.Decision) =
+    match d.Outcome with
+    | Blade.Effects.Declined why -> why.Contains needle
+    | _ -> false
 
 let private runCase (name: string) (src: string) (wantBreaks: int) (wantAborts: int) =
     match cppOfSource name src with
@@ -153,11 +229,24 @@ let runOptimizeTests () =
           runCase "while_spelling_break_and_abort" whileSpelling 1 1
           // Not absorbing -> declined: no break, no abort, full budget.
           runCase "ordinal_guard_declines" ordinalGuardDeclines 0 0
-          // A guard that calls a user function declines -- effectful,
-          // provably pure, or an intrinsic name the program shadows.
+          // Callee judgment by EFFECT SUMMARY (Blade.Effects): an effectful
+          // helper declines (directly or through a pure-looking wrapper);
+          // a pure helper, a chain of pure helpers, and a pure user
+          // function shadowing an intrinsic name are all admitted.
           runCase "effectful_guard_declines" effectfulGuardDeclines 0 0
-          runCase "pure_helper_guard_declines" pureHelperGuardDeclines 0 0
-          runCase "shadowed_intrinsic_guard_declines" shadowedIntrinsicGuardDeclines 0 0 ]
+          runCase "transitive_effectful_guard_declines" transitiveEffectfulGuardDeclines 0 0
+          runCase "pure_helper_guard_recognized" pureHelperGuardRecognized 1 0
+          runCase "transitive_pure_guard_recognized" transitivePureGuardRecognized 1 0
+          runCase "shadowed_intrinsic_pure_recognized" shadowedIntrinsicPureRecognized 1 0
+          // The decision record: what each pass decided and why.
+          decisionCase "decision_freeze_applied" freezeIdiom "freeze-recognition" applied
+              "freeze-recognition applied"
+          decisionCase "decision_freeze_declined_effectful" effectfulGuardDeclines "freeze-recognition"
+              (declinedMentioning "`tick`") "declined naming `tick`"
+          decisionCase "decision_freeze_declined_ordinal" ordinalGuardDeclines "freeze-recognition"
+              (declinedMentioning "step ordinal") "declined for the step ordinal"
+          decisionCase "decision_fusion_applied" fusionChain "elementwise-fusion" applied
+              "elementwise-fusion applied" ]
     let passed = results |> List.filter id |> List.length
     let failed = results.Length - passed
     printFooter "Optimization Layer" [$"{passed} passed"; $"{failed} failed"]

@@ -437,7 +437,8 @@ let private crossProcCallee : IRCallable =
       IsCommutative = false; CommGroups = []; AntisymGroups = []
       Parallelism = []; IsOmpParallel = false; IsCudaKernel = false; CudaBlockSize = 256; IsMpiParallel = false; IsArityPoly = false; ArityParam = None
       IsRepro = false
-      Captures = []; SignParities = [] }
+      Captures = []; SignParities = []
+      Effects = Blade.Effects.unknown }
 
 /// The call site both tests evaluate: `f(B_1, x_2)`.
 let private crossProcCallSite : IRExpr =

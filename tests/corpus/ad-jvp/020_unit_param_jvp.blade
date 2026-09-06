@@ -2,8 +2,8 @@
 // Forward mode supports units correctly for free: a tangent has the
 // primal's type VERBATIM, units included, so the whole pipeline's unit
 // checking applies to the synthesized code unchanged. (Reverse mode
-// refuses units -- ad/017 -- because a gradient's units are
-// <loss>/<param>, which its buffer ABI cannot express.)
+// declares each cotangent as <loss>/<param> -- ad/025 -- and refuses only
+// the in-body magnitude conversions the transform cannot see: ad/017, ad/026.)
 // f = x^2 : meters -> meters^2; at x = 3 m: primal 9 m^2, tangent 6 m^2.
 import ad as ad
 
