@@ -486,6 +486,43 @@ let rec internal adjointOfStmt (rc: RevCtx) (s: NStmt) : Result<NStmt list, stri
                  let c = fresh rc.Ctx "__c"
                  adjointOf rc rhs (inheritSpan lhs (ExprVar c)) |> Result.map (fun flow ->
                      [NLet (c, false, t); NAssign (t, fLit 0.0)] @ flow))
+    | CarryLoop (_, t, lo, hi, _, _) & NFor (_, _, _, body) ->
+        // The additive carry `s(t) = s(t-1) + INC` (GradNormalize.CarryLoop):
+        // a scan, whose adjoint is the SAME loop run backwards. Every
+        // per-step adjoint is the generic one -- general-overwrite saves and
+        // zeros `__g_s(t)`, the array-read rule scatters the saved value into
+        // `__g_s(t-1)`, INC's adjoint follows -- and descending order is what
+        // makes `__g_s(t)` complete when step t reads it: the loss's direct
+        // cotangent (deposited by later statements' adjoints, which run
+        // first) plus the carry from step t+1 (deposited one iteration
+        // earlier in this sweep). O(n), where the triangular unroll this
+        // replaces was O(n^2) (docs/plans/structural/01, section 2.1).
+        //
+        // The body is replayed exactly as the generic arm replays it, and
+        // the replay is a no-op here: at descending step t, `s(t-1)` is
+        // final (written at forward step t-1, not yet touched by this sweep)
+        // and INC reads only non-mutated inputs, so `s(t)` is rewritten with
+        // its own value.
+        let j = fresh rc.Ctx "__rj"
+        let tLet = NLet (t, false, sub (sub hi (iLit 1L)) (v j))
+        let localLets = body |> List.choose (fun s ->
+            match s with
+            | NLet (n, _, _) when Set.contains n rc.Diff -> Some n
+            | _ -> None)
+        let localCots =
+            localLets |> List.map (fun n ->
+                match body |> List.tryPick (fun s ->
+                        match s with
+                        | NLet (m, _, init) when m = n -> zerosLikeLiteral init
+                        | _ -> None) with
+                | Some z -> NLet (dName n, true, z)
+                | None -> NLet (dName n, true, fLit 0.0))
+        let folded =
+            List.rev body
+            |> traverseR (adjointOfStmt rc)
+            |> Result.map List.concat
+        folded |> Result.map (fun bodyAdjoints ->
+            [NFor (j, iLit 0L, sub hi lo, tLet :: body @ localCots @ bodyAdjoints)])
     | NFor (var, lo, hi, body) ->
         // Same-direction adjoint loop: REPLAY THE WHOLE BODY (fresh
         // per-iteration values, including loop-local arrays filled by

@@ -1,0 +1,33 @@
+// TEST: AD Recursive Array Carry, Trajectory Loss At 127
+import ad as ad
+// ============================================================================
+// The additive carry s(n) = s(n-1) + w(n-1) * xs(n-1) differentiated in
+// reverse mode through the DIRECT loop (docs/plans/structural/01): the
+// adjoint is the same loop run backwards, O(n). The loss reads the WHOLE trajectory, so every s(n) contributes: the carry into __g_s(n-1) accumulates the direct cotangent of s(n) plus everything after it.
+// Analytic gradient: d/dw(k) sum_n s(n) = xs(k) * (N - 1 - k).
+// Non-power-of-two extent on purpose; pins are exact products and sums of
+// short decimals.
+// ============================================================================
+let xs = 2.0 + 0.5 * Float64(0..127)
+function h(w: Array<Float like Idx<127>>) -> Float = {
+    let rec s: Array<Float like Idx<127>> =
+        match s with
+        | zero -> zero
+        | zero :: n -> zero :: 0.0
+        | prefix :: n -> prefix :: prefix(n - 1) + w(n - 1) * xs(n - 1)
+    reduce(s, (+))
+}
+let w0 = 1.0 + 0.001 * Float64(0..127)
+let mut dh = 0.0 * Float64(0..127)
+let hv = ad.grad(h)(w0, dh)
+let g0 = dh(0)
+let gmid = dh(63)
+let gpen = dh(125)
+let glast = dh(126)
+let gsum = reduce(dh, (+))
+// EXPECT: hv = 193857.5625
+// EXPECT: g0 = 252
+// EXPECT: gmid = 2110.5
+// EXPECT: gpen = 64.5
+// EXPECT: glast = 0
+// EXPECT: gsum = 182689.5

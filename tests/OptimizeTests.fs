@@ -206,6 +206,33 @@ let private declinedMentioning (needle: string) (d: Blade.Effects.Decision) =
     | Blade.Effects.Declined why -> why.Contains needle
     | _ -> false
 
+/// Reverse-mode AD of an additive recurrence (docs/plans/structural/01): the
+/// recurrence lowers to ONE direct loop in the primal and the adjoint is the
+/// same loop run backwards, so the gradient of tests/corpus/ad/008 emits
+/// exactly three counted loops -- the primal's, the forward replay's, and
+/// the descending adjoint's -- and none of the triangular unroll's `__rk` /
+/// `__rm` ordinals. The corpus proves the VALUES (008 and 027-029 at
+/// 127/257/509); only an emission pin can tell O(n) from O(n^2).
+let private recarrayGradEmission () =
+    let name = "recarray_grad_linear_emission"
+    let path = "tests/corpus/ad/008_recarray_grad.blade"
+    if not (System.IO.File.Exists path) then
+        resultLine Fail name $"missing {path} (run from the repo root)"
+        false
+    else
+    match cppOfSource "recarray_grad_linear_emission" (System.IO.File.ReadAllText path) with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        let loops = System.Text.RegularExpressions.Regex.Matches(cpp, @"for \(int64_t ").Count
+        let triangular = cpp.Contains "__rk" || cpp.Contains "__rm"
+        let descending = System.Text.RegularExpressions.Regex.IsMatch(cpp, @"- 1L\) - __k\d+\)")
+        if loops = 3 && not triangular && descending then
+            resultLine Pass name "3 counted loops (primal, replay, descending adjoint); no triangular ordinals"
+            true
+        else
+            resultLine Fail name ($"expected 3 counted loops, no __rk/__rm, a descending index; got {loops} loop(s), triangular={triangular}, descending={descending}")
+            false
+
 let private runCase (name: string) (src: string) (wantBreaks: int) (wantAborts: int) =
     match cppOfSource name src with
     | Error e -> resultLine Fail name e; false
@@ -246,7 +273,9 @@ let runOptimizeTests () =
           decisionCase "decision_freeze_declined_ordinal" ordinalGuardDeclines "freeze-recognition"
               (declinedMentioning "step ordinal") "declined for the step ordinal"
           decisionCase "decision_fusion_applied" fusionChain "elementwise-fusion" applied
-              "elementwise-fusion applied" ]
+              "elementwise-fusion applied"
+          // Reverse-mode AD of an additive recurrence is O(n): loop count pin.
+          recarrayGradEmission () ]
     let passed = results |> List.filter id |> List.length
     let failed = results.Length - passed
     printFooter "Optimization Layer" [$"{passed} passed"; $"{failed} failed"]

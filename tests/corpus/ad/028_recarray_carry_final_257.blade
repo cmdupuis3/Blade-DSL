@@ -1,0 +1,33 @@
+// TEST: AD Recursive Array Carry, Final-Element Loss At 257
+import ad as ad
+// ============================================================================
+// The additive carry s(n) = s(n-1) + w(n-1) * xs(n-1) differentiated in
+// reverse mode through the DIRECT loop (docs/plans/structural/01): the
+// adjoint is the same loop run backwards, O(n). The loss reads only the final element, so the backward carry alone transports the single seed down to every increment.
+// Analytic gradient: d/dw(k) s(N-1) = xs(k) for k < N - 1, 0 at k = N - 1.
+// Non-power-of-two extent on purpose; pins are exact products and sums of
+// short decimals.
+// ============================================================================
+let xs = 2.0 + 0.5 * Float64(0..257)
+function h(w: Array<Float like Idx<257>>) -> Float = {
+    let rec s: Array<Float like Idx<257>> =
+        match s with
+        | zero -> zero
+        | zero :: n -> zero :: 0.0
+        | prefix :: n -> prefix :: prefix(n - 1) + w(n - 1) * xs(n - 1)
+    s(256)
+}
+let w0 = 1.0 + 0.001 * Float64(0..257)
+let mut dh = 0.0 * Float64(0..257)
+let hv = ad.grad(h)(w0, dh)
+let g0 = dh(0)
+let gmid = dh(128)
+let gpen = dh(255)
+let glast = dh(256)
+let gsum = reduce(dh, (+))
+// EXPECT: hv = 19677.12
+// EXPECT: g0 = 2
+// EXPECT: gmid = 66
+// EXPECT: gpen = 129.5
+// EXPECT: glast = 0
+// EXPECT: gsum = 16832

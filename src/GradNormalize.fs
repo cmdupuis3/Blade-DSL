@@ -960,6 +960,48 @@ let internal checkWriteAfterRead (fname: string) (ctx: Ctx) (stmts: NStmt list) 
                             |> Result.bind (fun () -> checkBody b2))
                 checkBody body))
 
+/// `for t in lo..hi { lets*; s(t) = s(t - 1) + INC }` -- the additive carry
+/// the recursive-array pre-pass emits (GradExpand.expandRecArray), with INC
+/// and the lets free of `s`. Its adjoint is the same loop run BACKWARDS: the
+/// general-overwrite rule saves and zeros `__g_s(t)`, the array-read rule
+/// scatters the saved cotangent into `__g_s(t - 1)`, and INC's adjoint
+/// follows -- every step is already right, only the ORDER was not (the
+/// generic `NFor` adjoint replays ascending). GradSweeps' `NFor` arm uses
+/// this to emit the descending sweep; checkLoopDiscipline uses it to exempt
+/// the buffer from the "array recurrence" refusal. Structural, so it
+/// survives the inliner's renaming (a name-keyed table would not).
+/// Returns (buffer, step var, lo, hi, leading lets, increment).
+let internal (|CarryLoop|_|) (s: NStmt) : (string * string * Expr * Expr * NStmt list * Expr) option =
+    match s with
+    | NFor (t, lo, hi, body) when not body.IsEmpty ->
+        let lets, last = List.splitAt (body.Length - 1) body
+        let allLets = lets |> List.forall (function NLet _ -> true | _ -> false)
+        let isStepMinusOne (e: Expr) =
+            match e.Kind with
+            | ExprKind.ExprBinOp (_, OpSub, { Kind = ExprKind.ExprVar sv }, { Kind = ExprKind.ExprLit (LitInt 1L) }) -> sv = t
+            | _ -> false
+        let rec strip (e: Expr) = match e.Kind with ExprKind.ExprTyped (i, _) -> strip i | _ -> e
+        let isPrevRead (buf: string) (e: Expr) =
+            match (strip e).Kind with
+            | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar b }, [idx]) -> b = buf && isStepMinusOne idx
+            | _ -> false
+        let isLitOne (e: Expr) = match e.Kind with ExprKind.ExprLit (LitInt 1L) -> true | _ -> false
+        (match last with
+         | [ NAssign ({ Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar buf }, [ { Kind = ExprKind.ExprVar tv } ]) }, rhs) ]
+                when tv = t && allLets && isLitOne lo ->
+             let inc =
+                 match (strip rhs).Kind with
+                 | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevRead buf a && not (mentionsVar buf b) -> Some b
+                 | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevRead buf b && not (mentionsVar buf a) -> Some a
+                 | _ -> None
+             let letsFree =
+                 lets |> List.forall (function NLet (_, _, value) -> not (mentionsVar buf value) | _ -> false)
+             (match inc with
+              | Some inc when letsFree -> Some (buf, t, lo, hi, lets, inc)
+              | _ -> None)
+         | _ -> None)
+    | _ -> None
+
 /// Non-additive reassignment of a differentiable SCALAR is rejected
 /// everywhere: its adjoint needs the pre-statement value, which the
 /// re-evaluating reverse sweep cannot see. (Array ELEMENT writes stay legal
@@ -1018,6 +1060,24 @@ let internal checkLoopDiscipline (fname: string) (ctx: Ctx) (loops: NStmt list) 
                              else Ok ())
                      | _ -> err fname "unsupported assignment target")
             | NAssign _ -> Ok ()
+            | CarryLoop (buf, _, _, _, lets, inc) ->
+                // The additive carry: its one element write reads the same
+                // buffer at the previous ordinal BY DESIGN (that is the
+                // recurrence), and its adjoint is exact in the descending
+                // sweep -- so the "array recurrence" refusal below does not
+                // apply. The increment and the leading lets are held to the
+                // ordinary discipline against every OTHER accumulator.
+                let declared = boundNames lets |> Set.ofList
+                let accums = Set.difference (assignedNames lets) declared
+                let outer = if inLoop then Set.union loopAccums accums else accums
+                check lets true outer
+                |> Result.bind (fun () ->
+                    let mutable bad = None
+                    walkExpr fname ctx (fun n -> if Set.contains n outer && bad.IsNone then bad <- Some n) false inc
+                    |> Result.bind (fun () ->
+                        match bad with
+                        | Some n -> err fname $"accumulation reads accumulator '{n}' mutated in the same loop; restructure"
+                        | None -> Ok ()))
             | NFor (_, _, _, body) ->
                 // loop-local declarations are replay-reconstructed --
                 // exclude them from the read ban

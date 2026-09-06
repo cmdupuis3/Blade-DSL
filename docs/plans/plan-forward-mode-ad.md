@@ -108,7 +108,8 @@ let j = ad.jvp(f)                                          // binding form, free
   past `(+)` in F2.
 - **Naming**: tangents `__t_<name>`; rename grad's `__t` fresh-counter hoist
   prefix (Grad.fs:357) to `__hc` so the conventions stay apart. Prefix
-  inventory to stay clear of: `__g_ __rk __rm __red __rik __in __c __primal`.
+  inventory to stay clear of: `__g_ __rj __red __rik __in __c __primal` (`__rk`/`__rm`, the triangular
+  unroll's ordinals, retired with it -- docs/plans/structural/01).
 - **Diagnostics**: new code `BL5501` "jvp elaboration error". Registration in
   the `registryEntries` list (Diagnostics.fs:224-230) **and** a phase arm at
   :296-310 — the match defaults unlisted BL55xx codes to `PhElaborate "ml"`,

@@ -1081,13 +1081,20 @@ let internal mentionsVar (name: string) (e: Expr) : bool =
 /// ambient reduce-source extent env). The bound NAME is reused as the buffer
 /// so downstream reads of it keep resolving.
 ///
-///   * additive prefix recurrence `prefix :: prefix(n-1) + INC` (with a
-///     `zero :: n` seed arm, INC prefix-free) -> a TRIANGULAR accumulation
-///     `s(k) += INC[n:=m]` over `m in 1..k+1`. A same-direction adjoint loop
-///     is wrong for a genuine scan, so the scan is unrolled into independent
-///     scatter-adds -- semantically identical, and exactly differentiable.
+///   * a recurrence reading its immediate predecessor `prefix(n-1)` (with a
+///     `zero :: n` seed arm) -> the DIRECT loop `s(0) = seed; for n in 1..N
+///     { s(n) = SLICE[prefix := s] }`, in BOTH modes. Forward mode
+///     differentiates it in place (the tangent recurrence mirrors it).
+///     Reverse mode admits the additive shape `prefix(n-1) + INC` (INC
+///     prefix-free): its adjoint is the same loop run BACKWARDS -- the
+///     `CarryLoop` recognizer (GradNormalize) exempts it from the loop
+///     discipline and the `NFor` adjoint arm (GradSweeps) emits the
+///     descending sweep, O(n) work (docs/plans/structural/01). The
+///     triangular scatter-add this used to unroll into was O(n^2) in both
+///     the replayed primal and the adjoint.
 ///   * prefix-free construction `prefix :: f(n)` -> direct element writes.
-///   * anything else (nonlinear recurrence, rank >= 2, no seed) is rejected.
+///   * anything else (nonlinear recurrence in reverse mode, deeper lags,
+///     rank >= 2, no seed) is rejected.
 let internal expandRecArray (fname: string) (ctx: Ctx)
                            (name: string) (annot: TypeExpr) (def: RecArrayDef)
     : Result<Stmt list * int, string> =
@@ -1142,14 +1149,15 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
             | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevPrefixRead a && not (hasPrefix b) -> Some b
             | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevPrefixRead b && not (hasPrefix a) -> Some a
             | _ -> None
-        if errMode.Value = "jvp" && hasPrefix def.SliceExpr then
-            // FORWARD lowering of a genuine recurrence: it differentiates in
-            // place (the tangent recurrence mirrors it), so ANY smooth slice
-            // lowers to the direct element-write loop -- no triangular
-            // unroll, no additive restriction, and O(n) where grad's unroll
-            // is O(n^2). Prefix reads become reads of the buffer being
-            // built; v1 admits the immediate predecessor only -- deeper lags
-            // rely on the implicit-zero reads a plain loop cannot supply.
+        if hasPrefix def.SliceExpr then
+            // A genuine recurrence lowers to the DIRECT element-write loop in
+            // both modes. Forward mode differentiates it in place (the
+            // tangent recurrence mirrors it) and admits any smooth slice;
+            // reverse mode admits the additive shape, whose adjoint is the
+            // same loop run backwards (the CarryLoop arm in GradSweeps).
+            // Prefix reads become reads of the buffer being built; v1 admits
+            // the immediate predecessor only -- deeper lags rely on the
+            // implicit-zero reads a plain loop cannot supply.
             let rec onlyPrevReads (x: Expr) : bool =
                 match x.Kind with
                 | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar p }, [idx]) when p = prefixVar ->
@@ -1168,7 +1176,9 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
             | None -> err fname $"recursive array '{name}': a recurrence needs a `zero :: n` seed arm to be differentiable (v1)"
             | Some (seedStep, seedExpr) ->
                 if not (onlyPrevReads def.SliceExpr) then
-                    err fname $"recursive array '{name}': forward mode differentiates recurrences reading the immediate predecessor `prefix(n - 1)` only (deeper lags rely on implicit-zero reads a direct loop cannot supply, v1)"
+                    err fname $"recursive array '{name}': a differentiable recurrence may read the immediate predecessor `prefix(n - 1)` only (deeper lags rely on implicit-zero reads a direct loop cannot supply, v1)"
+                elif errMode.Value <> "jvp" && additiveRest.IsNone then
+                    err fname $"recursive array '{name}' is not differentiable (v1): only additive prefix recurrences `prefix :: prefix(n-1) + <increment>` (with a `zero :: n` seed arm and a prefix-free increment) and prefix-free construction are supported"
                 else
                     let sliceB = subst prefixVar bufVar def.SliceExpr
                     let seedWrite = [ StmtExpr (syn (ExprAssign (sAt (iLit 0L), subst seedStep (iLit 0L) seedExpr))) ]
@@ -1179,25 +1189,6 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
                     Ok (bufLet :: (seedWrite @ [loop]), n)
         else
         match additiveRest, def.SeedArm with
-        | Some rest, Some (seedStep, seedExpr) ->
-            let seeded = subst seedStep (iLit 0L) seedExpr
-            let isZeroSeed = (match seeded.Kind with ExprKind.ExprLit (LitFloat 0.0) -> true | _ -> false)
-            let kVar = fresh ctx "__rk"
-            let mVar = fresh ctx "__rm"
-            let restM = subst stepVar (v mVar) rest
-            let innerLoop =
-                StmtForIn (mVar,
-                           syn (ExprDotDot (iLit 1L, add (v kVar) (iLit 1L))),
-                           [ StmtExpr (syn (ExprAssign (sAt (v kVar), add (sAt (v kVar)) restM))) ])
-            let seedCarry =
-                if isZeroSeed then []
-                else [ StmtExpr (syn (ExprAssign (sAt (v kVar), add (sAt (v kVar)) seeded))) ]
-            let outerLoop =
-                StmtForIn (kVar, syn (ExprDotDot (iLit 1L, iLit (int64 n))), seedCarry @ [innerLoop])
-            let seedWrite =
-                if isZeroSeed then []
-                else [ StmtExpr (syn (ExprAssign (sAt (iLit 0L), seeded))) ]
-            Ok (bufLet :: (seedWrite @ [outerLoop]), n)
         | None, _ when not (hasPrefix def.SliceExpr) ->
             // Pure construction (no carried state): direct element writes.
             let loopStart, seedStmts =
