@@ -111,7 +111,7 @@ let rec freeVars (bound: Set<string>) (e: Expr) : Set<string> =
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprExtents i
     | ExprKind.ExprDecompact (i, _) | ExprKind.ExprTranspose (i, _, _)
     | ExprKind.ExprReynolds (i, _) | ExprKind.ExprStatic i
-    | ExprKind.ExprPartialApp (_, i, _) | ExprKind.ExprBlocked (_, i)
+    | ExprKind.ExprPartialApp (_, i, _)
     | ExprKind.ExprHalo (_, i) -> fv i
     | ExprKind.ExprBinOp (_, _, l, r) | ExprKind.ExprDotDot (l, r)
     | ExprKind.ExprTupleIndex (l, r) | ExprKind.ExprGuard (l, r)

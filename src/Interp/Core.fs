@@ -860,8 +860,8 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     // ---- M2 virtual-array sources (range / reverse / blocked): no standalone
     //      store -- consumed only as nest inputs (ArraySource.SVirtual). The
     //      suspended (expr, env) lets the Loops backend read the IRRange /
-    //      IRVirtualReverse / IRBlocked descriptor when it wires the nest.
-    | IRRange _ | IRVirtualReverse _ | IRBlocked _ ->
+    //      IRVirtualReverse descriptor when it wires the nest.
+    | IRRange _ | IRVirtualReverse _ ->
         VDeferred (expr, env)
 
     // ---- M2 indexing / currying / poly-index over a concrete array. Force a

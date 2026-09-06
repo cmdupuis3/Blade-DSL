@@ -1514,7 +1514,7 @@ and materializeSparseBinding
 /// double-consumer memoization, 0.3).
 and private resolveArraySource (st: InterpState) (env: Env) (arr: IRExpr) : ArraySource =
     match arr with
-    | IRRange _ | IRVirtualReverse _ | IRBlocked _ -> SVirtual
+    | IRRange _ | IRVirtualReverse _ -> SVirtual
     | IRVar (id, _) ->
         match envTryFind env id with
         | Some cell ->
@@ -2074,7 +2074,6 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     // -- Virtual arrays (standalone materialization; usually consumed as inputs).
     | IRRange (idxTys, offset) -> materializeVirtual st env idxTys (VirtualRange offset)
     | IRVirtualReverse ix -> materializeVirtual st env [ ix ] VirtualReverse
-    | IRBlocked _ -> raise (InterpUnsupported "IRBlocked standalone materialization (M2.7)")
 
     // -- Array expression ops.
     | IRIndex (arrExpr, idxExprs, _) ->

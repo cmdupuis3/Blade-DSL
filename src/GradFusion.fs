@@ -241,7 +241,6 @@ let rec internal containsPipelineOp (e: Expr) : bool =
     | ExprKind.ExprBlock (ss, fe) -> (ss |> List.exists stmtContainsPipelineOp) || opt fe
     | ExprKind.ExprObjectFor k -> containsPipelineOp k
     | ExprKind.ExprDotDot (l, h) -> containsPipelineOp l || containsPipelineOp h
-    | ExprKind.ExprBlocked (_, b) -> containsPipelineOp b
     | ExprKind.ExprHalo (_, o) -> containsPipelineOp o
     | ExprKind.ExprPure i | ExprKind.ExprCompute i | ExprKind.ExprRead i
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprGroupBucket i

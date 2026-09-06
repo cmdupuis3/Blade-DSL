@@ -2942,7 +2942,6 @@ and genReduceComputeBindingCore (ctx: CodeGenContext) (binding: IRBinding) (buil
                         | IRVar (id, _) -> Map.tryFind id ctx.VarNames |> Option.defaultValue ($"arr{i}")
                         | IRRange _ -> $"__range{i}"
                         | IRVirtualReverse _ -> $"__rev{i}"
-                        | IRBlocked _ -> $"__blk{i}"
                         | _ -> $"arr{i}")
                 let foldCg (info: ApplyInfo) (accName: string) =
                     // S2 routing, same rule as the single-kernel site.
@@ -3427,7 +3426,6 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                  | None -> Map.tryFind id ctx.VarNames |> Option.defaultValue ($"arr{i}"))
             | IRRange _ -> $"__range{i}"
             | IRVirtualReverse _ -> $"__rev{i}"
-            | IRBlocked _ -> $"__blk{i}"
             | _ -> $"arr{i}")
     /// Repoint every deferred operand slot at the deferred map's own leading
     /// source array, so the level's bound and peel name exist in C++ (and

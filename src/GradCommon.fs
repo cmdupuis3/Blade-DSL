@@ -339,7 +339,6 @@ let rec internal mentionsDeep (names: Set<string>) (e: Expr) : bool =
     | ExprKind.ExprBlock (ss, fe) -> (ss |> List.exists (stmtMentionsDeep names)) || opt fe
     | ExprKind.ExprObjectFor k -> m k
     | ExprKind.ExprDotDot (l, h) -> m l || m h
-    | ExprKind.ExprBlocked (_, b) -> m b
     | ExprKind.ExprHalo (_, o) -> m o
     | ExprKind.ExprPure i | ExprKind.ExprCompute i | ExprKind.ExprRead i
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprGroupBucket i
@@ -406,7 +405,6 @@ let rec internal allVarsDeep (e: Expr) : Set<string> =
         ss |> List.fold (fun acc s -> Set.union acc (stmtAllVarsDeep s)) (opt fe)
     | ExprKind.ExprObjectFor k -> allVarsDeep k
     | ExprKind.ExprDotDot (l, h) -> any [l; h]
-    | ExprKind.ExprBlocked (_, b) -> allVarsDeep b
     | ExprKind.ExprHalo (_, o) -> allVarsDeep o
     | ExprKind.ExprPure i | ExprKind.ExprCompute i | ExprKind.ExprRead i
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprGroupBucket i
@@ -496,7 +494,6 @@ let rec internal substKernMany (subs: Map<string, Expr>) (e: Expr) : Expr option
     | ExprKind.ExprMethodFor ops -> sList ops |> Option.bind (fun o -> re (ExprMethodFor o))
     | ExprKind.ExprObjectFor k -> s1 (fun a -> ExprObjectFor a) k
     | ExprKind.ExprDotDot (l, h) -> s2 (fun a b -> ExprDotDot (a, b)) l h
-    | ExprKind.ExprBlocked (t, x) -> s1 (fun a -> ExprBlocked (t, a)) x
     | ExprKind.ExprHalo (t, offs) -> s1 (fun a -> ExprHalo (t, a)) offs
     | ExprKind.ExprZip es -> sList es |> Option.bind (fun es' -> re (ExprZip es'))
     | ExprKind.ExprAlign (es, spec) -> sList es |> Option.bind (fun es' -> re (ExprAlign (es', spec)))

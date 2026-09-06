@@ -769,7 +769,6 @@ let tryGenMergedCompute (ctx: CodeGenContext) (name: string) (infos: ApplyInfo l
             | IRVar (id, _) -> Map.tryFind id ctx.VarNames |> Option.defaultValue ($"arr{i}")
             | IRRange _ -> $"__range{i}"
             | IRVirtualReverse _ -> $"__rev{i}"
-            | IRBlocked _ -> $"__blk{i}"
             | _ -> $"arr{i}")
     if infos |> List.exists (_.Arrays.IsEmpty) then
         Error ($"no arrays in method_for for fused '{name}'")
@@ -1009,7 +1008,6 @@ let tryGenCudaSoftJoin (ctx: CodeGenContext) (name: string) (infos: ApplyInfo li
             | IRVar (id, _) -> Map.tryFind id ctx.VarNames |> Option.defaultValue ($"arr{i}")
             | IRRange _ -> $"__range{i}"
             | IRVirtualReverse _ -> $"__rev{i}"
-            | IRBlocked _ -> $"__blk{i}"
             | _ -> $"arr{i}")
     let leafNames = infos |> List.mapi (fun i _ -> $"{name}_{i}")
     let leafCgs = infos |> List.mapi (fun i info ->

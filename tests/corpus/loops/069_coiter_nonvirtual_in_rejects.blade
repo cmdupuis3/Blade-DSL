@@ -1,7 +1,7 @@
 // TEST: Coiter Non-Virtual In Clause (rejects)
 // ERROR: BL3999
 // The `in` clause of a co-iteration `for` supplies the shared iteration
-// index and must be a VIRTUAL array (range/reverse/blocked). A zip of
+// index and must be a VIRTUAL array (range/reverse). A zip of
 // stored arrays is not one — the checker rejects it and steers to the
 // method_for(zip(...)) idiom (previously this silently mis-typed).
 type TimeIdx = Idx<3>

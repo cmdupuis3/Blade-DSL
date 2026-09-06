@@ -316,8 +316,6 @@ and internal unrollPackExpr (ctx: Ctx) (fname: string) (budget: int ref)
     | ExprKind.ExprRange tys -> subTys tys |> Result.map (fun ts -> re (ExprRange ts))
     | ExprKind.ExprTyped (i, t) ->
         go i |> Result.bind (fun i' -> subTy t |> Result.map (fun t' -> re (ExprTyped (i', t'))))
-    | ExprKind.ExprBlocked (t, x) ->
-        go x |> Result.bind (fun x' -> subTy t |> Result.map (fun t' -> re (ExprBlocked (t', x'))))
     | ExprKind.ExprHalo (t, offs) ->
         go offs |> Result.bind (fun o' -> subTy t |> Result.map (fun t' -> re (ExprHalo (t', o'))))
     // -- ordinary structure --------------------------------------------------

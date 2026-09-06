@@ -232,7 +232,6 @@ let private childrenOf (e: Expr) : Expr list =
     | ExprKind.ExprAlign (es, _) -> es
     | ExprKind.ExprJoin (es, _) -> es
     | ExprKind.ExprDotDot (a, b) -> [ a; b ]
-    | ExprKind.ExprBlocked (_, a) -> [ a ]
     | ExprKind.ExprHalo (_, a) -> [ a ]
     | ExprKind.ExprObjectFor a
     | ExprKind.ExprPure a

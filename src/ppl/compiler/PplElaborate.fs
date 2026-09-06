@@ -4002,7 +4002,6 @@ let rec private stripQualified (aliases: Set<string>) (e: Expr) : Expr =
     | ExprKind.ExprPartialApp (op, a, isLeft) -> inheritSpan e (ExprPartialApp (op, r a, isLeft))
     | ExprKind.ExprTranspose (a, d1, d2) -> inheritSpan e (ExprTranspose (r a, d1, d2))
     | ExprKind.ExprDecompact (a, d) -> inheritSpan e (ExprDecompact (r a, d))
-    | ExprKind.ExprBlocked (t, a) -> inheritSpan e (ExprBlocked (t, r a))
     | ExprKind.ExprHalo (t, offs) -> inheritSpan e (ExprHalo (t, r offs))
     | ExprKind.ExprMethodFor es -> inheritSpan e (ExprMethodFor (List.map r es))
     | ExprKind.ExprZip es -> inheritSpan e (ExprZip (List.map r es))

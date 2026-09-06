@@ -469,7 +469,6 @@ and ExprKind =
     | ExprRange of TypeExpr list           // range<I> or range<I1, ..., In> (multi-index)
     | ExprDotDot of lo: Expr * hi: Expr  // a..b: anonymous range sugar
     | ExprReverse of TypeExpr              // reverse<I>
-    | ExprBlocked of TypeExpr * Expr       // blocked<I, K>
     | ExprHalo of inner: TypeExpr * offsets: Expr  // halo<I, [o..]>: stencil traversal transformer over I (signed ordinal offsets, center = 0)
     // Zip and align
     | ExprZip of Expr list

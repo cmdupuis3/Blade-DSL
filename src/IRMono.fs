@@ -2195,7 +2195,6 @@ let internal shapeRewriteExpr (subst: Map<string, int64>) (expr: IRExpr) : IRExp
         | IRArrayLit (es, aty) -> IRArrayLit (es, rat aty)
         | IRRange (ixs, off) -> IRRange (ixs |> List.map rix, off)
         | IRVirtualReverse ix -> IRVirtualReverse (rix ix)
-        | IRBlocked (ix, bs) -> IRBlocked (rix ix, bs)
         | IRMethodFor info ->
             IRMethodFor { info with
                             ArrayTypes = info.ArrayTypes |> List.map rat

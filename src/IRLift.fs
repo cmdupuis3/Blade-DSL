@@ -899,7 +899,6 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
     | IRBreakIf c -> IRBreakIf (liftExpr builder c)
     | IRForRange (vid, lo, hi, body) ->
         IRForRange (vid, liftExpr builder lo, liftExpr builder hi, liftExpr builder body)
-    | IRBlocked (it, bs) -> IRBlocked (it, liftExpr builder bs)
 
     // Loop forms: their auto-materialize handles top-level Arrays for
     // inline forms. We still descend into the kernels and any nested

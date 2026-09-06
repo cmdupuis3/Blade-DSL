@@ -79,7 +79,6 @@ let rec mapExprPre (f: Expr -> Expr option) (e: Expr) : Expr =
         | ExprKind.ExprObjectFor k -> re (ExprObjectFor (g k))
         | ExprKind.ExprRange _ | ExprKind.ExprReverse _ | ExprKind.ExprHalo _ -> e
         | ExprKind.ExprDotDot (lo, hi) -> re (ExprDotDot (g lo, g hi))
-        | ExprKind.ExprBlocked (ty, x) -> re (ExprBlocked (ty, g x))
         | ExprKind.ExprZip es -> re (ExprZip (List.map g es))
         | ExprKind.ExprAlign (es, spec) -> re (ExprAlign (List.map g es, spec))
         | ExprKind.ExprStack es -> re (ExprStack (List.map g es))

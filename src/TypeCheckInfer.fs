@@ -1437,11 +1437,6 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
         let idx = lowerIndexType env 0 idxTy
         let elemType = elemTypeForIterationIndex idx
         Ok (mkTyped (TExprReverse idx) (mkVirtualArrayArrow [idx] elemType))
-    | ExprKind.ExprBlocked (idxTy, blockSize) ->
-        let idx = lowerIndexType env 0 idxTy
-        inferExpr env blockSize |> Result.bind (fun tBS ->
-            let elemType = elemTypeForIterationIndex idx
-            Ok (mkTyped (TExprBlocked (idx, tBS)) (mkVirtualArrayArrow [idx] elemType)))
 
     | ExprKind.ExprHalo (innerTy, offsetsExpr) ->
         // halo<Inner, offsets> in expression position -- a range over the halo

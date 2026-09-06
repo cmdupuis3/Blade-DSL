@@ -664,8 +664,6 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
     | TExprReverse indexType ->
         IRVirtualReverse indexType
     
-    | TExprBlocked (indexType, size) ->
-        IRBlocked (indexType, lowerTypedExpr env size)
     
     | TExprZip exprs ->
         IRZip (exprs |> List.map (lowerTypedExpr env))

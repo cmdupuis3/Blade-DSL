@@ -207,7 +207,6 @@ and TypedExprKind =
     | TExprRange of indexTypes: IRIndexType list
     | TExprDotDot of lo: TypedExpr * hi: TypedExpr
     | TExprReverse of indexType: IRIndexType
-    | TExprBlocked of indexType: IRIndexType * blockSize: TypedExpr
     // halo<Inner, [offsets]> has no typed node -- it typechecks to a
     // TExprRange over a "__halowin|"-tagged slot (TypeCheck.haloSlotOf); the
     // per-slot center offset is re-derived from the tag at loop building.

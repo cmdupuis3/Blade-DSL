@@ -198,7 +198,6 @@ type IRExpr =
     | IRSubset of array: IRExpr * dim: int * start: IRExpr * length: IRExpr
     | IRRange of IRIndexTypeG<IRExpr> list * offset: IRExpr option
     | IRVirtualReverse of IRIndexTypeG<IRExpr>
-    | IRBlocked of IRIndexTypeG<IRExpr> * blockSize: IRExpr
     // halo<CompoundIdx<m>> window read w(o): the COORDINATE of the present
     // cell at ordinal (window + offset). Renders via the peel-emitted local
     // alias `<w>_hcidx` of the materialized compound index (dense halo reads
@@ -1871,7 +1870,6 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IROrbitClass (levels, n) ->
         [n], (function [n'] -> IROrbitClass (levels, n') | _ -> badChildren "IROrbitClass")
     | IRUnique e -> [e], (function [e'] -> IRUnique e' | _ -> badChildren "IRUnique")
-    | IRBlocked (idxTy, bs) -> [bs], (function [bs'] -> IRBlocked (idxTy, bs') | _ -> badChildren "IRBlocked")
 
     // -- Two children ---------------------------------------------------------
     | IRBinOp (mode, op, l, r) -> [l; r], (function [l'; r'] -> IRBinOp (mode, op, l', r') | _ -> badChildren "IRBinOp")
@@ -2982,7 +2980,7 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
     | IRSlice _ | IRCurry _ | IRSubset _ | IRShift _ | IRReverse _ | IRDiag _
     | IRZip _ | IRAlign _ | IRStack [] | IRJoin ([], _)
     | IRTupleCons _ | IRTupleDecons _ | IRPolyIndex _ | IRPolyTail _ | IRReplicate _
-    | IRVirtualReverse _ | IRBlocked _ | IRZero ->
+    | IRVirtualReverse _ | IRZero ->
         IRTUnit
 
     // -- Coverage tail ---------------------------------------------------

@@ -177,7 +177,6 @@ let rec collectFreeVars (bound: Set<string>) (expr: Expr) : Set<string> =
     | ExprKind.ExprDecompact (array, _) -> collectFreeVars bound array
     | ExprKind.ExprGram (left, right) ->
         Set.union (collectFreeVars bound left) (collectFreeVars bound right)
-    | ExprKind.ExprBlocked (_, e) -> collectFreeVars bound e
     | ExprKind.ExprHalo (_, offsets) -> collectFreeVars bound offsets
     | ExprKind.ExprPartialApp (_, e, _) -> collectFreeVars bound e
     | ExprKind.ExprStatic e -> collectFreeVars bound e
@@ -2647,7 +2646,6 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprFunctorMap (f, c) -> [f; c]
         | TExprCompose (_, l, r) -> [l; r]
         | TExprDotDot (lo, hi) -> [lo; hi]
-        | TExprBlocked (_, bs) -> [bs]
         | TExprPure e | TExprCompute e | TExprRead e | TExprFillRandom e | TExprRank e
         | TExprExtents e | TExprReynolds (e, _) -> [e]
         | TExprRandGen (_, key, pars, weights, _) -> (key :: pars) @ (weights |> Option.map fst |> Option.toList)

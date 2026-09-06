@@ -782,7 +782,13 @@ Type-level iteration sources with `Void` element type; they erase completely:
 ```blade
 range<I>       // enumerate I in storage (= lex) order:  λi:I. i
 reverse<I>     // reversed
-blocked<I, K>  // K-sized cache blocks (spec level)
+```
+
+(`blocked<I, K>` was a spec-level placeholder for block iteration; it never had a
+parser arm and is gone. Block structure is a property of the AXIS: `Chunked<I, K>`
+and `segments(A)`, plans/structural/07.)
+
+```blade
 ```
 
 `range<CompoundIdx<...>>` emits mask-true tuples. Virtual and real arrays
@@ -1663,7 +1669,7 @@ application; sectioned operators `(+)`, `(/) x`.
 | `mask` `compound` `intersect` `union` `unique` `contains` `group_keys` `group_by` `sort` `reduce` `extents` | relational forms |
 | `gram` `hermitian` `conj` | linear-algebra value operators |
 | `reynolds(g[, Antisymmetric])` | symmetrizing kernel wrapper |
-| `range<I>` `reverse<I>` `blocked<I,K>` `m..n` | virtual arrays (`m..n` anonymous, half-open) |
+| `range<I>` `reverse<I>` `m..n` | virtual arrays (`m..n` anonymous, half-open) |
 | `Nat<I>` | unit-tagged index value |
 
 ## Appendix B: Glossary

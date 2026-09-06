@@ -332,8 +332,8 @@ let internal expandEagerMap (fname: string) (ctx: Ctx)
                      Ok { Axes = [ n - int h.Shrink ]; Readers = [ fun ixs -> List.head ixs ]; Window = Some h }
                  | _ ->
                      err fname "reverse mode lowers a `halo<I, [offs]>` stencil map over a literal `Idx<n>` inner index with a literal offset set (v1); a compound inner or a computed offset set has no static interior here -- use `ad.jvp`, whose capture-read rule keeps the window")
-            | ExprKind.ExprReverse _ | ExprKind.ExprBlocked _ ->
-                err fname "reverse mode lowers `range<I>`, named-array and `zip(...)` map operands (v1); `reverse<I>` / `blocked<I, K>` traversals are not supported"
+            | ExprKind.ExprReverse _ ->
+                err fname "reverse mode lowers `range<I>`, named-array and `zip(...)` map operands (v1); a `reverse<I>` traversal is not supported"
             | _ ->
                 err fname "reverse mode needs each map operand to be `range<Idx<n>>`, a named array with statically-known extents, or `zip(...)` of such arrays (v1)"
         mv.Ops |> traverseR classify |> Result.bind (fun slots ->

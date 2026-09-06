@@ -679,7 +679,7 @@ let rec internal occursFree (name: string) (e: Expr) : bool =
     | ExprKind.ExprNth | ExprKind.ExprZero | ExprKind.ExprSection _
     | ExprKind.ExprRange _ | ExprKind.ExprReverse _ -> false
     | ExprKind.ExprUnaryOp (_, i) -> o i
-    | ExprKind.ExprTyped (i, _) | ExprKind.ExprBlocked (_, i) | ExprKind.ExprHalo (_, i)
+    | ExprKind.ExprTyped (i, _) | ExprKind.ExprHalo (_, i)
     | ExprKind.ExprPure i | ExprKind.ExprCompute i | ExprKind.ExprRead i
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprGroupBucket i
     | ExprKind.ExprExtents i | ExprKind.ExprStatic i | ExprKind.ExprObjectFor i
@@ -799,7 +799,6 @@ let rec internal renameExpr (ren: Map<string, string>) (e: Expr) : Result<Expr, 
     | ExprKind.ExprObjectFor k -> r k |> Result.map (fun k' -> re (ExprObjectFor k'))
     | ExprKind.ExprDotDot (l, h) ->
         r l |> Result.bind (fun l' -> r h |> Result.map (fun h' -> re (ExprDotDot (l', h'))))
-    | ExprKind.ExprBlocked (t, inner) -> r inner |> Result.map (fun i -> re (ExprBlocked (t, i)))
     | ExprKind.ExprHalo (t, offs) -> r offs |> Result.map (fun o -> re (ExprHalo (t, o)))
     | ExprKind.ExprZip es -> rlist es |> Result.map (fun es' -> re (ExprZip es'))
     | ExprKind.ExprAlign (es, spec) -> rlist es |> Result.map (fun es' -> re (ExprAlign (es', spec)))

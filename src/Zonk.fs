@@ -245,7 +245,6 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         | TExprJoin (es, d) -> TExprJoin (zs es, d)
         | TExprSequence es -> TExprSequence (zs es)
         | TExprAlign (es, sp) -> TExprAlign (zs es, sp)
-        | TExprBlocked (it, bs) -> TExprBlocked (it, z bs)
         // Structured
         | TExprLet (name, vid, value, body) -> TExprLet (name, vid, z value, z body)
         | TExprMatch (scr, cases) ->

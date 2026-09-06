@@ -2709,7 +2709,6 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
                 (rname, arr)
             | IRRange _ -> ($"__range{i}", arr)
             | IRVirtualReverse _ -> ($"__rev{i}", arr)
-            | IRBlocked _ -> ($"__blk{i}", arr)
             | IRMask _ | IRIntersect _ | IRUnion _ | IRUnique _ ->
                 // Auto-materialize: when a method_for receives an inline form
                 // as one of its arrays, generate a temporary binding before
