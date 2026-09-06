@@ -1,5 +1,11 @@
 # Beyond symmetry: the Fortran-killer audit
 
+2026-09-05 follow-up: [round two](plan-fortran-killer-2.md) rebases this historical
+audit against current master and corrects several comparative claims in section 1.
+In particular, freeze recognition/guarded recurrences and scaled units now exist;
+symmetry alone does not license Cholesky; and a contraction flag is not a universal
+reproducibility guarantee. Treat the original findings below as their dated snapshot.
+
 Status: RESEARCHED 2026-08-29 (four-agent probe audit). 2026-08-30, on
 feat/expr-fusion: arc 1's fusion pass LANDED (fuseElementwiseChainsModule +
 flat-path gate integration; `a + b*c - d` = one loop, and the bare-range axis
