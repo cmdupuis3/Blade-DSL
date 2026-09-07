@@ -175,6 +175,7 @@ module IdeStores =
     let reset () =
         store.Value <- Map.empty
         DimChunks.reset ()
+        Blade.Types.SegmentTable.reset ()
 
     /// Record the module built at a provider load site (last write wins).
     let record (name: string) (pm: IRModule) =

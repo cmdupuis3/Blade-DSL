@@ -14505,7 +14505,9 @@ and registerTypeDecl (env: TypeEnv) (typeDecl: TypeDecl) : TypeResult<TypeEnv> =
             chunked |> Result.map (fun seg ->
                 let env' = registerTypeDef name defInfo env
                 match seg with
-                | Some (_, s) -> { env' with Segmentations = Map.add name s env'.Segmentations }
+                | Some (_, s) ->
+                    Blade.Types.SegmentTable.record name (segmentationOffsets s)
+                    { env' with Segmentations = Map.add name s env'.Segmentations }
                 | None -> env'))
 
     | TyDeclStruct (name, typeParams, fields, constraints, isStatic) ->

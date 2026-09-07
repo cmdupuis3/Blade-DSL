@@ -347,6 +347,20 @@ let haloContributors (h: HaloAccess) (outExtent: int64) (j: int64) : (int * int6
     |> List.map (fun o -> (o, j - h.Start - int64 o))
     |> List.filter (fun (_, i) -> 0L <= i && i < outExtent)
 
+/// The run boundaries of every `Chunked` alias registered in the current
+/// compilation, by alias (docs/plans/structural/07): what the stencil
+/// emitter reads to drive a halo map over a streamed segmented source one
+/// run at a time (§2.3). The checker records it beside its own
+/// Segmentations table; AsyncLocal, like the provider registries, so
+/// parallel test compilations do not see each other.
+module SegmentTable =
+    open System.Threading
+    let private table = new AsyncLocal<Map<string, int64 list>>()
+    let private entries () = match box table.Value with null -> Map.empty | _ -> table.Value
+    let record (alias: string) (offsets: int64 list) = table.Value <- Map.add alias offsets (entries ())
+    let tryFind (alias: string) : int64 list option = Map.tryFind alias (entries ())
+    let reset () = table.Value <- Map.empty
+
 /// The center's first valid ordinal for a halo slot (a projection of the
 /// record; kept for its call sites).
 let haloStartOffsetOfTag (tag: string) : int64 option =

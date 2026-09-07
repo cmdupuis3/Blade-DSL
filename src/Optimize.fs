@@ -230,6 +230,26 @@ let recognizeFreezeIdiom (calleeAdmissible: string -> string option) (def: RecAr
 /// reads one run per group, a key grouping needs the whole variable. The
 /// emission lives in codegen; this pass only says what it will do, so
 /// `blade plan` shows it.
+/// The streamed variable an expression reads, looking through a lifted
+/// kernel: the kernel of an apply is a reference to a callable in the
+/// module's function table, and the source it reads is one of that
+/// callable's CAPTURES (by the outer binding's id), not a var in the
+/// expression itself.
+let private streamedReadOf (modul: IRModule) (streamed: Map<Blade.Types.IRId, ProviderReadSpec>) (value: IRExpr) : ProviderReadSpec option =
+    let mutable found = None
+    iterIRExpr (fun e ->
+        match e with
+        | IRVar (vid, _) when Map.containsKey vid streamed -> found <- Some streamed.[vid]
+        | IRVar (fid, _) ->
+            (match modul.Functions |> List.tryFind (fun f -> f.Id = fid) with
+             | Some f ->
+                 (match f.Captures |> List.tryFind (fun c -> Map.containsKey c.Id streamed) with
+                  | Some c -> found <- Some streamed.[c.Id]
+                  | None -> ())
+             | None -> ())
+        | _ -> ()) value
+    found
+
 let private recordSegmentStreaming (modul: IRModule) : unit =
     let streamed =
         modul.ProviderReads
@@ -250,6 +270,16 @@ let private recordSegmentStreaming (modul: IRModule) : unit =
                 let s = streamed.[vid]
                 decide b.Name Blade.Effects.Applied
                     [ $"fold over the streamed variable '{s.VarName}' walks the store one block at a time, in storage order: the same operation sequence as the flat fold, so the answer is bitwise the materialized one" ]
+            | value when
+                    (let mutable halo = false
+                     iterIRExpr (fun e ->
+                         match e with
+                         | IRRange ([ ix ], _) when (match ix.Tag with Some t -> t.StartsWith Blade.Types.haloWinTagPrefix | None -> false) -> halo <- true
+                         | _ -> ()) value
+                     halo && (streamedReadOf modul streamed value).IsSome) ->
+                let s = (streamedReadOf modul streamed value).Value
+                decide b.Name Blade.Effects.Applied
+                    [ $"the stencil over the streamed variable '{s.VarName}' runs one segment at a time; each run is read with the ghost cells its halo reach demands, nothing else of the variable is ever in memory" ]
             | IRGroupBy (IRVar (vid, _), IRVar (gid, _)) when Map.containsKey vid streamed ->
                 let s = streamed.[vid]
                 if Set.contains gid structural then

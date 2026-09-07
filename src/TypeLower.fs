@@ -1597,10 +1597,17 @@ let haloSlotsOf (env: TypeEnv) (innerTy: TypeExpr) (offsetsExpr: Expr) : TypeRes
                 match inner.Extent with
                 | IRLit (IRLitInt n) -> IRLit (IRLitInt (n - shrink))
                 | e -> IRBinOp (IRElementwise, IRSub, e, IRLit (IRLitInt shrink))
+            // A `Chunked` alias adopts its inner axis's record (so it IS the
+            // axis), which for a store axis carries no name: the halo was
+            // declared over the ALIAS, and that is the name the segment-run
+            // emitter looks the runs up by (docs/plans/structural/07 §2.3).
             let innerName =
-                match inner.Tag with
-                | Some n when not (n.StartsWith("__")) -> n
-                | _ -> ""
+                match innerTy with
+                | TyNamed (n, []) when Map.containsKey n env.Segmentations -> n
+                | _ ->
+                    match inner.Tag with
+                    | Some n when not (n.StartsWith("__")) -> n
+                    | _ -> ""
             Ok { inner with
                     Id = env.Builder.FreshId()
                     Extent = shrunkExtent

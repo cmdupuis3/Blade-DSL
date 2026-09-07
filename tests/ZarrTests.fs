@@ -950,6 +950,57 @@ let sizes = extents(seg)
     streamedFoldE2E ()
 
     // ---------------------------------------------------------------
+    // 10g. STENCIL OVER SEGMENTS (docs/plans/structural/07 §2.3): a halo map
+    // over a streamed rank-1 variable on a `Chunked` axis runs one segment at
+    // a time, reading each run plus the ghost cells its reach demands. The
+    // values are the flat stencil's; the emission has no whole-array buffer.
+    // ---------------------------------------------------------------
+    printfn "\n--- stencil over segments: halo<CX, ..> over s.vars.A |> z.stream ---"
+    let stencilSegmentsE2E () =
+        let segStore = fixStore "zarr_segments"    // 10 cells 1..10, chunked at 4
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A: Array<Float like CX> = sample.vars.A |> z.stream
+let d = method_for(halo<CX, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1)) |> compute
+let d2 = method_for(halo<CX, [-2, 0, 2]>) <@> lambda(w) -> A(w(2)) * A(w(-2)) - A(w(0)) * A(w(0)) |> compute
+"""
+                            segStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "stencil over segments: `blade plan` records the decision"
+                    (decisions |> List.exists (fun d -> d.Rule = "segment-streaming" && d.Outcome = Blade.Effects.Applied && d.Evidence |> List.exists (fun e -> e.Contains "stencil")))
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Rule + ":" + d.Subject)))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_stencil"
+                check "stencil over segments: per-run emission, no whole-array buffer"
+                    (cppCode.Contains "stencil over segments" && not (cppCode.Contains "A_flat = new")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_stencil.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "stencil over segments: central difference" (has "d = [2, 2, 2, 2, 2, 2, 2, 2]") runOut
+                          check "stencil over segments: reach-2 kernel" (has "d2 = [-4, -4, -4, -4, -4, -4]") runOut
+                      | Ok (code, out) -> check "stencil over segments: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "stencil over segments: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP stencil over segments (compile skipped): %s" e
+                     else check "stencil over segments: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "stencil over segments: lowers" false e
+        with ex -> check "stencil over segments" false ex.Message
+    stencilSegmentsE2E ()
+
+    // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
     //
     // Every store dimension derives a named index type, and codegen emits one
