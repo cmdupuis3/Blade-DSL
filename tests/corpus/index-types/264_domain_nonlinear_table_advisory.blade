@@ -1,0 +1,17 @@
+// TEST: Enumerable Domain: A Non-Linear Conjunct Takes The Table Route (advisory)
+// WARN: BL4010
+// `(i * j) % 3 == 1` is not a linear inequality, so no closed form exists;
+// the box (49 cells) is under the cap, so the solutions are enumerated once
+// at compile time by the certified counting layer and baked as a key table
+// -- the loop still visits only the 8 solutions, and the BL4010 advisory
+// says the box was paid and how to avoid it.
+static struct Prod {
+    i: Int<min=0, max=6>,
+    j: Int<min=0, max=6>
+} where (i * j) % 3 == 1
+
+let static CARD = idx_card(Prod)
+// EXPECT: CARD = 8
+let R = method_for(range<Prod>) <@> lambda(i, j) -> i * 10 + j |> compute
+let total = reduce(R, (+))
+// EXPECT: total = 264

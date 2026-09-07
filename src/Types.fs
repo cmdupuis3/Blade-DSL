@@ -1167,3 +1167,86 @@ let (|PgIrrepsIdxLike|_|) (ix: IRIndexTypeG<'Ext>) : string option =
                   | Some n -> $"{n} (= {core})"
                   | None -> core)
         | _ -> Some "PgIrrepsIdx<?>"
+
+// ---------------------------------------------------------------------------
+// Enumerable constrained domains (docs/plans/structural/06)
+//
+// A `static struct R { ... } where ...` whose conjuncts are linear
+// inequalities on the fields enumerates in CLOSED FORM: level k (declaration
+// order, first field outermost) runs over an interval whose ends are affine
+// in the earlier levels. Difference constraints (`x_a - x_b <= c`, bounds)
+// are Fourier-Motzkin-projected at planning time so no prefix is dead; a
+// general affine bound on a level (`l3 <= l1 + l2`, `m_out == m1 + m2`) is
+// admitted unprojected -- a prefix may then meet an empty interval, which
+// costs the empty loop and nothing else. Every consumer (the compiler's
+// certificate, the C++ key builder, the interpreter) reads THIS record;
+// there is one enumeration order, lex ascending, and the position in it is
+// the storage offset.
+// ---------------------------------------------------------------------------
+
+/// `Const + Σ coef * x_level` over EARLIER levels.
+type DomainAffine = { Const: int64; Coefs: (int * int64) list }
+
+/// One end of a level's interval: a lower bound is the MAX of its forms, an
+/// upper the MIN (a level always has at least its box bound).
+type DomainBound = DomainAffine list
+
+type DomainLevel = { Field: string; Lo: DomainBound; Hi: DomainBound }
+
+type DomainPlan = {
+    Name: string
+    /// Declaration order = nesting order.
+    Levels: DomainLevel list
+    /// The solution count, walked at planning time.
+    Card: int64
+}
+
+let domainAffineValue (f: DomainAffine) (prefix: int64[]) : int64 =
+    f.Coefs |> List.fold (fun acc (j, a) -> acc + a * prefix.[j]) f.Const
+
+let domainLower (b: DomainBound) (prefix: int64[]) : int64 =
+    b |> List.map (fun f -> domainAffineValue f prefix) |> List.fold max System.Int64.MinValue
+
+let domainUpper (b: DomainBound) (prefix: int64[]) : int64 =
+    b |> List.map (fun f -> domainAffineValue f prefix) |> List.fold min System.Int64.MaxValue
+
+/// Every solution of the plan, lex ascending in declaration order.
+let enumerateDomain (plan: DomainPlan) : int64[] list =
+    let levels = Array.ofList plan.Levels
+    let r = levels.Length
+    let out = ResizeArray<int64[]>()
+    let prefix = Array.zeroCreate<int64> r
+    let rec go (k: int) =
+        if k = r then out.Add (Array.copy prefix)
+        else
+            let lo = domainLower levels.[k].Lo prefix
+            let hi = domainUpper levels.[k].Hi prefix
+            let mutable v = lo
+            while v <= hi do
+                prefix.[k] <- v
+                go (k + 1)
+                v <- v + 1L
+    if r > 0 then go 0
+    List.ofSeq out
+
+/// The solution count without materializing the solutions: the innermost
+/// level contributes its interval's length per prefix.
+let domainCardOf (levels: DomainLevel list) : int64 =
+    let levels = Array.ofList levels
+    let r = levels.Length
+    if r = 0 then 0L
+    else
+    let prefix = Array.zeroCreate<int64> r
+    let rec go (k: int) : int64 =
+        let lo = domainLower levels.[k].Lo prefix
+        let hi = domainUpper levels.[k].Hi prefix
+        if k = r - 1 then (if hi < lo then 0L else hi - lo + 1L)
+        else
+            let mutable total = 0L
+            let mutable v = lo
+            while v <= hi do
+                prefix.[k] <- v
+                total <- total + go (k + 1)
+                v <- v + 1L
+            total
+    go 0

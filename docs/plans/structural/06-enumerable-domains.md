@@ -1,6 +1,35 @@
 # 06 — Enumerable constrained domains: skip the excluded space
 
-**Status (2026-09-06): DESIGN, nothing built.** Elaborates item 6 of
+**Status: v1 BUILT 2026-09-07 (feat/revision-reuse), with the user's decisions
+of 2026-09-07 — the `static struct` name IS the index type (`range<R>`,
+`Array<T like R>`); `Int` and `Nat` fields (a Nat box may not start below 0);
+positional params; class-B fallback = certified table + BL4010 advisory; a new
+code BL4020 for the unenumerable case; the triangle admitted; absent-cell reads
+keep the sparse contract.** Built as the SPARSE-SHAPED route rather than a new
+index kind: `TypeLower` lowers a static-struct name to an `IxKSparse` record
+whose extent is `IRSparseKeys (SkDomain plan)` (closed form) or `SkStatic`
+(class B), so reads, folds, printing, the single-slot rule, fusion/CUDA/LLVM/AD
+refusals and the interpreter twin are the existing SparseIdx machinery; the C++
+key builder (`genSparseIndexFromKeys`'s `SkDomain` arm) walks the plan's nested
+affine-bounded loops in lex order into a `sparse_index_t` (O(card) build, O(1)
+hashed reads, no product-space scan), the interpreter walks the same plan in
+F# (`Types.enumerateDomain`). Recogniser `StructIdxFence.domainPlanOf` (linear
+forms over the fields, `<`/`<=`/`>`/`>=`/`==`/`abs`/`&&`, static names fold;
+difference constraints Fourier–Motzkin-projected innermost first, general
+affine bounds on a level attached unprojected — a dead prefix costs one empty
+loop); route + certificate `StructIdxSpec.domainRoute` (below the cap the
+closed-form enumeration is asserted equal to the counting layer's set and
+order — the third route; above it the plan stands alone, uncapped). Advisories
+at the `range<>` seam (TypeCheckInfer): class B, and the empty domain. Pins:
+`tests/corpus/index-types/260-267` (band in closed form with `abs`, the
+509×509 uncapped band, the rank-3 triangle over Nat fields with a lex-order
+fold, the CG anchor iterated with negative coordinates, the class-B advisory,
+the over-cap refusal, the empty-domain warning, the multi-slot refusal);
+`blade test interp index-types` green. Not done: A3 congruences, tag flow onto
+kernel params (Decision 2a), the §4 timing gate against the scan and the
+compound routes, flipping index-types/152 (dependent BOUNDS stay outside the
+box grammar; write the coupling as a `where` conjunct), a runtime cell census.
+Originally: DESIGN (2026-09-06). Elaborates item 6 of
 [`plan-structural-performance-opportunities.md`](../plan-structural-performance-opportunities.md)
 ("Require constrained domains to skip excluded space"). Every claim below is either
 marked *verified* (read in the current source at HEAD `e7abf38`, or emitted/run with

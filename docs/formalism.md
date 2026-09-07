@@ -410,6 +410,25 @@ extents — lookup hashes the tuple directly. Keys keep their **given order**
 (never sorted): iteration visits |keys| entries in key order, and the compact
 buffer is laid out in that order. Duplicate keys are a construction error.
 
+**A `static struct` name as an index type** (enumerable constrained domains,
+docs/plans/structural/06) — `range<R>` and `Array<T like R>` accept the name of
+a `static struct R { f₁: Int<min=a, max=b>, ... } where p₁, p₂, ...` whose
+fields are `Int` or `Nat` with static bounds: the iteration space is the
+struct's SOLUTION SET, in lex order of the fields (first field outermost), and
+the kernel takes one positional parameter per field. When every conjunct is a
+linear inequality on the fields (`i - j <= w`, `abs(i - j) <= w`,
+`l3 <= l1 + l2`, `m1 + m2 == m_out`; `<`, `>`, `>=`, `==`, `&&` accepted) the
+solutions are enumerated in CLOSED FORM — nested loops whose bounds are affine
+in the earlier fields, difference constraints Fourier–Motzkin-projected so no
+prefix is dead — exactly the solutions are visited and the box is never scanned
+nor capped. Otherwise the solutions are enumerated once at compile time by the
+counting layer (`idx_card`'s certified routes, box ≤ 100,000 cells) and baked
+as a key table, with a BL4010 advisory; a non-linear domain over the cap is
+refused (BL4020). Either way the slot is SparseIdx-shaped: the output is a
+sparse array over the solution set (full-key reads `R((i, j))`, flat folds in
+lex order), a domain slot is the whole iteration space (`range<R, J>` is
+refused), and an empty domain warns and iterates zero times.
+
 Tuple indexing with wildcards: a full key is an O(1) hash lookup (a missing
 key is a runtime error); a wildcard/short-prefix partial returns the matching
 entries **by gather** — with no sorted table there is no contiguous-window

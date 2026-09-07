@@ -920,7 +920,7 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
     | IRCompoundMask mk -> IRCompoundMask (liftExpr builder mk)
     | IRCompoundProject (parent, plen) -> IRCompoundProject (liftExpr builder parent, plen)
     | IRSparseKeys (SkRuntime keys) -> IRSparseKeys (SkRuntime (liftExpr builder keys))
-    | IRSparseKeys (SkStatic _) -> expr
+    | IRSparseKeys (SkStatic _) | IRSparseKeys (SkDomain _) -> expr
     // Only the base extent can hold a liftable inline form; the level list is data.
     | IROrbitClass (levels, n) -> IROrbitClass (levels, liftExpr builder n)
     | IRAssign (t, v) -> IRAssign (t, liftExpr builder v)

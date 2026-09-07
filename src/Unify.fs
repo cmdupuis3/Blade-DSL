@@ -117,6 +117,10 @@ type TypeError =
     /// allocator/traversal/compact-read/printer/provider path emits it -- legal
     /// type, unavailable storage. `levels` = rendered level list; `where_` = the seam.
     | OrbitStorageUnsupported of levels: string * where_: string
+    /// `range<R>` / `Array<T like R>` over a `static struct` whose solution
+    /// set cannot be enumerated: the constraints are not closed-form AND the
+    /// box is over the table cap (docs/plans/structural/06). BL4020.
+    | ConstrainedDomainRefused of name: string * why: string
     /// A wreath subscript at the wrong arity. A depth >= 2 OrbIdx record is ONE
     /// index slot spanning prod(ri) RAW AXES, so `W(i,j,k,l)` presents 4 args
     /// against 1 slot; without this case `dispatchAppOrIndex`'s catch-all would

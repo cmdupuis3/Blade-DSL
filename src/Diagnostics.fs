@@ -349,6 +349,13 @@ module Codes =
             // interpreted. Judged for literal offsets at the apply seam
             // (haloExtentClash's site walk); computed offsets stay fail-open.
             "BL4019", "halo offset outside the declared set"
+            // BL4020: `range<R>` over a `static struct` whose constraints
+            // are not linear inequalities on the fields AND whose box is over
+            // the cap for enumerating the solutions by table
+            // (docs/plans/structural/06). A linear domain enumerates in
+            // closed form and is not capped; a small non-linear one is
+            // tabled with a BL4010 advisory.
+            "BL4020", "constrained domain not enumerable"
             // BL5xxx: elaborators
             "BL5000", "ml elaboration error"
             "BL5100", "ppl elaboration error"

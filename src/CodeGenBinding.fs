@@ -1923,7 +1923,7 @@ and genSparseInitBinding (ctx: CodeGenContext) (binding: IRBinding) : string lis
          let idxName = $"{name}_idx"
          let idxLines =
              match sparseIx.Extent with
-             | IRSparseKeys (SkStatic _ as src) -> genSparseIndexFromKeys src None leadRank idxName
+             | IRSparseKeys ((SkStatic _ | SkDomain _) as src) -> genSparseIndexFromKeys src None leadRank idxName
              | IRSparseKeys (SkRuntime (IRVar (kid, _)) as src) ->
                  genSparseIndexFromKeys src (Map.tryFind kid ctx.VarNames) leadRank idxName
              | _ -> [ refusalErrorLine "" ($"sparse() binding '{name}': keys source is not a SparseIdx extent") ]
@@ -3311,9 +3311,12 @@ and genReduceComputeBindingCore (ctx: CodeGenContext) (binding: IRBinding) (buil
                 info.ArrayTypes |> List.exists (fun at ->
                     at.IndexTypes |> List.exists (fun ix ->
                         isRaggedFamilyKind ix.IxKind || ix.IxKind = IxKDepInner
-                        || ix.IxKind = IxKGroupOuter || ix.IxKind = IxKCompound)))
+                        || ix.IxKind = IxKGroupOuter || ix.IxKind = IxKCompound
+                        // a sparse/domain range's driver index is declared by
+                        // genApplyCombinator only; this path never builds one
+                        || ix.IxKind = IxKSparse)))
         if unsupportedInput then
-            (codegenError ctx ind "reduce over a deferred computation is not supported for ragged/grouped/compound inputs yet -- force with |> compute and reduce the array", ctx')
+            (codegenError ctx ind "reduce over a deferred computation is not supported for ragged/grouped/compound/sparse inputs yet -- bind the map with |> compute and reduce the array", ctx')
         else
             match resolveCallable kernelExpr with
             | Some callable when callable.Params.Length = 2 ->

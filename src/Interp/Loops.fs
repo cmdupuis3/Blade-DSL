@@ -1193,6 +1193,9 @@ and private resolveSparseKeys (st: InterpState) (env: Env) (src: SparseKeysSourc
     match src with
     | SkStatic entries ->
         entries |> List.map Array.ofList |> Array.ofList
+    // the closed-form domain: the same plan the C++ key builder walks,
+    // enumerated here in F# (docs/plans/structural/06)
+    | SkDomain plan -> enumerateDomain plan |> Array.ofList
     | SkRuntime keysExpr ->
         let keysArr =
             match force st env (Core.evalExpr st env keysExpr) with

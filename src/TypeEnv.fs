@@ -294,6 +294,12 @@ type TypeEnv = {
     /// A name set, not a TDIStruct flag: only decl-time checks and the
     /// constrained-index layers consult it.
     StaticStructs: Set<string>
+    /// Every declared struct's static-evaluator record (fields, raw field
+    /// decls with their bounds, declared and full conjunct lists, the static
+    /// marker), registered beside TDIStruct so the index fence and the
+    /// enumeration route (StructIdxFence / StructIdxSpec) can be asked from
+    /// the checker and the lowerer through `staticEnvOf`.
+    StructStatics: Map<string, StaticEval.StructStaticInfo>
     /// Non-fatal diagnostics accumulated during type-checking. A mutable
     /// ResizeArray so `{ env with ... }` updates share one collector across
     /// scopes. Surfaced only via `typeCheck`'s Ok return; skipped on the error path.
@@ -517,6 +523,7 @@ let emptyEnv () = {
     StaticValues = Map.empty
     SurfaceAliases = Map.empty
     StaticStructs = Set.empty
+    StructStatics = Map.empty
     Warnings = ResizeArray<string>()
     Provenance = System.Collections.Generic.Dictionary<IRId, Set<string>>()
     FuncConstraints = System.Collections.Generic.Dictionary<string, string list * (string * string list) list>()
@@ -757,6 +764,8 @@ let formatTypeError (err: TypeError) : string =
     // ONLY difference between the two spellings ("depth >= 2" here, "depth d"
     // there); everything else is identical and corpus-pinned. KEEP THEM IN
     // STEP or a half-updated pair tells the user two different stories.
+    | ConstrainedDomainRefused (name, why) ->
+        $"range<{name}>: {why}"
     | OrbitStorageUnsupported (levels, where_) ->
         sprintf "%s: OrbIdx<%s, n> is a declarable index class of depth >= 2, and a DEDUCED one can now be \
 allocated, written, printed, READ at an arbitrary tuple (the per-level canon fold, the accumulated \
@@ -1105,6 +1114,9 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // spellings of one shape, not to stop using RaggedIdx.
             | RaggedLensMismatch _ | RaggedLensNotStatic _ -> "BL4018"
             | HaloOffsetOutsideSet _ -> "BL4019"
+            // BL4020: a constrained domain that no route can enumerate --
+            // not closed-form (class B) and over the box cap for a table.
+            | ConstrainedDomainRefused _ -> "BL4020"
             | StructWhereNotBool _ | StructWhereError _ | WherePredicateUnannotated _
             | PplConstraintNeedsImport _
             | UnknownWhereConstraint _ -> "BL4001"

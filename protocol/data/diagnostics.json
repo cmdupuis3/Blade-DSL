@@ -900,6 +900,17 @@
       "docs": [
         "docs/features/equivariant-nn.md"
       ]
+    },
+    "BL4020": {
+      "title": "constrained domain not enumerable",
+      "explanation": "`range<R>` (or `Array<T like R>`) names a `static struct` whose solution set is the iteration space (docs/plans/structural/06). When the struct's `where` conjuncts are linear inequalities on the fields (`i - j <= w`, `abs(i - j) <= w`, `l3 <= l1 + l2`, `m1 + m2 == m_out`) the solutions are enumerated in CLOSED FORM -- nested loops whose bounds are affine in the earlier fields -- and the box size does not matter. When a conjunct is not linear (a product of fields, `%`, `||`, `!=`, a function call) the only route is to enumerate the whole box once at compile time and bake the solutions as a key table, which is capped at 100,000 box cells (with a BL4010 advisory when it is taken). This error is the case where neither route exists: a non-linear conjunct over a box above the cap.",
+      "fix": "Write the constraint as linear inequalities on the fields so it enumerates in closed form, or narrow the field bounds until the box is under the table cap.",
+      "examples": [
+        "tests/corpus/index-types/265_domain_nonlinear_over_cap_rejects.blade"
+      ],
+      "docs": [
+        "docs/plans/structural/06-enumerable-domains.md"
+      ]
     }
   }
 }

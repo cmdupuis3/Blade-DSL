@@ -1,0 +1,21 @@
+// TEST: Enumerable Domain: The Triangle Inequality Over Nat Fields (Rank 3)
+// `Nat` fields are index-eligible (their box must not start below 0). The
+// triangle |l1 - l2| <= l3 <= l1 + l2 mixes two difference constraints on
+// l3 (projected, so no (l1, l2) prefix is dead for them) with one bound by
+// a SUM of earlier fields, which v1 attaches unprojected: at a prefix whose
+// interval is empty the inner loop runs zero times. 85 of the 225 box cells
+// are solutions; the fold's lex order pins the enumeration order too.
+static struct Tri {
+    l1: Nat<min=0, max=4>,
+    l2: Nat<min=0, max=4>,
+    l3: Nat<min=0, max=8>
+} where l3 <= l1 + l2, l1 - l2 <= l3, l2 - l1 <= l3
+
+let static CARD = idx_card(Tri)
+// EXPECT: CARD = 85
+let R = method_for(range<Tri>) <@> lambda(a, b, c) -> a * 100 + b * 10 + c |> compute
+let total = reduce(R, (+))
+// EXPECT: total = 24470
+let cs = method_for(range<Tri>) <@> lambda(a, b, c) -> c |> compute
+let ord = reduce(cs, lambda(x, y) -> (x * 3 + y) % 1000003)
+// EXPECT: ord = 197286

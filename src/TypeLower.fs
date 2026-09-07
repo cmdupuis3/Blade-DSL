@@ -80,7 +80,7 @@ let staticEnvOf (env: TypeEnv) : StaticEval.StaticEnv =
       CalledFunctions = ref Set.empty
       ProviderRoots = Map.empty
       Segments = Map.empty
-      Structs = Map.empty }
+      Structs = env.StructStatics }
 
 let evalStaticIntExpr (env: TypeEnv) (expr: Expr) : int option =
     match evalConstExpr env expr with
@@ -1092,6 +1092,29 @@ and lowerIndexType env (_position: int) (ty: TypeExpr) : IRIndexType =
         match lookupTypeDef name env with
         | Some (TDIIndexType (_, idx, _)) -> { idx with Id = id }
         | Some (TDIEnumIdx (_, idx, _, _)) -> { idx with Id = id }
+        // A `static struct` name stands where an index type stands
+        // (docs/plans/structural/06): its solution set is the key
+        // enumeration of a SparseIdx-shaped slot -- closed-form (SkDomain)
+        // when the constraints are linear, a certified baked table otherwise.
+        // Refusals surface at the range<> seam (TypeCheckInfer) with their
+        // own code; this arm's failwith is the annotation-only backstop.
+        | Some (TDIStruct _) when (match Map.tryFind name (staticEnvOf env).Structs with
+                                  | Some si -> si.IsStatic
+                                  | None -> false) ->
+            (match Blade.StructIdxSpec.domainRoute (staticEnvOf env) name with
+             | Ok (Blade.StructIdxSpec.DomainClosedForm plan) ->
+                 { Id = id; Rank = plan.Levels.Length; Extent = IRSparseKeys (SkDomain plan)
+                   Symmetry = SymNone; Tag = Some "__sparseidx"; IxKind = IxKSparse
+                   Kind = SDimension; Dependencies = [] }
+             | Ok (Blade.StructIdxSpec.DomainTable (entries, _, _)) ->
+                 let rank =
+                     match entries with
+                     | e :: _ -> e.Length
+                     | [] -> (match Map.tryFind name (staticEnvOf env).Structs with Some si -> si.FieldDecls.Length | None -> 1)
+                 { Id = id; Rank = rank; Extent = IRSparseKeys (SkStatic entries)
+                   Symmetry = SymNone; Tag = Some "__sparseidx"; IxKind = IxKSparse
+                   Kind = SDimension; Dependencies = [] }
+             | Error msg -> failwith msg)
         | _ ->
             { Id = id; Rank = 1; Extent = IRParam (name, 0, IRTNat None); Symmetry = SymNone
               Tag = Some name; IxKind = ixKindOfTag (Some name); Kind = SDimension; Dependencies = [] }

@@ -500,6 +500,12 @@ and AlignSpec = {
 and SparseKeysSource =
     | SkStatic of entries: int64 list list
     | SkRuntime of keys: IRExpr
+    /// Enumerable constrained domain (docs/plans/structural/06): the keys are
+    /// the solutions of a static struct's linear constraints, enumerated in
+    /// closed form at RUN time (the C++ key builder) and at compile time
+    /// (the interpreter, the certificate) from one plan -- never a baked
+    /// table, so the domain is not box-capped.
+    | SkDomain of plan: DomainPlan
 
 
 // Concrete instantiations of the Types.fs generic family at IRExpr --
@@ -1878,6 +1884,7 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRCompoundProject (e, plen) -> [e], (function [e'] -> IRCompoundProject (e', plen) | _ -> badChildren "IRCompoundProject")
     | IRSparseKeys (SkRuntime e) -> [e], (function [e'] -> IRSparseKeys (SkRuntime e') | _ -> badChildren "IRSparseKeys")
     | IRSparseKeys (SkStatic _) -> [], (function [] -> expr | _ -> badChildren "IRSparseKeys")   // baked entries: no child exprs
+    | IRSparseKeys (SkDomain _) -> [], (function [] -> expr | _ -> badChildren "IRSparseKeys")   // a plan: data, no child exprs
     // The level list is compile-time data, never an expression; the BASE extent
     // is an ordinary extent expression and is exposed as the one child, so
     // substitution / varref collection / folding reach it exactly as they reach

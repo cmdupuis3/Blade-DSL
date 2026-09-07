@@ -1,0 +1,24 @@
+// TEST: Enumerable Domain: The CG Anchor's Equality Solves The Innermost Field
+// index-types/145's CGm112, now ITERATED: `m1 + m2 == m_out` is two
+// inequalities that pin m_out to the single value m1 + m2, clipped to its
+// box -- the innermost loop runs once or not at all, never over the box.
+// The 7 solutions (2/3/2 by m_out) are the counting layer's, in the same
+// order; negative coordinates are ordinary field values.
+static struct CGm112 {
+    m1:    Int<min=-1, max=1>,
+    m2:    Int<min=-1, max=1>,
+    m_out: Int<min=-1, max=1>
+} where m1 + m2 == m_out
+
+let static CARD = idx_card(CGm112)
+// EXPECT: CARD = 7
+let R = method_for(range<CGm112>) <@> lambda(a, b, c) -> a * 100 + b * 10 + c |> compute
+let total = reduce(R, (+))
+// EXPECT: total = 0
+let top = R((1, 0, 1))
+// EXPECT: top = 101
+let mid = R((-1, 1, 0))
+// EXPECT: mid = -90
+let ones = method_for(range<CGm112>) <@> lambda(a, b, c) -> 1 |> compute
+let n = reduce(ones, (+))
+// EXPECT: n = 7

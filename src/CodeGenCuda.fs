@@ -2654,7 +2654,8 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
                 // `<name>_cidx->unhash(r)[c]` (genElementBindingNew). The
                 // compound slot must be the range's SOLE index type for now;
                 // mixing (range<CompoundIdx<m>, J>) is unsupported.
-                let rname = $"__range{i}"
+                // per OUTPUT: two tabulated ranges in one program would otherwise redeclare one driver index
+                let rname = $"__range{i}_{name}"
                 (match idxTys with
                  | [ix] ->
                      (match ix.Extent with
@@ -2684,11 +2685,12 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
                 // (genLoopBoundExpr, genElementBindingNew, the extents fill)
                 // serve both tabulated kinds unchanged. Iteration visits the
                 // keys in GIVEN order (never sorted).
-                let rname = $"__range{i}"
+                // per OUTPUT: two tabulated ranges in one program would otherwise redeclare one driver index
+                let rname = $"__range{i}_{name}"
                 (match idxTys with
                  | [ix] ->
                      (match ix.Extent with
-                      | IRSparseKeys (SkStatic _ as src) ->
+                      | IRSparseKeys ((SkStatic _ | SkDomain _) as src) ->
                           let idxLines = genSparseIndexFromKeys src None ix.Rank ($"{rname}_cidx")
                           preCode <- preCode @ (idxLines |> List.map (fun s -> ind + s))
                           registerShapedAlloc ($"{rname}_cidx")
@@ -2707,7 +2709,7 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
                  | _ ->
                      preCode <- preCode @ codegenError ctx ind "range<SparseIdx<keys>, ...>: a sparse range slot cannot be combined with other index types in one range<> (not yet supported)")
                 (rname, arr)
-            | IRRange _ -> ($"__range{i}", arr)
+            | IRRange _ -> ($"__range{i}_{name}", arr)
             | IRVirtualReverse _ -> ($"__rev{i}", arr)
             | IRMask _ | IRIntersect _ | IRUnion _ | IRUnique _ ->
                 // Auto-materialize: when a method_for receives an inline form

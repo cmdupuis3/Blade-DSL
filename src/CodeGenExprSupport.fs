@@ -453,6 +453,34 @@ let genSparseIndexFromKeys (source: SparseKeysSource) (keysName: string option) 
             |> String.concat ", "
         [ $$"""std::vector<std::array<size_t, {{rank}}>> {{idxName}}_keys = { {{rows}} };"""
           $"sparse_index_t<{rank}>* {idxName} = new sparse_index_t<{rank}>(\"{idxName}\", std::move({idxName}_keys));" ]
+    | SkDomain plan ->
+        // Closed-form enumeration (docs/plans/structural/06): nested loops,
+        // level k over [lo_k, hi_k] with the ends affine in the earlier
+        // levels, pushing each solution in lex order -- the same order the
+        // interpreter and the compile-time certificate produce. Exactly the
+        // solutions are visited (plus an empty inner loop at a dead prefix
+        // of an unprojected general bound); the box is never scanned.
+        let r = plan.Levels.Length
+        let var k = $"__d{k}"
+        let affine (f: DomainAffine) =
+            f.Coefs |> List.fold (fun acc (j, a) -> $"{acc} + {a}LL * {var j}") $"({f.Const}LL)"
+        let boundExpr (isLower: bool) (b: DomainBound) =
+            let fn = if isLower then "std::max<int64_t>" else "std::min<int64_t>"
+            match b |> List.map affine with
+            | [] -> if isLower then "INT64_MIN" else "INT64_MAX"
+            | first :: rest -> rest |> List.fold (fun acc t -> $"{fn}({acc}, {t})") first
+        let opens =
+            plan.Levels |> List.mapi (fun k lvl ->
+                let ind = String.replicate k "    "
+                $"{ind}for (int64_t {var k} = {boundExpr true lvl.Lo}; {var k} <= {boundExpr false lvl.Hi}; ++{var k}) {{")
+        let push =
+            let comps = [ for k in 0 .. r - 1 -> $"(size_t){var k}" ] |> String.concat ", "
+            $"""{String.replicate r "    "}{idxName}_keys.push_back({{ {comps} }});"""
+        let closes = [ for k in r - 1 .. -1 .. 0 -> String.replicate k "    " + "}" ]
+        [ $"// enumerable domain {plan.Name}: {plan.Card} solution(s) in closed form, lex order (docs/plans/structural/06)"
+          $"std::vector<std::array<size_t, {rank}>> {idxName}_keys; {idxName}_keys.reserve({plan.Card});" ]
+        @ opens @ [ push ] @ closes
+        @ [ $"sparse_index_t<{rank}>* {idxName} = new sparse_index_t<{rank}>(\"{idxName}\", std::move({idxName}_keys));" ]
     | SkRuntime _ ->
         match keysName with
         | Some kn ->

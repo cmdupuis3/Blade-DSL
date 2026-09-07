@@ -490,3 +490,41 @@ let private idxCard (env: StaticEnv) (_fuel: int) (args: Expr list) : Result<Sta
 /// ProviderStatics.install precedent.
 let install () =
     registerSyntacticStaticBuiltin "idx_card" idxCard
+
+// ---------------------------------------------------------------------------
+// The enumeration route of a static struct used as an INDEX TYPE
+// (`range<R>`, `Array<T like R>`; docs/plans/structural/06).
+// ---------------------------------------------------------------------------
+
+open Blade.Types
+
+type DomainRoute =
+    /// Class A: enumerated in closed form from the plan, uncapped.
+    | DomainClosedForm of DomainPlan
+    /// Class B: the constraints are not closed-form; the box is under the
+    /// cap, so the solutions are enumerated by the counting layer and baked
+    /// as a static key table (lex order, certified).
+    | DomainTable of entries: int64 list list * card: int * why: string
+
+/// The route, with the house certificate: below the cap the closed-form
+/// enumeration must equal the counting layer's set AND order (a third route
+/// beside routeFlat / routeHeads); above it the plan stands alone.
+let domainRoute (env: StaticEnv) (name: string) : Result<DomainRoute, string> =
+    structStaticFence env name |> Result.bind (fun spec ->
+        let vol = boxVolume spec.Fields
+        match domainPlanOf env spec with
+        | Ok plan ->
+            if vol <= int64 maxBoxCells then
+                enumerateBox spec.Name spec.Fields (cellPredicateOf env spec)
+                |> Result.map (fun counted ->
+                    let mine = Blade.Types.enumerateDomain plan |> List.map List.ofArray
+                    if mine <> counted.Entries then
+                        failwith $"internal: the closed-form enumeration of {name} ({List.length mine} cells) disagrees with the counting layer ({counted.Card} cells) -- the recogniser's projection is wrong for this constraint shape; please report it"
+                    DomainClosedForm plan)
+            else Ok (DomainClosedForm plan)
+        | Error why ->
+            if vol <= int64 maxBoxCells then
+                enumerateBox spec.Name spec.Fields (cellPredicateOf env spec)
+                |> Result.map (fun counted -> DomainTable (counted.Entries, counted.Card, why))
+            else
+                Error ($"{name} cannot be enumerated: its constraints are not closed-form ({why}), and its box has {vol} cells, over the {maxBoxCells}-cell cap for enumerating a domain by table. Write the constraints as linear inequalities on the fields (`i - j <= w`, `l3 <= l1 + l2`, `abs(i - j) <= w`, `m1 + m2 == m_out`), or narrow the field bounds"))

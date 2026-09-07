@@ -226,6 +226,7 @@ first-class construct:
 | peel the innermost axis (partial reduction) | bare `reduce(A, (+))` — the default is `axes = 1`, so on rank ≥ 2 it returns an array, not a scalar | manual row loops |
 | several statistics in ONE pass | `reduce((L <@> k1) <&!> (L <@> k2) <&!> (L <@> k3), (+))` then tuple-destructure | separate passes |
 | filter / WHERE | `mask(xs, pred)` + `compound(data, mask)`; compose masks with `&&`/`\|\|` | a filter loop |
+| iterate a constrained index domain (a band, a triangle, a selection rule) | `static struct Band { i: Int<min=0, max=n-1>, j: Int<min=0, max=n-1> } where abs(i - j) <= w` then `method_for(range<Band>) <@> lambda(i, j) -> ...` -- linear conjuncts enumerate in closed form, only the solutions are visited (reads `R((i, j))`, `reduce(R, (+))`) | a dense nest with an `if` in the kernel; a mask over the whole box |
 | stencil / lags / rolling window | `method_for(halo<I, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1))` | index arithmetic with edge guards |
 | index generation | `0..8` anonymous range (a first-class rank-1 array), or `range<I>` when the named tag should flow | materialized iota; `method_for(range) <@> lambda(i) -> i \|> compute` |
 | coordinate axis / linspace | `x0 + dx * Float64(0..n)` — implicit lifting over the range | `method_for(range<I>) <@> lambda(j) -> x0 + dx * Float64(j)` for a body that is just affine in the index |

@@ -1394,6 +1394,35 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
     // (prefixed "__") keep the bare int64 element type, matching gap 1's
     // asymmetric treatment of named vs anonymous element-position tags.
     | ExprKind.ExprRange idxTys ->
+        // An enumerable constrained domain (`range<R>`, R a `static struct`;
+        // docs/plans/structural/06) is routed HERE, ahead of lowering, so a
+        // refusal has a code and a table-enumerated domain gets its advisory:
+        // the closed-form route visits exactly the solutions; the table
+        // route (class B) pays the box once at compile time and iterates the
+        // baked keys; neither scans the box at run time.
+        let domainSlots =
+            idxTys |> List.choose (fun ty ->
+                match ty with
+                | TyNamed (n, []) ->
+                    (match Map.tryFind n (Blade.TypeLower.staticEnvOf env).Structs with
+                     | Some si when si.IsStatic && (match lookupTypeDef n env with Some (TDIStruct _) -> true | _ -> false) -> Some n
+                     | _ -> None)
+                | _ -> None)
+        domainSlots
+        |> List.fold (fun acc n ->
+            acc |> Result.bind (fun () ->
+                match Blade.StructIdxSpec.domainRoute (Blade.TypeLower.staticEnvOf env) n with
+                | Error why -> Error (ConstrainedDomainRefused (n, why))
+                | Ok (Blade.StructIdxSpec.DomainTable (_, card, why)) ->
+                    emitWarning env "BL4010" expr.Span
+                        $"range<{n}>: the domain's constraints are not closed-form ({why}), so its {card} solution(s) were enumerated over the whole box at compile time and baked as a key table; the loop visits the solutions only, but the box is capped at {Blade.StructIdxSpec.maxBoxCells} cells. Writing the constraints as linear inequalities on the fields (`i - j <= w`, `abs(i - j) <= w`, `l3 <= l1 + l2`, `m1 + m2 == m_out`) enumerates them in closed form, uncapped"
+                    Ok ()
+                | Ok (Blade.StructIdxSpec.DomainClosedForm plan) when plan.Card = 0L ->
+                    emitWarning env "BL4010" expr.Span
+                        $"range<{n}>: the domain is EMPTY -- its constraints admit no cell of the box, so this loop runs zero times and its output has no cells"
+                    Ok ()
+                | Ok _ -> Ok ())) (Ok ())
+        |> Result.bind (fun () ->
         // A TyHalo slot builds through haloSlotsOf (static-offset validation +
         // interior shrink + "__halowin|" tag) and may SPLICE several slots
         // (nested per-axis offsets); every other slot lowers as before. n-D
@@ -1478,7 +1507,7 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
             match List.tryLast idxs with
             | Some i -> elemTypeForIterationIndex i
             | None -> IRTScalar ETInt64
-        Ok (mkTyped (TExprRange idxs) (mkVirtualArrayArrow idxs elemType)))
+        Ok (mkTyped (TExprRange idxs) (mkVirtualArrayArrow idxs elemType))))
     | ExprKind.ExprDotDot (lo, hi) ->
         inferExpr env lo |> Result.bind (fun tLo ->
         inferExpr env hi |> Result.bind (fun tHi ->
@@ -14900,6 +14929,19 @@ and registerTypeDecl (env: TypeEnv) (typeDecl: TypeDecl) : TypeResult<TypeEnv> =
         | Some e -> Error e
         | None ->
             let env = if isStatic then { env with StaticStructs = Set.add name env.StaticStructs } else env
+            // The static evaluator's own record of this struct (the same
+            // shape StaticEval.resolveStatics builds), so `staticEnvOf`
+            // carries it to the index fence and the enumeration route.
+            let env =
+                { env with
+                    StructStatics =
+                        Map.add name
+                            ({ StaticEval.StructStaticInfo.Fields = fields |> List.map (_.Name)
+                               Conjuncts = structConjuncts fields constraints
+                               FieldDecls = fields
+                               Declared = constraints
+                               IsStatic = isStatic } : StaticEval.StructStaticInfo)
+                            env.StructStatics }
             let fieldTypes = fields |> List.map (fun f -> (f.Name, lowerTypeExpr env f.Type))
             // Field range refinements: SEQUENTIAL scoping -- a bound may
             // reference only EARLIER fields and statics, and call only
