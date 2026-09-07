@@ -2343,6 +2343,30 @@ let computeDeferredIds (bindings: IRBinding list) : Set<int> =
 
 let genPrintStatements (modul: IRModule) : string list =
     let deferredIds = computeDeferredIds modul.Bindings
+    // `--print <names>` (BLADE_PRINT, CodeGenState.printSelection): print only
+    // the named bindings. A name that is not a top-level binding AT ALL is a
+    // typo, and a typo that silently printed nothing would look exactly like a
+    // program that computed nothing -- so it refuses, by name, listing what is
+    // there. (A name that IS a binding but never prints -- a deferred loop
+    // value, a streamed read -- prints nothing, as it does unselected.)
+    let selection = printSelection ()
+    // The refusal is SPLICED (refusalErrorLine), not merely recorded: the
+    // channel delivers BL7004 only for a translation unit that carries a
+    // marker, and a recorded-but-unspliced message would leave the typo
+    // printing nothing and exiting 0 -- the very failure this guards.
+    let selectionRefusal =
+        match selection with
+        | Some names ->
+            let sep = ", "
+            let declared = modul.Bindings |> List.map (fun b -> b.Name) |> Set.ofList
+            let unknown = Set.difference names declared |> Set.toList
+            if unknown.IsEmpty then []
+            else
+                let known = declared |> Set.toList |> List.filter (fun n -> not (n.StartsWith "__")) |> String.concat sep
+                let missing = String.concat sep unknown
+                let verb = if unknown.Length = 1 then "is not a top-level binding of this program" else "are not top-level bindings of this program"
+                [ refusalErrorLine "    " $"--print: {missing} {verb} -- it has: {known}" ]
+        | None -> []
     // A deferred binding that a consumer FORCED (forceDeferredArrayInput
     // materialized it under its own name at main's top level) is a real
     // array by program end and prints like any eager binding; one that
@@ -2350,7 +2374,8 @@ let genPrintStatements (modul: IRModule) : string list =
     // populated during genModule, so callers must assemble print code AFTER
     // body generation.
     let forcedIds = (forcedDeferredIdsCell ()).Value
-    modul.Bindings |> List.collect (fun b ->
+    selectionRefusal @
+    (modul.Bindings |> List.collect (fun b ->
         // |> compute of a DEFERRED combinator is a forced materialization and
         // always prints; |> compute of anything ELSE prints exactly when the
         // wrapped value itself would (an eager reduce/scalar is unchanged by
@@ -2377,8 +2402,15 @@ let genPrintStatements (modul: IRModule) : string list =
                 arr.IndexTypes |> List.exists (fun idx ->
                     idx.Symmetry = SymSymmetric || idx.Symmetry = SymAntisymmetric || idx.Symmetry = SymHermitian)
             | _ -> false
-        
-        if isPrintable then
+
+        // The `--print` selection, applied exactly where the interpreter's
+        // twin applies it (Interp/Print.printBindingsOnly's `wanted`).
+        let wanted =
+            match selection with
+            | Some names -> Set.contains b.Name names
+            | None -> true
+
+        if isPrintable && wanted then
             match IR.stripUnits b.Type with
             | IRTScalar (ETFloat64 | ETFloat32 | ETInt64 | ETInt32 | ETBool | ETComplex64 | ETComplex128 | ETString) ->
                 genPrintScalar b.Name
@@ -2587,7 +2619,7 @@ let genPrintStatements (modul: IRModule) : string list =
             | IRTNamed _ -> []
             | IRTUnit -> []
             | _ -> []
-        else []
+        else [])
     )
 
 /// Assemble the main() function wrapper around binding code and print statements.

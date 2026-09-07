@@ -51,11 +51,20 @@ type TileInputPlan = {
     /// the trailing grid dims -- tile t's chunks are [t*G, (t+1)*G).
     ChunkCount: int
     TrailingGrid: int64
-    /// The need-masked read emitted at the binding, and the remainder read
-    /// (every chunk the compute phase did not need) emitted after the tiled
-    /// binding. Both unindented.
+    /// Whether anything OTHER than the tiled binding observes this input: a
+    /// later consumer, a function body, or the print pass (which prints every
+    /// top-level binding unless `--print` selects; docs/plans/structural/04,
+    /// 3.5). False means the remainder read has no reader, so the chunks the
+    /// compute phase did not need are never fetched at all -- the total-bytes
+    /// saving the plan says appears exactly when the input is not printed.
+    Observed: bool
+    /// The need-masked read emitted at the binding, the remainder read (every
+    /// chunk the compute phase did not need) emitted after the tiled binding,
+    /// and the buffer release alone -- what an UNOBSERVED input emits in
+    /// place of the remainder, so nothing leaks. All unindented.
     Phase1: string list
     Phase2: string list
+    Release: string list
 }
 and TilePlan = {
     /// The tiled binding's C++ name (genApplyCombinator's `name`).
@@ -744,6 +753,35 @@ let ompSuppressedBlockMarker (requested: bool) (reason: string) : string =
 /// this assembly, so the assemblers include `blade_tilecache.hpp` (and
 /// Build.fs keys `-DBLADE_TOOLCHAIN_ID` off the include line). Same shape
 /// as linalgUsedCell.
+/// `blade run --print <names>` / `BLADE_PRINT`: WHICH top-level bindings the
+/// emitted program prints. `None` (unset, or empty) is the default and prints
+/// every printable binding, which is what every corpus pin reads.
+///
+/// The CLI prints every top-level binding, so a program's own output can
+/// dominate its cost -- a 4000 x 4000 map prints 231 MB before it does
+/// anything else, which is why revision reuse's saved chunk reads were
+/// invisible end to end (docs/plans/structural/04, 3.5 and the scale run).
+/// Selecting the bindings is the honest fix: it changes WHAT THE PROGRAM
+/// PRINTS, visibly and by request, rather than making printing lazy behind
+/// the user's back.
+///
+/// Read per call like every other env gate (a harness pins it mid-process),
+/// and read by BOTH lanes -- codegen's print pass and the interpreter's --
+/// so a differential run compares like with like. Names are separated by
+/// commas, spaces or semicolons. A name that is not a top-level binding at
+/// all is a loud refusal (genPrintStatements); a name that IS one but never
+/// prints (a deferred loop value, a streamed read) prints nothing, exactly
+/// as it does without the flag.
+let printSelection () : Set<string> option =
+    match System.Environment.GetEnvironmentVariable "BLADE_PRINT" with
+    | null -> None
+    | v ->
+        let names =
+            v.Split([| ','; ' '; ';' |], System.StringSplitOptions.RemoveEmptyEntries)
+            |> Array.map (fun s -> s.Trim())
+            |> Array.filter (fun s -> s <> "")
+        if names.Length = 0 then None else Some (Set.ofArray names)
+
 let internal tilesUsedStorage =
     System.Threading.AsyncLocal<bool ref>()
 
@@ -811,8 +849,16 @@ let tileLoopLines (ind: string) (plan: TilePlan) (loopCode: string list) : strin
         $"{ind}}}" ]
     @ (if plan.Hoisted then
            plan.Inputs |> List.collect (fun i ->
-               [ $"{ind}// the remainder of {i.CppName}: every chunk the compute phase did not need (the print pass reads it whole)" ]
-               @ (i.Phase2 |> List.map (fun s -> ind + s)))
+               if i.Observed then
+                   [ $"{ind}// the remainder of {i.CppName}: every chunk the compute phase did not need, for the consumers that read it whole (the print pass, a later binding)" ]
+                   @ (i.Phase2 |> List.map (fun s -> ind + s))
+               else
+                   // Nothing reads this input but the tiled nest, so the
+                   // chunks its hit tiles would have needed are never
+                   // fetched: the buffers are released and the remainder
+                   // read is not emitted at all.
+                   [ $"{ind}// {i.CppName} has no reader but the tiled nest above, so its unneeded chunks are never read" ]
+                   @ (i.Release |> List.map (fun s -> ind + s)))
        else [])
     @ [ $"{ind}if (blade_tiles::verbose()) {{"
         $"{ind}    std::fprintf(stderr, \"[tiles] {f}: computed %%zu/{plan.Tiles}, hit %%zu/{plan.Tiles}\\n\", {f}__computed, {f}__loaded);" ]

@@ -3799,6 +3799,32 @@ let total = reduce(F, (+), axes = 2)
                         check "tiles: s2's total reflects the changed chunk (values, not a stale hit)"
                             (match printedScalar "total" cold2 with Some v -> abs (v - (2.0 * 210.0 + 20.0 + 2.0 * 400.0)) <= 1e-9 | None -> false) cold2
                     | Ok _, Error e | Error e, _ -> check "tiles: E@s2 runs" false e
+
+                // WHERE READ AVOIDANCE BECOMES REAL. The remainder read exists
+                // for the consumers that read the input whole -- and the CLI
+                // prints every top-level binding, so `A` always had one. With
+                // `--print total` selecting the array away, nothing observes
+                // `A` but the tiled nest, and the chunks its HIT tiles would
+                // have needed are never fetched at all (structural/04, 3.5;
+                // the scale run's second pass). The emission says so too: no
+                // remainder read is generated.
+                let priorPrint = Environment.GetEnvironmentVariable "BLADE_PRINT"
+                Environment.SetEnvironmentVariable("BLADE_PRINT", "total")
+                try
+                    match buildTiled "ic_tiles_unobs" srcS1 with
+                    | Error e -> baselineFailed "tiles unobserved input" e
+                    | Ok (exeU, cppU) ->
+                        check "tiles: with the input selected away, the emission carries no remainder read"
+                            (cppU.Contains "has no reader but the tiled nest above" && not (cppU.Contains "for the consumers that read it whole")) ""
+                        match runTiled exeU with
+                        | Ok warmU ->
+                            check "tiles: an unobserved input never fetches the chunks its hit tiles would have needed"
+                                (census warmU "[tiles] F: computed 0/2, hit 2/2" && census warmU "[chunks] A: read 0/4 (compute 0, remainder 0)") warmU
+                            check "tiles: the selection prints only `total`, and its value is unchanged"
+                                (match printedScalar "total" warmU with Some v -> abs (v - (2.0 * 210.0 + 20.0)) <= 1e-9 | None -> false) warmU
+                        | Error e -> check "tiles: unobserved-input run" false e
+                finally
+                    Environment.SetEnvironmentVariable("BLADE_PRINT", priorPrint)
         finally
             Environment.SetEnvironmentVariable("BLADE_TILE_CACHE", priorStore)
             Environment.SetEnvironmentVariable("BLADE_TILE_CACHE_VERBOSE", priorVerbose)

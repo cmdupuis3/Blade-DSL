@@ -749,19 +749,28 @@ let tileCacheDir () : string option =
         | t when Path.IsPathRooted t -> Some t
         | _ -> None
 
-/// The exe cache's count cap, applied to tile files (one per tile per
-/// snapshot, small); oldest-mtime first down to 3/4 of the cap.
+/// The exe cache's caps, applied to tile files: oldest-mtime first, down to
+/// 3/4 of whichever cap tripped. BOTH caps matter and for the exe cache's
+/// reason -- a tile holds one chunk's worth of OUTPUT CELLS, so a coarse
+/// grid makes them large (8 tiles of a 4000 x 4000 float64 field are 128 MB,
+/// measured) and a count cap alone would let the store reach hundreds of
+/// gigabytes before it evicted anything.
 let private evictTileCache (dir: string) : unit =
     try
         if Directory.Exists dir then
             let entries = DirectoryInfo(dir).GetFiles("*.tile", SearchOption.AllDirectories)
-            if entries.Length > exeCacheMaxEntries then
+            let total = entries |> Array.sumBy _.Length
+            if entries.Length > exeCacheMaxEntries || total > exeCacheMaxBytes then
                 let targetCount = (exeCacheMaxEntries * 3) / 4
+                let targetBytes = (exeCacheMaxBytes / 4L) * 3L
                 let mutable count = entries.Length
+                let mutable bytes = total
                 for f in entries |> Array.sortBy _.LastWriteTimeUtc do
-                    if count > targetCount then
+                    if count > targetCount || bytes > targetBytes then
+                        let len = f.Length
                         (try f.Delete() with _ -> ())
                         count <- count - 1
+                        bytes <- bytes - len
     with _ -> ()
 
 /// The toolchain identity a tile-enabled program carries

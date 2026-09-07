@@ -2712,8 +2712,11 @@ module CppIcechunk =
     /// nested array and keeps the flat and chunk buffers; phase 2 -- emitted
     /// after the tiled consumer -- assembles what `<doneName>[]` has not
     /// recorded, re-copies the flat buffer into the nested array and releases
-    /// both. Counters `<v>__read1` / `<v>__read2` feed the verbose census.
-    let genReadVarPhased (path: string) (varName: string) (cppVarName: string) (arrType: IRArrayType) (needName: string) (doneName: string) : string list * string list =
+    /// both. The third list is the RELEASE alone, for an input nothing reads
+    /// but the tiled nest: then the remainder is never fetched and the
+    /// partially assembled array is simply freed. Counters `<v>__read1` /
+    /// `<v>__read2` feed the verbose census.
+    let genReadVarPhased (path: string) (varName: string) (cppVarName: string) (arrType: IRArrayType) (needName: string) (doneName: string) : string list * string list * string list =
         let ra = resolveOrFail "read" path varName
         if ra.Meta.Blade.IsSome then
             failwith $"icechunk codegen: variable '{varName}' is blade-packed; the dense reader cannot materialize it (this indicates a typing inconsistency)"
@@ -2729,7 +2732,8 @@ module CppIcechunk =
         let phase2 =
             ZarrProvider.CppZarr.genAssembleFlatPhased fetch ra.Meta v elemCpp (Some (needName, doneName, $"{v}__read2")) 2
             @ materializeFlat ra v elemCpp false true
-        phase1, phase2
+        let release = [ $"delete[] {v}_cbuf;"; $"delete[] {v}_flat;" ]
+        phase1, phase2, release
 
     /// Packed (SymIdx/AntisymIdx) and orbit (OrbIdx) reader. The store's pool
     /// IS the in-memory representation, so assembly is the ordinary flat chunk

@@ -58,6 +58,33 @@ let private dispatchInner (args: string[]) : int =
     if noCacheVerb && Array.contains "--no-cache" args then
         System.Environment.SetEnvironmentVariable("BLADE_EXE_CACHE", "0")
     let args = if noCacheVerb then args |> Array.filter (fun a -> a <> "--no-cache") else args
+    // `--print <names>` is a MODE like the two above: it selects WHICH
+    // top-level bindings the compiled program prints (every one, by default).
+    // The CLI has printed all of them since there was a CLI, which makes a
+    // program's own output dominate its cost on a large array -- see
+    // docs/plans/structural/04's scale run. It changes the EMISSION, so it
+    // travels as a process-level env pin that codegen reads at its own site
+    // (and the interpreter mirrors, so both lanes print one set); the
+    // executable cache keys on the emitted text, so a selection can never
+    // serve a binary that printed something else. Stripped as a PAIR from
+    // argv so every verb pattern accepts it in any position.
+    let printFlagErr =
+        match args |> Array.tryFindIndex (fun a -> a = "--print") with
+        | None -> None
+        | Some i ->
+            if i + 1 >= args.Length || args.[i + 1].StartsWith "--" then
+                Some "--print requires a comma-separated list of top-level binding names (e.g. run prog.blade --print total)"
+            else
+                System.Environment.SetEnvironmentVariable("BLADE_PRINT", args.[i + 1])
+                None
+    let args =
+        match args |> Array.tryFindIndex (fun a -> a = "--print") with
+        | Some i when i + 1 < args.Length && not (args.[i + 1].StartsWith "--") ->
+            Array.append args.[.. i - 1] args.[i + 2 ..]
+        | _ -> args
+    match printFlagErr with
+    | Some msg -> eprintfn "Error: %s" msg; 1
+    | None ->
     match args with
     // User-facing commands.
     // `run <file> [--verbose] [--mpi N] [--memcheck]` -- flags in any order

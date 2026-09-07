@@ -225,18 +225,41 @@ let planTiles (modul: IRModule) : Map<string, TilePlan> * Map<IRId, TilePlan> =
                                 && (modul.Bindings |> List.forall (fun ob ->
                                         ob.Id <= rb.Id || ob.Id >= b.Id
                                         || not (Set.contains id (Map.find ob.Id bindingRefs)))))
+                        // Read avoidance is only REAL for an input nothing
+                        // else observes: the print pass reads every top-level
+                        // binding unless `--print` selects (structural/04,
+                        // 3.5), and a later binding or a function body may
+                        // read it too. An observed input still has its
+                        // remainder fetched after the tiled nest; an
+                        // unobserved one never fetches the chunks its hit
+                        // tiles would have needed.
+                        let printed (nm: string) =
+                            match printSelection () with
+                            | None -> true
+                            | Some names -> Set.contains nm names
                         let inputPlans =
                             resolved |> List.map (fun (id, rb, spec, ra) ->
                                 let cpp = cppNameOf rb
                                 let need = $"{cpp}__need"
                                 let don = $"{cpp}__done"
-                                let (p1, p2) =
+                                let (p1, p2, rel) =
                                     Blade.IcechunkProvider.CppIcechunk.genReadVarPhased spec.FilePath spec.VarName cpp spec.VarType need don
+                                let otherReaders =
+                                    Set.contains id functionRefs
+                                    || (modul.Bindings |> List.exists (fun ob ->
+                                            ob.Id <> b.Id && ob.Id <> rb.Id
+                                            && Set.contains id (Map.find ob.Id bindingRefs)))
                                 { ReadId = id; CppName = cpp; Spec = spec
                                   ChunkCount = ra.Table.Length; TrailingGrid = trailingGrid
-                                  Phase1 = p1; Phase2 = p2 })
+                                  Observed = otherReaders || printed rb.Name
+                                  Phase1 = p1; Phase2 = p2; Release = rel })
                         for (id, _, _, _) in resolved do claimed.Add id |> ignore
-                        if verbose then eprintfn "[tiles] plan %s: %d tile(s) over %d input(s), probe %s" b.Name nt inputPlans.Length (if hoisted then "hoisted to the read" else "at the binding")
+                        if verbose then
+                            let unread = inputPlans |> List.filter (fun i -> not i.Observed) |> List.map (fun i -> i.CppName)
+                            let note =
+                                if unread.IsEmpty then ""
+                                else sprintf "; no reader but the nest for %s (unneeded chunks never fetched)" (String.concat ", " unread)
+                            eprintfn "[tiles] plan %s: %d tile(s) over %d input(s), probe %s%s" b.Name nt inputPlans.Length (if hoisted then "hoisted to the read" else "at the binding") note
                         plans.Add
                             { Output = outName; BindingId = b.Id; Inputs = inputPlans
                               Tiles = nt; LeadBounds = leadBounds; Trailing = trailing

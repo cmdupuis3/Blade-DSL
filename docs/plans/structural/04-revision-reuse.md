@@ -26,21 +26,48 @@ grammar otherwise), census under `BLADE_TILE_CACHE_VERBOSE`. Pins:
 `tests/IcechunkTests.fs` section 22 (one-changed-chunk fixture: 5 chunk
 files; E@s1 cold 2/2 computed, warm 2/2 hit; E@s2 recomputes 1 of 2 tiles and
 its compute phase reads 2 of 4 chunks; cold = warm = interpreter stdout; the
-untiled emission carries no tile code). **Scale run (4.3 item 4), 2026-09-07,
-4000x4000 float64 chunked 500x500 (64 chunks, 8 leading-axis tiles), one
-changed chunk, exe cache off so every run compiles:** the mechanism does what
-the census promises -- E@s2 after E@s1 computes 1/8 tiles, hits 7/8, and its
-compute phase reads 8/64 chunks (remainder 56 for the print pass) -- but the
-end-to-end wall clock is flat at ~31 s in every configuration (off 29.8 / 35.4,
-cold 31.7, warm 31.7, one-changed 31.0), because the CLI lane prints every
-top-level binding: 231 MB of formatted stdout (`A` and `F` in full) dwarfs the
-128 MB read and the 16M-cell map it saves. The 2x gate is therefore NOT met
-in the CLI lane, exactly as risk 2 predicted, and not because compile
-dominates: the mechanism is kept as an opt-in (unset = off, no emission
-change) and the `--print <names>` flag of section 3.5 is the gating
-follow-up before any claim of end-to-end speed. NOT done: per-level tile
-bounds (the 1-of-4 geometry), the halo consumer, captured scalars in the key
-(declined), `--print`. Originally: DESIGN (2026-09-06). Elaborates item 4 of
+untiled emission carries no tile code).
+
+**Scale run (4.3 item 4), 2026-09-07** -- 4000x4000 float64 chunked 500x500
+(64 chunks, 8 leading-axis tiles), one changed chunk, exe cache off. Run in
+two passes, because the first pass measured the wrong thing:
+
+*Pass 1, printing everything.* Flat at ~31 s in every configuration (off 29.8
+/ 35.4, cold 31.7, warm 31.7, one-changed 31.0) -- the CLI lane prints every
+top-level binding, and 231 MB of formatted stdout (`A` and `F` in full) dwarfs
+the 128 MB read and the 16M-cell map. Risk 2, measured: the gate could not be
+read at all through the printing.
+
+*Pass 2, after `--print` landed* (section 3.5's follow-up, now built:
+`blade run --print total`). The 31 s becomes 2.9 s, of which 2.6 s is the
+COMPILE -- a new snapshot always recompiles (1.3), so end-to-end is compile-
+bound at this size and the honest comparison is the executable's own time,
+medians of 9 interleaved samples:
+
+| program (16M cells) | warm, tiled | untiled | ratio |
+|---|---|---|---|
+| `x * 2.0 + 1.0` | 211 ms | 259 ms | 1.23x |
+| `exp(sin x) + log(1 + x^2) + sqrt(x + 3)` | 211 ms | 522 ms | **2.47x** |
+
+and on the second snapshot (one chunk of 64 changed) the census is exactly the
+design's: `computed 1/8, hit 7/8`, `read 8/64 (compute 8, remainder 0)`.
+
+**The 2x gate is met -- on a task whose kernel is worth caching**, and the
+cheap map says why the qualifier is not a hedge: a tile holds the OUTPUT of
+one input chunk, so for an elementwise map the cache is the same size as the
+input it replaces and a warm run trades input bytes for tile bytes, keeping
+only the compute. The saving is therefore the RECOMPUTE, and it shows exactly
+when recompute costs more than re-reading it. A second finding from pass 2:
+read avoidance was not real until `--print` existed -- the remainder read
+(phase 2) fetched every chunk the compute phase skipped, because the print
+pass observes `A`. Codegen now emits phase 2 only for an input something
+actually observes (a later binding, a function body, or the print selection);
+an unobserved input releases its buffers and never fetches those chunks, which
+is what turns `read 64/64 (compute 0, remainder 64)` into `read 0/64`.
+
+NOT done: per-level tile bounds (the 1-of-4 geometry), the halo consumer,
+captured scalars in the key (declined). Originally: DESIGN (2026-09-06).
+Elaborates item 4 of
 [plan-structural-performance-opportunities.md](../plan-structural-performance-opportunities.md)
 ("Make versioned scientific computation reuse unchanged work"). Baseline:
 working tree at `bd019dc`; every `file:line` below was read at that state, and

@@ -85,7 +85,8 @@ The binary is `bin/Release/net10.0/Blade.exe` (below, `blade` = that exe or
 blade check prog.blade        # typecheck only
 blade emit prog.blade         # emit C++ without compiling
 blade compile prog.blade      # produce an executable
-blade run prog.blade          # compile and run (--verbose, --mpi N, --memcheck, --run-record out.json)
+blade run prog.blade          # compile and run (--verbose, --mpi N, --memcheck, --run-record out.json,
+                              #                  --print a,b -- print only these top-level bindings)
 blade plan prog.blade         # optimization decisions + the input manifest (--json)
 blade test                    # full default suite
 ```
@@ -147,6 +148,7 @@ final-newline fixing — these are byte-pinned assets; never auto-reformat them.
 | `BLADE_AD_HALO_GATHER` | reverse-mode rule for a `halo` stencil map: unset/`1` keeps the map and emits the GATHER adjoint (default); `0`/`off` lowers it into the construction loop and scatters. Same function either way; `blade test access` compares the two byte-for-byte |
 | `BLADE_MARCH` / `BLADE_FP_CONTRACT` | g++ `-march=` (default `native`) / `-ffp-contract=` (default `fast`) |
 | `BLADE_STDLIB` | extra stdlib search root |
+| `BLADE_PRINT` | which top-level bindings the program prints (comma/space separated); unset = all of them, the default every corpus pin reads. Set by `--print a,b` on any verb. Read by BOTH lanes (codegen's print pass and the interpreter's), so a differential run compares like with like; a name that is no binding refuses BL7004. It changes the EMISSION, so the exe cache keys on it for free |
 | `BLADE_TILE_CACHE` | revision reuse (structural/04): unset = OFF; `1`/`on` = `%LOCALAPPDATA%\Blade\tile-cache`, an absolute path = that store. Read by the COMPILER (plans tiled bindings) and by the COMPILED PROGRAM (probe/load/store); `BLADE_TILE_CACHE_VERBOSE=1` prints the planner's admissions and the run's `[tiles]`/`[chunks]` census |
 | `BLADE_RUN_RECORD` | read by the COMPILED PROGRAM at exit: path of the JSON run record (input manifest + observed size/mtime per input, executable/compiler identity, FP policy and library routes from the `-DBLADE_RR_*` build defines, RNG generator, ok / BLxxxx status). `blade run --run-record path` sets it |
 | `NETCDF_DIR` | NetCDF provider include/link root |

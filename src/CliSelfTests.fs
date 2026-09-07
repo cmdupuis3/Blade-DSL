@@ -87,6 +87,90 @@ let runCliSmokeTests () : TH.BlockResult =
                     record "no intermediates left behind" TH.Fail (String.concat ", " leftovers)
         finally
             try Directory.Delete(tmpDir, true) with _ -> ()
+
+    // --- `--print <names>`: which top-level bindings the program prints ---
+    //
+    // The CLI has always printed EVERY top-level binding, which is what makes
+    // a program's own output dominate its cost on a large array (the scale run
+    // of docs/plans/structural/04: 231 MB of stdout hid every saved chunk
+    // read). The selection is a MODE, pinned process-wide (BLADE_PRINT), read
+    // by codegen's print pass AND the interpreter's, so the two lanes print
+    // one set and a differential run still compares like with like.
+    //
+    // Emission-only cases need no toolchain; the run cases skip without g++.
+    let printSrc =
+        "let x = 1 + 2 * 3\n\
+         let y = x * 2\n\
+         let z = [1.0, 2.0, 3.0]\n"
+    let withPrint (v: string option) (f: unit -> unit) =
+        let prior = System.Environment.GetEnvironmentVariable "BLADE_PRINT"
+        System.Environment.SetEnvironmentVariable("BLADE_PRINT", (match v with Some s -> s | None -> null))
+        try f () finally System.Environment.SetEnvironmentVariable("BLADE_PRINT", prior)
+    let cppOf (label: string) (src: string) : Result<string, string> =
+        match Blade.Lowering.lower src with
+        | Error e -> Error e
+        | Ok ir -> Ok (fst (Blade.CodeGen.genSelfContainedProgramFromIR ir label))
+    let recordCase name cond detail = record name (if cond then TH.Pass else TH.Fail) detail
+    (match cppOf "print_all" printSrc with
+     | Error e -> record "print: default emission" TH.Fail e
+     | Ok all ->
+         recordCase "print: unset prints every binding"
+             (all.Contains "\"x = \"" && all.Contains "\"y = \"" && all.Contains "\"z = [\"") ""
+         withPrint (Some "y") (fun () ->
+             match cppOf "print_y" printSrc with
+             | Error e -> record "print: --print y emission" TH.Fail e
+             | Ok sel ->
+                 recordCase "print: a selection emits the named binding's print and no other"
+                     (sel.Contains "\"y = \"" && not (sel.Contains "\"x = \"") && not (sel.Contains "\"z = [\"")) ""
+                 // Everything ELSE about the program is untouched: a selection
+                 // changes what is printed, never what is computed.
+                 recordCase "print: a selection changes only the print block"
+                     (sel.Contains "int64_t x = " && sel.Contains "int64_t y = ") "")
+         withPrint (Some "y, z") (fun () ->
+             match cppOf "print_yz" printSrc with
+             | Error e -> record "print: multi-name selection" TH.Fail e
+             | Ok sel ->
+                 recordCase "print: names separate on commas and spaces"
+                     (sel.Contains "\"y = \"" && sel.Contains "\"z = [\"" && not (sel.Contains "\"x = \"")) "")
+         withPrint (Some "totl") (fun () ->
+             // A typo must be LOUD: a silently empty print block looks exactly
+             // like a program that computed nothing.
+             match cppOf "print_typo" printSrc with
+             | Error e -> record "print: an unknown name refuses" TH.Fail e
+             | Ok sel ->
+                 recordCase "print: an unknown name splices a refusal naming it and the real bindings"
+                     (sel.Contains "#error" && sel.Contains "totl" && sel.Contains "x, y, z") ""))
+    // The two lanes agree under one pin: the interpreter prints the same set.
+    withPrint (Some "y") (fun () ->
+        match Blade.Lowering.lower printSrc with
+        | Error e -> record "print: interpreter honours the pin" TH.Fail e
+        | Ok ir ->
+            let r = Blade.Interp.Run.runProgram ir "print_interp" Blade.Interp.Value.defaultLimits
+            let out = r.Stdout.Replace("\r\n", "\n")
+            recordCase "print: the interpreter prints the same selection as codegen"
+                (out.Contains "y = 14" && not (out.Contains "x = 7")) out)
+    // End to end through the user-facing compile+run path.
+    if not capabilities.Value.HasGpp then
+        record "print: compiled run honours the selection" TH.Skip "requires g++, not found"
+    else
+        let pDir = Path.Combine(Path.GetTempPath(), "blade_print_sel_" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(pDir) |> ignore
+        try
+            let srcFile = Path.Combine(pDir, "psel.blade")
+            File.WriteAllText(srcFile, printSrc)
+            withPrint (Some "y") (fun () ->
+                match compileToExe srcFile None false false with
+                | Error e -> record "print: compiled run honours the selection" TH.Fail e
+                | Ok exe ->
+                    match runExecutable exe with
+                    | Ok (0, out) ->
+                        recordCase "print: compiled run honours the selection"
+                            (out.Contains "y = 14" && not (out.Contains "x = 7") && not (out.Contains "z = ")) out
+                    | Ok (code, out) -> record "print: compiled run honours the selection" TH.Fail $"exit {code}: {out}"
+                    | Error e -> record "print: compiled run honours the selection" TH.Fail e)
+        finally
+            try Directory.Delete(pDir, true) with _ -> ()
+
     let count o = results |> Seq.filter (fun (_, r) -> r = o) |> Seq.length
     let passed, failed, skipped = count TH.Pass, count TH.Fail, count TH.Skip
     let failedNames = results |> Seq.filter (fun (_, r) -> r = TH.Fail) |> Seq.map fst |> List.ofSeq

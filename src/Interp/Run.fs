@@ -588,6 +588,14 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
     // the print block), which is what keeps the two lanes byte-identical.
     for frame in Blade.Display.Frame.drain () do
         sb.Append(frame).Append('\n') |> ignore
+    // `--print` (BLADE_PRINT) selects the same bindings in BOTH lanes, so a
+    // differential run compares like with like. An explicit argument -- the
+    // REPL's snippet echo, which shows one binding and hides the session --
+    // is a per-call decision and wins over the ambient pin.
+    let printOnly =
+        match printOnly with
+        | Some _ -> printOnly
+        | None -> Blade.CodeGenState.printSelection ()
     Print.printBindingsOnly testName lookup state.ForcedDeferred merged printOnly sb
 
     // The memo this run hands to its successor: every top-level binding that
