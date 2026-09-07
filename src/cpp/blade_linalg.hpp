@@ -40,6 +40,7 @@
 //
 //   L1  blade_dot_{s,d,c,z}            -- complex is dotu, NEVER dotc
 //   L2  blade_gemv_{s,d,c,z}           -- CblasNoTrans at every precision
+//   L2  blade_gemv_t_{s,d,c,z}         -- real Trans, COMPLEX **ConjTrans** (gram_apply's first half, t = B^H x)
 //   L2  blade_symv_{s,d}               -- packed; layout proven, surface pending
 //   L3  blade_gram_same_{s,d,c,z}      -- real syrk, COMPLEX **herk**
 //   L3  blade_gram_distinct_{s,d,c,z}  -- real Trans, COMPLEX **ConjTrans**
@@ -171,6 +172,50 @@ namespace blade_linalg {
         const std::complex<double> alpha(1.0, 0.0), beta(0.0, 0.0);
         cblas_zgemv(CblasRowMajor, CblasNoTrans,
                     (blasint)m, (blasint)n, &alpha, A.p, (blasint)n, x, 1, &beta, y, 1);
+    }
+
+    // L2 -- gemv, TRANSPOSED.  t(n) = A(m x n)^H * x(m), A as a Blade ROW SKELETON
+    //
+    // The first half of `gram_apply(A, B, x)` (t = B^H x). Real is CblasTrans, COMPLEX is CblasConjTrans -- the
+    // conjugation Blade's scalar loop applies (`conj_scalar(B[j][k]) * x[j]`), the same flag logic as the distinct
+    // gram's gemm. Same staging contract as gemv above; `x` has m cells and `t` has n.
+
+    inline void blade_gemv_t_s(size_t m, size_t n,
+                               float** Arows, size_t Acells,
+                               const float* BLADE_RESTRICT x,
+                               float* BLADE_RESTRICT t) {
+        in_view<float> A(Arows, m, n, Acells);
+        cblas_sgemv(CblasRowMajor, CblasTrans,
+                    (blasint)m, (blasint)n, 1.0f, A.p, (blasint)n, x, 1, 0.0f, t, 1);
+    }
+
+    inline void blade_gemv_t_d(size_t m, size_t n,
+                               double** Arows, size_t Acells,
+                               const double* BLADE_RESTRICT x,
+                               double* BLADE_RESTRICT t) {
+        in_view<double> A(Arows, m, n, Acells);
+        cblas_dgemv(CblasRowMajor, CblasTrans,
+                    (blasint)m, (blasint)n, 1.0, A.p, (blasint)n, x, 1, 0.0, t, 1);
+    }
+
+    inline void blade_gemv_t_c(size_t m, size_t n,
+                               std::complex<float>** Arows, size_t Acells,
+                               const std::complex<float>* x,
+                               std::complex<float>* t) {
+        in_view<std::complex<float>> A(Arows, m, n, Acells);
+        const std::complex<float> alpha(1.0f, 0.0f), beta(0.0f, 0.0f);
+        cblas_cgemv(CblasRowMajor, CblasConjTrans,
+                    (blasint)m, (blasint)n, &alpha, A.p, (blasint)n, x, 1, &beta, t, 1);
+    }
+
+    inline void blade_gemv_t_z(size_t m, size_t n,
+                               std::complex<double>** Arows, size_t Acells,
+                               const std::complex<double>* x,
+                               std::complex<double>* t) {
+        in_view<std::complex<double>> A(Arows, m, n, Acells);
+        const std::complex<double> alpha(1.0, 0.0), beta(0.0, 0.0);
+        cblas_zgemv(CblasRowMajor, CblasConjTrans,
+                    (blasint)m, (blasint)n, &alpha, A.p, (blasint)n, x, 1, &beta, t, 1);
     }
 
     // L2 -- symv.  y(n) = A(n x n) * x(n) for SYMMETRIC A in PACKED storage

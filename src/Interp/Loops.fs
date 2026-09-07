@@ -2212,6 +2212,13 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let l = forceInputArray st env lExpr
         let r = forceInputArray st env rExpr
         VArray (A.gramArray l r (typeOf expr))
+    | IRGramApply (lExpr, rExpr, xExpr) ->
+        // gram_apply = the action A (B^H x). Same FORCE-then-materialize
+        // shape as gram; two ascending folds, twin of materializeGramApplyForm.
+        let l = forceInputArray st env lExpr
+        let r = forceInputArray st env rExpr
+        let x = forceInputArray st env xExpr
+        VArray (A.gramApplyArray l r x (typeOf expr))
     | IRMatmul (lExpr, rExpr) ->
         // matmul = the dense A.B product. Same FORCE-then-materialize
         // shape as gram; the naive i/j/t-ascending fold mirrors the shim's

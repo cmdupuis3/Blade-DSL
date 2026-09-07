@@ -237,6 +237,7 @@ let private unitGuessOfBody (ctx: Ctx) (fd: FunctionDecl) (stmts: NStmt list) : 
         | ExprKind.ExprStack es | ExprKind.ExprSequence es | ExprKind.ExprJoin (es, _) ->
             es |> List.fold (fun acc x -> add acc (g x)) (Known None)
         | ExprKind.ExprGram (a, b) -> mul (g a) (g b)
+        | ExprKind.ExprGramApply (a, b, x) -> mul (mul (g a) (g b)) (g x)
         | ExprKind.ExprBlock (stmts, Some fe) ->
             let env' = stmtsEnv env stmts
             go env' fe
@@ -384,7 +385,7 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
                 (match value with
                  | { Kind = ExprKind.ExprArrayLit _ } | ConstFill _ -> None
                  | { Kind = ExprKind.ExprVar _ | ExprKind.ExprTranspose _ | ExprKind.ExprStack _
-                          | ExprKind.ExprJoin _ | ExprKind.ExprGram _ | ExprKind.ExprGuard _
+                          | ExprKind.ExprJoin _ | ExprKind.ExprGram _ | ExprKind.ExprGramApply _ | ExprKind.ExprGuard _
                           | ExprKind.ExprPure _ | ExprKind.ExprCompute _
                           | ExprKind.ExprSort _ | ExprKind.ExprSequence _
                           | ExprKind.ExprReplicate _ } when Map.containsKey n dimsEnv -> None
@@ -411,7 +412,7 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
                  match value with
                  | { Kind = ExprKind.ExprVar _ } -> Some (n, dimsMsg "an array alias")
                  | { Kind = ExprKind.ExprTranspose _ | ExprKind.ExprStack _
-                          | ExprKind.ExprJoin _ | ExprKind.ExprGram _ | ExprKind.ExprGuard _
+                          | ExprKind.ExprJoin _ | ExprKind.ExprGram _ | ExprKind.ExprGramApply _ | ExprKind.ExprGuard _
                           | ExprKind.ExprPure _ | ExprKind.ExprCompute _
                           | ExprKind.ExprSort _ | ExprKind.ExprSequence _
                           | ExprKind.ExprReplicate _ } -> Some (n, dimsMsg "a reindexing combinator")

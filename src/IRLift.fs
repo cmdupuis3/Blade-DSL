@@ -22,7 +22,7 @@ let isInlineForm (e: IRExpr) : bool =
     match e with
     | IRMask _ | IRSort _ | IRIntersect _ | IRUnion _ | IRUnique _
     | IRGroupBy _ | IRGroupKeys _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRSegmentsGrid _ | IRUngroup _ | IRUngroupRows _ | IRUngroupGrid _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _
-    | IRReduceCompute _ | IRMatmul _ | IREigh _ | IRSolve _ -> true
+    | IRReduceCompute _ | IRMatmul _ | IRGramApply _ | IREigh _ | IRSolve _ -> true
     | IRCompute (IRApplyCombinator _) -> true
     | _ -> false
 
@@ -57,7 +57,7 @@ let isStatementShaped (e: IRExpr) : bool =
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _ -> true
     // Shape-changing / contraction forms.
     | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _
-    | IRGram _ | IRMatmul _ | IREigh _ | IRSolve _ -> true
+    | IRGram _ | IRGramApply _ | IRMatmul _ | IREigh _ | IRSolve _ -> true
     // Whole-array eager unary forms.
     | IRArrayNegate _ | IRArrayConjugate _ -> true
     // Grouping: the `group_keys` CSR tables and the two accessors that read
@@ -206,6 +206,9 @@ let internal isNestedLoopComputeArg (e: IRExpr) : bool =
     // declared. IRGram allocates one fresh pool with its own extents table, so
     // it hoists exactly like IRMatmul beside it.
     | IRGram _ -> true
+    // `gram_apply(A, B, x)` is array-typed (rank 1) and allocates its own
+    // pools, so it hoists like the two above.
+    | IRGramApply _ -> true
     // IREigh is deliberately ABSENT, and its absence is a decision rather than
     // an omission: an eigh node is TUPLE-typed, and a loop form's `Arrays` slot
     // holds arrays. There is no surface spelling that puts a tuple where the
@@ -668,6 +671,14 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
         let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
         let (bindsR, rFinal) = liftChildEvaluatedOnce builder r'
         wrapLets (bindsL @ bindsR) (IRGram (lFinal, rFinal, s))
+    | IRGramApply (l, r, x) ->
+        let l' = liftExpr builder l
+        let r' = liftExpr builder r
+        let x' = liftExpr builder x
+        let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
+        let (bindsR, rFinal) = liftChildEvaluatedOnce builder r'
+        let (bindsX, xFinal) = liftChildEvaluatedOnce builder x'
+        wrapLets (bindsL @ bindsR @ bindsX) (IRGramApply (lFinal, rFinal, xFinal))
     | IRMatmul (l, r) ->
         let l' = liftExpr builder l
         let r' = liftExpr builder r

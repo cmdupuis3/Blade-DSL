@@ -1,0 +1,41 @@
+// TEST: gram_apply grad + jvp: the adjoint action is itself a gram_apply
+// y = gram_apply(a, b, x) = a (b^T x). Hand values: t = b^T x = [12, 9],
+// y = [30, 72, 114], loss = 2 y(0) + y(2) = 174, ybar = [2, 0, 1].
+//   xbar = b (a^T ybar) = b [7, 10] = [7, 10, 17, 24]   -- gram_apply(b, a, ybar): no N x K object
+//   abar = ybar t^T                = [[24, 18], [0, 0], [12, 9]]
+//   bbar = x s^T, s = a^T ybar     = [[7, 10], [14, 20], [21, 30], [28, 40]]
+// (docs/plans/structural/05, 3.2). The differential gate: the forward tangent
+// along a seed equals the reverse gradient contracted with it, exactly.
+import ad as ad
+
+type I = Idx<3>
+type J = Idx<4>
+type K = Idx<2>
+
+function floss(a: Array<Float like I, K>, b: Array<Float like J, K>, x: Array<Float like J>) -> Float = {
+    let y = gram_apply(a, b, x)
+    y(0) * 2.0 + y(2)
+}
+
+let a0 = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+let b0 = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]]
+let x0 = [1.0, 2.0, 3.0, 4.0]
+let mut da = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+let mut db = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+let mut dx = [0.0, 0.0, 0.0, 0.0]
+let gv = ad.grad(floss)(a0, b0, x0, da, db, dx)
+// EXPECT: gv = 174
+// EXPECT: da = [[24, 18], [0, 0], [12, 9]]
+// EXPECT: db = [[7, 10], [14, 20], [21, 30], [28, 40]]
+// EXPECT: dx = [7, 10, 17, 24]
+
+let sa = [[0.5, -1.0], [0.25, 2.0], [0.0, -0.5]]
+let sb = [[1.0, 1.0], [0.0, -1.0], [2.0, 0.5], [-1.0, 3.0]]
+let sx = [1.0, -2.0, 0.5, 1.5]
+let (jp, jt) = ad.jvp(floss)(a0, b0, x0, sa, sb, sx)
+let dot1 = reduce(reduce(da * sa, (+)), (+))
+let dot2 = reduce(reduce(db * sb, (+)), (+))
+let dot3 = reduce(dx * sx, (+))
+let resid = jt - (dot1 + dot2 + dot3)
+// EXPECT: jp = 174
+// EXPECT: resid = 0

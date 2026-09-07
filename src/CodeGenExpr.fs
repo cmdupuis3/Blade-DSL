@@ -1474,6 +1474,8 @@ and materializeInlineForm (subst: SubstMap) (names: Map<IRId, string>) (varName:
         materializeNegateConjugateForm subst names varName elemTypeStr.Value form arrExpr
     | IRGram (lExpr, rExpr, sameArray) ->
         materializeGramForm subst names varName elemTypeStr.Value lExpr rExpr sameArray
+    | IRGramApply (lExpr, rExpr, xExpr) ->
+        materializeGramApplyForm subst names varName elemTypeStr.Value lExpr rExpr xExpr
     | IRMatmul (lExpr, rExpr) ->
         materializeMatmulForm subst names varName elemTypeStr.Value lExpr rExpr
     // `elemTypeStr` is deliberately NOT forwarded: eigh produces TWO pools whose
@@ -2793,6 +2795,106 @@ and materializeGramForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
                   [MatPool (varName, outElemStr, 2, "nullptr", None, ownedExtents)])
      | _ -> None)
 
+
+and materializeGramApplyForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (lExpr: IRExpr) (rExpr: IRExpr) (xExpr: IRExpr) : (string list * MaterializedAlloc list) option =
+    // gram_apply(A, B, x) = A * (B^H * x):  y[i] = sum_k A[i][k] * t[k], with
+    // t[k] = sum_j conj(B[j][k]) * x[j]. A : m x n, B : p x n, x : p. TWO
+    // rank-1 pools (t: n cells, y: m cells) and no m x p matrix -- the action
+    // of gram(A, B) declared as such (docs/plans/structural/05, 3.2). Both
+    // halves fold ASCENDING from the element zero, one accumulator per output
+    // cell, so the per-cell operation sequence is fixed and the interpreter
+    // twin (gramApplyArray) reproduces it bit for bit; no reassociation, no
+    // licence. The first half walks B's rows in order (unit-stride reads, the
+    // n accumulators live in the t pool); the second half's rows are
+    // independent and thread without a licence, exactly as gram's nest does.
+    // Dispatch (BLAS on) is two L2 calls resolved by LinAlgPatterns like
+    // every node route: the transposed gemv adapter for t, the plain one for
+    // y; no route emits the loops below. Block comments only: this list may
+    // be space-joined into a single-line IIFE at an expression position.
+    let lName = exprToCppCore subst names lExpr
+    let rName = exprToCppCore subst names rExpr
+    let xName = exprToCppCore subst names xExpr
+    let lTy = inferExprType lExpr
+    let rTy = inferExprType rExpr
+    let xTy = inferExprType xExpr
+    (match lTy, rTy, xTy with
+     | ArrayElem la, ArrayElem ra, ArrayElem xa ->
+        let isComplexElem (t: IRType) =
+            match stripUnits t with IRTScalar (ETComplex64 | ETComplex128) -> true | _ -> false
+        let outElem =
+            if isComplexElem la.ElemType then la.ElemType
+            elif isComplexElem ra.ElemType then ra.ElemType
+            elif isComplexElem xa.ElemType then xa.ElemType
+            else la.ElemType
+        let outElemStr = irTypeToCpp outElem
+        let mExtent = literalOrRuntimeExtentOfArray la lName 0
+        let nExtent = literalOrRuntimeExtentOfArray la lName 1
+        let pExtent = literalOrRuntimeExtentOfArray ra rName 0
+        let mDim = extentDimOfArray la lName 0
+        let nDim = extentDimOfArray la lName 1
+        let tName = $"{varName}__t"
+        let tExtentsName = $"{tName}_extents"
+        let extentsName = $"{varName}_extents"
+        // Runtime twins of the checker's static agreement (BL8011): B's
+        // trailing axis against A's, x's extent against B's leading axis.
+        // Emitted only when the two are not the same literal.
+        let guardIf (litA: int64 option) (litB: int64 option) (lhs: string) (rhs: string) (what: string) =
+            match litA, litB with
+            | Some a, Some b when a = b -> []
+            | _ ->
+                [ $$"""if ((int64_t)({{lhs}}) != (int64_t)({{rhs}})) {"""
+                  $"    std::cerr << \"Blade runtime: gram_apply(A, B, x): {what} (\" << {lhs} << \" vs \" << {rhs} << \")\" << std::endl;"
+                  "    blade_rt::panic(\"BL8011\", \"co-iteration extent mismatch\", nullptr, 0);"
+                  "}" ]
+        let guards =
+            guardIf (literalExtentOfArray la 1) (literalExtentOfArray ra 1) nExtent (literalOrRuntimeExtentOfArray ra rName 1) "A's and B's trailing axes must be equal"
+            @ guardIf (literalExtentOfArray ra 0) (literalExtentOfArray xa 0) pExtent (literalOrRuntimeExtentOfArray xa xName 0) "x must have B's leading extent"
+        let (tExtentDecl, tOwned) = emitExtentsTable "" tExtentsName 1 [nDim]
+        let (yExtentDecl, yOwned) = emitExtentsTable "" extentsName 1 [mDim]
+        let tAlloc = $"Array<{outElemStr}, 1> {tName} = {{ allocate<typename promote<{outElemStr}, 1>::type, nullptr>({tExtentsName}), {tExtentsName} }};"
+        let yAlloc = $"Array<{outElemStr}, 1> {varName} = {{ allocate<typename promote<{outElemStr}, 1>::type, nullptr>({extentsName}), {extentsName} }};"
+        let halves = Blade.LinAlgPatterns.classifyGramApply lExpr rExpr xExpr
+        let resolvedT = halves |> Option.bind (fun (t, _) -> Blade.LinAlgPatterns.resolveNodeRoute t)
+        let resolvedY = halves |> Option.bind (fun (_, y) -> Blade.LinAlgPatterns.resolveNodeRoute y)
+        let lCells = denseCellCountExpr lTy lName
+        let rCells = denseCellCountExpr rTy rName
+        for resolved in [ resolvedT; resolvedY ] do
+            match resolved with
+            | Some (Blade.LinAlgPatterns.CudaBlas, _) -> (cudaLinalgUsedCell ()).Value <- true
+            | Some (Blade.LinAlgPatterns.HostBlas, _) -> (linalgUsedCell ()).Value <- true
+            | None -> ()
+        let tLoop =
+            match resolvedT with
+            | Some (_, entry) ->
+                [ $"/* {(dispatchMarkerTag resolvedT)} dispatch: gram_apply(A, B, x), t = B^H x */ {entry}({pExtent}, {nExtent}, {rName}.data, {rCells}, {xName}.data, {tName}.data);" ]
+            | None ->
+                [ $$"""for (size_t __gk = 0; __gk < {{nExtent}}; __gk++) { {{tName}}[__gk] = {{outElemStr}}(); }"""
+                  $$"""for (size_t __gj = 0; __gj < {{pExtent}}; __gj++) {"""
+                  $"    const {(irTypeToCpp ra.ElemType)}* BLADE_RESTRICT __growj = &{rName}[__gj][0];"
+                  $"    const {(irTypeToCpp xa.ElemType)} __gx = {xName}[__gj];"
+                  $$"""    for (size_t __gk = 0; __gk < {{nExtent}}; __gk++) {"""
+                  $"        {tName}[__gk] += nested_array_utilities::conj_scalar(__growj[__gk]) * __gx;"
+                  "    }"
+                  "}" ]
+        let yLoop =
+            match resolvedY with
+            | Some (_, entry) ->
+                [ $"/* {(dispatchMarkerTag resolvedY)} dispatch: gram_apply(A, B, x), y = A t */ {entry}({mExtent}, {nExtent}, {lName}.data, {lCells}, {tName}.data, {varName}.data);" ]
+            | None ->
+                [ (if ompThreadEmissionEnabled () then "BLADE_OMP_PARALLEL_FOR"
+                   else ompThreadsSuppressedBlockMarker ())
+                  $$"""for (size_t __gi = 0; __gi < {{mExtent}}; __gi++) {"""
+                  $"    const {(irTypeToCpp la.ElemType)}* BLADE_RESTRICT __growi = &{lName}[__gi][0];"
+                  $"    {outElemStr} __gacc = {outElemStr}();"
+                  $$"""    for (size_t __gk = 0; __gk < {{nExtent}}; __gk++) {"""
+                  $"        __gacc += __growi[__gk] * {tName}[__gk];"
+                  "    }"
+                  $"    {varName}[__gi] = __gacc;"
+                  "}" ]
+        Some (guards @ tExtentDecl @ [ tAlloc ] @ tLoop @ yExtentDecl @ [ yAlloc ] @ yLoop,
+              [ MatPool (tName, outElemStr, 1, "nullptr", None, tOwned)
+                MatPool (varName, outElemStr, 1, "nullptr", None, yOwned) ])
+     | _ -> None)
 
 and materializeMatmulForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (lExpr: IRExpr) (rExpr: IRExpr) : (string list * MaterializedAlloc list) option =
     // matmul(A, B) = A * B:  result[i][j] = sum_t A[i][t] * B[t][j].

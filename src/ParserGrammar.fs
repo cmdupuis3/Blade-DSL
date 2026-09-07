@@ -721,6 +721,19 @@ and parsePrimary (tokens: Token list) : ParseResult<Expr> =
         expect TokRParen afterRight >>= fun _ remaining ->
         success (mkE tokens remaining (ExprGram (left, right))) remaining
 
+    // gram_apply(A, B, x) = A * (B^H * x): the ACTION of gram(A, B) on the
+    // vector x without forming the m x p matrix. A is m x n, B is p x n, x
+    // has p cells, the result has m cells (docs/plans/structural/05, 3.2).
+    | Some (TokKeyword KwGramApply) ->
+        advance tokens |> expect TokLParen >>= fun _ afterLParen ->
+        parseExprImpl afterLParen >>= fun left afterLeft ->
+        expect TokComma afterLeft >>= fun _ afterComma ->
+        parseExprImpl afterComma >>= fun right afterRight ->
+        expect TokComma afterRight >>= fun _ afterComma2 ->
+        parseExprImpl afterComma2 >>= fun vec afterVec ->
+        expect TokRParen afterVec >>= fun _ remaining ->
+        success (mkE tokens remaining (ExprGramApply (left, right, vec))) remaining
+
     | Some (TokKeyword KwDecompact) ->
         advance tokens |> expect TokLParen >>= fun _ afterLParen ->
         parseExprImpl afterLParen >>= fun array afterArr ->

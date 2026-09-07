@@ -520,6 +520,8 @@ let rec private rewriteExpr (st: ElabState) (ctx: Ctx) (aliases: Set<string>) (s
         r a |> Result.bind (fun a' -> r k |> Result.map (fun k' -> inheritSpan e (ExprSort (a', k'))))
     | ExprKind.ExprGram (l, rr) ->
         r l |> Result.bind (fun l' -> r rr |> Result.map (fun r' -> inheritSpan e (ExprGram (l', r'))))
+    | ExprKind.ExprGramApply (l, rr, x) ->
+        r l |> Result.bind (fun l' -> r rr |> Result.bind (fun r' -> r x |> Result.map (fun x' -> inheritSpan e (ExprGramApply (l', r', x')))))
     | ExprKind.ExprReduce (a, k, init, ax) ->
         r a |> Result.bind (fun a' ->
         r k |> Result.bind (fun k' ->

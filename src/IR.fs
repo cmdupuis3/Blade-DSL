@@ -179,6 +179,7 @@ type IRExpr =
     | IRTranspose of array: IRExpr * dim1: int * dim2: int
     | IRDecompact of array: IRExpr * dim: int
     | IRGram of left: IRExpr * right: IRExpr * isSameArray: bool  // A * B^H contraction; symmetric/Hermitian when isSameArray
+    | IRGramApply of left: IRExpr * right: IRExpr * vec: IRExpr  // A * (B^H * x): the action of gram(A, B) on x; rank-1 result, no m x p matrix
     | IRMatmul of left: IRExpr * right: IRExpr  // A(m x k) * B(k x n) -> dense m x n; the math package's matmul, emitted through blade_linalg
     /// eigh(S): eigendecomposition of a rank-2 square operand -> the TUPLE
     /// (Q, LAM), emitted through `blade_lapack`. TUPLE-typed with TWO fresh
@@ -1924,6 +1925,7 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRBreakIf c -> [c], (function [c'] -> IRBreakIf c' | _ -> badChildren "IRBreakIf")
     | IRCurry (arr, idx, r) -> [arr; idx], (function [arr'; idx'] -> IRCurry (arr', idx', r) | _ -> badChildren "IRCurry")
     | IRGram (l, r, same) -> [l; r], (function [l'; r'] -> IRGram (l', r', same) | _ -> badChildren "IRGram")
+    | IRGramApply (l, r, x) -> [l; r; x], (function [l'; r'; x'] -> IRGramApply (l', r', x') | _ -> badChildren "IRGramApply")
     | IRMatmul (l, r) -> [l; r], (function [l'; r'] -> IRMatmul (l', r') | _ -> badChildren "IRMatmul")
     | IRLet (id, v, b) -> [v; b], (function [v'; b'] -> IRLet (id, v', b') | _ -> badChildren "IRLet")
 
@@ -2836,6 +2838,32 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
                 let s1 = { pOuter with Rank = 1; Symmetry = SymNone }
                 mkArrayLike { la with ElemType = outElem; IndexTypes = [s0; s1] }
          | t, _ -> t)
+    | IRGramApply (l, r, x) ->
+        // gram_apply(A, B, x) = A * (B^H * x). A : m x n, B : p x n, x : p ->
+        // y : m, one plain axis with A's leading extent. Element type complex
+        // iff any operand is; units multiply through both contractions (twin
+        // of inferGramApply's join).
+        (match typeOf l, typeOf r, typeOf x with
+         | ArrayElem la, ArrayElem ra, ArrayElem xa when la.IndexTypes.Length >= 1 ->
+            let isComplexElem (t: IRType) =
+                match stripUnits t with IRTScalar (ETComplex64 | ETComplex128) -> true | _ -> false
+            let outBare =
+                [ la.ElemType; ra.ElemType; xa.ElemType ]
+                |> List.tryFind isComplexElem
+                |> Option.map stripUnits
+                |> Option.defaultValue (stripUnits la.ElemType)
+            let mulU a b =
+                match a, b with
+                | Some lu, Some ru -> Some (unitMul lu ru)
+                | Some u, None | None, Some u -> Some { u with Nominal = None }
+                | None, None -> None
+            let outElem =
+                match mulU (mulU (getUnits la.ElemType) (getUnits ra.ElemType)) (getUnits xa.ElemType) with
+                | Some u -> IRTUnitAnnotated (outBare, u)
+                | None -> outBare
+            let s0 = { la.IndexTypes.[0] with Rank = 1; Symmetry = SymNone }
+            mkArrayLike { la with ElemType = outElem; IndexTypes = [s0] }
+         | t, _, _ -> t)
     | IRMatmul (l, r) ->
         // matmul(A, B). A : m x k, B : k x n -> DENSE m x n (two plain axes,
         // SymNone). No conjugation and no symmetry claim: unlike gram, matmul

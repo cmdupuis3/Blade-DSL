@@ -1670,6 +1670,8 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
         inferTranspose env array d1 d2
     | ExprKind.ExprGram (leftE, rightE) ->
         inferGram env leftE rightE
+    | ExprKind.ExprGramApply (leftE, rightE, vecE) ->
+        inferGramApply env leftE rightE vecE
     | ExprKind.ExprDecompact (array, d) ->
         inferDecompact env array d
     | ExprKind.ExprReduce (array, kernel, init, axes) ->
@@ -3545,6 +3547,60 @@ and inferGram (env: TypeEnv) leftE rightE : TypeResult<TypedExpr> =
                             let s1 = freshSlot rOuter SymNone 1
                             mkArrayArrow [s0; s1] outElem None
                     Ok (mkTyped (TExprGram (tL, tR, sameArray)) resultType))))))
+
+
+and inferGramApply (env: TypeEnv) leftE rightE vecE : TypeResult<TypedExpr> =
+    // gram_apply(A, B, x) = A * (B^H * x): the ACTION of gram(A, B) on x
+    // without forming the m x p matrix (docs/plans/structural/05, 3.2).
+    // A: m x n, B: p x n, x: p -> y: m. The factors are held to gram's own
+    // rules (rank 2, two PLAIN slots each, one element type, static
+    // contracted extents agree); x is a rank-1 plain array over B's leading
+    // extent; units multiply through both contractions. The result carries
+    // no symmetry claim (it is a vector), so there is no same-array mode.
+    inferExpr env leftE |> Result.bind (fun tL ->
+    inferExpr env rightE |> Result.bind (fun tR ->
+    inferExpr env vecE |> Result.bind (fun tX ->
+        requireArrayArgMinRank env tL "gram_apply" 2 |> Result.bind (fun lTy ->
+        requireArrayArgMinRank env tR "gram_apply" 2 |> Result.bind (fun rTy ->
+        requireArrayArgMinRank env tX "gram_apply" 1 |> Result.bind (fun xTy ->
+            let dimsOf (t: IRArrayType) = t.IndexTypes |> List.sumBy (fun ix -> max 1 ix.Rank)
+            if dimsOf lTy <> 2 || dimsOf rTy <> 2 then
+                Error (Other $"gram_apply(A, B, x): A and B must be rank-2 (matrix) arrays; got rank-{dimsOf lTy} and rank-{dimsOf rTy}. gram_apply contracts B's trailing axis with x and A's trailing axis with the result: A (m x n), B (p x n), x (p) -> y (m).")
+            elif lTy.IndexTypes.Length <> 2 || rTy.IndexTypes.Length <> 2 then
+                Error (Other "gram_apply(A, B, x): A and B must carry two PLAIN index axes; a compact symmetric/antisymmetric/Hermitian rank-2 group is not a factor. decompact(A, d) first.")
+            elif xTy.IndexTypes.Length <> 1 || xTy.IndexTypes.Head.Rank <> 1 || xTy.IndexTypes.Head.Symmetry <> SymNone then
+                Error (Other "gram_apply(A, B, x): x must be a rank-1 array over one plain axis (B's leading axis).")
+            else
+                let lOuter = lTy.IndexTypes.[0].Extent
+                let lInner = lTy.IndexTypes.[1].Extent
+                let rOuter = rTy.IndexTypes.[0].Extent
+                let rInner = rTy.IndexTypes.[1].Extent
+                let xExt = xTy.IndexTypes.[0].Extent
+                let staticDisagree (a: IRExpr) (b: IRExpr) =
+                    match tryEvalIntIR a, tryEvalIntIR b with
+                    | Some va, Some vb -> va <> vb
+                    | _ -> false
+                if staticDisagree lInner rInner then
+                    Error (Other "gram_apply(A, B, x): the contracted (trailing) dimensions of A and B must match.")
+                elif staticDisagree rOuter xExt then
+                    Error (Other "gram_apply(A, B, x): x must have B's leading extent (B is p x n, so x has p cells).")
+                else
+                let sameElem (a: IRType) (b: IRType) = unify env.Subst (stripUnits a) (stripUnits b)
+                match sameElem lTy.ElemType rTy.ElemType |> Result.bind (fun () -> sameElem lTy.ElemType xTy.ElemType) with
+                | Error _ ->
+                    Error (Other (sprintf "gram_apply(A, B, x): the operands must share one element type, got %A, %A and %A. Convert explicitly (e.g. `Float64(B)`, `Complex128(x)`, which lift elementwise) so the contraction's width is named in the source." (env.Subst.Resolve (stripUnits lTy.ElemType)) (env.Subst.Resolve (stripUnits rTy.ElemType)) (env.Subst.Resolve (stripUnits xTy.ElemType))))
+                | Ok () ->
+                    let outBare = env.Subst.Resolve (stripUnits lTy.ElemType)
+                    unitRulesForOp OpMul (getUnits lTy.ElemType) (getUnits rTy.ElemType) |> Result.bind (fun u1 ->
+                    unitRulesForOp OpMul u1 (getUnits xTy.ElemType) |> Result.bind (fun outUnit ->
+                    let outElem =
+                        match outUnit with
+                        | Some u -> IRTUnitAnnotated (outBare, u)
+                        | None -> outBare
+                    let slot =
+                        { Id = env.Builder.FreshId(); Rank = 1; Extent = lOuter
+                          Symmetry = SymNone; Tag = None; IxKind = IxKPlain; Kind = SDimension; Dependencies = [] }
+                    Ok (mkTyped (TExprGramApply (tL, tR, tX)) (mkArrayArrow [slot] outElem None))))))))))
 
 
 and inferMatmul (env: TypeEnv) leftE rightE : TypeResult<TypedExpr> =

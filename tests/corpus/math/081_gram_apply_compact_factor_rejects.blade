@@ -1,0 +1,10 @@
+// TEST: Math gram_apply: a compact Gram matrix is not a factor (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: two PLAIN index axes
+// gram_apply's factors are the U, V of an action U (V^H x); a symmetric
+// compact rank-2 group (a gram result) has one index record, not two, and is
+// refused with the same steer as gram's own compact-operand rule.
+let A: Array<Float64 like Idx<2>, Idx<3>> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let x: Array<Float64 like Idx<2>> = [1.0, 2.0]
+let G = gram(A, A)
+let y = gram_apply(G, A, x)

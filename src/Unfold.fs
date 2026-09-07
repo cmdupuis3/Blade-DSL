@@ -108,6 +108,7 @@ let rec mapExprPre (f: Expr -> Expr option) (e: Expr) : Expr =
         | ExprKind.ExprTranspose (a, d1, d2) -> re (ExprTranspose (g a, d1, d2))
         | ExprKind.ExprDecompact (a, d) -> re (ExprDecompact (g a, d))
         | ExprKind.ExprGram (l, r) -> re (ExprGram (g l, g r))
+        | ExprKind.ExprGramApply (l, r, x) -> re (ExprGramApply (g l, g r, g x))
         | ExprKind.ExprExtents a -> re (ExprExtents (g a))
         | ExprKind.ExprStruct (id, fields, spread) -> re (ExprStruct (id, fields |> List.map (fun (n, x) -> (n, g x)), spread |> Option.map g))
         | ExprKind.ExprSection _ -> e

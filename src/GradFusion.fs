@@ -253,6 +253,7 @@ let rec internal containsPipelineOp (e: Expr) : bool =
     | ExprKind.ExprContains (l, r) | ExprKind.ExprGroupBy (l, r)
     | ExprKind.ExprSort (l, r) | ExprKind.ExprGram (l, r)
     | ExprKind.ExprAssign (l, r) -> containsPipelineOp l || containsPipelineOp r
+    | ExprKind.ExprGramApply (a, b, x) -> containsPipelineOp a || containsPipelineOp b || containsPipelineOp x
     | ExprKind.ExprReduce (a, k, i, ax) ->
         containsPipelineOp a || containsPipelineOp k || opt i || opt ax
     | ExprKind.ExprStruct (_, fields, spread) ->

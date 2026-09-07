@@ -1142,6 +1142,47 @@ let gramArray (left: BladeArray) (right: BladeArray) (outType: IRType) : BladeAr
             out
     | _ -> raise (ArrayOpUnsupported "gram: output type is not an array")
 
+/// gram_apply(a, b, x) = a * (b^H * x):  y[i] = sum_k a[i][k] * t[k] with
+/// t[k] = sum_j conj(b[j][k]) * x[j] (materializeGramApplyForm's twin). Two
+/// ascending width-exact folds from the element zero, one accumulator per
+/// cell: t's fold runs j ascending per k, y's runs k ascending per i --
+/// exactly the C++ loops' per-cell order, so the lanes agree bit for bit.
+/// BL8011 twins of the emitter's guards on the two runtime extents.
+let gramApplyArray (a: BladeArray) (b: BladeArray) (x: BladeArray) (outType: IRType) : BladeArray =
+    match outType with
+    | ArrayElem outArr ->
+        let outElem = outArr.ElemType
+        let m = if a.Extents.Length >= 1 then a.Extents.[0] else 0L
+        let n = if a.Extents.Length >= 2 then a.Extents.[1] else 0L
+        let p = if b.Extents.Length >= 1 then b.Extents.[0] else 0L
+        let bn = if b.Extents.Length >= 2 then b.Extents.[1] else 0L
+        let xp = if x.Extents.Length >= 1 then x.Extents.[0] else 0L
+        // The two guards carry the emitter's wording so an ABORT pin reads the
+        // same in both lanes.
+        if bn <> n then
+            raise (InterpPanic ("BL8011", "co-iteration extent mismatch -- gram_apply(A, B, x): A's and B's trailing axes must be equal", None, 0))
+        if xp <> p then
+            raise (InterpPanic ("BL8011", "co-iteration extent mismatch -- gram_apply(A, B, x): x must have B's leading extent", None, 0))
+        let zero = zeroOfElemTy outElem
+        let narrow = narrowToElem outElem
+        let t =
+            Array.init (int n) (fun k ->
+                let mutable acc = zero
+                for j in 0L .. p - 1L do
+                    let bv = narrow (N.evalUnaryOp IRConj (readCell b [ j; int64 k ]))
+                    let xv = narrow (readCell x [ j ])
+                    acc <- narrow (N.evalBinOp IRAdd acc (narrow (N.evalBinOp IRMul bv xv)))
+                acc)
+        let out = allocDense outElem outArr.IndexTypes [| m |]
+        for i in 0L .. m - 1L do
+            let mutable acc = zero
+            for k in 0L .. n - 1L do
+                let av = narrow (readCell a [ i; k ])
+                acc <- narrow (N.evalBinOp IRAdd acc (narrow (N.evalBinOp IRMul av t.[int k])))
+            writeCell out [ i ] acc
+        out
+    | _ -> raise (ArrayOpUnsupported "gram_apply: output type is not an array")
+
 /// matmul(left, right) = left * right:  R[i][j] = sum_t left[i][t]*right[t][j]
 /// (materializeMatmulForm; C++ side is one `blade_linalg::blade_matmul` call).
 /// Always dense m x n -- A*A is not symmetric, so no same-array claim like

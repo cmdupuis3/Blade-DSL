@@ -927,7 +927,7 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     //      negate/conjugate. Like the eager set/reshape ops these MATERIALIZE a
     //      fresh array, so route to the Loops backend (mirrors CodeGen's
     //      materialize{Decompact,Gram,Negate/Conjugate}Form emitters).
-    | IRDecompact _ | IRGram _ | IRMatmul _ | IRSolve _ | IRArrayNegate _ | IRArrayConjugate _ ->
+    | IRDecompact _ | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _ | IRArrayNegate _ | IRArrayConjugate _ ->
         evalArrayNode st env expr
 
     // ---- eigh: same materializing family, but its value is a TUPLE (Q, LAM)

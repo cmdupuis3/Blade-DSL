@@ -596,7 +596,7 @@ body-level let RHS of that shape in IRCompute; emitting nothing here would regis
             currentTupleChildren <- ctxAfter.TupleChildren
             currentNames <- Map.add id varName currentNames
             code
-        | IRMask _ | IRIntersect _ | IRUnion _ | IRSort _ | IRUnique _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _ | IRGram _ | IRMatmul _ | IREigh _ | IRSolve _
+        | IRMask _ | IRIntersect _ | IRUnion _ | IRSort _ | IRUnique _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _ | IRGram _ | IRGramApply _ | IRMatmul _ | IREigh _ | IRSolve _
         | IRStack _ | IRJoin _ ->
             // The lift pass can place an inline form as a let value at
             // function-body level. The same materialization helper used by

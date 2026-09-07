@@ -482,6 +482,11 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
     // gram is bilinear, not linear -- its own arm (C6 reverse, jvp tangent)
     | { Kind = ExprKind.ExprGram (ga, gb) } ->
         walkExpr fname ctx onVar inKernel ga |> Result.bind (fun () -> walkExpr fname ctx onVar inKernel gb)
+    // gram_apply is trilinear -- its own arms (reverse, jvp tangent)
+    | { Kind = ExprKind.ExprGramApply (ga, gb, gx) } ->
+        walkExpr fname ctx onVar inKernel ga
+        |> Result.bind (fun () -> walkExpr fname ctx onVar inKernel gb)
+        |> Result.bind (fun () -> walkExpr fname ctx onVar inKernel gx)
     // Grouping data is constant plumbing in BOTH modes: keys are Int/index
     // data, so a `group_keys`/`group_bucket`/`extents` binding carries no
     // derivative and the explicit-bucket gather pattern (2.17a) rides the
@@ -694,6 +699,7 @@ let rec internal occursFree (name: string) (e: Expr) : bool =
     | ExprKind.ExprContains (l, r) | ExprKind.ExprGroupBy (l, r)
     | ExprKind.ExprSort (l, r) | ExprKind.ExprGram (l, r)
     | ExprKind.ExprAssign (l, r) -> o l || o r
+    | ExprKind.ExprGramApply (a, b, x) -> o a || o b || o x
     | ExprKind.ExprApp (f, args) -> o f || any args
     | ExprKind.ExprIf (c, t, f) -> o c || o t || o f
     | ExprKind.ExprTuple es | ExprKind.ExprArrayLit es | ExprKind.ExprMethodFor es
@@ -841,6 +847,8 @@ let rec internal renameExpr (ren: Map<string, string>) (e: Expr) : Result<Expr, 
     | ExprKind.ExprDecompact (a, d) -> r a |> Result.map (fun a' -> re (ExprDecompact (a', d)))
     | ExprKind.ExprGram (a, b) ->
         r a |> Result.bind (fun a' -> r b |> Result.map (fun b' -> re (ExprGram (a', b'))))
+    | ExprKind.ExprGramApply (a, b, x) ->
+        r a |> Result.bind (fun a' -> r b |> Result.bind (fun b' -> r x |> Result.map (fun x' -> re (ExprGramApply (a', b', x')))))
     | ExprKind.ExprExtents a -> r a |> Result.map (fun a' -> re (ExprExtents a'))
     | ExprKind.ExprStruct (nm, fields, spread) ->
         fields
@@ -1504,6 +1512,11 @@ let rec internal staticDimsOf (ctx: Ctx) (denv: Map<string, int list>) (e: Expr)
     | ExprKind.ExprGram (a, b) ->
         (match staticDimsOf ctx denv a, staticDimsOf ctx denv b with
          | Some (i :: _), Some (j :: _) -> Some [i; j]
+         | _ -> None)
+    // gram_apply(A, B, x): a vector over A's leading axis
+    | ExprKind.ExprGramApply (a, _, _) ->
+        (match staticDimsOf ctx denv a with
+         | Some (i :: _) -> Some [i]
          | _ -> None)
     // C7: a sort is a permutation -- same shape as its (rank-1) operand
     | ExprKind.ExprSort (a, _) -> staticDimsOf ctx denv a

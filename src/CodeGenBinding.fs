@@ -80,6 +80,8 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genArrayNegateConjugateBinding ctx binding builder arrExpr
     | IRGram (_, _, _) ->
         genGramBinding ctx binding builder
+    | IRGramApply (_, _, _) ->
+        genGramApplyBinding ctx binding builder
     | IRMatmul (_, _) ->
         genMatmulBinding ctx binding builder
     | IREigh _ ->
@@ -2661,6 +2663,25 @@ and genGramBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         | Some (s, allocs) -> registerMaterializedAllocs allocs; s
         | None -> []
     let code = [$"{ind}// gram: A * B^H (Gram product)"] @ (matStmts |> List.map (fun s -> ind + s))
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+
+and genGramApplyBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
+    // gram_apply(A, B, x) = A * (B^H * x): the action of gram(A, B) on x,
+    // materialized as two rank-1 pools (B^H x, then A times it) and never the
+    // m x p matrix. The shared helper emits the statement form.
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> irTypeToCpp at.ElemType
+        | _ -> "double"
+    let matStmts =
+        match materializeInlineForm emptySubst ctx.VarNames name (lazy elemStr) binding.Value with
+        | Some (s, allocs) -> registerMaterializedAllocs allocs; s
+        | None -> []
+    let code = [$"{ind}// gram_apply: A * (B^H * x) (Gram action, no m x p pool)"] @ (matStmts |> List.map (fun s -> ind + s))
     let ctx' = addVarName binding.Id name ctx
     (code, ctx')
 

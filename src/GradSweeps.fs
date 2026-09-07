@@ -447,6 +447,55 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
                       Ok (List.ofSeq flows)
                   | _ -> err rc.Fname "gram operands need statically-known dims to differentiate (v1)")
              | _ -> err rc.Fname "differentiating gram needs named array operands (v1); bind the operands first")
+        | ExprKind.ExprGramApply _ when not cotIdent ->
+            err rc.Fname "the adjoint of gram_apply nested under transpose/guard/stack/join is not supported (v1); bind it to its own let first (`let y = gram_apply(a, b, x)` then wrap `y`), which gives it an identity cotangent and differentiates today"
+        | ExprKind.ExprGramApply (ga, gb, gx) ->
+            // y = a (b^T x) over REAL named operands (v1, as gram's arm). With
+            // the cotangent ybar read whole by name and t = b^T x (n cells):
+            //   xbar += b (a^T ybar) = gram_apply(b, a, ybar)  -- the adjoint
+            //                          ACTION, itself a gram_apply: no m x p
+            //   abar(i, k) += ybar(i) * t(k)
+            //   bbar(j, k) += x(j) * s(k),   s = a^T ybar (n cells)
+            // The two n-cell vectors are per-column prodsums over the
+            // factor's transpose (docs/plans/structural/05, 3.2); the
+            // m x p Gram matrix is never formed, in the primal or here.
+            (match ga.Kind, gb.Kind, gx.Kind with
+             | ExprKind.ExprVar a, ExprKind.ExprVar b, ExprKind.ExprVar x ->
+                 (match Map.tryFind a denv, Map.tryFind b denv, Map.tryFind x denv with
+                  | Some dimsA, Some dimsB, Some dimsX ->
+                      // t(k) = sum_j mat(j, k) * vec(j): a row map over mat's transpose.
+                      let colDots (mat: string) (vec: string) =
+                          let rname = fresh ctx "__gr"
+                          syn (ExprCompute (syn (ExprBinOp (Elementwise, OpApply,
+                                                             syn (ExprMethodFor [ syn (ExprTranspose (v mat, 0, 1)) ]),
+                                                             syn (ExprLambda ([ { Name = rname; Type = None; Default = None; NameSpan = noSpan } ], None,
+                                                                              syn (ExprApp (v "prodsum", [ v rname; v vec ]))))))))
+                      let flows = ResizeArray<NStmt>()
+                      if Set.contains x rc.Diff then
+                          let tX = fresh ctx "__gx"
+                          flows.Add (NLet (tX, false, syn (ExprGramApply (v b, v a, v (dName xname)))))
+                          for st in accumLoop ctx dimsX (fun idx -> syn (ExprApp (v (dName x), idx))) (fun idx -> syn (ExprApp (v tX, idx))) do flows.Add st
+                      if Set.contains a rc.Diff then
+                          let tT = fresh ctx "__gt"
+                          flows.Add (NLet (tT, false, colDots b x))
+                          for st in accumLoop ctx dimsA
+                                        (fun idx -> syn (ExprApp (v (dName a), idx)))
+                                        (fun idx ->
+                                            match idx with
+                                            | [ i; k ] -> mul (syn (ExprApp (v (dName xname), [ i ]))) (syn (ExprApp (v tT, [ k ])))
+                                            | _ -> fLit 0.0) do flows.Add st
+                      if Set.contains b rc.Diff then
+                          let tS = fresh ctx "__gs"
+                          flows.Add (NLet (tS, false, colDots a (dName xname)))
+                          for st in accumLoop ctx dimsB
+                                        (fun idx -> syn (ExprApp (v (dName b), idx)))
+                                        (fun idx ->
+                                            match idx with
+                                            | [ j; k ] -> mul (syn (ExprApp (v x, [ j ]))) (syn (ExprApp (v tS, [ k ])))
+                                            | _ -> fLit 0.0) do flows.Add st
+                      Ok (List.ofSeq flows)
+                  | _ -> err rc.Fname "gram_apply operands need statically-known dims to differentiate (v1)")
+             | _ -> err rc.Fname "differentiating gram_apply needs named array operands (v1); bind the operands first")
         // C7: the adjoint of a sort is the cotangent GATHERED through the
         // INVERSE permutation -- dA(j) += ds(invperm(j)). No scatter
         // primitive is needed: the inverse is a second sort the pre-pass
@@ -477,7 +526,7 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
          | Some dims -> Some (flow true (fun idx -> syn (ExprApp (v (dName xname), idx))) dims value)
          | None -> None)
     | ExprKind.ExprTranspose _ | ExprKind.ExprStack _ | ExprKind.ExprJoin _
-    | ExprKind.ExprGram _ | ExprKind.ExprSort _
+    | ExprKind.ExprGram _ | ExprKind.ExprGramApply _ | ExprKind.ExprSort _
     | ExprKind.ExprSequence _ | ExprKind.ExprReplicate _ ->
         (match Map.tryFind xname denv with
          | Some dims -> Some (flow true (fun idx -> syn (ExprApp (v (dName xname), idx))) dims value)
@@ -801,6 +850,17 @@ let rec internal tangentOfExpr (rc: RevCtx) (e: Expr) : Result<Expr, string> =
             let t1 = if isZeroLit ta then fLit 0.0 else syn (ExprGram (ta, gb))
             let t2 = if isZeroLit tb then fLit 0.0 else syn (ExprGram (ga, tb))
             addZ t1 t2))
+    // gram_apply is trilinear: d[a (b^H x)] = gram_apply(da, b, x) +
+    // gram_apply(a, db, x) + gram_apply(a, b, dx), inactive terms folded
+    // away (a scalar-zero placeholder must not reach the node).
+    | { Kind = ExprKind.ExprGramApply (ga, gb, gx) } ->
+        tangentOfExpr rc ga |> Result.bind (fun ta ->
+        tangentOfExpr rc gb |> Result.bind (fun tb ->
+        tangentOfExpr rc gx |> Result.map (fun tx ->
+            let t1 = if isZeroLit ta then fLit 0.0 else syn (ExprGramApply (ta, gb, gx))
+            let t2 = if isZeroLit tb then fLit 0.0 else syn (ExprGramApply (ga, tb, gx))
+            let t3 = if isZeroLit tx then fLit 0.0 else syn (ExprGramApply (ga, gb, tx))
+            addZ (addZ t1 t2) t3)))
     | { Kind = ExprKind.ExprIf (c, t, f) } ->
         // Branch of tangents under the same condition (see walkExpr's arm).
         tangentOfExpr rc t |> Result.bind (fun tt ->
@@ -1179,6 +1239,24 @@ and internal tangentOfStmt (rc: RevCtx) (s: NStmt) : Result<NStmt list, string> 
                            NLet (t1, false, syn (ExprGram (ta, gb)))
                            NLet (t2, false, syn (ExprGram (ga, tb)))
                            NLet (tName x, isMut, add (v t1) (v t2)) ]))
+             // gram_apply: the same per-term temps, three terms.
+             | { Kind = ExprKind.ExprGramApply (ga, gb, gx) } ->
+                 tangentOfExpr rc ga |> Result.bind (fun ta ->
+                 tangentOfExpr rc gb |> Result.bind (fun tb ->
+                 tangentOfExpr rc gx |> Result.map (fun tx ->
+                     let terms =
+                         [ (ta, (fun () -> syn (ExprGramApply (ta, gb, gx))))
+                           (tb, (fun () -> syn (ExprGramApply (ga, tb, gx))))
+                           (tx, (fun () -> syn (ExprGramApply (ga, gb, tx)))) ]
+                         |> List.filter (fun (t, _) -> not (isZeroLit t))
+                         |> List.map (fun (_, mk) -> mk ())
+                     match terms with
+                     | [] -> [s]
+                     | [ one ] -> [s; NLet (tName x, isMut, one)]
+                     | many ->
+                         let temps = many |> List.map (fun e -> (fresh rc.Ctx "__gt", e))
+                         let total = temps |> List.map (fun (nm, _) -> v nm) |> List.reduce add
+                         [s] @ (temps |> List.map (fun (nm, e) -> NLet (nm, false, e))) @ [ NLet (tName x, isMut, total) ])))
              | ConstFill (cnt, _) -> Ok [s; NLet (tName x, isMut, zeroFill cnt)]
              | _ -> tangentOfExpr rc value |> Result.map (fun t -> [s; NLet (tName x, isMut, t)]))
     | NAssign (lhs, rhs) ->

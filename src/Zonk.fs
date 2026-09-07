@@ -204,6 +204,7 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         | TExprTranspose (a, d1, d2) -> TExprTranspose (z a, d1, d2)
         | TExprDecompact (a, d) -> TExprDecompact (z a, d)
         | TExprGram (l, r, s) -> TExprGram (z l, z r, s)
+        | TExprGramApply (l, r, x) -> TExprGramApply (z l, z r, z x)
         | TExprMatmul (l, r) -> TExprMatmul (z l, z r)
         | TExprEigh a -> TExprEigh (z a)
         | TExprSolve (a, b) -> TExprSolve (z a, z b)

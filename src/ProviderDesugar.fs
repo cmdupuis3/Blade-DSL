@@ -259,6 +259,7 @@ let private childrenOf (e: Expr) : Expr list =
     | ExprKind.ExprSort (a, b)
     | ExprKind.ExprGram (a, b)
     | ExprKind.ExprAssign (a, b) -> [ a; b ]
+    | ExprKind.ExprGramApply (a, b, x) -> [ a; b; x ]
     | ExprKind.ExprReduce (a, k, init, axes) ->
         [ a; k ] @ Option.toList init @ Option.toList axes
     | ExprKind.ExprStruct (_, flds, spread) ->

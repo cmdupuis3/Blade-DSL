@@ -1,0 +1,19 @@
+// TEST: Math gram_apply: the Gram action on a vector, same array
+// gram_apply(A, A, v) = A (A^T v): the ACTION of gram(A, A) on v without the
+// N x N Gram matrix (docs/plans/structural/05, section 3.2). The emission
+// holds two rank-1 pools -- the D-cell t = A^T v and the N-cell result -- and
+// never the matrix (tests/LinAlgTests.fs pins that, gate on and off).
+// Integer-valued data so the pins are exact and `blade test interp math`
+// byte-compares: the reference forms the Gram matrix the long way (gram,
+// decompact, a row prodsum), and the two agree cell for cell.
+type N = Idx<5>
+type D = Idx<3>
+let A: Array<Float64 like N, D> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [2.0, 0.0, 1.0], [1.0, 1.0, 1.0]]
+let v: Array<Float64 like N> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let y = gram_apply(A, A, v)
+// EXPECT: y = [278, 683, 1088, 137, 135]
+let G = gram(A, A)
+let Gd = decompact(G, 0)
+let y_ref = method_for(Gd) <@> lambda(row) -> prodsum(row, v) |> compute
+let dev = reduce(y - y_ref, (+))
+// EXPECT: dev = 0

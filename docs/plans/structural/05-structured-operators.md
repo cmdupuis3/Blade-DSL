@@ -1,6 +1,31 @@
 # 05 — Structured operators: Gram-operator application without a Gram allocation
 
-Status: DESIGN, nothing built. Elaborates item 5 of
+Status: STEP 1 BUILT 2026-09-07 on `feat/streaming-reductions-cd` -- the applied-action
+node `gram_apply(A, B, x)` (D1 (i), D2 core, D3 no sugar, D4 conjugate, D6 the `j`-outer
+unit-stride half, D7 not built), with typecheck, IR, lowering, the native C++ arm, the
+routed arm (a new `GemvT` routine and `blade_gemv_t_{s,d,c,z}` adapters, policy rows
+pinned), the interpreter twin, and the AD rules (trilinear jvp; reverse with the adjoint
+action as a `gram_apply` and the factor cotangents as outer products of the cotangent
+with two n-cell intermediates -- each an n-cell per-column prodsum over the factor's
+transpose, the v1 spelling; no m × p object anywhere). Gate §4: values exact against the
+materialized and factored references (`tests/corpus/math/077-082`: same-array, distinct,
+generic action, units, complex-conjugate, static refusal, compact-factor refusal, dynamic
+BL8011), emission pins gate on/off (`tests/LinAlgTests.fs`), hand-derived `da`/`db`/`dx`
+plus the jvp-vs-grad identity (`tests/corpus/ad-jvp-comb/109`), `interp math` and the
+`linalg` block green. Timing (§4 item 3, medians of 5 interleaved whole-process runs, ms,
+sizes (601, 37) / (1201, 61) / (2401, 97); the process floor is ~65 ms so only the largest
+size separates): gate off M = 71 / 78 / 123, F = 67 / 67 / 70, G = 68 / 70 / 70; gate on
+(OpenBLAS) M = 73 / 86 / 125, F = 67 / 67 / 70, G = 70 / 70 / 71; pragmas suppressed at
+(2401, 97), gate off: M = 235, F = 74, G = 68. G is within round-to-round noise of F at
+every size and 1.8x (3.5x serial) ahead of M at the largest, with the ratio growing in N as
+predicted. Checksums of G and F agree to the last digit at (1201, 61) and (2401, 97) and
+differ in the 15th digit at (601, 37) under the default `-ffp-contract=fast` -- g++
+contracts the two nests differently, not a different operation sequence: with
+`BLADE_FP_CONTRACT=off` the two checksums are bit-identical (937.072865780409 both) while
+M's differs (…411), which is exactly §1.6's ~1e-14 between the matrix and the factored
+action. Step 2 (the operator VALUE, `solve`-family factorization values,
+separability) stays a follow-on co-designed with fortran-killer-2 §6.2, as §3.4 says.
+Elaborated (as a DESIGN) item 5 of
 [plan-structural-performance-opportunities.md](../plan-structural-performance-opportunities.md)
 ("Preserve structured operators until their consumers decide what to compute").
 Baseline: HEAD `e7abf38`, read from a SHARED working tree that at the time carried other

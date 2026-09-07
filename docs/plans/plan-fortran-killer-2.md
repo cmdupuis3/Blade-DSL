@@ -369,6 +369,15 @@ promised precision, bound retries, and define a higher-precision fallback or fai
 LAPACK already supplies [mixed-precision refinement drivers](https://www.netlib.org/lapack/explore-html/db/d57/group__posv__mixed_gae2473f2512d331fbdec3b1e2b63fc821.html);
 Blade's contribution would be safe composition and provenance of the chosen route.
 
+**Co-design note (2026-09-07).** The first member of the "operator consumed by actions,
+not by cells" family landed as structural/05 step 1: `gram_apply(A, B, x)` = A·(Bᴴx), an
+eager node with a native arm, a transposed-gemv BLAS route, an interpreter twin, and AD
+rules whose adjoint action is itself a `gram_apply`. A factorization VALUE (this section)
+and an operator value (structural/05 step 2) are one ABI/ownership design -- an immutable
+snapshot consumed by solve / transpose-solve / derivative actions -- and should be decided
+together; the node exists so that design has a concrete consumer and a fixture for the
+`dot(w, Jv) = dot(Jᵀw, v)` identity of 6.3.
+
 ### 6.3 Matrix-free linearization: a later extension with its own gate
 
 `ad.jvp` currently requires scalar or all-scalar-tuple returns (`Grad.fs:280`), so

@@ -356,6 +356,8 @@ and internal unrollPackExpr (ctx: Ctx) (fname: string) (budget: int ref)
     | ExprKind.ExprPartialApp (op, x, l) -> g1 (fun a -> ExprPartialApp (op, a, l)) x
     | ExprKind.ExprReynolds (k, anti) -> g1 (fun a -> ExprReynolds (a, anti)) k
     | ExprKind.ExprGram (l, r) -> g2 (fun a b -> ExprGram (a, b)) l r
+    | ExprKind.ExprGramApply (l, r, x) ->
+        go l |> Result.bind (fun l' -> go r |> Result.bind (fun r' -> go x |> Result.map (fun x' -> re (ExprGramApply (l', r', x')))))
     | ExprKind.ExprGuard (c, b) -> g2 (fun a b2 -> ExprGuard (a, b2)) c b
     | ExprKind.ExprReplicate (c, b) -> g2 (fun a b2 -> ExprReplicate (a, b2)) c b
     | ExprKind.ExprMask (a, p) -> g2 (fun x y -> ExprMask (x, y)) a p

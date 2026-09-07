@@ -339,6 +339,10 @@ type LinAlgRoutine =
     | Syrk
     /// y = A * x (matrix-vector).
     | Gemv
+    /// `?gemv` with the matrix TRANSPOSED (conjugate-transposed for complex):
+    /// the first half of `gram_apply` (t = B^H x). Its own row because its
+    /// adapter is its own entry point, and a policy is stated per routine.
+    | GemvT
     /// s = x . y (inner product).
     | Dot
     /// s = ||x||_2. Named so the policy table can state its decision; NOT
@@ -410,6 +414,10 @@ type LinAlgRoute =
     /// matched body is `prodsum(row, x)`, which conjugates nothing, so every
     /// precision uses `CblasNoTrans`, including the complex ones.
     | RouteGemv
+    /// `blade_gemv_t_<p>` -- t = B^H x, row skeleton in, rank-1 pool out; real
+    /// is CblasTrans, complex CblasConjTrans (the conjugation Blade's scalar
+    /// loop applies). The first half of `gram_apply`; the second is RouteGemv.
+    | RouteGemvT
     /// `blade_eigh_packed_<p>` -- eigendecomposition of a rank-2 COMPACT
     /// operand, straight off `pool_base`. Real is `?spev`; complex is
     /// `?hpev` (Hermitian). ZERO-CONVERSION ROUTE: Blade's row-major-upper
@@ -528,6 +536,8 @@ let policy : (LinAlgRoutine * BlasLevel * LinAlgBackend * Routing * string) list
       "same as gemm, and it halves the work by computing one triangle -- which is also Blade's storage. COMPLEX instances are HERMITIAN (cherk/zherk), matching what Blade's own complex loop already computes"
       Gemv, L2, HostBlas, ViaShim,
       "pays modestly (bandwidth-bound but cache-blocked); MATCHED (Phase 5b) on the per-row prodsum-fiber nest"
+      GemvT, L2, HostBlas, ViaShim,
+      "the transposed sibling of gemv, same argument: `gram_apply`'s first half (t = B^H x) is one strided pass over B that a cache-blocked cblas ?gemv(Trans) pays for modestly; its native twin is the j-outer unit-stride accumulation into the t pool"
       Dot,  L1, HostBlas, ViaShim,
       "an L1 REDUCTION, unlike axpy/scal: the serial FP chain is the bottleneck and BLAS breaks it; MATCHED (Phase 5b) on reduce-over-deferred-zip-product. COMPLEX instances are dotu, NEVER dotc (Blade's fold does not conjugate). PRECEDENCE: an `omp`-licensed fold kernel WINS -- an explicit user reorder licence beats a dispatch heuristic, and under no-BLAS this route's fallback is serial, so firing would silently strip licensed parallelism"
       Nrm2, L1, HostBlas, ViaShim,
@@ -548,6 +558,7 @@ let policy : (LinAlgRoutine * BlasLevel * LinAlgBackend * Routing * string) list
       Syrk, L3, CudaBlas, ViaShim,
       "same L3 argument as gemm, and it halves the work by computing one triangle. COMPLEX instances are HERMITIAN (cublasCherk/Zherk), matching what Blade's own complex loop computes. THE TRAP ROW: under the operand swap this composes an upper<->lower FILL-MODE FLIP with the conjugation -- verified at runtime against the host result, not argued"
       Gemv, L2, CudaBlas, Native, cudaPcieBound
+      GemvT, L2, CudaBlas, Native, cudaPcieBound
       Dot,  L1, CudaBlas, Native, cudaPcieBound
       Nrm2, L1, CudaBlas, Native,
       "not matched on any backend (no sqrt-shape case exists), and " + cudaPcieBound
@@ -668,6 +679,7 @@ let shimEntryPoint (backend: LinAlgBackend) (call: LinAlgCall) : string option =
             | RouteMatmul -> Some $"blade_linalg::blade_matmul_{p}"
             | RouteDot -> Some $"blade_linalg::blade_dot_{p}"
             | RouteGemv -> Some $"blade_linalg::blade_gemv_{p}"
+            | RouteGemvT -> Some $"blade_linalg::blade_gemv_t_{p}"
             // Different namespace AND different header: `blade_lapack.hpp`
             // carries its own `#ifndef BLADE_HAS_LAPACK #error`, so a program
             // that names these advertises a LAPACK dependency distinct from a
@@ -697,7 +709,7 @@ let shimEntryPoint (backend: LinAlgBackend) (call: LinAlgCall) : string option =
             // Eigh, so the ViaShim arm above already declined. Spelled out so
             // that flipping one of those policy rows produces a compile error
             // here -- a missing entry point rather than a silently wrong one.
-            | RouteDot | RouteGemv | RouteEighPacked | RouteEighDense | RouteSolve -> None
+            | RouteDot | RouteGemv | RouteGemvT | RouteEighPacked | RouteEighDense | RouteSolve -> None
 
 /// Resolve a NODE-matched call (`gram`, `matmul`) to the backend it runs on
 /// and the C++ entry point it lands on -- the one place the emission-mode
@@ -792,6 +804,37 @@ let classifyGram (l: IRExpr) (r: IRExpr) (sameArray: bool) : LinAlgCall option =
                    ElemType = le
                    Precision = prec
                    PackedTriangularResult = false }
+    | _ -> None
+
+/// Classify `gram_apply(a, b, x)` = a . (b^H . x) into its TWO L2 halves:
+/// `t = b^H x` through the TRANSPOSED gemv adapter (`GemvT`: CblasTrans for
+/// real, CblasConjTrans for complex -- the conjugation the scalar loop
+/// applies, exactly as the distinct gram's gemm does), then `y = a t` through
+/// the plain one. Each half resolves its own backend like a node route (both
+/// CudaBlas rows are Native, so they land on the host adapters or the
+/// loops). None when any operand is not an array or the three precisions
+/// disagree; the emitter then keeps its scalar loops for both halves.
+let classifyGramApply (a: IRExpr) (b: IRExpr) (x: IRExpr) : (LinAlgCall * LinAlgCall) option =
+    match elemOf a, elemOf b, elemOf x with
+    | Some ae, Some be, Some xe ->
+        (match agreedPrecision ae be, agreedPrecision be xe with
+         | Some prec, Some _ ->
+            let half (routine: LinAlgRoutine) (route: LinAlgRoute) (ops: LinAlgOperand list) =
+                { Routine = routine
+                  Route = route
+                  Level = L2
+                  Operands = ops
+                  NestOperands = []
+                  M = Some { Operand = RoleA; Axis = 0 }
+                  N = None
+                  K = Some { Operand = RoleA; Axis = 1 }
+                  ElemType = ae
+                  Precision = prec
+                  PackedTriangularResult = false }
+            let tOps = [ { Role = RoleA; Expr = b; Transposed = true }; { Role = RoleB; Expr = x; Transposed = false } ]
+            let yOps = [ { Role = RoleA; Expr = a; Transposed = false } ]
+            Some (half GemvT RouteGemvT tOps, half Gemv RouteGemv yOps)
+         | _ -> None)
     | _ -> None
 
 /// Classify `matmul(a, b)`: C(m x n) = A(m x k) * B(k x n), dense result, no

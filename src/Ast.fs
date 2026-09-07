@@ -517,6 +517,7 @@ and ExprKind =
     | ExprReduce of array: Expr * kernel: Expr * init: Expr option * axes: Expr option
     | ExprTranspose of array: Expr * dim1: int * dim2: int  // transpose(A, [d1, d2]) - swap two arity-1 SymNone axes (hard; allocates)
     | ExprDecompact of array: Expr * dim: int  // decompact(A, d) - pull the compact component at dim d out as a free Idx (hard; allocates dense)
+    | ExprGramApply of left: Expr * right: Expr * vec: Expr  // gram_apply(A, B, x) = A * (B^H * x): the action of gram(A, B) on x, y[i] = sum_k A[i][k] * sum_j conj(B[j][k]) x[j]; rank-1 result over A's leading axis, no m x p matrix.
     | ExprGram of left: Expr * right: Expr  // gram(A, B) = A * B^H: result[i][j] = sum_k A[i][k]*conj(B[j][k]). Square+Hermitian/symmetric when A,B same array; dense otherwise.
     | ExprExtents of array: Expr                   // extents(A) - innermost dim extent (rank-1 only for now)
     // Struct construction

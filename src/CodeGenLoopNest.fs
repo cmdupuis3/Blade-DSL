@@ -3162,7 +3162,7 @@ let rec isFreshPoolForm (e: IRExpr) : bool =
     | IRApplyCombinator _ | IRComposeApply _ -> true
     | IRArrayLit _ -> true
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _ -> true
-    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRMatmul _ -> true
+    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRGramApply _ | IRMatmul _ -> true
     // eigh: BOTH pools it produces are fresh (`allocate<>` under derived names)
     // and neither borrows the operand's `.extents` pointer -- each gets its own
     // table. So an escaping (Q, LAM) need not pin S, and propagation stops here.
@@ -3277,7 +3277,7 @@ let internal isMaterializedFreshArray (v: IRExpr) : bool =
     | IRCompute inner -> isFreshPoolForm inner
     | IRArrayLit _ -> true
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _
-    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRMatmul _ | IRSolve _
+    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _
     | IRArrayNegate _ | IRArrayConjugate _ -> true
     | _ -> false
 

@@ -730,7 +730,7 @@ let builtinCallNames : string list =
       "guard"; "reynolds"; "zero"; "rank"; "arity"; "extents"; "reduce"; "mask"
       "compound"; "sparse"; "zip"; "stack"; "sort"; "unique"; "intersect"; "union"
       "contains"; "display.emit"; "group_by"; "group_keys"; "transpose"; "decompact"
-      "gram"; "matmul"; "eigh"; "solve"; "sequence"; "replicate"; "complex"
+      "gram"; "gram_apply"; "matmul"; "eigh"; "solve"; "sequence"; "replicate"; "complex"
       "prodsum"; "fill_random" ]
 
 /// The builtin a typed node is an application of, with its argument nodes
@@ -780,6 +780,7 @@ let private builtinCallOf (te: TypedExpr) : (string * TypedExpr list) option =
     | TExprTranspose (a, _, _) -> Some ("transpose", [a])
     | TExprDecompact (a, _) -> Some ("decompact", [a])
     | TExprGram (l, r, _) -> Some ("gram", [l; r])
+    | TExprGramApply (l, r, x) -> Some ("gram_apply", [l; r; x])
     | TExprMatmul (l, r) -> Some ("matmul", [l; r])
     | TExprEigh a -> Some ("eigh", [a])
     | TExprSolve (a, b) -> Some ("solve", [a; b])

@@ -177,6 +177,8 @@ let rec collectFreeVars (bound: Set<string>) (expr: Expr) : Set<string> =
     | ExprKind.ExprDecompact (array, _) -> collectFreeVars bound array
     | ExprKind.ExprGram (left, right) ->
         Set.union (collectFreeVars bound left) (collectFreeVars bound right)
+    | ExprKind.ExprGramApply (left, right, vec) ->
+        Set.unionMany [ collectFreeVars bound left; collectFreeVars bound right; collectFreeVars bound vec ]
     | ExprKind.ExprHalo (_, offsets) -> collectFreeVars bound offsets
     | ExprKind.ExprPartialApp (_, e, _) -> collectFreeVars bound e
     | ExprKind.ExprStatic e -> collectFreeVars bound e
@@ -2659,6 +2661,7 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprTranspose (a, _, _) -> [a]
         | TExprDecompact (a, _) -> [a]
         | TExprGram (l, r, _) -> [l; r]
+        | TExprGramApply (l, r, x) -> [l; r; x]
         | TExprMatmul (l, r) -> [l; r]
         | TExprEigh a -> [a]
         | TExprSolve (a, b) -> [a; b]

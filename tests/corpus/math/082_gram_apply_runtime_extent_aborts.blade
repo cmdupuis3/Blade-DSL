@@ -1,0 +1,12 @@
+// TEST: Math gram_apply: runtime extent mismatch aborts (aborts)
+// ABORT: error[BL8011]
+// ABORT: A's and B's trailing axes must be equal
+// Inside a function over abstract factors the extents are the caller's, so
+// the checker cannot see that B's trailing axis (2) is not A's (3); the
+// emitted guard -- the twin of the interpreter's -- aborts before either
+// contraction reads past a row end.
+function act(a: T^2, b: T^2, w: T^1) -> T^1 = gram_apply(a, b, w)
+let A: Array<Float64 like Idx<2>, Idx<3>> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let B: Array<Float64 like Idx<2>, Idx<2>> = [[1.0, 2.0], [4.0, 5.0]]
+let x: Array<Float64 like Idx<2>> = [1.0, 2.0]
+let y = act(A, B, x)

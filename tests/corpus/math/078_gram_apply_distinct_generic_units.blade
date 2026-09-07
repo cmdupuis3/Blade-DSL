@@ -1,0 +1,31 @@
+// TEST: Math gram_apply: distinct factors, a generic action, and units
+// gram_apply(A, B, x) = A (B^T x) for A: N x D, B: K x D, x: K -- the action
+// of the DENSE gram(A, B) on x, checked against that matrix applied the long
+// way. The same node reached through an abstract-typed function
+// (T^2, T^2, T^1 -> T^1), and the unit rule: unit(y) = unit(A) * unit(B) *
+// unit(x), the product of both contractions.
+Unit meter
+Unit second
+type N = Idx<5>
+type D = Idx<3>
+type K = Idx<4>
+let A: Array<Float64 like N, D> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [2.0, 0.0, 1.0], [1.0, 1.0, 1.0]]
+let B: Array<Float64 like K, D> = [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]]
+let x: Array<Float64 like K> = [1.0, -1.0, 2.0, 3.0]
+let y = gram_apply(A, B, x)
+// EXPECT: y = [28, 76, 124, 20, 16]
+let G = gram(A, B)
+let y_ref = method_for(G) <@> lambda(row) -> prodsum(row, x) |> compute
+let dev = reduce(y - y_ref, (+))
+// EXPECT: dev = 0
+
+function act(a: T^2, b: T^2, w: T^1) -> T^1 = gram_apply(a, b, w)
+let yf = act(A, B, x)
+let devf = reduce(yf - y, (+))
+// EXPECT: devf = 0
+
+let Am: Array<Float64<meter> like N, D> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [2.0, 0.0, 1.0], [1.0, 1.0, 1.0]]
+let Bm: Array<Float64<meter> like K, D> = [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]]
+let xs: Array<Float64<second> like K> = [1.0, -1.0, 2.0, 3.0]
+let ym: Array<Float64<meter^2 * second> like N> = gram_apply(Am, Bm, xs)
+// EXPECT: ym = [28, 76, 124, 20, 16]

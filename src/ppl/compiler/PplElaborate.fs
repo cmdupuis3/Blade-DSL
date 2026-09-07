@@ -314,6 +314,7 @@ let rec private anyExpr (p: Expr -> bool) (e: Expr) : bool =
     | ExprKind.ExprMask (a, pr) | ExprKind.ExprCompound (a, pr) | ExprKind.ExprSparse (a, pr) | ExprKind.ExprGroupBy (a, pr)
     | ExprKind.ExprIntersect (a, pr) | ExprKind.ExprUnion (a, pr) | ExprKind.ExprContains (a, pr)
     | ExprKind.ExprSort (a, pr) | ExprKind.ExprGram (a, pr) -> any a || any pr
+    | ExprKind.ExprGramApply (a, b, x) -> any a || any b || any x
     | ExprKind.ExprReduce (a, k, i, _) -> any a || any k || (i |> Option.map any |> Option.defaultValue false)
     | ExprKind.ExprAssign (l, r) -> any l || any r
     | _ -> false
@@ -4023,6 +4024,7 @@ let rec private stripQualified (aliases: Set<string>) (e: Expr) : Expr =
     | ExprKind.ExprGroupBy (v, g) -> inheritSpan e (ExprGroupBy (r v, r g))
     | ExprKind.ExprSort (a, k) -> inheritSpan e (ExprSort (r a, r k))
     | ExprKind.ExprGram (l, rr) -> inheritSpan e (ExprGram (r l, r rr))
+    | ExprKind.ExprGramApply (l, rr, x) -> inheritSpan e (ExprGramApply (r l, r rr, r x))
     | ExprKind.ExprReduce (a, k, init, ax) -> inheritSpan e (ExprReduce (r a, r k, Option.map r init, ax))
     | ExprKind.ExprStruct (nm, fields, spread) ->
         inheritSpan e (ExprStruct (nm, fields |> List.map (fun (fn, fe) -> (fn, r fe)), Option.map r spread))

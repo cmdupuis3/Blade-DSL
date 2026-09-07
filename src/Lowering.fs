@@ -838,6 +838,8 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
         IRDecompact (lowerTypedExpr env array, dim)
     | TExprGram (left, right, isSameArray) ->
         IRGram (lowerTypedExpr env left, lowerTypedExpr env right, isSameArray)
+    | TExprGramApply (left, right, vec) ->
+        IRGramApply (lowerTypedExpr env left, lowerTypedExpr env right, lowerTypedExpr env vec)
     | TExprMatmul (left, right) ->
         IRMatmul (lowerTypedExpr env left, lowerTypedExpr env right)
     | TExprEigh operand ->

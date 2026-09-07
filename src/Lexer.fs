@@ -101,6 +101,7 @@ and Keyword =
     | KwTranspose
     | KwHermitian
     | KwGram
+    | KwGramApply
     | KwDecompact
     | KwPure
     | KwCompute
@@ -222,6 +223,7 @@ let keywordEntries : (string * Keyword) list =
       "transpose", KwTranspose
       "hermitian", KwHermitian
       "gram", KwGram
+      "gram_apply", KwGramApply
       "decompact", KwDecompact
       "pure", KwPure
       "compute", KwCompute

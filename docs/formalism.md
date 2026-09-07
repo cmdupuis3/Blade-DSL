@@ -717,6 +717,15 @@ the annotation hook only.
 
 - `gram(...)` — Gram matrix construction over dense, symmetric, or Hermitian
   structure (value-checked against independent oracles).
+- `gram_apply(A, B, x)` — the ACTION of `gram(A, B)` on a vector, `A·(Bᴴ·x)`,
+  without forming the Gram matrix: A is m × n, B is p × n, x has p cells,
+  the result m; two rank-1 temporaries and never an m × p pool. The factors
+  obey `gram`'s rules (rank 2, plain axes, one element type, contracted
+  extents agree), x must have B's leading extent (static: refused; dynamic:
+  BL8011), units multiply through both contractions, and complex factors
+  conjugate B exactly as `gram` does. Its reverse-mode adjoint action is
+  itself a `gram_apply` (`x̄ += gram_apply(B, A, ȳ)`); the factor cotangents
+  are outer products of the cotangent with the two n-cell intermediates.
 - `hermitian(A)` — adjoint.
 - `conj(x)` — componentwise conjugation (identity on reals).
 - `reduce(A[, kernel[, init]][, axes = n])` — right-to-left fold of the
@@ -1672,7 +1681,7 @@ application; sectioned operators `(+)`, `(/) x`.
 | `comm(...)` `poly(args)` `arity` `nth` | commutativity, arity polymorphism |
 | `omp(x: n)` `cuda` `tdim(...)` | backend/parallelism/T-dim clauses |
 | `mask` `compound` `intersect` `union` `unique` `contains` `group_keys` `group_by` `sort` `reduce` `extents` | relational forms |
-| `gram` `hermitian` `conj` | linear-algebra value operators |
+| `gram` `gram_apply` `hermitian` `conj` | linear-algebra value operators |
 | `reynolds(g[, Antisymmetric])` | symmetrizing kernel wrapper |
 | `range<I>` `reverse<I>` `m..n` | virtual arrays (`m..n` anonymous, half-open) |
 | `Nat<I>` | unit-tagged index value |

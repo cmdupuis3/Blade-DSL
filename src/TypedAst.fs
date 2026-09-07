@@ -324,6 +324,9 @@ and TypedExprKind =
     | TExprTranspose of array: TypedExpr * dim1: int * dim2: int
     | TExprDecompact of array: TypedExpr * dim: int
     | TExprGram of left: TypedExpr * right: TypedExpr * isSameArray: bool
+    /// gram_apply(A, B, x) = A * (B^H * x): the action of gram(A, B) on x
+    /// (rank-1 result over A's leading axis); no m x p matrix is formed.
+    | TExprGramApply of left: TypedExpr * right: TypedExpr * vec: TypedExpr
     /// matmul(A, B): A(m x k) * B(k x n) -> dense m x n, routed through
     /// blade_linalg rather than synthesized as a Blade triple loop.
     | TExprMatmul of left: TypedExpr * right: TypedExpr

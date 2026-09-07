@@ -351,6 +351,7 @@ let rec internal mentionsDeep (names: Set<string>) (e: Expr) : bool =
     | ExprKind.ExprContains (l, r) | ExprKind.ExprGroupBy (l, r)
     | ExprKind.ExprSort (l, r) | ExprKind.ExprGram (l, r)
     | ExprKind.ExprAssign (l, r) -> m l || m r
+    | ExprKind.ExprGramApply (a, b, x) -> m a || m b || m x
     | ExprKind.ExprReduce (a, k, i, ax) -> m a || m k || opt i || opt ax
     | ExprKind.ExprStruct (_, fields, spread) ->
         (fields |> List.exists (fun (_, fe) -> m fe)) || opt spread
@@ -417,6 +418,7 @@ let rec internal allVarsDeep (e: Expr) : Set<string> =
     | ExprKind.ExprContains (l, r) | ExprKind.ExprGroupBy (l, r)
     | ExprKind.ExprSort (l, r) | ExprKind.ExprGram (l, r)
     | ExprKind.ExprAssign (l, r) -> any [l; r]
+    | ExprKind.ExprGramApply (a, b, x) -> any [a; b; x]
     | ExprKind.ExprReduce (a, k, i, ax) -> Set.union (any [a; k]) (Set.union (opt i) (opt ax))
     | ExprKind.ExprStruct (_, fields, spread) ->
         fields |> List.fold (fun acc (_, fe) -> Set.union acc (allVarsDeep fe)) (opt spread)
@@ -526,6 +528,10 @@ let rec internal substKernMany (subs: Map<string, Expr>) (e: Expr) : Expr option
     | ExprKind.ExprTranspose (a, d1, d2) -> s1 (fun x -> ExprTranspose (x, d1, d2)) a
     | ExprKind.ExprDecompact (a, d) -> s1 (fun x -> ExprDecompact (x, d)) a
     | ExprKind.ExprGram (l, r) -> s2 (fun x y -> ExprGram (x, y)) l r
+    | ExprKind.ExprGramApply (l, r, x) ->
+        (match s l, s r, s x with
+         | Some l', Some r', Some x' -> re (ExprGramApply (l', r', x'))
+         | _ -> None)
     | ExprKind.ExprExtents a -> s1 (fun x -> ExprExtents x) a
     | ExprKind.ExprPartialApp (op, x, isLeft) -> s1 (fun a -> ExprPartialApp (op, a, isLeft)) x
     | ExprKind.ExprAssign (l, r) -> s2 (fun x y -> ExprAssign (x, y)) l r
@@ -715,6 +721,6 @@ let rec internal producesArray (arrays: Set<string>) (e: Expr) : bool =
     // grouping-derived data arrays (2.17a): the row->bucket map and
     // per-group sizes are Int arrays read by index
     | ExprKind.ExprGroupBucket _ | ExprKind.ExprExtents _ -> true
-    | ExprKind.ExprGram _ -> true
+    | ExprKind.ExprGram _ | ExprKind.ExprGramApply _ -> true
     | _ -> false
 

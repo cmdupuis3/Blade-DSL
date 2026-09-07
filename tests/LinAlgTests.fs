@@ -167,6 +167,30 @@ let private emissionCases : (string * bool * string * string list * string list)
          // the runtime spelling (denseCellCountExpr, deliberately untouched).
          "G.data, (3 * 4)" ],
        [ "cblas_"; "#include <cblas.h>"; "blade_gram_same_" ])
+      // gram_apply(A, A, v) -- the ACTION of the Gram matrix on a vector
+      // (docs/plans/structural/05, 3.2): TWO L2 calls, the transposed gemv
+      // adapter for t = A^T v and the plain one for y = A t, and no
+      // `blade_gram_*` call because no Gram matrix is formed. Each call
+      // carries the skeleton operand's pool capacity like every adapter.
+      ("gram_apply_routes_to_two_gemv_adapters", true,
+       realMat + "let v: Array<Float64 like Idx<3>> = [1.0, 2.0, 3.0]
+let y = gram_apply(A, A, v)
+",
+       [ shimInclude; "blade_linalg::blade_gemv_t_d("; "blade_linalg::blade_gemv_d("
+         "linalg dispatch: gram_apply(A, B, x), t = B^H x"; "linalg dispatch: gram_apply(A, B, x), y = A t"
+         "A.data, (A.extents[0] * A.extents[1]), v.data, y__t.data"
+         "A.data, (A.extents[0] * A.extents[1]), y__t.data, y.data" ],
+       [ "cblas_"; "blade_gram_same_"; "blade_gram_distinct_"; "conj_scalar(__growj"; "Array<double, 2> y" ])
+      // Gate off: the two rank-1 loops, nothing else -- the first half
+      // accumulates into the t pool over A's rows, the second folds each row
+      // of A against t. No Gram pool and no row-mode `decompact` nest.
+      ("gram_apply_gate_off_keeps_two_vector_loops", false,
+       realMat + "let v: Array<Float64 like Idx<3>> = [1.0, 2.0, 3.0]
+let y = gram_apply(A, A, v)
+",
+       [ "y__t[__gk] += nested_array_utilities::conj_scalar(__growj[__gk]) * __gx;"
+         "__gacc += __growi[__gk] * y__t[__gk];" ],
+       [ "blade_gemv"; shimInclude; "blade_gram_"; "Array<double, 2> y"; "decompact" ])
       // matmul — the first-class intrinsic. `__math_matmul` must NOT survive
       // into the output (it is a pre-inference marker), and no synthesized
       // `__math_<n>` triple-loop function may be generated for it either.
@@ -786,6 +810,8 @@ let runLinAlgEmissionTests () : BlockResult =
           "host_syrk_via_shim", LinAlgPatterns.HostBlas, LinAlgPatterns.Syrk, LinAlgPatterns.ViaShim
           "host_dot_via_shim",  LinAlgPatterns.HostBlas, LinAlgPatterns.Dot,  LinAlgPatterns.ViaShim
           "host_gemv_via_shim", LinAlgPatterns.HostBlas, LinAlgPatterns.Gemv, LinAlgPatterns.ViaShim
+          // The transposed sibling (gram_apply's first half): same L2 argument.
+          "host_gemvt_via_shim", LinAlgPatterns.HostBlas, LinAlgPatterns.GemvT, LinAlgPatterns.ViaShim
           // Same paying-L1-reduction policy as dot, but NOT MATCHED (no
           // sqrt-shape case exists). The row is here so "routed via the shim
           // but never recognised" stays readable from the table rather than
@@ -806,6 +832,7 @@ let runLinAlgEmissionTests () : BlockResult =
           "cuda_syrk_via_shim", LinAlgPatterns.CudaBlas, LinAlgPatterns.Syrk, LinAlgPatterns.ViaShim
           "cuda_dot_native",    LinAlgPatterns.CudaBlas, LinAlgPatterns.Dot,  LinAlgPatterns.Native
           "cuda_gemv_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Gemv, LinAlgPatterns.Native
+          "cuda_gemvt_native",  LinAlgPatterns.CudaBlas, LinAlgPatterns.GemvT, LinAlgPatterns.Native
           "cuda_nrm2_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Nrm2, LinAlgPatterns.Native
           "cuda_axpy_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Axpy, LinAlgPatterns.Native
           "cuda_scal_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Scal, LinAlgPatterns.Native ]
