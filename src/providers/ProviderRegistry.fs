@@ -87,6 +87,9 @@ type ProviderSpec = {
     /// the variable's own ordinals), arrType. None: rank-1 streams refuse.
     GenStreamRowsOpen: (string -> string -> string -> IRArrayType -> string list) option
     GenStreamRows: (string -> string -> string -> string -> string -> string -> IRArrayType -> string list) option
+    /// The natural block of a rank-1 streamed variable -- its chunk edge --
+    /// which a streamed FOLD walks one block at a time (args: path, varName).
+    StreamRowsBlock: (string -> string -> int64) option
     /// #include lines injected when a module reads/writes via this provider
     /// (packed/simplex reads also pull linearized_storage.hpp separately).
     Includes: unit -> string list

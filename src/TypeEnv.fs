@@ -283,6 +283,11 @@ type TypeEnv = {
     /// when G's outer slot carries one of these ids (inferGroupBy mints the
     /// slot fresh, so the id is the only handle that survives).
     SegmentedOuters: System.Collections.Generic.Dictionary<IRId, string>
+    /// The `Chunked` aliases named by a value binding's ANNOTATION, per slot
+    /// (None for a slot that is not a Chunked alias), by binding name: what
+    /// `segments(a)` over a VALUE reads. An array whose slots are all
+    /// `Chunked` already says its tiling; the aliases need not be repeated.
+    SlotAliases: System.Collections.Generic.Dictionary<string, string option list>
     /// Names declared `static struct` (the static-eligibility fence).
     /// Registration validates fields against StaticValue shapes and records
     /// the name on success, so later static structs can nest earlier ones.
@@ -492,6 +497,7 @@ let emptyEnv () = {
     TypeDefs = Map.empty
     Segmentations = Map.empty
     SegmentedOuters = System.Collections.Generic.Dictionary<IRId, string>()
+    SlotAliases = System.Collections.Generic.Dictionary<string, string option list>()
     VariantTags = Map.empty
     Subst = Subst()
     Builder = IRBuilder()

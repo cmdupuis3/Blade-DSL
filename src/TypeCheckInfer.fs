@@ -641,6 +641,18 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
     // segments(A) / ungroup(G[, A]) -- the structural grouping of a Chunked
     // axis and its inverse (docs/plans/structural/07 §2.2, §3.3). By-name
     // intrinsics: a user binding of the same name shadows them.
+    // segments(a) over a VALUE: the tiling its annotation declared.
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, [ { Kind = ExprKind.ExprVar x } ]) when (lookupVar "segments" env).IsNone && (lookupVar x env).IsSome && not (Map.containsKey x env.Segmentations) ->
+        (match env.SlotAliases.TryGetValue x with
+         | true, aliases when aliases |> List.forall Option.isSome ->
+             (match aliases |> List.map Option.get with
+              | [ a ] -> inferSegments env a
+              | [ a0; a1 ] -> inferSegmentsGrid env [ a0; a1 ]
+              | _ -> Error (Other $"segments({x}): tile groupings of rank {aliases.Length} are not supported (rank 1 and 2)"))
+         | true, aliases ->
+             let missing = aliases |> List.mapi (fun i a -> if a.IsNone then Some (string i) else None) |> List.choose id
+             Error (Other $"""segments({x}): slot(s) {String.concat ", " missing} of '{x}' are not declared `Chunked`; annotate every slot with a `Chunked<..>` alias, or name the aliases: segments(C0[, C1])""")
+         | _ -> Error (Other $"segments({x}): '{x}' has no annotation naming `Chunked<..>` slots; annotate it (`let {x}: Array<T like C0, C1> = ..`) or name the aliases: segments(C0[, C1])"))
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, [ { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "segments" env).IsNone ->
         inferSegments env alias
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, [ { Kind = ExprKind.ExprVar a0 }; { Kind = ExprKind.ExprVar a1 } ]) when (lookupVar "segments" env).IsNone ->
@@ -10430,6 +10442,17 @@ and inferLetBindingValue (env: TypeEnv) (binding: Binding) : TypeResult<TypedExp
     match binding.Type with
     | Some annot ->
         let annotTy = lowerTypeExpr env annot
+        // Remember which slots the annotation names as `Chunked` aliases, so
+        // `segments(name)` can read the array's own tiling (structural/07).
+        (match binding.Pattern.Kind, annot with
+         | PatVar name, TyArray (_, its) ->
+             let aliases =
+                 its |> List.map (fun t ->
+                     match t with
+                     | TyNamed (n, []) when Map.containsKey n env.Segmentations -> Some n
+                     | _ -> None)
+             if aliases |> List.exists Option.isSome then env.SlotAliases.[name] <- aliases
+         | _ -> ())
         // Recursive array definition (`let rec q: T = match q with ...`).
         // Route to the dedicated desugar BEFORE the generic annotated-value
         // machinery: the structured arms become the internal sequential

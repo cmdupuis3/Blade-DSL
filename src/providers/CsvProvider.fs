@@ -465,6 +465,7 @@ let spec : Blade.ProviderRegistry.ProviderSpec = {
     GenStreamFiber = None
     GenStreamRowsOpen = None
     GenStreamRows = None
+    StreamRowsBlock = None
     Includes = CppCsv.genIncludes
     VarDimNames = fun _ _ -> None  // CSV carries no dimension names
     Fingerprint = fileFingerprint

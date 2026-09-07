@@ -1,0 +1,26 @@
+// TEST: Segments Of A Value Read Its Declared Chunked Slots
+// An array whose annotation names `Chunked` aliases already says its
+// tiling (docs/plans/structural/07): `segments(a)` over the VALUE is the
+// rank-1 grouping for one slot and the tile grouping for two, without
+// repeating the aliases.
+type I0 = Idx<10>
+type I1 = Idx<6>
+type C0 = Chunked<I0, 4>
+type C1 = Chunked<I1, 3>
+let b: Array<Float like C0> = 1.0 + Float64(0..10)
+let sb = segments(b)
+let nb = extents(sb)
+// EXPECT: nb = [4, 4, 2]
+let gb = group_by(b, sb)
+let sums = method_for(gb) <@> lambda(r) -> reduce(r, (+)) |> compute
+// EXPECT: sums = [10, 26, 19]
+let a: Array<Float like C0, C1> = method_for(range<I0>, range<I1>) <@> lambda(i, j) -> Float64(i) * 10.0 + Float64(j) |> compute
+let ta = segments(a)
+let na = extents(ta)
+// EXPECT: na = [12, 12, 12, 12, 6, 6]
+let ga = group_by(a, ta)
+let firsts = method_for(ga) <@> lambda(r) -> r(0) |> compute
+// EXPECT: firsts = [0, 3, 40, 43, 80, 83]
+let back = ungroup(ga)
+let dev = reduce(back - a, (+), axes = 2)
+// EXPECT: dev = 0

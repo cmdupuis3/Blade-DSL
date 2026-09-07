@@ -2839,6 +2839,69 @@ and genReduceBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuil
         | Some c when c.Params.Length = 2 && c.IsOmpParallel && foldKernelReproVetoed c ->
             [ $"{ind}// [omp] requested but emitted serial: fold kernel is `where repro` (the operation order is the contract; reorder licence vetoed)" ]
         | _ -> []
+    // STREAMED FOLD (docs/plans/structural/07, decision D6 as read: a fold over
+    // a segmented axis is the plain flat fold at the API). The operand is a
+    // rank-1 variable bound with `.stream`: no array exists, so the fold walks
+    // the store one block at a time -- the block is the store's own chunk
+    // edge -- and folds the cells in STORAGE ORDER. That is the same operation
+    // sequence as the flat fold over a materialized copy, so the two agree
+    // bitwise; nothing is reassociated and no reorder licence is asked
+    // (`omp` on the kernel is noted and ignored: the store is read serially).
+    let streamedFold =
+        match Map.tryFind arrName ctx.StreamedArrays with
+        | Some spec when spec.VarType.IndexTypes.Length = 1 ->
+            let pspec = (Blade.ProviderRegistry.tryFind spec.Provider).Value
+            match pspec.GenStreamRows, pspec.StreamRowsBlock with
+            | Some genRows, Some blockOf ->
+                let n =
+                    match spec.VarType.IndexTypes.[0].Extent with
+                    | IRLit (IRLitInt n) -> n
+                    | _ -> raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"streamed fold over '{spec.VarName}' needs a static extent")))
+                let block = max 1L (blockOf spec.FilePath spec.VarName)
+                let blk = $"{name}__blk"
+                let stepOf (acc: string) (cell: string) : string * string list =
+                    match resolveCallable kernelExpr with
+                    | Some callable when callable.Params.Length = 2 ->
+                        (match pathAOp with
+                         | Some (op, _) -> ($"{acc} {(binOpToCpp op)} {cell}", [])
+                         | None ->
+                             let (wrapperCode, wname) = genCallableWrapper ctx.VarNames name callable
+                             ($"{wname}({acc}, {cell})", wrapperCode |> List.map (fun s -> ind + s)))
+                    | _ -> raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"streamed fold over '{spec.VarName}': the kernel must be a two-argument fold kernel")))
+                let (stepExpr, wrapperLines) = stepOf name $"{blk}[__q]"
+                let seedLines, firstGuard =
+                    match initExpr with
+                    | Some initE -> ([ $"{ind}{elemStr} {name} = {(exprToCppCtx ctx initE)};" ], "")
+                    | None ->
+                        if n <= 0L then
+                            raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"streamed fold over '{spec.VarName}': the variable is empty and the fold has no seed")))
+                        ([ $"{ind}{elemStr} {name} = ({elemStr})0;"; $"{ind}bool {name}__first = true;" ],
+                         $"if ({name}__first) {{ {name} = {blk}[__q]; {name}__first = false; }} else ")
+                let ompNote =
+                    match resolveCallable kernelExpr with
+                    | Some c when c.IsOmpParallel -> [ $"{ind}// [omp] requested but emitted serial: the operand is streamed from the store in storage order" ]
+                    | _ -> []
+                let rowRead =
+                    genRows spec.FilePath spec.VarName arrName blk "__lo" "__hi" spec.VarType
+                    |> List.map (fun s -> ind + "    " + s)
+                Some (
+                    elemErrCode @ ompNote @ wrapperLines
+                    @ [ $"{ind}// reduce: STREAMED fold over '{spec.VarName}' in storage order, {block} cells per block (bitwise the flat fold)"
+                        $"{ind}{elemStr}* {blk} = new {elemStr}[{block}];" ]
+                    @ seedLines
+                    @ [ $$"""{{ind}}for (size_t __lo = 0; __lo < {{n}}UL; __lo += {{block}}UL) {"""
+                        $"{ind}    size_t __hi = __lo + {block}UL; if (__hi > {n}UL) __hi = {n}UL;" ]
+                    @ rowRead
+                    @ [ $"{ind}    for (size_t __q = 0; __q < __hi - __lo; __q++) {firstGuard}{name} = {stepExpr};"
+                        $"{ind}}}"
+                        $"{ind}delete[] {blk};" ])
+            | _ ->
+                let ctx' = addVarName binding.Id name ctx
+                Some (codegenError ctx ind $"provider '{spec.Provider}' does not support per-block streamed folds ('{spec.VarName}' -- bind with .read)")
+        | _ -> None
+    match streamedFold with
+    | Some code -> (code, addVarName binding.Id name ctx)
+    | None ->
     let code =
         match resolveCallable kernelExpr with
         | Some callable when callable.Params.Length = 2 ->

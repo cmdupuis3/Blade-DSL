@@ -220,7 +220,48 @@ let recognizeFreezeIdiom (calleeAdmissible: string -> string option) (def: RecAr
 /// specialization), then elementwise-chain fusion. One entry point so the
 /// pipeline reads as a stage, and so a new pass has one obvious place to
 /// join.
+/// The SEGMENT-STREAMING decision (docs/plans/structural/07 §3.4; the
+/// principle the user stated: a computation over a streamed, segmented
+/// variable is examined as a whole before `compute`, and the compiler --
+/// not a task graph -- chooses between reading the store one run at a
+/// time and materializing). Today the choice is by consumer SHAPE and is
+/// recorded, not costed: a fold walks the store block by block in storage
+/// order (bitwise the flat fold), a `group_by` under a structural grouping
+/// reads one run per group, a key grouping needs the whole variable. The
+/// emission lives in codegen; this pass only says what it will do, so
+/// `blade plan` shows it.
+let private recordSegmentStreaming (modul: IRModule) : unit =
+    let streamed =
+        modul.ProviderReads
+        |> Map.filter (fun _ s -> s.Streamed && s.VarType.IndexTypes.Length = 1)
+    if not (Map.isEmpty streamed) then
+        let structural =
+            modul.Bindings
+            |> List.choose (fun b -> match b.Value with IRSegments _ | IRSegmentsGrid _ -> Some b.Id | _ -> None)
+            |> Set.ofList
+        let decide (subject: string) (outcome: Blade.Effects.DecisionOutcome) (evidence: string list) =
+            Blade.Effects.Decisions.record
+                { Blade.Effects.Rule = "segment-streaming"; Version = 1
+                  Span = Blade.Ast.noSpan; Subject = subject
+                  Outcome = outcome; Evidence = evidence }
+        for b in modul.Bindings do
+            match b.Value with
+            | IRReduce (IRVar (vid, _), _, _) when Map.containsKey vid streamed ->
+                let s = streamed.[vid]
+                decide b.Name Blade.Effects.Applied
+                    [ $"fold over the streamed variable '{s.VarName}' walks the store one block at a time, in storage order: the same operation sequence as the flat fold, so the answer is bitwise the materialized one" ]
+            | IRGroupBy (IRVar (vid, _), IRVar (gid, _)) when Map.containsKey vid streamed ->
+                let s = streamed.[vid]
+                if Set.contains gid structural then
+                    decide b.Name Blade.Effects.Applied
+                        [ $"group_by over the streamed variable '{s.VarName}' under a structural grouping reads one run per group straight into its row; the whole variable is never materialized" ]
+                else
+                    decide b.Name (Blade.Effects.Declined "a key grouping needs every cell before any row is known")
+                        [ $"'{s.VarName}' is streamed but the grouping is by keys; bind it with .read" ]
+            | _ -> ()
+
 let optimizeModule (builder: IRBuilder) (modul: IRModule) : IRModule =
+    recordSegmentStreaming modul
     modul
     |> foldConstMatchesModule
     |> (fun m -> fuseElementwiseChainsModule m builder)

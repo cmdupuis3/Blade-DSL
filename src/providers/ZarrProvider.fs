@@ -2439,6 +2439,10 @@ let spec : Blade.ProviderRegistry.ProviderSpec = {
     GenStreamFiber = Some CppZarr.genStreamFiber
     GenStreamRowsOpen = Some CppZarr.genStreamRowsOpen
     GenStreamRows = Some CppZarr.genStreamRows
+    StreamRowsBlock = Some (fun path varName ->
+        match tryFindArray (load path) varName with
+        | Some m when not m.Chunks.IsEmpty -> List.head m.Chunks
+        | _ -> 4096L)
     Includes = CppZarr.genIncludes
     VarDimNames = fun path varName ->
         try

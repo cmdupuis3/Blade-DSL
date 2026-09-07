@@ -890,6 +890,66 @@ let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
     streamedSegmentsE2E ()
 
     // ---------------------------------------------------------------
+    // 10f. STREAMED FOLD (decision D6 of docs/plans/structural/07): `reduce`
+    // over a rank-1 `.stream` variable is the plain flat fold at the API and
+    // walks the store one block at a time in storage order -- the same
+    // operation sequence as the flat fold over a materialized copy, so the
+    // answer is bitwise identical and no reorder licence is involved. Both
+    // a builtin operator and a lambda kernel; and `segments(A)` off the
+    // annotation's `Chunked` slot. The decision is recorded for `blade plan`.
+    // ---------------------------------------------------------------
+    printfn "
+--- streamed fold: reduce(s.vars.A |> z.stream, (+)) ---"
+    let streamedFoldE2E () =
+        let segStore = fixStore "zarr_segments"    // 10 cells 1..10, chunked at 4
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A: Array<Float like CX> = sample.vars.A |> z.stream
+let total = reduce(A, (+))
+let biggest = reduce(A, lambda(x, y) -> if x > y then x else y)
+let shifted = reduce(A, (+), 100.0)
+let seg = segments(A)
+let sizes = extents(seg)
+"""
+                            segStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "streamed fold: `blade plan` records segment-streaming for the folds"
+                    (decisions |> List.filter (fun d -> d.Rule = "segment-streaming" && d.Outcome = Blade.Effects.Applied) |> List.length >= 3)
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Rule + ":" + d.Subject)))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_fold"
+                check "streamed fold: block-wise emission, no whole-array buffer"
+                    (cppCode.Contains "STREAMED fold" && not (cppCode.Contains "A_flat = new") && not (cppCode.Contains "Array<double, 1> A = ")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_fold.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "streamed fold: builtin (+) = 55" (has "total = 55") runOut
+                          check "streamed fold: lambda max = 10" (has "biggest = 10") runOut
+                          check "streamed fold: seeded (+) = 155" (has "shifted = 155") runOut
+                          check "streamed fold: segments(A) off the annotation" (has "sizes = [4, 4, 2]") runOut
+                      | Ok (code, out) -> check "streamed fold: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "streamed fold: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP streamed fold (compile skipped): %s" e
+                     else check "streamed fold: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "streamed fold: lowers" false e
+        with ex -> check "streamed fold" false ex.Message
+    streamedFoldE2E ()
+
+    // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
     //
     // Every store dimension derives a named index type, and codegen emits one
