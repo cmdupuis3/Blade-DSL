@@ -366,6 +366,56 @@ Tests: `sql-group-by` cases "Group Extents", "Group Gather Elision", "Group
 Extents Inline Argument"; the emission shape (which a value check cannot see) is
 pinned by the "Group Gather Elision" block in `tests/Test_Sqlish.fs`.
 
+## 7c. `segments(A)`, `files(A)`, `ungroup` — structural groupings of a segmented axis
+
+A chunked dimension is a grouping of its axis whose keys are given by STRUCTURE
+rather than by values (docs/plans/structural/07). The surface is one type and
+three name-keyed forms:
+
+```blade
+type I  = Idx<10>
+type CI = Chunked<I, 4>                       // I segmented into runs of four: [0,4) [4,8) [8,10)
+type CX = Chunked<s.index.x, store>           // a store axis, chunked as the store chunks it
+type T  = Chunked<s1.index.x, [[s1, store], [s2, 2]]>   // x TILED over two stores, each with its own grid
+
+let seg = segments(CI)                        // GroupKeys<I>: the run partition, no key array, no permutation
+let g   = group_by(a, seg)                    // groups x members, as for any grouping
+let back = ungroup(g)                         // Array<Float like I>: the runs reassembled over I
+let fs  = files(T)                            // the FILE level of a tiled axis: one run per store, labelled
+let v   = ungroup([v1, v2], T)                // a variable living in both stores, named over T
+```
+
+- `Chunked<I, spec>` **is** `I`: the alias adopts I's record, so arrays over `CI` and
+  over `I` are one type. The segmentation lives beside the alias and is read only
+  by `segments`/`files`. A file-tiled axis is a NEW axis of the summed extent,
+  named by the alias; its inner only names the dimension the stores tile, and each
+  store keeps its own chunk grid (a `store` entry inherits it, a literal sets it,
+  none leaves the file unchunked). Only extents and chunk edges are consulted --
+  never a coordinate value: the declaration order *is* the axis order.
+- `segments(A)` and `files(A)` are groupings on exactly the terms of `group_keys`
+  (section 7): name-keyed (BL3017), sharing one binding co-iterates,
+  `group_bucket`/`extents` read them. They emit no permutation: the position
+  accessor every grouping now carries (`<gk>__at`) is the identity here and
+  `__perm` for a CSR grouping, so downstream consumers do not know which regime
+  built the table. `segments` of a tiled axis is its innermost (per-file chunk)
+  level; `files` its outermost. In a static position `segments(A)` is the tuple
+  of run sizes, so `let static n = length(segments(A))` is a compile-time segment
+  count.
+- `ungroup(G)` restores the axis from a `group_by(_, segments(A))` result;
+  `ungroup(G, A)` names the axis when G derives from one (a map over it keeps
+  neither the outer id nor the grouping registration). `ungroup([r1, .., rF], A)`
+  assembles one array per store over a tiled axis; rows are bare names whose
+  extents must match the stores'. `join` is untouched: it concatenates into a
+  fresh axis, `ungroup` reassembles an existing one.
+
+Not yet: an elementwise map over a grouped array (the ragged-map emitter's
+standing refusal, so the per-segment elementwise idiom is `ungroup` then map, or
+map then `group_by`); per-segment lazy reads (a grouped provider read still
+materializes the whole variable); string-label indexing of the `files` outer
+axis; static `segments` for provider axes; chunk edges for netcdf and icechunk
+(zarr only). Tests: `tests/corpus/segments/`, and `blade test zarr` sections 10c
+(inherited edge) and 10d (two stores).
+
 ## 8. `group_by(values, gk)` — ragged grouped view
 
 ```blade

@@ -190,6 +190,9 @@ Full semantics in [features/sql.md](features/sql.md). All implemented and tested
 | `... !contains(B, x)` | Antijoin | Idiom |
 | `group_keys(k₁, k₂, ...)` | GROUP BY keys | CSR grouping structure; static (Idx / EnumIdx) and dynamic dispatch |
 | `group_by(values, gk)` | GROUP BY | Rank-2 ragged result; per-group kernels/reduces; elementwise map rejected by design |
+| `Chunked<I, K>` / `Chunked<s.index.d, store>` / `Chunked<s1.index.d, [[s1, store], [s2, 2]]>` | segmented axis | The alias IS the axis; a regular grid, a store-inherited grid (zarr), or stores tiling the dimension with their own grids. Coordinates never consulted. docs/plans/structural/07, sql.md 7c |
+| `segments(A)` / `files(A)` | structural GROUP BY | Groupings with no key array and no permutation (identity `__at`); `files` is the labelled file level of a tiled axis. Statically evaluable for literal grids |
+| `ungroup(G[, A])` / `ungroup([r1, ..], A)` | inverse of a structural grouping | Rows written back over the axis; the row form names a multi-store variable over a tiled axis. `join` untouched |
 | `sort(A, keyFn)` | ORDER BY | Stable, key-extractor (not comparator); dense result |
 | `reduce(A[, kernel[, init]][, axes = n])` | Aggregates | Default `(+)`; folds RIGHT-TO-LEFT, the innermost `n` axes with `n = 1` by default (rank k in, rank k−n out; `axes = rank(A)` is the full fold to a scalar — named slot, since the 3rd positional argument is the seed; `n` must be an integer literal, 1 ≤ n ≤ rank). 3-arg init form seeds EACH folded group and defines the empty result (landed, arc 4) — without init, statically-empty rejected and dynamic extents guarded |
 | `extents(A)` | COUNT(*) | Cardinality on compound = post-WHERE count |
