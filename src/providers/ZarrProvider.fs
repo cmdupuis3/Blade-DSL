@@ -1401,13 +1401,16 @@ module CppZarr =
                   ind + $"if ({v}_cf.gcount() != (std::streamsize){chunkBytes}) {{ std::cerr << \"Zarr error: chunk '\" << {v}_key << \"' of '{varName}' is short (expected {chunkBytes} bytes) -- a compressed or corrupt store?\" << std::endl; std::exit(1); }}" ]
               Ident = $"{v}_key" }
 
-    /// The chunk-assembly core shared by the dense and packed readers: emits
-    /// C++ assembling the (physical, dense) on-disk array into a flat
-    /// row-major buffer `<cppVarName>_flat` of type `elemCpp`, one chunk at a
-    /// time out of `fetch`. All metadata is baked at compile time -- the
-    /// generated program parses no JSON. Absent chunks fill with fill_value
-    /// (or fail loudly when null). Caller owns (and must delete[]) `<cppVarName>_flat`.
-    let genAssembleFlatVia (fetch: ChunkFetchEmitter) (meta: ZarrArrayMeta) (cppVarName: string) (elemCpp: string) : string list =
+    /// The chunk-assembly core, PHASED: `mask = Some (need, done, counter)`
+    /// splits the assembly into two emissions over the same buffers -- phase 1
+    /// reads the chunks `need[]` marks (recording `done[]`, counting reads in
+    /// `counter`) and keeps `<v>_cbuf`; phase 2 reads whatever is not done and
+    /// releases it. Revision reuse's read avoidance (docs/plans/structural/04,
+    /// 3.4): the compute phase touches only the chunks its unhit tiles need,
+    /// the print pass gets the whole array afterwards. `None` is the ordinary
+    /// one-shot assembly.
+    let genAssembleFlatPhased (fetch: ChunkFetchEmitter) (meta: ZarrArrayMeta) (cppVarName: string) (elemCpp: string)
+                              (mask: (string * string * string) option) (phase: int) : string list =
         let v = cppVarName
         let varName = meta.Name
         let rank = meta.Shape.Length
@@ -1419,6 +1422,7 @@ module CppZarr =
         let grid = gridDims meta.Shape meta.Chunks |> List.map int
         let gStr = rowMajorStrides shape
         let cStr = rowMajorStrides chunks
+        let gridStr = rowMajorStrides grid
         let total = shape |> List.fold (*) 1
         let chunkCount = chunks |> List.fold (*) 1
         let chunkBytes = chunkCount * meta.Dtype.ByteSize
@@ -1441,7 +1445,10 @@ module CppZarr =
             [ for d in 0 .. rank - 1 ->
                 let ind = String.replicate d "    "
                 $"{ind}for (size_t {v}_c{d} = 0; {v}_c{d} < {grid.[d]}; {v}_c{d}++) {{" ]
-        let gInd = String.replicate rank "    "
+        let gInd0 = String.replicate rank "    "
+        // Under a mask the chunk body sits one level deeper, inside the
+        // need / not-done test.
+        let gInd = if mask.IsSome then gInd0 + "    " else gInd0
 
         // In-bounds limits per dim (edge chunks are stored padded; copy the
         // intersection only).
@@ -1465,9 +1472,20 @@ module CppZarr =
             [ for d in 0 .. rank - 1 -> $"{v}_l{d} * {cStr.[d]}" ]
             |> String.concat " + "
 
+        // Under a mask, a satisfied chunk (read or filled) is recorded and
+        // a read is counted.
+        let satisfied =
+            match mask with
+            | Some (_, doneName, counter) -> [ gInd + $"    {doneName}[{v}_cidx] = true; {counter}++;" ]
+            | None -> []
+        let filledMark =
+            match mask with
+            | Some (_, doneName, _) -> [ gInd + $"    {doneName}[{v}_cidx] = true;" ]
+            | None -> []
         let presentBranch =
             [ gInd + $"if ({src.Present}) {{" ]
             @ src.Read (gInd + "    ")
+            @ satisfied
             @ (copyLoops $"{v}_flat[{gIdx}] = ({elemCpp}){v}_cbuf[{cIdx}];")
         let missingBranch =
             match meta.FillValue with
@@ -1477,6 +1495,7 @@ module CppZarr =
                   gInd + "}" ]
             | _ ->
                 [ gInd + "} else {" ]
+                @ filledMark
                 @ (copyLoops $"{v}_flat[{gIdx}] = {v}_fillv;" |> List.map (fun s -> "    " + s))
                 @ [ gInd + "}" ]
 
@@ -1488,11 +1507,37 @@ module CppZarr =
 
         let gridClose = [ for d in rank - 1 .. -1 .. 0 -> String.replicate d "    " + "}" ]
 
-        header
-        @ gridLoops
-        @ chunkBody
-        @ gridClose
-        @ [ $"delete[] {v}_cbuf;" ]
+        match mask with
+        | None ->
+            header
+            @ gridLoops
+            @ chunkBody
+            @ gridClose
+            @ [ $"delete[] {v}_cbuf;" ]
+        | Some (needName, doneName, _) ->
+            // Phase 1 reads the NEEDED chunks (the compute phase's) and keeps the
+            // chunk buffer; phase 2 reads what is not yet done and releases it.
+            let cidx =
+                [ for d in 0 .. rank - 1 -> $"{v}_c{d} * {gridStr.[d]}" ] |> String.concat " + "
+            let test = if phase = 1 then $"{needName}[{v}_cidx]" else $"!{doneName}[{v}_cidx]"
+            (if phase = 1 then header else [])
+            @ gridLoops
+            @ [ gInd0 + $"size_t {v}_cidx = {cidx};"
+                gInd0 + $"if ({test}) {{" ]
+            @ chunkBody
+            @ [ gInd0 + "}" ]
+            @ gridClose
+            @ (if phase = 1 then [] else [ $"delete[] {v}_cbuf;" ])
+
+    /// The chunk-assembly core shared by the dense and packed readers: emits
+    /// C++ assembling the (physical, dense) on-disk array into a flat
+    /// row-major buffer `<cppVarName>_flat` of type `elemCpp`, one chunk at a
+    /// time out of `fetch`. All metadata is baked at compile time -- the
+    /// generated program parses no JSON. Absent chunks fill with fill_value
+    /// (or fail loudly when null). Caller owns (and must delete[]) `<cppVarName>_flat`.
+    /// (The unmasked case of `genAssembleFlatPhased`, byte for byte.)
+    let genAssembleFlatVia (fetch: ChunkFetchEmitter) (meta: ZarrArrayMeta) (cppVarName: string) (elemCpp: string) : string list =
+        genAssembleFlatPhased fetch meta cppVarName elemCpp None 1
 
     /// The assembly core over a Zarr store directory (its file-per-chunk-key fetch).
     let private genAssembleFlat (storePath: string) (store: ZarrStore) (meta: ZarrArrayMeta) (cppVarName: string) (elemCpp: string) : string list =

@@ -2790,6 +2790,10 @@ let runtimeHeaderNames : string list =
       // at exit with what the run observed and how it ended. Header-only,
       // host-only; deployed unconditionally and included by every program.
       "blade_run_record.hpp"
+      // Revision reuse (docs/plans/structural/04): the local tile store's
+      // probe/load/store. INCLUDED only by a program with a tiled binding
+      // (tilesUsedCell); deployed unconditionally like the rest.
+      "blade_tilecache.hpp"
       // Dense linear-algebra dispatch: blade_gemm / blade_syrk plus the
       // gram/matmul adapters, resolving to cblas under -DBLADE_HAS_BLAS and to
       // native fallbacks otherwise. INCLUDED only by programs that actually

@@ -38,6 +38,44 @@ let internal panicSpanArgs (span: Blade.Ast.Span) : string =
 // Code Generation Context
 
 /// Tracks information needed during code generation
+/// Revision reuse (docs/plans/structural/04, v1): one tiled binding's plan,
+/// built by CodeGenTiles.planTiles and consumed at three seams -- the
+/// need-masked provider read (CodeGenBinding), the tile run loop around the
+/// nest (CodeGenCuda.genApplyCombinator), and the remainder read after it.
+type TileInputPlan = {
+    /// The provider-read binding this input is.
+    ReadId: IRId
+    CppName: string
+    Spec: ProviderReadSpec
+    /// Chunks in the variable's grid (row-major flat), and the product of
+    /// the trailing grid dims -- tile t's chunks are [t*G, (t+1)*G).
+    ChunkCount: int
+    TrailingGrid: int64
+    /// The need-masked read emitted at the binding, and the remainder read
+    /// (every chunk the compute phase did not need) emitted after the tiled
+    /// binding. Both unindented.
+    Phase1: string list
+    Phase2: string list
+}
+and TilePlan = {
+    /// The tiled binding's C++ name (genApplyCombinator's `name`).
+    Output: string
+    BindingId: IRId
+    Inputs: TileInputPlan list
+    /// Tiles = leading-axis chunks; LeadBounds has Tiles + 1 entries.
+    Tiles: int
+    LeadBounds: int64 list
+    /// Cells per leading-axis row (the product of the trailing extents).
+    Trailing: int64
+    ElemCpp: string
+    /// One SHA-256 hex key per tile.
+    Keys: string list
+    /// The probe runs at the inputs' reads (read avoidance) when nothing
+    /// between the read and the tiled binding observes the input; otherwise
+    /// the tile loop probes by loading (recompute avoidance only).
+    Hoisted: bool
+}
+
 type CodeGenContext = {
     /// Map from IR variable IDs to C++ variable names
     VarNames: Map<IRId, string>
@@ -98,6 +136,11 @@ type CodeGenContext = {
     /// deep-copies storage (fresh alloc + pool copy) instead of aliasing the Array wrapper by
     /// value, so mutation can't corrupt the source array.
     MutableArrayLets: Set<IRId>
+    /// Revision reuse (docs/plans/structural/04): tile plans by the tiled
+    /// binding's C++ name, and the hoisted probes by the provider-read
+    /// binding they attach to. Empty unless BLADE_TILE_CACHE is set.
+    TilePlans: Map<string, TilePlan>
+    TileReads: Map<IRId, TilePlan>
     /// Accumulated code generation warnings (unsupported IR nodes, fallbacks, etc.)
     Warnings: string list ref
 }
@@ -697,6 +740,88 @@ let ompSuppressedBlockMarker (requested: bool) (reason: string) : string =
 /// picks cblas or the native fallback at C++ compile time. The include line
 /// below is what keeps codegen and build in lockstep; Build.fs keys its
 /// -D/-I/link flags off it.
+/// Revision reuse: set when a tiled binding or a hoisted probe was emitted
+/// this assembly, so the assemblers include `blade_tilecache.hpp` (and
+/// Build.fs keys `-DBLADE_TOOLCHAIN_ID` off the include line). Same shape
+/// as linalgUsedCell.
+let internal tilesUsedStorage =
+    System.Threading.AsyncLocal<bool ref>()
+
+let tilesUsedCell () : bool ref =
+    let v = tilesUsedStorage.Value
+    if isNull (box v) then
+        let fresh = ref false
+        tilesUsedStorage.Value <- fresh
+        fresh
+    else v
+
+/// The probe emitted at the FIRST input read of a hoisted tile plan: every
+/// input's need/done masks, the tile hit table, and the need of each unhit
+/// tile's chunks. Emitted before the phase-1 read of that input (unindented).
+let tileProbeLines (plan: TilePlan) : string list =
+    let f = plan.Output
+    let keys = plan.Keys |> List.map (fun k -> $"\"{k}\"") |> String.concat ", "
+    let lo = plan.LeadBounds |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+    [ $"// revision reuse (docs/plans/structural/04): probe the tile store for {f} before its inputs are read,"
+      $"// so a chunk only a stored tile depends on is not read for the compute phase"
+      $"static const char* {f}__tkeys[{plan.Tiles}] = {{ {keys} }};"
+      $"static const size_t {f}__tlo[{plan.Tiles + 1}] = {{ {lo} }};"
+      $"bool {f}__hit[{plan.Tiles}];" ]
+    @ (plan.Inputs |> List.collect (fun i ->
+        [ $"bool {i.CppName}__need[{i.ChunkCount}]; bool {i.CppName}__done[{i.ChunkCount}];"
+          $"for (size_t __c = 0; __c < {i.ChunkCount}UL; __c++) {{ {i.CppName}__need[__c] = false; {i.CppName}__done[__c] = false; }}" ]))
+    @ [ $"for (size_t __tt = 0; __tt < {plan.Tiles}UL; __tt++) {{"
+        $"    {f}__hit[__tt] = blade_tiles::probe({f}__tkeys[__tt], (std::uint64_t)({f}__tlo[__tt + 1] - {f}__tlo[__tt]) * {plan.Trailing}UL * sizeof({plan.ElemCpp}));" ]
+    @ (plan.Inputs |> List.map (fun i ->
+        $"    for (size_t __j = 0; __j < {i.TrailingGrid}UL; __j++) {i.CppName}__need[__tt * {i.TrailingGrid}UL + __j] = !{f}__hit[__tt];"))
+    @ [ "}" ]
+
+/// The tile run loop around the (outer-level-bounded) nest `loopCode`, then
+/// the remainder reads and the verbose census. `ind` is the binding's indent.
+let tileLoopLines (ind: string) (plan: TilePlan) (loopCode: string list) : string list =
+    let f = plan.Output
+    let keysDecl =
+        if plan.Hoisted then []
+        else
+            let keys = plan.Keys |> List.map (fun k -> $"\"{k}\"") |> String.concat ", "
+            let lo = plan.LeadBounds |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+            [ $"{ind}static const char* {f}__tkeys[{plan.Tiles}] = {{ {keys} }};"
+              $"{ind}static const size_t {f}__tlo[{plan.Tiles + 1}] = {{ {lo} }};" ]
+    let hitTest =
+        if plan.Hoisted then $"{f}__hit[__tt]"
+        else $"blade_tiles::probe({f}__tkeys[__tt], __tbytes)"
+    [ $"{ind}// revision reuse (docs/plans/structural/04): {f} is computed one leading-axis tile at a time;"
+      $"{ind}// a tile whose key (task text + output geometry + the content identities of the chunks it reads)"
+      $"{ind}// is in the tile store is loaded instead of recomputed. Values only: what prints is unchanged." ]
+    @ keysDecl
+    @ [ $"{ind}size_t {f}__computed = 0, {f}__loaded = 0;"
+        $"{ind}for (size_t __tt = 0; __tt < {plan.Tiles}UL; __tt++) {{"
+        $"{ind}    size_t __blade_mpi_lo_{f} = {f}__tlo[__tt];"
+        $"{ind}    size_t __blade_mpi_hi_{f} = {f}__tlo[__tt + 1];"
+        $"{ind}    {plan.ElemCpp}* __tbase = pool_base({f}.data) + __blade_mpi_lo_{f} * {plan.Trailing}UL;"
+        $"{ind}    std::uint64_t __tbytes = (std::uint64_t)(__blade_mpi_hi_{f} - __blade_mpi_lo_{f}) * {plan.Trailing}UL * sizeof({plan.ElemCpp});"
+        $"{ind}    if ({hitTest}) {{"
+        $"{ind}        if (!blade_tiles::load({f}__tkeys[__tt], __tbase, __tbytes)) {{ std::cerr << \"Blade tile cache error: tile \" << __tt << \" of '{f}' was present at the probe and is gone at the load\" << std::endl; std::exit(1); }}"
+        $"{ind}        {f}__loaded++;"
+        $"{ind}    }} else {{" ]
+    @ (loopCode |> List.map (fun s -> "        " + s))
+    @ [ $"{ind}        blade_tiles::store({f}__tkeys[__tt], __tbase, __tbytes);"
+        $"{ind}        {f}__computed++;"
+        $"{ind}    }}"
+        $"{ind}}}" ]
+    @ (if plan.Hoisted then
+           plan.Inputs |> List.collect (fun i ->
+               [ $"{ind}// the remainder of {i.CppName}: every chunk the compute phase did not need (the print pass reads it whole)" ]
+               @ (i.Phase2 |> List.map (fun s -> ind + s)))
+       else [])
+    @ [ $"{ind}if (blade_tiles::verbose()) {{"
+        $"{ind}    std::fprintf(stderr, \"[tiles] {f}: computed %%zu/{plan.Tiles}, hit %%zu/{plan.Tiles}\\n\", {f}__computed, {f}__loaded);" ]
+    @ (if plan.Hoisted then
+           plan.Inputs |> List.map (fun i ->
+               $"{ind}    std::fprintf(stderr, \"[chunks] {i.CppName}: read %%zu/{i.ChunkCount} (compute %%zu, remainder %%zu)\\n\", {i.CppName}__read1 + {i.CppName}__read2, {i.CppName}__read1, {i.CppName}__read2);")
+       else [])
+    @ [ $"{ind}}}" ]
+
 let internal linalgUsedStorage =
     System.Threading.AsyncLocal<bool ref>()
 
@@ -1126,6 +1251,8 @@ let emptyContext () = {
     SparseInits = Map.empty
     GroupedArrays = Map.empty
     MutableArrayLets = Set.empty
+    TilePlans = Map.empty
+    TileReads = Map.empty
     Warnings = ref []
 }
 

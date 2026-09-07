@@ -3678,6 +3678,134 @@ let total = reduce(w, (+))
             try Directory.Delete(scratch, true) with _ -> ())
 
     // ---------------------------------------------------------------
+    // 22. Revision reuse: the tile store across snapshots (structural/04)
+    // ---------------------------------------------------------------
+    // A pure elementwise map over a checkout's variable runs one leading-axis
+    // tile at a time; each tile's key carries the content identities of the
+    // chunks it reads, so a run against a later snapshot recomputes only the
+    // tiles whose chunks moved -- and, with the probe hoisted before the
+    // read, the compute phase reads only those chunks. Values, never text:
+    // cold and warm stdout are identical and equal the interpreter's. The
+    // fixture is wxSpec with ONE changed chunk (rows 3-4, columns 2-3, +100),
+    // so s2's manifest shares three chunk ids with s1's and mints one.
+    // Leading-axis tiles over the 3x2-chunked 5x4 grid: two lat tiles of two
+    // chunks each; the changed chunk sits in lat tile 1.
+    printfn "\n--- revision reuse: tiles across snapshots ---"
+    (try
+        let tileRoot = fixRepo "ic_tiles"
+        let tempV2One =
+            tempV1 |> Array.mapi (fun i v -> (if i / 4 >= 3 && i % 4 >= 2 then v + 100.0 else v))
+        let oneSpec =
+            let coords = [
+                IW.mkArray "lat" ["lat"] [5L] [5L] (IW.IceF64 latData)
+                IW.mkArray "lon" ["lon"] [4L] [4L] (IW.IceF64 lonData) ]
+            let tempOf (d: float[]) =
+                { IW.mkArray "temp" ["lat"; "lon"] [5L; 4L] [3L; 2L] (IW.IceF64 d) with InlineThreshold = 0 }
+            { IW.emptyRepo with
+                Compress = true
+                Seed = 7
+                Snapshots = [ IW.mkSnapshot "s1" (coords @ [ tempOf tempV1 ]); IW.mkSnapshot "s2" (coords @ [ tempOf tempV2One ]) ]
+                Branches = [ ("main", "s2") ]
+                Tags = [ ("v1.0", "s1") ] }
+        IW.writeRepoAt [ tileRoot; Path.Combine(e2eDir, tileRoot) ] oneSpec
+        resetCaches ()
+        check "tiles: one changed chunk mints ONE new chunk file (5, not 8)"
+            ((filesIn (Path.Combine(tileRoot, "chunks"))).Length = 5)
+            (sprintf "%d chunk files" (filesIn (Path.Combine(tileRoot, "chunks"))).Length)
+
+        let srcOf (checkoutExpr: string) =
+            sprintf """
+import icechunk as ic
+
+let repo = ic.load("%s")
+let ck = %s
+let A = ck.vars.temp |> ic.read
+let F = method_for(A) <@> lambda(x) -> x * 2.0 + 1.0 |> compute
+let total = reduce(F, (+), axes = 2)
+"""
+                    tileRoot checkoutExpr
+        let srcS1 = srcOf "repo.checkout(\"v1.0\", ic.tag)"
+        let srcS2 = srcOf "repo.checkout(\"main\")"
+
+        // Off: no tile code reaches the emission at all.
+        (match lower srcS1 with
+         | Error e -> check "tiles: E lowers" false e
+         | Ok ir ->
+             let (cppOff, _) = CodeGen.genSelfContainedProgramFromIR ir "ic_tiles_off"
+             check "tiles: with BLADE_TILE_CACHE unset the emission carries no tile code"
+                 (not (cppOff.Contains "blade_tiles") && not (cppOff.Contains "blade_tilecache.hpp")) "")
+
+        // On: a private absolute store for this section alone.
+        let store = Path.GetFullPath(Path.Combine(e2eDir, "tile_cache_" + Guid.NewGuid().ToString("N")))
+        Directory.CreateDirectory store |> ignore
+        let priorStore = Environment.GetEnvironmentVariable "BLADE_TILE_CACHE"
+        let priorVerbose = Environment.GetEnvironmentVariable "BLADE_TILE_CACHE_VERBOSE"
+        Environment.SetEnvironmentVariable("BLADE_TILE_CACHE", store)
+        Environment.SetEnvironmentVariable("BLADE_TILE_CACHE_VERBOSE", "1")
+        try
+            let buildTiled (label: string) (src: string) : Result<string * string, string> =
+                match lower src with
+                | Error e -> Error $"lower: {e}"
+                | Ok ir ->
+                    let (cpp, _) = CodeGen.genSelfContainedProgramFromIR ir label
+                    CodeGen.deployRuntimeHeaders e2eDir
+                    let cppFile = Path.Combine(e2eDir, label + ".cpp")
+                    File.WriteAllText(cppFile, cpp)
+                    match compileCpp cppFile e2eDir with
+                    | Error e -> Error e
+                    | Ok exe -> Ok (exe, cpp)
+            let runTiled (exe: string) : Result<string, string> =
+                match runExecutable exe with
+                | Ok (0, out) -> Ok out
+                | Ok (code, out) -> Error $"exit {code}: {out}"
+                | Error e -> Error e
+            let census (out: string) (needle: string) = out.Contains needle
+            let stdoutOnly (out: string) =
+                let i = out.IndexOf "\n[stderr]:"
+                icNormOut (if i >= 0 then out.Substring(0, i) else out)
+            match buildTiled "ic_tiles_s1" srcS1 with
+            | Error e -> baselineFailed "tiles s1" e
+            | Ok (exeS1, cppS1) ->
+                check "tiles: the emission tiles F over 2 leading-axis tiles with the probe hoisted to A's read"
+                    (cppS1.Contains "F__tlo[3]" && cppS1.Contains "A__need[" && cppS1.Contains "blade_tiles::probe(F__tkeys")
+                    ""
+                match runTiled exeS1, runTiled exeS1 with
+                | Ok cold, Ok warm ->
+                    check "tiles: E@s1 cold computes every tile and reads every chunk in the compute phase"
+                        (census cold "[tiles] F: computed 2/2, hit 0/2" && census cold "[chunks] A: read 4/4 (compute 4, remainder 0)") cold
+                    check "tiles: E@s1 warm hits every tile and reads every chunk in the remainder"
+                        (census warm "[tiles] F: computed 0/2, hit 2/2" && census warm "[chunks] A: read 4/4 (compute 0, remainder 4)") warm
+                    check "tiles: cold and warm stdout are byte-identical" (stdoutOnly cold = stdoutOnly warm) ""
+                    (match icInterpStdout "ic_tiles_s1_interp" srcS1 with
+                     | Ok interp -> check "tiles: E@s1 stdout equals the interpreter's" (stdoutOnly cold = icNormOut interp) (stdoutOnly cold + "\n---\n" + icNormOut interp)
+                     | Error e -> check "tiles: E@s1 interpreter run" false e)
+                    check "tiles: the store holds one file per tile" ((Directory.GetFiles(store, "*.tile", SearchOption.AllDirectories)).Length = 2) ""
+                | Ok _, Error e | Error e, _ -> check "tiles: E@s1 runs" false e
+                match buildTiled "ic_tiles_s2" srcS2 with
+                | Error e -> baselineFailed "tiles s2" e
+                | Ok (exeS2, _) ->
+                    match runTiled exeS2, runTiled exeS2 with
+                    | Ok cold2, Ok warm2 ->
+                        check "tiles: E@s2 after E@s1 recomputes ONLY the tile holding the changed chunk (1 of 2) and reads only its 2 chunks in the compute phase"
+                            (census cold2 "[tiles] F: computed 1/2, hit 1/2" && census cold2 "[chunks] A: read 4/4 (compute 2, remainder 2)") cold2
+                        check "tiles: E@s2 again hits every tile"
+                            (census warm2 "[tiles] F: computed 0/2, hit 2/2") warm2
+                        check "tiles: E@s2 cold and warm stdout are byte-identical" (stdoutOnly cold2 = stdoutOnly warm2) ""
+                        (match icInterpStdout "ic_tiles_s2_interp" srcS2 with
+                         | Ok interp -> check "tiles: E@s2 stdout equals the interpreter's" (stdoutOnly cold2 = icNormOut interp) (stdoutOnly cold2 + "\n---\n" + icNormOut interp)
+                         | Error e -> check "tiles: E@s2 interpreter run" false e)
+                        check "tiles: the store holds s1's two tiles plus s2's one changed tile"
+                            ((Directory.GetFiles(store, "*.tile", SearchOption.AllDirectories)).Length = 3) ""
+                        check "tiles: s2's total reflects the changed chunk (values, not a stale hit)"
+                            (match printedScalar "total" cold2 with Some v -> abs (v - (2.0 * 210.0 + 20.0 + 2.0 * 400.0)) <= 1e-9 | None -> false) cold2
+                    | Ok _, Error e | Error e, _ -> check "tiles: E@s2 runs" false e
+        finally
+            Environment.SetEnvironmentVariable("BLADE_TILE_CACHE", priorStore)
+            Environment.SetEnvironmentVariable("BLADE_TILE_CACHE_VERBOSE", priorVerbose)
+            try Directory.Delete(store, true) with _ -> ()
+     with ex -> check "tiles: revision reuse" false ex.Message)
+
+    // ---------------------------------------------------------------
     // Summary
     // ---------------------------------------------------------------
     printFooter "Icechunk Provider" [$"{passed} passed"; $"{failed} failed"]

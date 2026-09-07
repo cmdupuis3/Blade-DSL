@@ -1798,6 +1798,11 @@ let private chunkLocText (loc: ChunkLoc) : string =
     | Inline b -> "i:" + sha256Hex b
     | Native nc -> $"c:{base32Encode nc.ChunkId}+{nc.Offset}+{nc.Length}"
 
+/// One chunk's content identity as text, for a consumer outside this file:
+/// the tile keys of revision reuse (docs/plans/structural/04, 2.1) carry
+/// exactly the identities of the chunks a tile reads.
+let chunkIdentityText (loc: ChunkLoc) : string = chunkLocText loc
+
 /// The §5.2 fingerprint of dimension `dimName`'s coordinate variable in this
 /// checkout, or `None` when the checkout has no coordinate variable named
 /// after the dim (then name + extent is the whole identity).
@@ -2652,22 +2657,11 @@ module CppIcechunk =
         | Ok ra -> ra
         | Error e -> failwith $"icechunk {what} of variable '{varName}' from '{path}': {e}"
 
-    /// Dense reader: the shared assembly core over the baked chunk table into
-    /// `<v>_flat`, then the same materialization CppNetcdf/CppZarr do (nested
-    /// Array via allocate<>, flat->nested copy, buffers released).
-    let genReadVar (path: string) (varName: string) (cppVarName: string) (arrType: IRArrayType) : string list =
-        let ra = resolveOrFail "read" path varName
-        if ra.Meta.Blade.IsSome then
-            failwith $"icechunk codegen: variable '{varName}' is blade-packed; the dense reader cannot materialize it (this indicates a typing inconsistency)"
-        // Rank 0 is refused at the metadata gate (`arrayMetaOfNode`), so this
-        // is a restatement, not a live path -- but the loop nest below opens
-        // with `idxVars.[0]`, which on an empty list is an IndexOutOfRange
-        // escaping codegen rather than anything a user can read.
-        if ra.Meta.Shape.IsEmpty then
-            failwith $"icechunk codegen: variable '{varName}' is rank 0 -- rank-0 arrays are not supported by the icechunk provider (this indicates a typing inconsistency)"
-        let v = cppVarName
-        let elemCpp = elemCppOf arrType.ElemType
-        let assemble = ZarrProvider.CppZarr.genAssembleFlatVia (icechunkChunkFetch ra) ra.Meta v elemCpp
+    /// The flat -> nested materialization of `genReadVar` (nested Array via
+    /// allocate<>, flat->nested copy, the flat buffer released). `declare`
+    /// emits the extents + allocation (false: the nested array already
+    /// exists and is re-filled); `release` deletes the flat buffer.
+    let private materializeFlat (ra: ResolvedArray) (v: string) (elemCpp: string) (declare: bool) (release: bool) : string list =
         let shape = ra.Meta.Shape |> List.map int
         let rank = shape.Length
         let extentDecls = shape |> List.mapi (fun i n -> $"size_t {v}_extent_{i} = {n};")
@@ -2684,15 +2678,58 @@ module CppIcechunk =
                 acc <- $"({acc}) * {extentNames.[i]} + {idxVars.[i]}"
             acc
         let bodyInd = String.replicate rank "    "
-        let materialize =
+        (if declare then
             extentDecls
             @ [ $"""size_t {v}_extents[] = {{ {(String.concat ", " extentNames)} }};"""
                 $"Array<{elemCpp}, {rank}> {v} = {{ allocate<typename promote<{elemCpp}, {rank}>::type, nullptr>({v}_extents), {v}_extents }};" ]
-            @ openLoops
-            @ [ $"{bodyInd}{v}{nestedSub} = {v}_flat[{flatIdx}];" ]
-            @ [ for d in rank - 1 .. -1 .. 0 -> $"""{(String.replicate d "    ")}}}""" ]
-            @ [ $"delete[] {v}_flat;" ]
-        assemble @ materialize
+         else [])
+        @ openLoops
+        @ [ $"{bodyInd}{v}{nestedSub} = {v}_flat[{flatIdx}];" ]
+        @ [ for d in rank - 1 .. -1 .. 0 -> $"""{(String.replicate d "    ")}}}""" ]
+        @ (if release then [ $"delete[] {v}_flat;" ] else [])
+
+    /// Dense reader: the shared assembly core over the baked chunk table into
+    /// `<v>_flat`, then the same materialization CppNetcdf/CppZarr do (nested
+    /// Array via allocate<>, flat->nested copy, buffers released).
+    let genReadVar (path: string) (varName: string) (cppVarName: string) (arrType: IRArrayType) : string list =
+        let ra = resolveOrFail "read" path varName
+        if ra.Meta.Blade.IsSome then
+            failwith $"icechunk codegen: variable '{varName}' is blade-packed; the dense reader cannot materialize it (this indicates a typing inconsistency)"
+        // Rank 0 is refused at the metadata gate (`arrayMetaOfNode`), so this
+        // is a restatement, not a live path -- but the loop nest below opens
+        // with `idxVars.[0]`, which on an empty list is an IndexOutOfRange
+        // escaping codegen rather than anything a user can read.
+        if ra.Meta.Shape.IsEmpty then
+            failwith $"icechunk codegen: variable '{varName}' is rank 0 -- rank-0 arrays are not supported by the icechunk provider (this indicates a typing inconsistency)"
+        let v = cppVarName
+        let elemCpp = elemCppOf arrType.ElemType
+        let assemble = ZarrProvider.CppZarr.genAssembleFlatVia (icechunkChunkFetch ra) ra.Meta v elemCpp
+        assemble @ materializeFlat ra v elemCpp true true
+
+    /// The dense read in two phases for revision reuse (docs/plans/
+    /// structural/04, 3.4): phase 1 -- emitted at the binding -- assembles
+    /// only the chunks `<needName>[]` marks, materializes the (partial)
+    /// nested array and keeps the flat and chunk buffers; phase 2 -- emitted
+    /// after the tiled consumer -- assembles what `<doneName>[]` has not
+    /// recorded, re-copies the flat buffer into the nested array and releases
+    /// both. Counters `<v>__read1` / `<v>__read2` feed the verbose census.
+    let genReadVarPhased (path: string) (varName: string) (cppVarName: string) (arrType: IRArrayType) (needName: string) (doneName: string) : string list * string list =
+        let ra = resolveOrFail "read" path varName
+        if ra.Meta.Blade.IsSome then
+            failwith $"icechunk codegen: variable '{varName}' is blade-packed; the dense reader cannot materialize it (this indicates a typing inconsistency)"
+        if ra.Meta.Shape.IsEmpty then
+            failwith $"icechunk codegen: variable '{varName}' is rank 0 -- rank-0 arrays are not supported by the icechunk provider (this indicates a typing inconsistency)"
+        let v = cppVarName
+        let elemCpp = elemCppOf arrType.ElemType
+        let fetch = icechunkChunkFetch ra
+        let phase1 =
+            [ $"size_t {v}__read1 = 0, {v}__read2 = 0;" ]
+            @ ZarrProvider.CppZarr.genAssembleFlatPhased fetch ra.Meta v elemCpp (Some (needName, doneName, $"{v}__read1")) 1
+            @ materializeFlat ra v elemCpp true false
+        let phase2 =
+            ZarrProvider.CppZarr.genAssembleFlatPhased fetch ra.Meta v elemCpp (Some (needName, doneName, $"{v}__read2")) 2
+            @ materializeFlat ra v elemCpp false true
+        phase1, phase2
 
     /// Packed (SymIdx/AntisymIdx) and orbit (OrbIdx) reader. The store's pool
     /// IS the in-memory representation, so assembly is the ordinary flat chunk

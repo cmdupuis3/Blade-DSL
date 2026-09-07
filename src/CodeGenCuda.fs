@@ -3286,7 +3286,11 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
             // below; the Allgatherv afterward restores the full output on all
             // ranks (SPMD invariant -- downstream code needs no changes).
             let mpiDense = (mpiShape = Some MpiDense)
-            let codeGen = if mpiDense || segmentRun.IsSome then { codeGen with MpiSlab = true } else codeGen
+            // Revision reuse (docs/plans/structural/04): a tiled binding's nest
+            // runs one leading-axis tile at a time through the same outer-level
+            // slab substitution the MPI slab and the segment run use.
+            let tilePlan = Map.tryFind name ctx.TilePlans
+            let codeGen = if mpiDense || segmentRun.IsSome || tilePlan.IsSome then { codeGen with MpiSlab = true } else codeGen
 
             // Generate loop nest. The LinAlg dispatch is tried first: a
             // recognised BLAS shape is a strictly stronger rewrite than a flat
@@ -3304,11 +3308,11 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
             let loopCode =
                 // a segment run loop owns the outer bounds: neither the BLAS
                 // rewrite nor the flat collapse honours them
-                match (if segmentRun.IsSome then None
+                match (if segmentRun.IsSome || tilePlan.IsSome then None
                        else tryGenLinAlgNest streamedMap info.ArrayTypes codeGen tempCtx.VarNames tempCtx.Indent) with
                 | Some la -> la
                 | None ->
-                match (if segmentRun.IsSome then None
+                match (if segmentRun.IsSome || tilePlan.IsSome then None
                        else tryGenFlatElementwiseNest streamedMap info.ArrayTypes codeGen tempCtx.VarNames tempCtx.Indent) with
                 | Some flat -> flat
                 | None -> genLoopNestStreamed streamedMap codeGen tempCtx.VarNames tempCtx.Indent
@@ -3454,7 +3458,12 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                 // the reach demands, the read, the alias, the slab bounds.
                 let segLoop =
                     match segmentRun with
-                    | None -> loopCode
+                    | None ->
+                        (match tilePlan with
+                         | Some plan ->
+                             (tilesUsedCell ()).Value <- true
+                             tileLoopLines ind plan loopCode
+                         | None -> loopCode)
                     | Some (offsets, cMin, cMax, rLo, rHi, start, sources, kind) ->
                         let missing =
                             sources |> List.tryFind (fun (_, s) -> ((Blade.ProviderRegistry.tryFind s.Provider).Value).GenStreamRows.IsNone)

@@ -725,6 +725,64 @@ let private evictExeCache (dir: string) : unit =
                         bytes <- bytes - len
     with _ -> ()
 
+// ---------------------------------------------------------------------------
+// The tile store of revision reuse (docs/plans/structural/04, 3.1): a local
+// on-disk store beside the exe cache, gated by BLADE_TILE_CACHE with the exe
+// cache's grammar EXCEPT that unset means OFF (the mechanism is opt-in). The
+// generated program locates it at run time (blade_tilecache.hpp's `dir()`);
+// the compiler reads the same variable to decide whether to emit tile
+// phases at all (CodeGenTiles.tileCacheEnabled) and to evict here.
+// ---------------------------------------------------------------------------
+
+let tileCacheDir () : string option =
+    let defaultDir () =
+        let root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+        if String.IsNullOrEmpty root then None
+        else Some (Path.Combine(root, "Blade", "tile-cache"))
+    match Environment.GetEnvironmentVariable "BLADE_TILE_CACHE" with
+    | null | "" -> None
+    | v ->
+        match v.Trim() with
+        | "" -> None
+        | t when t = "1" || t.ToLowerInvariant() = "on" || t.ToLowerInvariant() = "true" -> defaultDir ()
+        | t when t = "0" || t.ToLowerInvariant() = "off" || t.ToLowerInvariant() = "false" -> None
+        | t when Path.IsPathRooted t -> Some t
+        | _ -> None
+
+/// The exe cache's count cap, applied to tile files (one per tile per
+/// snapshot, small); oldest-mtime first down to 3/4 of the cap.
+let private evictTileCache (dir: string) : unit =
+    try
+        if Directory.Exists dir then
+            let entries = DirectoryInfo(dir).GetFiles("*.tile", SearchOption.AllDirectories)
+            if entries.Length > exeCacheMaxEntries then
+                let targetCount = (exeCacheMaxEntries * 3) / 4
+                let mutable count = entries.Length
+                for f in entries |> Array.sortBy _.LastWriteTimeUtc do
+                    if count > targetCount then
+                        (try f.Delete() with _ -> ())
+                        count <- count - 1
+    with _ -> ()
+
+/// The toolchain identity a tile-enabled program carries
+/// (`-DBLADE_TOOLCHAIN_ID=...`): the exe cache's key terms other than the
+/// program text and the DLL stamp -- compiler, flags, what `-march=native`
+/// selected, the runtime headers -- so bits compiled by a different
+/// toolchain never share a tile file, without hashing at run time.
+let private toolchainIdentity (flags: string) : string =
+    let material =
+        String.concat " "
+            [ "blade-toolchain-v1"
+              gppIdentity.Value
+              flags
+              (if (marchFlag ()).Contains "native" then nativeTargetIdentity.Value else "")
+              runtimeHeaderDigest.Value ]
+    use sha = System.Security.Cryptography.SHA256.Create()
+    sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes material)
+    |> Array.map _.ToString("x2")
+    |> String.concat ""
+    |> fun h -> h.Substring(0, 16)
+
 /// Cache lookup. On a hit the entry is copied to `exeFullPath` (the exact file
 /// a real compile would have written) and its mtime is bumped so eviction sees
 /// it as recently used. Any failure -- a racing evictor deleted it, the copy
@@ -896,7 +954,16 @@ let compileCppWithExtraSource (srcText: string option) (extraLinkInputs: string 
             let fpc = tok (fpContractFlag ())
             let flag (b: bool) = if b then "1" else "0"
             $" -DBLADE_RR_MARCH={march} -DBLADE_RR_FPC={fpc} -DBLADE_RR_REASSOC={flag (Blade.CodeGenState.fpReassocEnabled ())} -DBLADE_RR_BLAS={flag wantsBlas} -DBLADE_RR_LAPACK={flag wantsLapack} -DBLADE_RR_CUBLAS={flag (not (List.isEmpty deviceInputs))}"
-        let args = $"-std=c++17 {optFlags ()}{rrDefines} {ompFlag} {safetyFlags}{blasCompileFlags} -o \"{exeFullPath}\" \"{cppFullPath}\"{extraFlags}{netcdfFlags}{mpiFlags}{blasLinkFlags}"
+        // Revision reuse: a program with a tiled binding (the include line is
+        // written by codegen exactly then) carries the toolchain identity its
+        // tile files are keyed under; the store is evicted here, never in C++.
+        let tileDefines =
+            if cppText.Contains "#include \"blade_tilecache.hpp\"" then
+                (match tileCacheDir () with Some d -> evictTileCache d | None -> ())
+                let tid = toolchainIdentity (optFlags () + " " + ompFlag)
+                $" -DBLADE_TOOLCHAIN_ID={tid}"
+            else ""
+        let args = $"-std=c++17 {optFlags ()}{rrDefines}{tileDefines} {ompFlag} {safetyFlags}{blasCompileFlags} -o \"{exeFullPath}\" \"{cppFullPath}\"{extraFlags}{netcdfFlags}{mpiFlags}{blasLinkFlags}"
         
         // The executable cache (Stage 4.1, above). v1 scope, deliberately
         // narrow -- every excluded lane is one whose inputs are not fully

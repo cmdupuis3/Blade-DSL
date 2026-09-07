@@ -384,6 +384,10 @@
     <Compile Include="src/CodeGenLoopNest.fs" />
     <Compile Include="src/CodeGenCuda.fs" />
     <Compile Include="src/CodeGenFusion.fs" />
+    <!-- Revision reuse (docs/plans/structural/04): the tile PLANNER: which
+         bindings tile, and each tile's content key. Needs Fusion's
+         bindingCppName; the emission helpers it feeds live in CodeGenState. -->
+    <Compile Include="src/CodeGenTiles.fs" />
     <Compile Include="src/CodeGenBinding.fs" />
     <Compile Include="src/CodeGen.fs" />
     <!-- The direct LLVM back end (BLADE_LLVM lane): IRProgram -> textual .ll,
@@ -721,6 +725,10 @@
     </None>
     <None Include="src/cpp/blade_run_record.hpp">
       <Link>cpp/blade_run_record.hpp</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="src/cpp/blade_tilecache.hpp">
+      <Link>cpp/blade_tilecache.hpp</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="src/cpp/blade_linalg.hpp">

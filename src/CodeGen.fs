@@ -1817,6 +1817,9 @@ let genModule (modul: IRModule) (builder: IRBuilder) : string list * string list
 
     let ctx0 = emptyContext ()
     let ctx0 = { ctx0 with ProviderReads = modul.ProviderReads; ProviderWrites = modul.ProviderWrites; RandomInits = modul.RandomInits; CompoundInits = modul.CompoundInits; SparseInits = modul.SparseInits; MutableArrayLets = modul.MutableArrayLets }
+    // Revision reuse (docs/plans/structural/04): empty unless BLADE_TILE_CACHE is set.
+    let (tilePlans, tileReads) = Blade.CodeGenTiles.planTiles modul
+    let ctx0 = { ctx0 with TilePlans = tilePlans; TileReads = tileReads }
 
     // First pass: register ALL names (both bindings and functions) in context
     let ctx0 =
@@ -1939,6 +1942,9 @@ let genModuleSplit (modul: IRModule) (builder: IRBuilder) : string list * string
     resetAllocScopeStack ()
     let ctx0 = emptyContext ()
     let ctx0 = { ctx0 with ProviderReads = modul.ProviderReads; ProviderWrites = modul.ProviderWrites; RandomInits = modul.RandomInits; CompoundInits = modul.CompoundInits; SparseInits = modul.SparseInits; MutableArrayLets = modul.MutableArrayLets }
+    // Revision reuse (docs/plans/structural/04): empty unless BLADE_TILE_CACHE is set.
+    let (tilePlans, tileReads) = Blade.CodeGenTiles.planTiles modul
+    let ctx0 = { ctx0 with TilePlans = tilePlans; TileReads = tileReads }
     let ctx0 =
         modul.Bindings |> List.fold (fun c b -> addVarName b.Id b.Name c) ctx0
     let ctx0 =
@@ -2806,6 +2812,7 @@ let genMainProgram (modul: IRModule) (testName: string) : string =
     (streamBufDeclsCell ()).Value <- Set.empty
     (forcedDeferredIdsCell ()).Value <- Set.empty
     (linalgUsedCell ()).Value <- false
+    (tilesUsedCell ()).Value <- false
     (cudaLinalgUsedCell ()).Value <- false
     (lapackUsedCell ()).Value <- false
     (ompApiUsedCell ()).Value <- false
@@ -2838,6 +2845,10 @@ let genMainProgram (modul: IRModule) (testName: string) : string =
     // line). Appended post-body like the CUDA prototypes below. A program
     // using neither gram nor matmul never names the header at all.
     let includes = if (linalgUsedCell ()).Value then includes @ ["#include \"blade_linalg.hpp\""] else includes
+    // blade_tilecache.hpp only when a tiled binding was emitted (revision
+    // reuse, docs/plans/structural/04); Build.fs keys -DBLADE_TOOLCHAIN_ID
+    // off this include line.
+    let includes = if (tilesUsedCell ()).Value then includes @ ["#include \"blade_tilecache.hpp\""] else includes
     // blade_linalg_cuda.hpp: the DEVICE half of the same collect-then-append
     // shape, its OWN cell and its own build consequence -- Build.fs
     // sniffs THIS line to write the companion `.cu`, build it with nvcc and
@@ -3000,6 +3011,7 @@ let genSelfContainedProgram (modul: IRModule) (testName: string) : string =
     // reads it to auto-print deferred bindings that ended up materialized.
     (forcedDeferredIdsCell ()).Value <- Set.empty
     (linalgUsedCell ()).Value <- false
+    (tilesUsedCell ()).Value <- false
     (cudaLinalgUsedCell ()).Value <- false
     (lapackUsedCell ()).Value <- false
     (ompApiUsedCell ()).Value <- false
@@ -3055,6 +3067,10 @@ let genSelfContainedProgram (modul: IRModule) (testName: string) : string =
     // Build.fs keys -DBLADE_HAS_BLAS + the -I/link flags off this include
     // line). Appended post-body like the CUDA prototypes below.
     let includes = if (linalgUsedCell ()).Value then includes @ ["#include \"blade_linalg.hpp\""] else includes
+    // blade_tilecache.hpp only when a tiled binding was emitted (revision
+    // reuse, docs/plans/structural/04); Build.fs keys -DBLADE_TOOLCHAIN_ID
+    // off this include line.
+    let includes = if (tilesUsedCell ()).Value then includes @ ["#include \"blade_tilecache.hpp\""] else includes
     // blade_linalg_cuda.hpp: the DEVICE half of the same collect-then-append
     // shape, its OWN cell and its own build consequence -- Build.fs
     // sniffs THIS line to write the companion `.cu`, build it with nvcc and
@@ -3119,6 +3135,7 @@ let genProgramWithExternalRuntime (modul: IRModule) (testName: string) : string 
     // Reset the S0 module-global promotion collector (see moduleGlobalDeclsCell).
     (moduleGlobalDeclsCell ()).Value <- []
     (linalgUsedCell ()).Value <- false
+    (tilesUsedCell ()).Value <- false
     (cudaLinalgUsedCell ()).Value <- false
     (lapackUsedCell ()).Value <- false
     (ompApiUsedCell ()).Value <- false
@@ -3132,6 +3149,10 @@ let genProgramWithExternalRuntime (modul: IRModule) (testName: string) : string 
     // Build.fs keys -DBLADE_HAS_BLAS + the -I/link flags off this include
     // line).
     let includes = if (linalgUsedCell ()).Value then includes @ ["#include \"blade_linalg.hpp\""] else includes
+    // blade_tilecache.hpp only when a tiled binding was emitted (revision
+    // reuse, docs/plans/structural/04); Build.fs keys -DBLADE_TOOLCHAIN_ID
+    // off this include line.
+    let includes = if (tilesUsedCell ()).Value then includes @ ["#include \"blade_tilecache.hpp\""] else includes
     // blade_linalg_cuda.hpp: the DEVICE half of the same collect-then-append
     // shape, its OWN cell and its own build consequence -- Build.fs
     // sniffs THIS line to write the companion `.cu`, build it with nvcc and

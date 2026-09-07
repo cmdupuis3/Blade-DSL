@@ -1054,6 +1054,73 @@ let private fusionEnabled () =
         | "0" | "off" | "false" -> false
         | _ -> true
 
+// The fusion pass's admission predicates, LIFTED so a second consumer can
+// ask the same questions without a copy: the tile planner (CodeGenTiles,
+// docs/plans/structural/04 section 2.2) admits a binding iff the pass would
+// treat it as a plain pure elementwise map. `fuseElementwiseChainsModule`'s
+// locals below delegate here.
+
+/// Purity with module-local resolution. Anything unresolvable declines; a
+/// callee whose typed effect summary is REPEATABLE is admitted without a walk.
+let rec internal tilePureBody (callables: System.Collections.Generic.Dictionary<IRId, IRCallable>) (visited: Set<IRId>) (e: IRExpr) : bool =
+    let mutable ok = true
+    iterIRExpr (fun n ->
+        if ok then
+            match n with
+            | IRDisplayEmit _ -> ok <- false
+            | IRAssign _ -> ok <- false
+            | IRApp (IRVar (fid, _), _, _) ->
+                if not (Set.contains fid visited) then
+                    match callables.TryGetValue fid with
+                    | true, callee ->
+                        if callee.IsStatic then ok <- false
+                        elif Blade.Effects.isRepeatable callee.Effects then ()
+                        elif not (tilePureBody callables (Set.add fid visited) callee.Body) then
+                            ok <- false
+                    | _ -> ok <- false
+            | IRApp _ -> ok <- false
+            | _ -> ()) e
+    ok
+
+let private tilePlainIx (ix: IRIndexType) =
+    ix.IxKind = IxKPlain && ix.Symmetry = SymNone
+let private tilePlainArrayTypes (ats: IRArrayType list) =
+    ats |> List.forall (fun at -> at.IndexTypes |> List.forall tilePlainIx)
+
+/// A plain dense elementwise map/co-iteration with a scalar kernel and none
+/// of the structure-exploiting metadata populated.
+let internal tilePlainInfo (info: ApplyInfo) =
+    not info.HasReynolds
+    && info.SpeedupFactor = 1L && info.ReynoldsSpeedup = 1L
+    && info.KernelTDims.IsEmpty && info.KernelOutputRank = 0
+    && info.KernelInputRanks |> List.forall ((=) 0)
+    && info.SymcomStates |> List.forall (fun s -> s = SCNeither)
+    && info.TriangularLevels |> List.forall not
+    && tilePlainArrayTypes info.ArrayTypes
+    && (match info.Loop with IRMethodFor _ | IRObjectFor _ -> true | _ -> false)
+    && (info.Arrays.Length = 1
+        || (info.IsCoIteration && not info.SharedIndexTypes.IsEmpty))
+    && info.Identities.Length = info.Arrays.Length
+    && info.ArrayTypes.Length = info.Arrays.Length
+    && info.SDimsPerArray.Length = info.Arrays.Length
+    && info.SymcomStates.Length = info.Arrays.Length
+    && info.TriangularLevels.Length = info.Arrays.Length
+    && info.KernelInputRanks.Length = info.Arrays.Length
+
+let internal tilePlainKernel (k: IRCallable) (arity: int) =
+    not k.IsCommutative && k.CommGroups.IsEmpty && k.AntisymGroups.IsEmpty
+    && k.Parallelism.IsEmpty && not k.IsOmpParallel && not k.IsCudaKernel
+    && not k.IsMpiParallel && not k.IsArityPoly && not k.IsStatic
+    && k.Params.Length = arity
+
+let internal tileKernelOf (callables: System.Collections.Generic.Dictionary<IRId, IRCallable>) (info: ApplyInfo) : IRCallable option =
+    match info.Kernel with
+    | IRVar (kid, _) ->
+        match callables.TryGetValue kid with
+        | true, k -> Some k
+        | _ -> None
+    | _ -> None
+
 let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModule =
     if not (fusionEnabled ()) then modul else
     let callables = System.Collections.Generic.Dictionary<IRId, IRCallable>()
@@ -1087,33 +1154,7 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
     // not installed yet at this point in the pipeline (it is built at
     // liftInlineFormsModule entry), so IRPrint.exprAttrs' cross-procedural
     // IRApp arm cannot be used here. Anything unresolvable declines.
-    let rec pureBody (visited: Set<IRId>) (e: IRExpr) : bool =
-        let mutable ok = true
-        iterIRExpr (fun n ->
-            if ok then
-                match n with
-                | IRDisplayEmit _ -> ok <- false
-                | IRAssign _ -> ok <- false
-                | IRApp (IRVar (fid, _), _, _) ->
-                    if not (Set.contains fid visited) then
-                        match callables.TryGetValue fid with
-                        | true, callee ->
-                            if callee.IsStatic then ok <- false
-                            // The typed summary (Blade.Effects, computed at
-                            // checkFunctionDecl with callees resolved) is the
-                            // shared legality fact: REPEATABLE means no
-                            // assignment, no display, no external read, no
-                            // unknown call anywhere below -- everything this
-                            // walk would check, plus callees the module-local
-                            // table cannot see. `unknown` (lambdas, clones of
-                            // unmarked callables) falls through to the walk.
-                            elif Blade.Effects.isRepeatable callee.Effects then ()
-                            elif not (pureBody (Set.add fid visited) callee.Body) then
-                                ok <- false
-                        | _ -> ok <- false
-                | IRApp _ -> ok <- false
-                | _ -> ()) e
-        ok
+    let pureBody (visited: Set<IRId>) (e: IRExpr) : bool = tilePureBody callables visited e
 
     let plainIx (ix: IRIndexType) =
         ix.IxKind = IxKPlain && ix.Symmetry = SymNone
@@ -1123,32 +1164,9 @@ let fuseElementwiseChainsModule (modul: IRModule) (builder: IRBuilder) : IRModul
     // A combinator this pass may touch (as host or inner): a plain dense
     // elementwise map/co-iteration with a scalar kernel and none of the
     // structure-exploiting metadata populated.
-    let plainInfo (info: ApplyInfo) =
-        not info.HasReynolds
-        && info.SpeedupFactor = 1L && info.ReynoldsSpeedup = 1L
-        && info.KernelTDims.IsEmpty && info.KernelOutputRank = 0
-        && info.KernelInputRanks |> List.forall ((=) 0)
-        && info.SymcomStates |> List.forall (fun s -> s = SCNeither)
-        && info.TriangularLevels |> List.forall not
-        && plainArrayTypes info.ArrayTypes
-        && (match info.Loop with IRMethodFor _ | IRObjectFor _ -> true | _ -> false)
-        // Arity >= 2 must be a genuine co-iteration: splicing operands into
-        // an OUTER PRODUCT would change its meaning, not its cost.
-        && (info.Arrays.Length = 1
-            || (info.IsCoIteration && not info.SharedIndexTypes.IsEmpty))
-        // Defensive: every per-array list rides in lockstep with Arrays.
-        && info.Identities.Length = info.Arrays.Length
-        && info.ArrayTypes.Length = info.Arrays.Length
-        && info.SDimsPerArray.Length = info.Arrays.Length
-        && info.SymcomStates.Length = info.Arrays.Length
-        && info.TriangularLevels.Length = info.Arrays.Length
-        && info.KernelInputRanks.Length = info.Arrays.Length
+    let plainInfo (info: ApplyInfo) = tilePlainInfo info
 
-    let plainKernel (k: IRCallable) (arity: int) =
-        not k.IsCommutative && k.CommGroups.IsEmpty && k.AntisymGroups.IsEmpty
-        && k.Parallelism.IsEmpty && not k.IsOmpParallel && not k.IsCudaKernel
-        && not k.IsMpiParallel && not k.IsArityPoly && not k.IsStatic
-        && k.Params.Length = arity
+    let plainKernel (k: IRCallable) (arity: int) = tilePlainKernel k arity
 
     let kernelOf (info: ApplyInfo) : IRCallable option =
         match info.Kernel with

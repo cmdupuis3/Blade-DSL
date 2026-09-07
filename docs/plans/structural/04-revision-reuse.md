@@ -1,6 +1,46 @@
 # 04 -- Revision reuse: cache pure output tiles across Icechunk snapshots
 
-Status: DESIGN (2026-09-06); nothing built. Elaborates item 4 of
+Status: **v1 BUILT 2026-09-07 (feat/revision-reuse)** as LEADING-AXIS tiles --
+the section-4.4 re-scope (a tile = one chunk of the leading axis, all trailing
+axes, so the fixture gives 1-of-2 rather than 1-of-4). What landed: the planner
+`src/CodeGenTiles.fs` (admission = the fusion pass's lifted predicates
+`IRMono.tilePlainInfo` / `tilePlainKernel` / `tilePureBody`, capture-free
+kernels, whole-variable dense icechunk inputs sharing the output's shape and
+chunk grid; every tile's key = SHA-256 of the kernel's printed IR + operand
+order + output type, the output geometry and tile bounds, and per input the
+canonical repo path, node id, `zarr.json` hash and `chunkIdentityText` of the
+tile's chunks); the tile run loop through the MPI-slab / segment-run
+outer-level substitution (`CodeGenCuda.genApplyCombinator`, `tileLoopLines`
+in CodeGenState) with `blade_tiles::probe/load/store`
+(`src/cpp/blade_tilecache.hpp`, C stdio, header-validated files under
+`<dir>/<key[0:2]>/<key>-<toolchain>.tile`); read avoidance by a probe hoisted
+to the input's read (`tileProbeLines`) and a need-masked two-phase assembly
+(`ZarrProvider.genAssembleFlatPhased`, `IcechunkProvider.genReadVarPhased`:
+phase 1 reads the unhit tiles' chunks, phase 2 after the tiled binding reads
+the remainder for the print pass) -- hoisted only when nothing between the
+read and the binding observes the input; `-DBLADE_TOOLCHAIN_ID` from Build.fs
+(compiler, flags, `-march=native` selection, runtime headers) keys the file
+name so no hashing happens at run time; eviction (the exe cache's count cap)
+in the compiler. Gate: `BLADE_TILE_CACHE` (unset = OFF; the exe cache's
+grammar otherwise), census under `BLADE_TILE_CACHE_VERBOSE`. Pins:
+`tests/IcechunkTests.fs` section 22 (one-changed-chunk fixture: 5 chunk
+files; E@s1 cold 2/2 computed, warm 2/2 hit; E@s2 recomputes 1 of 2 tiles and
+its compute phase reads 2 of 4 chunks; cold = warm = interpreter stdout; the
+untiled emission carries no tile code). **Scale run (4.3 item 4), 2026-09-07,
+4000x4000 float64 chunked 500x500 (64 chunks, 8 leading-axis tiles), one
+changed chunk, exe cache off so every run compiles:** the mechanism does what
+the census promises -- E@s2 after E@s1 computes 1/8 tiles, hits 7/8, and its
+compute phase reads 8/64 chunks (remainder 56 for the print pass) -- but the
+end-to-end wall clock is flat at ~31 s in every configuration (off 29.8 / 35.4,
+cold 31.7, warm 31.7, one-changed 31.0), because the CLI lane prints every
+top-level binding: 231 MB of formatted stdout (`A` and `F` in full) dwarfs the
+128 MB read and the 16M-cell map it saves. The 2x gate is therefore NOT met
+in the CLI lane, exactly as risk 2 predicted, and not because compile
+dominates: the mechanism is kept as an opt-in (unset = off, no emission
+change) and the `--print <names>` flag of section 3.5 is the gating
+follow-up before any claim of end-to-end speed. NOT done: per-level tile
+bounds (the 1-of-4 geometry), the halo consumer, captured scalars in the key
+(declined), `--print`. Originally: DESIGN (2026-09-06). Elaborates item 4 of
 [plan-structural-performance-opportunities.md](../plan-structural-performance-opportunities.md)
 ("Make versioned scientific computation reuse unchanged work"). Baseline:
 working tree at `bd019dc`; every `file:line` below was read at that state, and

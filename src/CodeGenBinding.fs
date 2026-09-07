@@ -1491,6 +1491,19 @@ and genProviderReadBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: 
                   addVarName binding.Id name ctx)
              | _ -> raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.iceCodegen ($"packed provider read '{spec.VarName}': binding is not array-typed"))))
     else
+    match Map.tryFind binding.Id ctx.TileReads with
+    | Some plan ->
+        // Revision reuse (docs/plans/structural/04, 3.4): this read feeds a
+        // tiled binding whose probe is hoisted here. The FIRST of the plan's
+        // inputs (by emission order) carries the probe; each input's phase-1
+        // read assembles only the chunks the unhit tiles need. The remainder
+        // is read after the tiled binding (tileLoopLines).
+        (tilesUsedCell ()).Value <- true
+        let ip = plan.Inputs |> List.find (fun i -> i.ReadId = binding.Id)
+        let first = plan.Inputs |> List.minBy (fun i -> i.ReadId)
+        let lines = (if first.ReadId = binding.Id then tileProbeLines plan else []) @ ip.Phase1
+        (lines |> List.map (fun s -> ind + s), addVarName binding.Id name ctx)
+    | None ->
     let readCode =
         (match spec.MaskName, spec.MaskType with
          | Some maskName, Some maskType ->
