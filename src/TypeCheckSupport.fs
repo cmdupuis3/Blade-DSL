@@ -2664,6 +2664,8 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprGramApply (l, r, x) -> [l; r; x]
         | TExprMatmul (l, r) -> [l; r]
         | TExprEigh a -> [a]
+        | TExprLu a -> [a]
+        | TExprLuSolve (l, p, b, _) -> [l; p; b]
         | TExprSolve (a, b) -> [a; b]
         | TExprArrayNegate a -> [a]
         | TExprArrayConjugate a -> [a]
@@ -3059,6 +3061,7 @@ let effectsOfBody (env: TypeEnv) (selfId: IRId option) (body: TypedExpr) : Blade
             | TExprRead _ -> Blade.Effects.readsExternal
             | TExprUnaryOp (OpMath ("lgamma" | "digamma"), _) -> Blade.Effects.mayFail
             | TExprIndex _ | TExprTupleIndex _ | TExprReduce _ | TExprSolve _ | TExprEigh _
+            | TExprLu _ | TExprLuSolve _
             | TExprMatch _ | TExprConstraintCheck _ | TExprGuard _ -> Blade.Effects.mayFail
             | _ -> Blade.Effects.noEffects
         typedExprChildren e |> List.fold (fun acc c -> Blade.Effects.join acc (go c)) own

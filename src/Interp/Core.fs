@@ -934,7 +934,7 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     //      rather than one array, so the Loops backend returns a VTuple here.
     //      Reachable only when the LAPACK gate was on at elaboration; gate
     //      off, `math.eigh` is synthesized Blade source and this node never exists.
-    | IREigh _ ->
+    | IREigh _ | IRLu _ | IRLuSolve _ ->
         evalArrayNode st env expr
 
     | other ->

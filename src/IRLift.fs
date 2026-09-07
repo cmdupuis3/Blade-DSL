@@ -22,7 +22,7 @@ let isInlineForm (e: IRExpr) : bool =
     match e with
     | IRMask _ | IRSort _ | IRIntersect _ | IRUnion _ | IRUnique _
     | IRGroupBy _ | IRGroupKeys _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRSegmentsGrid _ | IRUngroup _ | IRUngroupRows _ | IRUngroupGrid _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _
-    | IRReduceCompute _ | IRMatmul _ | IRGramApply _ | IREigh _ | IRSolve _ -> true
+    | IRReduceCompute _ | IRMatmul _ | IRGramApply _ | IREigh _ | IRSolve _ | IRLu _ | IRLuSolve _ -> true
     | IRCompute (IRApplyCombinator _) -> true
     | _ -> false
 
@@ -57,7 +57,7 @@ let isStatementShaped (e: IRExpr) : bool =
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _ -> true
     // Shape-changing / contraction forms.
     | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _
-    | IRGram _ | IRGramApply _ | IRMatmul _ | IREigh _ | IRSolve _ -> true
+    | IRGram _ | IRGramApply _ | IRMatmul _ | IREigh _ | IRSolve _ | IRLu _ | IRLuSolve _ -> true
     // Whole-array eager unary forms.
     | IRArrayNegate _ | IRArrayConjugate _ -> true
     // Grouping: the `group_keys` CSR tables and the two accessors that read
@@ -209,6 +209,9 @@ let internal isNestedLoopComputeArg (e: IRExpr) : bool =
     // `gram_apply(A, B, x)` is array-typed (rank 1) and allocates its own
     // pools, so it hoists like the two above.
     | IRGramApply _ -> true
+    // `lu_solve(...)` likewise (array-typed rank 1); `lu` is tuple-typed and
+    // absent for IREigh's reason.
+    | IRLuSolve _ -> true
     // IREigh is deliberately ABSENT, and its absence is a decision rather than
     // an omission: an eigh node is TUPLE-typed, and a loop form's `Arrays` slot
     // holds arrays. There is no surface spelling that puts a tuple where the
@@ -685,6 +688,18 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
         let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
         let (bindsR, rFinal) = liftChildEvaluatedOnce builder r'
         wrapLets (bindsL @ bindsR) (IRMatmul (lFinal, rFinal))
+    | IRLu matrix ->
+        let m' = liftExpr builder matrix
+        let (binds, mFinal) = liftChildEvaluatedOnce builder m'
+        wrapLets binds (IRLu mFinal)
+    | IRLuSolve (l, p, b, t) ->
+        let l' = liftExpr builder l
+        let p' = liftExpr builder p
+        let b' = liftExpr builder b
+        let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
+        let (bindsP, pFinal) = liftChildEvaluatedOnce builder p'
+        let (bindsB, bFinal) = liftChildEvaluatedOnce builder b'
+        wrapLets (bindsL @ bindsP @ bindsB) (IRLuSolve (lFinal, pFinal, bFinal, t))
     | IREigh operand ->
         // Same evaluate-once lift, same reason: `materializeEighForm` spells
         // the operand THREE times (`.extents[0]`, and `.data` twice, bare and

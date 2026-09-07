@@ -88,6 +88,10 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genEighBinding ctx binding builder
     | IRSolve (_, _) ->
         genSolveBinding ctx binding builder
+    | IRLu _ ->
+        genLuBinding ctx binding builder
+    | IRLuSolve _ ->
+        genLuSolveBinding ctx binding builder
     | IRReduce (arrExpr, kernelExpr, initExpr) ->
         genReduceBinding ctx binding builder arrExpr kernelExpr initExpr
     | IRReduceCompute (compExpr, kernelExpr, seedExpr) ->
@@ -2746,6 +2750,40 @@ and genEighBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
     let code =
         [$"{ind}// eigh: symmetric/Hermitian eigendecomposition -> (Q, LAM)"]
         @ (matStmts |> List.map (fun s -> ind + s))
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+
+and genLuBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
+    // lu(A) -> (LU, piv): a TUPLE value like eigh's, two pools under derived
+    // names bound to one make_tuple; the shared helper derives both element
+    // types itself.
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let matStmts =
+        match materializeInlineForm emptySubst ctx.VarNames name (lazy "") binding.Value with
+        | Some (s, allocs) -> registerMaterializedAllocs allocs; s
+        | None -> []
+    let code =
+        [$"{ind}// lu: partial-pivoted LU factorization -> (LU, piv), kept for repeated solves"]
+        @ (matStmts |> List.map (fun s -> ind + s))
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+
+and genLuSolveBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
+    // lu_solve(LU, piv, b) -> x: one array result, genSolveBinding's shape.
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> irTypeToCpp at.ElemType
+        | _ -> "double"
+    let matStmts =
+        match materializeInlineForm emptySubst ctx.VarNames name (lazy elemStr) binding.Value with
+        | Some (s, allocs) -> registerMaterializedAllocs allocs; s
+        | None -> []
+    let code = [$"{ind}// lu_solve: apply a stored LU factorization (no refactoring)"] @ (matStmts |> List.map (fun s -> ind + s))
     let ctx' = addVarName binding.Id name ctx
     (code, ctx')
 

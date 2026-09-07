@@ -193,6 +193,12 @@ type IRExpr =
     /// nest (byte-pinned against `Interp/ArrayOps.solveArray`), and the LAPACK
     /// `dgesv` route only replaces those loops when the gate is on.
     | IRSolve of matrix: IRExpr * rhs: IRExpr
+    /// `m.lu(A)` -> (LU, piv): the factorization value (tuple of two pools),
+    /// the partial-pivoted LU `m.solve` computes, kept. Same pivot rule, same
+    /// arithmetic order, so `lu_solve(lu(A), b)` is bitwise `solve(A, b)`.
+    | IRLu of matrix: IRExpr
+    /// `lu_solve(LU, piv, b[, transposed])`: apply the stored factors.
+    | IRLuSolve of lu: IRExpr * piv: IRExpr * rhs: IRExpr * transposed: bool
     | IRArrayNegate of array: IRExpr     // whole-array elementwise negation (eager); type-preserving
     | IRArrayConjugate of array: IRExpr  // whole-array elementwise conjugation (eager); type-preserving
     | IRReverse of array: IRExpr * dim: int
@@ -1858,6 +1864,8 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRDecompact (e, d) -> [e], (function [e'] -> IRDecompact (e', d) | _ -> badChildren "IRDecompact")
     | IREigh e -> [e], (function [e'] -> IREigh e' | _ -> badChildren "IREigh")
     | IRSolve (a, b) -> [a; b], (function [a'; b'] -> IRSolve (a', b') | _ -> badChildren "IRSolve")
+    | IRLu a -> [a], (function [a'] -> IRLu a' | _ -> badChildren "IRLu")
+    | IRLuSolve (l, p, b, t) -> [l; p; b], (function [l'; p'; b'] -> IRLuSolve (l', p', b', t) | _ -> badChildren "IRLuSolve")
     | IRHaloUnhash (w, o) -> [w], (function [w'] -> IRHaloUnhash (w', o) | _ -> badChildren "IRHaloUnhash")
     | IRArrayNegate e -> [e], (function [e'] -> IRArrayNegate e' | _ -> badChildren "IRArrayNegate")
     | IRArrayConjugate e -> [e], (function [e'] -> IRArrayConjugate e' | _ -> badChildren "IRArrayConjugate")
@@ -2916,6 +2924,24 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
         // decidable. The id is cosmetic -- the authoritative result type is the
         // one `inferSolve` built and lowering attached.
         (match typeOf matrix with
+         | ArrayElem aa when not aa.IndexTypes.IsEmpty ->
+            let axis = { aa.IndexTypes.Head with Rank = 1; Symmetry = SymNone; IxKind = IxKPlain; Dependencies = [] }
+            mkArrayLike { aa with IndexTypes = [axis] }
+         | t -> t)
+    | IRLu matrix ->
+        // lu(A) -> (LU : n x n dense Float64, piv : n dense Int64). Both
+        // extents are A's leading one; ids cosmetic (`inferLu` built the
+        // authoritative type).
+        (match typeOf matrix with
+         | ArrayElem aa when not aa.IndexTypes.IsEmpty ->
+            let axis = { aa.IndexTypes.Head with Rank = 1; Symmetry = SymNone; IxKind = IxKPlain; Dependencies = [] }
+            IRTTuple [ mkArrayLike { aa with IndexTypes = [axis; axis] }
+                       mkArrayLike { aa with ElemType = IRTScalar ETInt64; IndexTypes = [axis] } ]
+         | t -> t)
+    | IRLuSolve (lu, _, _, _) ->
+        // lu_solve(LU, piv, b) -> x : dense rank-1 of LU's leading extent,
+        // Float64 (the solve twin's rule, from the factor).
+        (match typeOf lu with
          | ArrayElem aa when not aa.IndexTypes.IsEmpty ->
             let axis = { aa.IndexTypes.Head with Rank = 1; Symmetry = SymNone; IxKind = IxKPlain; Dependencies = [] }
             mkArrayLike { aa with IndexTypes = [axis] }

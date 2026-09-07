@@ -343,6 +343,14 @@ and TypedExprKind =
     /// The LAPACK `dgesv` route is an availability-gated replacement for those
     /// loops, not a precondition for the node existing.
     | TExprSolve of matrix: TypedExpr * rhs: TypedExpr
+    /// `m.lu(A)` -> (LU, piv): the FACTORIZATION VALUE of plan-fortran-killer-2
+    /// section 6.2 -- an ordinary tuple of two fresh arrays (the packed L\U
+    /// factor, n x n Float64; the pivot rows, n Int64), immutable by
+    /// construction (A was copied), consumed by the solve actions below.
+    | TExprLu of matrix: TypedExpr
+    /// `m.lu_solve(LU, piv, b)` / `m.lu_solve_t(LU, piv, b)`: x with A x = b
+    /// (or A^T x = b) from a stored factorization, no refactoring.
+    | TExprLuSolve of lu: TypedExpr * piv: TypedExpr * rhs: TypedExpr * transposed: bool
     | TExprArrayNegate of array: TypedExpr
     | TExprArrayConjugate of array: TypedExpr
     | TExprExtents of array: TypedExpr

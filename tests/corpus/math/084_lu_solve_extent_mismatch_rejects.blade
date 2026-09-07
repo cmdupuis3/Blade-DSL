@@ -1,0 +1,11 @@
+// TEST: Math lu_solve: b must match the factor's dimension (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: b's extent must match the factor's dimension
+// The checker's agreement rule for the apply half: a stored n x n factor
+// takes a length-n right-hand side, and a literal disagreement never
+// compiles (math/073 pins the same rule for `solve`).
+import math as m
+let A: Array<Float64 like Idx<3>, Idx<3>> = [[1.0, 1.0, 1.0], [2.0, 4.0, 1.0], [1.0, 0.0, 2.0]]
+let b4: Array<Float64 like Idx<4>> = [1.0, 2.0, 3.0, 4.0]
+let f = m.lu(A)
+let x = m.lu_solve(f, b4)

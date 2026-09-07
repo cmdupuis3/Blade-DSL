@@ -2235,6 +2235,18 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let s = forceInputArray st env operandExpr
         let (q, lam) = A.eighArrays s (typeOf expr)
         VTuple [| VArray q; VArray lam |]
+    | IRLu mExpr ->
+        // lu = the factorization kept: a TUPLE (LU, piv), like eigh's shape;
+        // `A.luArrays` is the operation-for-operation twin of
+        // materializeLuForm's native arm.
+        let m = forceInputArray st env mExpr
+        let (lu, piv) = A.luArrays m (typeOf expr)
+        VTuple [| VArray lu; VArray piv |]
+    | IRLuSolve (lExpr, pExpr, rExpr, transposed) ->
+        let l = forceInputArray st env lExpr
+        let p = forceInputArray st env pExpr
+        let r = forceInputArray st env rExpr
+        VArray (A.luSolveArray l p r transposed (typeOf expr))
     | IRSolve (mExpr, rExpr) ->
         // solve = the dense LU linear solve. Same FORCE-then-materialize shape
         // as gram/matmul, and like matmul (and unlike eigh) it is the twin of

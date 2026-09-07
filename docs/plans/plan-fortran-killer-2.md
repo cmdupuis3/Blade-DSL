@@ -413,6 +413,28 @@ an ill-conditioned system. Use established expert drivers where suitable: [LAPAC
 DPOSVXX](https://www.netlib.org/lapack/explore-html/d5/d95/group__posvxx_ga48edd52284bc03902274c5a275bf00ea.html)
 already illustrates error bounds, condition information, and factor reuse.
 
+**Landed (2026-09-07), the first milestone: one dense real solve family with a
+factorization VALUE.** `m.lu(A)` keeps the partial-pivoted LU `m.solve` computes as an
+ordinary tuple `(LU, piv)` -- the packed L\U factor (n x n Float64) and the pivot rows
+(n Int64, 0-based) -- immutable by construction (A was copied), and `m.lu_solve(f, b)` /
+`m.lu_solve_t(f, b)` (or the two-halves spelling `(LU, piv, b)`) apply it to any
+right-hand side, plain or transposed, without refactoring. Same working copy, same
+strict-`>` pivot rule, same fused elimination order, so `lu_solve(lu(A), b)` is BITWISE
+`solve(A, b)`; the interpreter twins (`luArrays`, `luSolveArray`) reproduce both arms
+byte for byte. LAPACK route: `?getrf` / `?getrs` ('N'/'T') through
+`blade_lapack::blade_lu_d` / `blade_lu_solve_d` with the same column-major bridge as
+solve's adapter and the pivots converted to the stored 0-based convention; policy rows
+`Getrf` / `Getrs` pinned. This is the operator-value form docs/plans/structural/05 step
+2 asked to co-design: structure carried by the NODE and an ordinary tuple, no new
+type, no forcing rules -- a factorization is consumed by actions, never by cells, and a
+tuple already refuses cell reads. Pins: `tests/corpus/math/083-086` (the exact 3 x 3:
+factor values, two right-hand sides, the two-halves spelling, the transpose solve,
+`d = 0` against `solve`; the extent refusal; the singular abort at factor time; the
+function-body shape) and `tests/LapackTests.fs` (both gates, the rejection, the policy
+rows). Not done: the derivative actions (`A dx = db - dA x` and the transpose solve as
+the reverse action) -- they are the 6.3 linearization's business and wait on it; the
+checked result (residual / conditioning / status) and mixed-precision refinement.
+
 Gate the initial demonstrator on several RHS vectors plus a derivative action:
 count one factorization; compare solutions/residuals against the same LAPACK backend
 from Fortran; independently check the derivative identity on well-conditioned cases;

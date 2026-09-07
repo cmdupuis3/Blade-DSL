@@ -252,6 +252,29 @@ let private emissionCases : (string * bool * string * string list * string list)
        [ lapackInclude ],
        [ "#include \"blade_linalg.hpp\""; "blade_linalg::" ])
 
+      // ================= LU: THE FACTORIZATION KEPT =================
+      // `m.lu(A)` is `?getrf` and each `m.lu_solve[_t]` is `?getrs` ('N' or
+      // 'T'); one factor call for any number of solves. The native markers
+      // must be gone, as for solve.
+      ("lu_factor_once_routes_to_getrf_getrs", true,
+       sysF64 + "let f = m.lu(A)\nlet x = m.lu_solve(f, bv)\nlet y = m.lu_solve_t(f, bv)\n",
+       [ lapackInclude; "blade_lapack::blade_lu_d("; "blade_lapack::blade_lu_solve_d("
+         "lapack dispatch: lu(A) -> (LU, piv), dense square operand"
+         "lapack dispatch: lu_solve(LU, piv, b) -> x, plain"
+         "lapack dispatch: lu_solve(LU, piv, b) -> x, transposed"
+         "blade_rt::panic(\"BL8007\"" ],
+       [ "LAPACKE_"; "__math_lu"; "/* lu factor"; "/* lu solve"; "blade_linalg.hpp" ])
+      // Gate OFF: Blade's own factor loop (once) and the two apply loops,
+      // the byte-identity truth `blade test interp math` compares.
+      ("lu_gate_off_is_native_factor_and_applies", false,
+       sysF64 + "let f = m.lu(A)\nlet x = m.lu_solve(f, bv)\nlet y = m.lu_solve_t(f, bv)\n",
+       [ "/* lu factor: partial-pivoted, multipliers stored below the diagonal, pivot rows in piv */"
+         "/* lu solve: pivots, then L (unit lower), then U */"
+         "/* lu solve transposed: U^T (forward), L^T (backward), then the pivots undone */"
+         nativePivotTieBreak
+         "blade_rt::panic(\"BL8007\"" ],
+       [ lapackInclude; "blade_lapack::"; "__math_lu"; "LAPACKE_" ])
+
       // ================= GATE ON, BUT DECLINED =================
       // An explicit SWEEPS budget keeps the synthesized Jacobi EVEN WITH THE
       // GATE ON. A stated sweep count is a request for the cyclic-Jacobi
@@ -396,7 +419,15 @@ let private rejectionCases : (string * string * string) list =
        "let A: Array<Float64 like Idx<3>, Idx<3>> = [[2.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0]]\n"
        + "let bv: Array<Float64 like Idx<4>> = [1.0, 2.0, 3.0, 4.0]\n"
        + "let x = __math_solve(A, bv)\n",
-       "b's extent must match A's dimension") ]
+       "b's extent must match A's dimension")
+      // The apply half's own copy of the agreement rule (corpus math/084 pins
+      // the surface spelling).
+      ("lu_solve_rejects_extent_disagreement",
+       "let LU: Array<Float64 like Idx<3>, Idx<3>> = [[2.0, 4.0, 1.0], [0.5, -2.0, 1.5], [0.5, 0.5, -0.25]]\n"
+       + "let piv: Array<Int64 like Idx<3>> = [1, 2, 2]\n"
+       + "let bv: Array<Float64 like Idx<4>> = [1.0, 2.0, 3.0, 4.0]\n"
+       + "let x = __math_lu_solve(LU, piv, bv)\n",
+       "b's extent must match the factor's dimension") ]
 
 let runLapackEmissionTests () : BlockResult =
     printHeader "LAPACK Eigensolver Dispatch"
@@ -509,7 +540,12 @@ let runLapackEmissionTests () : BlockResult =
           // absence of the operation. Pinned so landing cuSOLVER's
           // getrf/getrs pair is a deliberate table edit.
           "host_solve_via_shim", LinAlgPatterns.HostBlas, LinAlgPatterns.Solve, LinAlgPatterns.ViaShim
-          "cuda_solve_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Solve, LinAlgPatterns.Native ]
+          "cuda_solve_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Solve, LinAlgPatterns.Native
+          // The factor-once pair (?getrf / ?getrs), read as Solve's rows are.
+          "host_getrf_via_shim", LinAlgPatterns.HostBlas, LinAlgPatterns.Getrf, LinAlgPatterns.ViaShim
+          "host_getrs_via_shim", LinAlgPatterns.HostBlas, LinAlgPatterns.Getrs, LinAlgPatterns.ViaShim
+          "cuda_getrf_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Getrf, LinAlgPatterns.Native
+          "cuda_getrs_native",   LinAlgPatterns.CudaBlas, LinAlgPatterns.Getrs, LinAlgPatterns.Native ]
     for (name, backend, routine, expected) in policyCases do
         let actual = LinAlgPatterns.routingOf backend routine
         if actual = expected then

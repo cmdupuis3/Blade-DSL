@@ -2322,7 +2322,7 @@ let internal shapeSpecWorthwhile (func: IRFuncDef) : bool =
         match e with
         | IRApplyCombinator _ | IRComposeApply _ | IRMethodFor _
         | IRReduce _ | IRReduceCompute _ | IRProdSum _ | IRForRange _
-        | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _ | IRArrayProduct _ | IRArrayNegate _ | IRArrayConjugate _
+        | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _ | IRLu _ | IRLuSolve _ | IRArrayProduct _ | IRArrayNegate _ | IRArrayConjugate _
         | IRReynolds _ | IRDecompact _ | IRTranspose _ -> found <- true
         | _ -> ()) func.Body
     found

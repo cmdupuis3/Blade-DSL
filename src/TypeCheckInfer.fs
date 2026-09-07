@@ -1127,6 +1127,13 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
     // interpreter.
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_solve" }, [aExpr; bExpr]) when (lookupVar "__math_solve" env).IsNone ->
         inferSolve env aExpr bExpr
+    // ---- __math_lu(A) / __math_lu_solve[_t](LU, piv, b): the factorization value ----
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_lu" }, [aExpr]) when (lookupVar "__math_lu" env).IsNone ->
+        inferLu env aExpr
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_lu_solve" }, [luExpr; pivExpr; bExpr]) when (lookupVar "__math_lu_solve" env).IsNone ->
+        inferLuSolve env luExpr pivExpr bExpr false
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_lu_solve_t" }, [luExpr; pivExpr; bExpr]) when (lookupVar "__math_lu_solve_t" env).IsNone ->
+        inferLuSolve env luExpr pivExpr bExpr true
 
     | ExprKind.ExprApp (func, args) ->
         // CHAINED FACTORY SUGAR first: `f(x)(a : q1)(b : q2)` flattens to
@@ -3863,6 +3870,95 @@ and inferSolve (env: TypeEnv) (matrixE: Expr) (rhsE: Expr) : TypeResult<TypedExp
                           Kind = SDimension; Dependencies = [] }
                     let resultType = mkArrayArrow [ freshSlot n0 ] aTy.ElemType None
                     Ok (mkTyped (TExprSolve (tA, tB)) resultType)))))
+
+/// `m.lu(A)` -> (LU, piv): A held to exactly `inferSolve`'s rules for the
+/// matrix (rank-2, two plain axes, square where static, Float64,
+/// materialized), the value a tuple of two fresh pools: the packed L\U
+/// factor over A's shape and the pivot rows as Int64 over A's leading axis.
+/// The factorization is the one `solve` computes, kept -- so it can be
+/// applied to several right-hand sides and transposed without refactoring
+/// (plan-fortran-killer-2 section 6.2; the operator-value form of
+/// docs/plans/structural/05 step 2, carried by the NODE and an ordinary
+/// tuple, no new type).
+and inferLu (env: TypeEnv) (matrixE: Expr) : TypeResult<TypedExpr> =
+    inferExpr env matrixE |> Result.bind (fun tA ->
+        requireArrayArgMinRank env tA "lu" 2 |> Result.bind (fun aTy ->
+            let plainRank2 (a: IRArrayType) =
+                a.IndexTypes.Length = 2 && a.IndexTypes |> List.forall (fun ix -> ix.Rank <= 1)
+            if not (plainRank2 aTy) then
+                Error (Other "lu: A must be a rank-2 dense SQUARE matrix (two plain index axes, Array<Float64 like Idx<n>, Idx<n>>).")
+            elif aTy.IsVirtual then
+                Error (Other "lu: A must be a materialized array -- a virtual (range / reverse) view has no pool for the factorization to read; bind it with |> compute first.")
+            elif (match aTy.ElemType with IRTScalar ETFloat64 -> false | _ -> true) then
+                Error (Other "lu: A must have Float64 elements (Array<Float64 like Idx<n>, Idx<n>>).")
+            else
+                let n0 = aTy.IndexTypes.[0].Extent
+                let n1 = aTy.IndexTypes.[1].Extent
+                let disagree (l: IRExpr) (r: IRExpr) =
+                    match tryEvalIntIR l, tryEvalIntIR r with
+                    | Some a, Some b -> a <> b
+                    | _ -> false
+                if disagree n0 n1 then
+                    Error (Other "lu: A must be SQUARE (n x n); its two extents disagree.")
+                else
+                    let freshSlot (ext: IRExpr) =
+                        { Id = env.Builder.FreshId(); Rank = 1; Extent = ext
+                          Symmetry = SymNone; Tag = None; IxKind = IxKPlain
+                          Kind = SDimension; Dependencies = [] }
+                    let luTy = mkArrayArrow [ freshSlot n0; freshSlot n0 ] aTy.ElemType None
+                    let pivTy = mkArrayArrow [ freshSlot n0 ] (IRTScalar ETInt64) None
+                    Ok (mkTyped (TExprLu tA) (IRTTuple [ luTy; pivTy ]))))
+
+/// `m.lu_solve(LU, piv, b)` / `m.lu_solve_t(LU, piv, b)`: apply a stored
+/// factorization. LU rank-2 plain square Float64, piv rank-1 Int64 of the
+/// same extent, b rank-1 Float64 of the same extent; the answer is a fresh
+/// rank-1 Float64 pool over LU's leading axis (the solve twin's rule).
+and inferLuSolve (env: TypeEnv) (luE: Expr) (pivE: Expr) (rhsE: Expr) (transposed: bool) : TypeResult<TypedExpr> =
+    let what = if transposed then "lu_solve_t" else "lu_solve"
+    inferExpr env luE |> Result.bind (fun tL ->
+    inferExpr env pivE |> Result.bind (fun tP ->
+    inferExpr env rhsE |> Result.bind (fun tB ->
+        requireArrayArgMinRank env tL what 2 |> Result.bind (fun lTy ->
+        requireArrayArgMinRank env tP what 1 |> Result.bind (fun pTy ->
+        requireArrayArgMinRank env tB what 1 |> Result.bind (fun bTy ->
+            let plainRank2 (a: IRArrayType) =
+                a.IndexTypes.Length = 2 && a.IndexTypes |> List.forall (fun ix -> ix.Rank <= 1)
+            let plainRank1 (a: IRArrayType) =
+                a.IndexTypes.Length = 1 && a.IndexTypes.Head.Rank <= 1
+            let isF64 (t: IRType) = match t with IRTScalar ETFloat64 -> true | _ -> false
+            let isI64 (t: IRType) = match t with IRTScalar ETInt64 -> true | _ -> false
+            if not (plainRank2 lTy) then
+                Error (Other $"{what}: LU must be the rank-2 dense square factor `m.lu(A)` returns (Array<Float64 like Idx<n>, Idx<n>>).")
+            elif not (plainRank1 pTy) || not (isI64 pTy.ElemType) then
+                Error (Other $"{what}: piv must be the rank-1 Int64 pivot vector `m.lu(A)` returns (Array<Int64 like Idx<n>>).")
+            elif not (plainRank1 bTy) then
+                Error (Other $"{what}: b must be a rank-1 dense vector (Array<Float64 like Idx<n>>).")
+            elif lTy.IsVirtual || pTy.IsVirtual || bTy.IsVirtual then
+                Error (Other $"{what}: every argument must be a materialized array; bind a virtual view with |> compute first.")
+            elif not (isF64 lTy.ElemType) || not (isF64 bTy.ElemType) then
+                Error (Other $"{what}: LU and b must have Float64 elements.")
+            else
+                let n0 = lTy.IndexTypes.[0].Extent
+                let n1 = lTy.IndexTypes.[1].Extent
+                let pn = pTy.IndexTypes.Head.Extent
+                let bn = bTy.IndexTypes.Head.Extent
+                let disagree (l: IRExpr) (r: IRExpr) =
+                    match tryEvalIntIR l, tryEvalIntIR r with
+                    | Some a, Some b -> a <> b
+                    | _ -> false
+                if disagree n0 n1 then
+                    Error (Other $"{what}: LU must be SQUARE (n x n); its two extents disagree.")
+                elif disagree n0 pn then
+                    Error (Other $"{what}: piv's extent must match the factor's dimension (LU is n x n, piv must be length n).")
+                elif disagree n0 bn then
+                    Error (Other $"{what}(LU, piv, b): b's extent must match the factor's dimension (LU is n x n, b must be length n).")
+                else
+                    let freshSlot (ext: IRExpr) =
+                        { Id = env.Builder.FreshId(); Rank = 1; Extent = ext
+                          Symmetry = SymNone; Tag = None; IxKind = IxKPlain
+                          Kind = SDimension; Dependencies = [] }
+                    let resultType = mkArrayArrow [ freshSlot n0 ] lTy.ElemType None
+                    Ok (mkTyped (TExprLuSolve (tL, tP, tB, transposed)) resultType)))))))
 
 
 // stack / join -- the two rank-changing assembly combinators (formalism 2.6)

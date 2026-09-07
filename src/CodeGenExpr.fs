@@ -1488,6 +1488,12 @@ and materializeInlineForm (subst: SubstMap) (names: Map<IRId, string>) (varName:
         materializeEighForm subst names varName operand
     | IRSolve (mExpr, rExpr) ->
         materializeSolveForm subst names varName elemTypeStr.Value mExpr rExpr
+    // `elemTypeStr` not forwarded for lu: a TUPLE value (Float64 factor,
+    // Int64 pivots), both derived from the operand, as for eigh.
+    | IRLu mExpr ->
+        materializeLuForm subst names varName mExpr
+    | IRLuSolve (lExpr, pExpr, rExpr, transposed) ->
+        materializeLuSolveForm subst names varName elemTypeStr.Value lExpr pExpr rExpr transposed
     // `elemTypeStr` not forwarded: a range's element is always Int64, and the
     // caller-side inference has no arm for a bare range (same Lazy discipline
     // as IREigh above -- this arm must not force it).
@@ -3189,6 +3195,151 @@ and materializeEighForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
             Some ([ refusalErrorLine "" "Blade codegen: eigh reached emission with no LAPACK route (availability gate changed after elaboration?); the synthesized Jacobi path is chosen at elaboration time and cannot be recovered here" ], [])
      | _ -> None)
 
+
+and materializeLuForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (mExpr: IRExpr) : (string list * MaterializedAlloc list) option =
+    // lu(A) -> (LU, piv): the partial-pivoted LU `materializeSolveForm`
+    // computes, KEPT. LU is a fresh n x n dense pool holding L (unit lower,
+    // multipliers below the diagonal) and U (on and above); piv is a fresh
+    // n-cell Int64 pool, piv[k] = the row swapped with row k at step k
+    // (0-based, LAPACK's ipiv less one). The elimination is the solve form's
+    // statement for statement -- same working-copy order, same STRICT `>`
+    // pivot rule, same exact-zero singularity test (BL8007) -- so
+    // `lu_solve(lu(A), b)` reproduces `solve(A, b)` to the bit, and the
+    // interpreter twin `luArrays` reproduces this. Routed arm: `?getrf`
+    // through `blade_lapack::blade_lu_d`, which bridges the column-major
+    // scratch both ways and converts the pivots; that arm agrees to ~1e-14
+    // like every LAPACK route, so the differential harnesses run gate-off.
+    let aName = exprToCppCore subst names mExpr
+    (match inferExprType mExpr with
+     | ArrayElem aa ->
+        let elemStr = irTypeToCpp aa.ElemType
+        let nExtent = $"{aName}.extents[0]"
+        let nName = $"{varName}__n"
+        let luName = $"{varName}__lu"
+        let pivName = $"{varName}__piv"
+        let infoName = $"{varName}__info"
+        let luExtents = $"{luName}_extents"
+        let pivExtents = $"{pivName}_extents"
+        let call = Blade.LinAlgPatterns.classifyLu aa
+        let shimEntry = call |> Option.bind (Blade.LinAlgPatterns.shimEntryPoint Blade.LinAlgPatterns.HostBlas)
+        match shimEntry with
+        | Some _ -> (lapackUsedCell ()).Value <- true
+        | None -> ()
+        let (luExtentsDecl, luOwned) = emitExtentsTable "" luExtents 2 [(nExtent, false); (nExtent, false)]
+        let (pivExtentsDecl, pivOwned) = emitExtentsTable "" pivExtents 1 [(nExtent, false)]
+        let decls =
+            luExtentsDecl
+            @ [ arrayAlloc { Ind = ""; Elem = elemStr; Rank = 2; Name = luName; Symm = "nullptr"; Strict = None; Extents = luExtents } ]
+            @ pivExtentsDecl
+            @ [ arrayAlloc { Ind = ""; Elem = "int64_t"; Rank = 1; Name = pivName; Symm = "nullptr"; Strict = None; Extents = pivExtents } ]
+        let panicLine = "blade_rt::panic(\"BL8007\", \"lu(A): the matrix is SINGULAR -- LU factorization found an exactly-zero pivot\", nullptr, 0);"
+        let body =
+            match shimEntry with
+            | Some entry ->
+                [ $"const size_t {nName} = {nExtent};"
+                  $"/* lapack dispatch: lu(A) -> (LU, piv), dense square operand */ int {infoName} = {entry}({nName}, {aName}.data, {luName}.data, {pivName}.data);"
+                  $$"""if ({{infoName}} != 0) { {{panicLine}} }""" ]
+            | None ->
+                [ "/* lu factor: partial-pivoted, multipliers stored below the diagonal, pivot rows in piv */"
+                  $"const size_t {nName} = {nExtent};"
+                  $$"""for (size_t __si = 0; __si < {{nName}}; __si++) { for (size_t __sj = 0; __sj < {{nName}}; __sj++) { {{luName}}[__si][__sj] = {{aName}}[__si][__sj]; } }"""
+                  $$"""for (size_t __sk = 0; __sk < {{nName}}; __sk++) {"""
+                  "    size_t __sp = __sk;"
+                  $"    {elemStr} __sbig = std::fabs({luName}[__sk][__sk]);"
+                  $$"""    for (size_t __si = __sk + 1; __si < {{nName}}; __si++) {"""
+                  $"        {elemStr} __sm = std::fabs({luName}[__si][__sk]);"
+                  "        if (__sm > __sbig) { __sbig = __sm; __sp = __si; }"
+                  "    }"
+                  $$"""    if ({{luName}}[__sp][__sk] == {{elemStr}}(0)) { {{panicLine}} }"""
+                  $"    {pivName}[__sk] = (int64_t)__sp;"
+                  "    if (__sp != __sk) {"
+                  $$"""        for (size_t __sj = 0; __sj < {{nName}}; __sj++) { {{elemStr}} __st = {{luName}}[__sk][__sj]; {{luName}}[__sk][__sj] = {{luName}}[__sp][__sj]; {{luName}}[__sp][__sj] = __st; }"""
+                  "    }"
+                  $$"""    for (size_t __si = __sk + 1; __si < {{nName}}; __si++) {"""
+                  $"        {elemStr} __sf = {luName}[__si][__sk] / {luName}[__sk][__sk];"
+                  $"        {luName}[__si][__sk] = __sf;"
+                  $$"""        for (size_t __sj = __sk + 1; __sj < {{nName}}; __sj++) { {{luName}}[__si][__sj] = {{luName}}[__si][__sj] - __sf * {{luName}}[__sk][__sj]; }"""
+                  "    }"
+                  "}" ]
+        let tupleLine =
+            $"std::tuple<Array<{elemStr}, 2>, Array<int64_t, 1>> {varName} = std::make_tuple({luName}, {pivName});"
+        Some (decls @ ["{"] @ body @ ["}"; tupleLine],
+              [ MatPool (luName, elemStr, 2, "nullptr", None, luOwned)
+                MatPool (pivName, "int64_t", 1, "nullptr", None, pivOwned) ])
+     | _ -> None)
+
+and materializeLuSolveForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (lExpr: IRExpr) (pExpr: IRExpr) (rExpr: IRExpr) (transposed: bool) : (string list * MaterializedAlloc list) option =
+    // lu_solve(LU, piv, b) -> x with A x = b from the stored factors: x = b,
+    // the pivot swaps applied in step order, the multipliers applied in the
+    // solve form's fused order (k outer, i inner), then the same back
+    // substitution -- bitwise `solve(A, b)`. lu_solve_t solves A^T x = b: with
+    // P A = L U, A^T = U^T L^T P, so U^T y = b (forward, divide by the
+    // diagonal), L^T w = y (backward, unit diagonal), x = P^T w (the swaps
+    // undone in REVERSE step order). Interpreter twin: `luSolveArray`.
+    // Routed arm: `?getrs` with 'N' / 'T' through `blade_lapack::blade_lu_solve_d`.
+    let lName = exprToCppCore subst names lExpr
+    let pName = exprToCppCore subst names pExpr
+    let bName = exprToCppCore subst names rExpr
+    (match inferExprType lExpr, inferExprType rExpr with
+     | ArrayElem la, ArrayElem _ ->
+        let outElemStr = irTypeToCpp la.ElemType
+        let nExtent = $"{lName}.extents[0]"
+        let extentsName = $"{varName}_extents"
+        let nName = $"{varName}__n"
+        let infoName = $"{varName}__info"
+        let call = Blade.LinAlgPatterns.classifyLuSolve la
+        let shimEntry = call |> Option.bind (Blade.LinAlgPatterns.shimEntryPoint Blade.LinAlgPatterns.HostBlas)
+        match shimEntry with
+        | Some _ -> (lapackUsedCell ()).Value <- true
+        | None -> ()
+        let (extentDecl, ownedExtents) = emitExtentsTable "" extentsName 1 [(nExtent, false)]
+        let allocDecl =
+            $"Array<{outElemStr}, 1> {varName} = {{ allocate<typename promote<{outElemStr}, 1>::type, nullptr>({extentsName}), {extentsName} }};"
+        let modeWord = if transposed then "transposed" else "plain"
+        let transArg = if transposed then 1 else 0
+        let body =
+            match shimEntry with
+            | Some entry ->
+                [ $"const size_t {nName} = {nExtent};"
+                  $"/* lapack dispatch: lu_solve(LU, piv, b) -> x, {modeWord} */ int {infoName} = {entry}({nName}, {lName}.data, {pName}.data, {bName}.data, {varName}.data, {transArg});"
+                  $$"""if ({{infoName}} != 0) { blade_rt::panic("BL8007", "lu_solve: the stored factorization is invalid", nullptr, 0); }""" ]
+            | None when not transposed ->
+                [ "/* lu solve: pivots, then L (unit lower), then U */"
+                  $"const size_t {nName} = {nExtent};"
+                  $$"""for (size_t __si = 0; __si < {{nName}}; __si++) { {{varName}}[__si] = {{bName}}[__si]; }"""
+                  $$"""for (size_t __sk = 0; __sk < {{nName}}; __sk++) {"""
+                  $"    size_t __sp = (size_t){pName}[__sk];"
+                  $$"""    if (__sp != __sk) { {{outElemStr}} __sxt = {{varName}}[__sk]; {{varName}}[__sk] = {{varName}}[__sp]; {{varName}}[__sp] = __sxt; }"""
+                  $$"""    for (size_t __si = __sk + 1; __si < {{nName}}; __si++) { {{varName}}[__si] = {{varName}}[__si] - {{lName}}[__si][__sk] * {{varName}}[__sk]; }"""
+                  "}"
+                  $$"""for (size_t __skk = {{nName}}; __skk > 0; __skk--) {"""
+                  "    size_t __sk = __skk - 1;"
+                  $"    {outElemStr} __ss = {varName}[__sk];"
+                  $$"""    for (size_t __sj = __sk + 1; __sj < {{nName}}; __sj++) { __ss = __ss - {{lName}}[__sk][__sj] * {{varName}}[__sj]; }"""
+                  $"    {varName}[__sk] = __ss / {lName}[__sk][__sk];"
+                  "}" ]
+            | None ->
+                [ "/* lu solve transposed: U^T (forward), L^T (backward), then the pivots undone */"
+                  $"const size_t {nName} = {nExtent};"
+                  $$"""for (size_t __sk = 0; __sk < {{nName}}; __sk++) {"""
+                  $"    {outElemStr} __ss = {bName}[__sk];"
+                  $$"""    for (size_t __sj = 0; __sj < __sk; __sj++) { __ss = __ss - {{lName}}[__sj][__sk] * {{varName}}[__sj]; }"""
+                  $"    {varName}[__sk] = __ss / {lName}[__sk][__sk];"
+                  "}"
+                  $$"""for (size_t __skk = {{nName}}; __skk > 0; __skk--) {"""
+                  "    size_t __sk = __skk - 1;"
+                  $"    {outElemStr} __ss = {varName}[__sk];"
+                  $$"""    for (size_t __sj = __sk + 1; __sj < {{nName}}; __sj++) { __ss = __ss - {{lName}}[__sj][__sk] * {{varName}}[__sj]; }"""
+                  $"    {varName}[__sk] = __ss;"
+                  "}"
+                  $$"""for (size_t __skk = {{nName}}; __skk > 0; __skk--) {"""
+                  "    size_t __sk = __skk - 1;"
+                  $"    size_t __sp = (size_t){pName}[__sk];"
+                  $$"""    if (__sp != __sk) { {{outElemStr}} __sxt = {{varName}}[__sk]; {{varName}}[__sk] = {{varName}}[__sp]; {{varName}}[__sp] = __sxt; }"""
+                  "}" ]
+        Some (extentDecl @ [allocDecl; "{"] @ body @ ["}"],
+              [MatPool (varName, outElemStr, 1, "nullptr", None, ownedExtents)])
+     | _ -> None)
 
 and materializeSolveForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (mExpr: IRExpr) (rExpr: IRExpr) : (string list * MaterializedAlloc list) option =
     // solve(A, b) -> x with A.x = b, by partial-pivoted LU. A : n x n dense,

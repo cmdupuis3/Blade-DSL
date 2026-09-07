@@ -1293,6 +1293,103 @@ let solveArray (matrix: BladeArray) (rhs: BladeArray) (outType: IRType) : BladeA
         out
     | _ -> raise (ArrayOpUnsupported "solve: output type is not an array")
 
+/// lu(A) -> (LU, piv): `solveArray`'s elimination, kept -- the same working
+/// copy, the same strict-`>` pivot rule, the same exact-zero singularity
+/// test; the multipliers stay below the diagonal, piv[k] is the row swapped
+/// with k at step k (0-based). Twin of materializeLuForm's native arm.
+let luArrays (matrix: BladeArray) (outType: IRType) : BladeArray * BladeArray =
+    match outType with
+    | IRTTuple [ ArrayElem luArr; ArrayElem pivArr ] ->
+        let n = if matrix.Extents.Length >= 1 then int matrix.Extents.[0] else 0
+        let lu = Array.zeroCreate<float> (n * n)
+        let piv = Array.zeroCreate<int64> n
+        for i in 0 .. n - 1 do
+            for j in 0 .. n - 1 do
+                lu.[i * n + j] <- toF64v (indexArray matrix [VInt (int64 i); VInt (int64 j)])
+        for k in 0 .. n - 1 do
+            let mutable p = k
+            let mutable big = abs lu.[k * n + k]
+            for i in k + 1 .. n - 1 do
+                let m = abs lu.[i * n + k]
+                if m > big then
+                    big <- m
+                    p <- i
+            if lu.[p * n + k] = 0.0 then
+                raise (InterpPanic ("BL8007",
+                                    "lu(A): the matrix is SINGULAR -- LU factorization found an exactly-zero pivot",
+                                    None, 0))
+            piv.[k] <- int64 p
+            if p <> k then
+                for j in 0 .. n - 1 do
+                    let t = lu.[k * n + j]
+                    lu.[k * n + j] <- lu.[p * n + j]
+                    lu.[p * n + j] <- t
+            for i in k + 1 .. n - 1 do
+                let f = lu.[i * n + k] / lu.[k * n + k]
+                lu.[i * n + k] <- f
+                for j in k + 1 .. n - 1 do
+                    lu.[i * n + j] <- lu.[i * n + j] - f * lu.[k * n + j]
+        let luOut = allocDense luArr.ElemType luArr.IndexTypes [| int64 n; int64 n |]
+        for i in 0 .. n - 1 do
+            for j in 0 .. n - 1 do writeCell luOut [ int64 i; int64 j ] (VFloat lu.[i * n + j])
+        let pivOut = allocDense pivArr.ElemType pivArr.IndexTypes [| int64 n |]
+        for k in 0 .. n - 1 do writeCell pivOut [ int64 k ] (VInt piv.[k])
+        (luOut, pivOut)
+    | _ -> raise (ArrayOpUnsupported "lu: output type is not a (LU, piv) tuple")
+
+/// lu_solve[_t](LU, piv, b): the stored factors applied, twin of
+/// materializeLuSolveForm's two native arms (plain: pivots, L, U in the
+/// solve form's fused order, bitwise `solveArray`; transposed: U^T forward,
+/// L^T backward, pivots undone in reverse step order).
+let luSolveArray (lu: BladeArray) (piv: BladeArray) (rhs: BladeArray) (transposed: bool) (outType: IRType) : BladeArray =
+    match outType with
+    | ArrayElem outArr ->
+        let n = if lu.Extents.Length >= 1 then int lu.Extents.[0] else 0
+        let l (i: int) (j: int) = toF64v (indexArray lu [VInt (int64 i); VInt (int64 j)])
+        let pv (k: int) =
+            match indexArray piv [VInt (int64 k)] with
+            | VInt p -> int p
+            | VInt32 p -> int p
+            | VFloat p -> int p
+            | _ -> k
+        let x = Array.init n (fun i -> toF64v (indexArray rhs [VInt (int64 i)]))
+        if not transposed then
+            for k in 0 .. n - 1 do
+                let p = pv k
+                if p <> k then
+                    let t = x.[k] in x.[k] <- x.[p]; x.[p] <- t
+                for i in k + 1 .. n - 1 do
+                    x.[i] <- x.[i] - l i k * x.[k]
+            for kk in n .. -1 .. 1 do
+                let k = kk - 1
+                let mutable s = x.[k]
+                for j in k + 1 .. n - 1 do
+                    s <- s - l k j * x.[j]
+                x.[k] <- s / l k k
+        else
+            let y = Array.zeroCreate<float> n
+            for k in 0 .. n - 1 do
+                let mutable s = x.[k]
+                for j in 0 .. k - 1 do
+                    s <- s - l j k * y.[j]
+                y.[k] <- s / l k k
+            for kk in n .. -1 .. 1 do
+                let k = kk - 1
+                let mutable s = y.[k]
+                for j in k + 1 .. n - 1 do
+                    s <- s - l j k * y.[j]
+                y.[k] <- s
+            for kk in n .. -1 .. 1 do
+                let k = kk - 1
+                let p = pv k
+                if p <> k then
+                    let t = y.[k] in y.[k] <- y.[p]; y.[p] <- t
+            for i in 0 .. n - 1 do x.[i] <- y.[i]
+        let out = allocDense outArr.ElemType outArr.IndexTypes [| int64 n |]
+        for i in 0 .. n - 1 do writeCell out [ int64 i ] (VFloat x.[i])
+        out
+    | _ -> raise (ArrayOpUnsupported "lu_solve: output type is not an array")
+
 /// eigh(S) -> (Q, LAM): symmetric eigendecomposition by cyclic two-sided
 /// Jacobi. Q's columns are the eigenvectors, LAM is descending, each Q column
 /// sign-fixed so the first row attaining the maximum |entry| is positive --

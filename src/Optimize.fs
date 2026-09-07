@@ -398,7 +398,7 @@ let private isFreshForm (e: IRExpr) : bool =
         | IRApplyCombinator _ | IRComposeApply _ | IRArrayLit _ -> true
         | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _ -> true
         | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRGramApply _ | IRMatmul _ -> true
-        | IREigh _ | IRSolve _ | IRArrayNegate _ | IRArrayConjugate _ -> true
+        | IREigh _ | IRSolve _ | IRLu _ | IRLuSolve _ | IRArrayNegate _ | IRArrayConjugate _ -> true
         | IRReduce _ | IRReduceCompute _ | IRProdSum _ -> true
         | _ -> false
     go e

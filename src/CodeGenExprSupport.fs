@@ -107,6 +107,7 @@ let inferInlineElemTypeStr (opName: string) (form: IRExpr) : string =
         // derives BOTH element types itself, since Q's and LAM's can differ),
         // so this arm exists purely to keep the diagnostic honest.
         | IREigh a -> a
+        | IRLu a -> a
         | _ -> form
     match inferExprType arrExpr with
     | ArrayElem a -> elemTypeToCpp a.ElemType

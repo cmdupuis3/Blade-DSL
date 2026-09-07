@@ -844,6 +844,10 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
         IRMatmul (lowerTypedExpr env left, lowerTypedExpr env right)
     | TExprEigh operand ->
         IREigh (lowerTypedExpr env operand)
+    | TExprLu matrix ->
+        IRLu (lowerTypedExpr env matrix)
+    | TExprLuSolve (lu, piv, rhs, t) ->
+        IRLuSolve (lowerTypedExpr env lu, lowerTypedExpr env piv, lowerTypedExpr env rhs, t)
     | TExprSolve (matrix, rhs) ->
         IRSolve (lowerTypedExpr env matrix, lowerTypedExpr env rhs)
     | TExprArrayNegate array ->

@@ -3167,6 +3167,10 @@ let rec isFreshPoolForm (e: IRExpr) : bool =
     // and neither borrows the operand's `.extents` pointer -- each gets its own
     // table. So an escaping (Q, LAM) need not pin S, and propagation stops here.
     | IREigh _ -> true
+    // lu: (LU, piv) are two fresh pools with their own tables, like eigh's.
+    | IRLu _ -> true
+    // lu_solve: x is a fresh pool, like solve's.
+    | IRLuSolve _ -> true
     // solve: x is a fresh `allocate<>` pool with its own extents table -- it
     // borrows nothing from A or b (b's values are COPIED in, not aliased), so
     // an escaping x need pin neither operand and propagation stops here.
@@ -3277,7 +3281,7 @@ let internal isMaterializedFreshArray (v: IRExpr) : bool =
     | IRCompute inner -> isFreshPoolForm inner
     | IRArrayLit _ -> true
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _
-    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _
+    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _ | IRLuSolve _
     | IRArrayNegate _ | IRArrayConjugate _ -> true
     | _ -> false
 
