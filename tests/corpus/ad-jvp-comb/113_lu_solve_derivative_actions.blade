@@ -1,0 +1,83 @@
+// TEST: LU derivative actions: A dx = db - dA x forward, transposed solves in reverse
+// The factorization is taken ONCE and never differentiated: every derivative
+// is one more solve against the same factors (plan-fortran-killer-2 sections
+// 6.2/6.3). Forward, `x = A^{-1} b` gives `A dx = db - dA x`; reverse,
+// `bbar += A^{-T} xbar` and `Abar += -(A^{-T} xbar) x^T` -- the transposed
+// solve IS the reverse action. For `x = A^{-T} b` the roles swap.
+//
+// A = [[1,1,1],[2,4,1],[1,0,2]] (math/070's exact matrix), b = [6,13,7],
+// x = [1,2,3]; loss = 2 x(0) + x(2) = 5, xbar = [2,0,1].
+//   bbar = A^{-T} [2,0,1] = [12,-3,-4]
+//   Abar = -bbar x^T = [[-12,-24,-36],[3,6,9],[4,8,12]]
+// Seeds sA = I, sb = [1,1,1]: dx = A^{-1}(sb - sA x) = A^{-1}[0,-1,-2] = [8,-3,-5];
+// the transpose identity: dot(xbar, dx) = 11 = trace(Abar) + sum(bbar) = 6 + 5.
+// Transposed: xt = A^{-T} bt with bt = [8,9,9], xt = [1,2,3]:
+//   dxt = A^{-T}(sbt - sA^T xt) = A^{-T}[0,-1,-2] = [11,-3,-5]
+//   btbar = A^{-1} [2,0,1] = [13,-5,-6], Abar = -xt btbar^T = [[-13,5,6],[-26,10,12],[-39,15,18]]
+//   dot(xbar, dxt) = 17 = trace(Abar) + sum(btbar) = 15 + 2.
+import ad as ad
+import math as m
+type N = Idx<3>
+
+function solve_loss(a: Array<Float64 like N, N>, b: Array<Float64 like N>) -> Float64 = {
+    let f = m.lu(a)
+    let x = m.lu_solve(f, b)
+    x(0) * 2.0 + x(2)
+}
+function solve_fn(a: Array<Float64 like N, N>, b: Array<Float64 like N>) -> Array<Float64 like N> = {
+    let f = m.lu(a)
+    let x = m.lu_solve(f, b)
+    x
+}
+function solve_t_fn(a: Array<Float64 like N, N>, b: Array<Float64 like N>) -> Array<Float64 like N> = {
+    let f = m.lu(a)
+    let x = m.lu_solve_t(f, b)
+    x
+}
+
+let A: Array<Float64 like N, N> = [[1.0, 1.0, 1.0], [2.0, 4.0, 1.0], [1.0, 0.0, 2.0]]
+let b: Array<Float64 like N> = [6.0, 13.0, 7.0]
+let sA: Array<Float64 like N, N> = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+let sb: Array<Float64 like N> = [1.0, 1.0, 1.0]
+let w: Array<Float64 like N> = [2.0, 0.0, 1.0]
+
+// reverse, scalar loss
+let mut da: Array<Float64 like N, N> = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+let mut db: Array<Float64 like N> = [0.0, 0.0, 0.0]
+let gv = ad.grad(solve_loss)(A, b, da, db)
+// EXPECT: gv = 5
+// EXPECT: da = [[-12, -24, -36], [3, 6, 9], [4, 8, 12]]
+// EXPECT: db = [12, -3, -4]
+
+// forward, array-valued
+let (x, dx) = ad.jvp(solve_fn)(A, b, sA, sb)
+// EXPECT: x = [1, 2, 3]
+// EXPECT: dx = [8, -3, -5]
+
+// reverse, seeded
+let mut da2: Array<Float64 like N, N> = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+let mut db2: Array<Float64 like N> = [0.0, 0.0, 0.0]
+let xv = ad.vjp(solve_fn)(A, b, w, da2, db2)
+// EXPECT: xv = [1, 2, 3]
+// EXPECT: da2 = [[-12, -24, -36], [3, 6, 9], [4, 8, 12]]
+// EXPECT: db2 = [12, -3, -4]
+let lhs = reduce(w * dx, (+))
+let rhs = reduce(reduce(da2 * sA, (+)), (+)) + reduce(db2 * sb, (+))
+// EXPECT: lhs = 11
+// EXPECT: rhs = 11
+
+// the transposed solve, both directions
+let bt: Array<Float64 like N> = [8.0, 9.0, 9.0]
+let (xt, dxt) = ad.jvp(solve_t_fn)(A, bt, sA, sb)
+// EXPECT: xt = [1, 2, 3]
+// EXPECT: dxt = [11, -3, -5]
+let mut da3: Array<Float64 like N, N> = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+let mut db3: Array<Float64 like N> = [0.0, 0.0, 0.0]
+let xtv = ad.vjp(solve_t_fn)(A, bt, w, da3, db3)
+// EXPECT: xtv = [1, 2, 3]
+// EXPECT: da3 = [[-13, 5, 6], [-26, 10, 12], [-39, 15, 18]]
+// EXPECT: db3 = [13, -5, -6]
+let lhs_t = reduce(w * dxt, (+))
+let rhs_t = reduce(reduce(da3 * sA, (+)), (+)) + reduce(db3 * sb, (+))
+// EXPECT: lhs_t = 17
+// EXPECT: rhs_t = 17

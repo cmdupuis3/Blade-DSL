@@ -417,7 +417,7 @@ let internal subsetHead =
 /// of them. Each message says what was met and the nearest spelling that
 /// works.
 let internal combinatorOpMsg (op: BinOp) : string =
-    let grad = (errMode.Value = "grad")
+    let grad = (errMode.Value <> "jvp")   // grad and vjp share the reverse sweep
     match op with
     | OpApply ->
         if grad then
@@ -579,6 +579,9 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
         onVar name
         args |> iterR (walkExpr fname ctx onVar inKernel)
     | { Kind = ExprKind.ExprApp _ } -> err fname "only named calls and array reads are supported in differentiated code"
+    // A tuple projection (`f[0]`, the elaborated spelling of a solve's factor
+    // operand): the tuple's name carries whatever taint it has.
+    | { Kind = ExprKind.ExprTupleIndex (t, _) } -> walkExpr fname ctx onVar inKernel t
     | { Kind = ExprKind.ExprArrayLit elems } ->
         elems |> iterR (walkExpr fname ctx onVar inKernel)
     | { Kind = ExprKind.ExprIf (c, t, f) } ->
@@ -1520,6 +1523,8 @@ let rec internal staticDimsOf (ctx: Ctx) (denv: Map<string, int list>) (e: Expr)
          | _ -> None)
     // C7: a sort is a permutation -- same shape as its (rank-1) operand
     | ExprKind.ExprSort (a, _) -> staticDimsOf ctx denv a
+    // a solve against LU factors: the right-hand side's shape
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar n }, [ _; _; b ]) when isLuSolveName n -> staticDimsOf ctx denv b
     | _ -> None
 
 /// Zero array literal for a dims list (rank-general).

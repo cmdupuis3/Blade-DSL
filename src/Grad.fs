@@ -1,10 +1,15 @@
-/// grad() and jvp() -- reverse- and forward-mode automatic differentiation
-/// as AST-level source transforms (pre-typecheck), surfaced through the
-/// `ad` module. The header below documents grad; jvp's surface, ABI, and
-/// subset are documented at `synthesizeJvp` (its subset is a strict
+/// grad(), jvp() and vjp() -- reverse- and forward-mode automatic
+/// differentiation as AST-level source transforms (pre-typecheck), surfaced
+/// through the `ad` module. The header below documents grad; jvp's surface,
+/// ABI, and subset are documented at `synthesizeJvp` (its subset is a strict
 /// superset -- forward mode needs no reverse sweep, so the discipline
-/// checks below do not apply to it), and the composition driver
-/// (`ad.jvp(ad.grad(f))` = HVP) at `expandModule`.
+/// checks below do not apply to it), vjp's -- the SEEDED reverse mode for an
+/// ARRAY-valued function, `f__vjp(args..., __seed, buffers...)` accumulating
+/// J^T seed -- at `synthesizeRev`, and the composition driver
+/// (`ad.jvp(ad.grad(f))` = HVP) at `expandModule`. jvp accepts array-valued
+/// returns too (`(y, J v)`), so the pair is a matrix-free linearization:
+/// forward action and adjoint action from one resolved function, no
+/// Jacobian formed (plan-fortran-killer-2 section 6.3).
 ///
 /// Surface form: `import ad as ad` then `ad.grad(f)` where `f` is a
 /// top-level function in the same module returning a Float scalar. The pass
@@ -92,6 +97,7 @@ let isComplexMathIntrinsic = GradCommon.isComplexMathIntrinsic
 // Synthesize f__grad
 
 let private gradSuffix = "__grad"
+let private vjpSuffix = "__vjp"
 
 /// The unit of a cotangent: <loss unit> / <value unit>, as a surface unit
 /// expression, or None when neither carries a unit (the pre-existing bare
@@ -278,35 +284,65 @@ let private adBodyWhere : WhereClause option =
     Some { Commutativity = []; Antisymmetry = []; Parallel = []; Repro = false; TDims = []
            Custom = [ ("__ad_body", []) ] }
 
-let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, string> =
-    errMode.Value <- "grad"
+/// `synthesize` builds `f__grad` (scalar loss, seed 1.0). With `vjp = true`
+/// it builds `f__vjp` for an ARRAY-valued `f` (plan-fortran-killer-2 section
+/// 6.3, the reverse half of a matrix-free linearization): the body's value
+/// must be a NAMED array (`let y = ..` then `y`, or an array parameter), the
+/// synthesized function takes one more parameter after the originals --
+/// `__seed`, the cotangent of the output, typed exactly as the return -- and
+/// seeds the reverse sweep with it instead of 1.0. Everything else is
+/// grad's: cotangent buffers for array params are `mut` out-parameters that
+/// ACCUMULATE, scalar-param cotangents come back beside the primal. So
+/// `ad.vjp(f)(args..., w, buffers...)` accumulates J^T w, and with
+/// `ad.jvp(f)(args..., seeds...)` = (y, J v) the identity
+/// `dot(w, J v) = sum over params of dot(J^T w, v)` is checkable exactly.
+let private synthesizeRev (ctx: Ctx) (fd: FunctionDecl) (vjp: bool) : Result<FunctionDecl, string> =
+    errMode.Value <- (if vjp then "vjp" else "grad")
     let fname = fd.Name
+    let modeName = if vjp then "vjp" else "grad"
+    let suffix = if vjp then vjpSuffix else gradSuffix
+    let seedName = "__seed"
     // The loss's unit, if any: the numerator of every cotangent's unit and
-    // the seed's type.
-    let lossUnit = fd.ReturnType |> Option.bind (unitArgOf ctx)
+    // the seed's type. For an array-valued output it is the ELEMENT's unit.
+    let lossUnit =
+        fd.ReturnType |> Option.bind (fun rt ->
+            match resolveTy ctx rt with
+            | TyArray (elem, _) -> unitArgOf ctx elem
+            | _ -> unitArgOf ctx rt)
     let paramTyOf (pname: string) : TypeExpr =
         fd.Params |> List.tryFind (fun q -> q.Name = pname)
         |> Option.bind (fun q -> q.Type)
         |> Option.defaultValue TyFloat64
     // The synthesized name must be free: splicing a second `f__grad` beside a
     // user function of that name would silently shadow one of them.
-    (if Map.containsKey (fname + gradSuffix) ctx.Decls then
-        err fname $"a function named '{fname}{gradSuffix}' already exists in this module; grad would synthesize a colliding declaration -- rename it"
+    (if Map.containsKey (fname + suffix) ctx.Decls then
+        err fname $"a function named '{fname}{suffix}' already exists in this module; {modeName} would synthesize a colliding declaration -- rename it"
      else Ok ())
     |> Result.bind (fun () ->
     // Return type must be a Float scalar (checked syntactically; the
     // typechecker re-verifies the generated function anyway). A unit-carrying
     // loss is fine: its unit is the numerator of every cotangent's unit.
-    match fd.ReturnType |> Option.map (resolveTy ctx) with
-    | Some t when isFloatTy t -> Ok ()
-    | Some (TyNamed (("Float" | "Float64" | "Float32"), _ :: _)) -> Ok ()
-    | Some _ -> err fname "grad requires a function returning Float (scalar loss)"
-    | None -> err fname "grad requires an explicit `-> Float` return annotation"
+    // vjp instead requires an ARRAY of Float.
+    let isFloatScalar (t: TypeExpr) =
+        isFloatTy t || (match t with TyNamed (("Float" | "Float64" | "Float32"), _ :: _) -> true | _ -> false)
+    match vjp, fd.ReturnType |> Option.map (resolveTy ctx) with
+    | false, Some t when isFloatScalar t -> Ok ()
+    | false, Some _ -> err fname "grad requires a function returning Float (scalar loss); for an array-valued function use ad.vjp"
+    | false, None -> err fname "grad requires an explicit `-> Float` return annotation"
+    | true, Some (TyArray (elem, _)) when isFloatScalar (resolveTy ctx elem) -> Ok ()
+    | true, Some _ -> err fname "vjp requires a function returning an array of Float; for a scalar loss use ad.grad"
+    | true, None -> err fname "vjp requires an explicit `-> Array<...>` return annotation"
     |> Result.bind (fun () ->
     // classify parameters, normalize + inline, gate reserved names, validate
     prepareForSweeps ctx fd id ignore false |> Result.bind (fun prep ->
     let stmts = prep.Stmts
     let finalE = prep.FinalE
+    (if vjp then
+        (match finalE.Kind with
+         | ExprKind.ExprVar _ -> Ok ()
+         | _ -> err fname "vjp requires the body's value to be a NAMED array (`let y = ...` then `y`, or an array parameter) (v1)")
+     else Ok ())
+    |> Result.bind (fun () ->
     let scalarDiff =
         prep.Classes |> List.choose (fun (p, c) ->
             match c with DiffScalar -> Some p.Name | _ -> None)
@@ -331,7 +367,7 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
             | _ -> m) paramDims
     let rc = { Fname = fname; Ctx = ctx; Diff = diff; Arrays = arrays; Known = prep.Known
                ArrayIdxTys = prep.ArrayIdxTys; LoopBindings = Map.empty; Dims = dimsEnv
-               SortPlans = prep.SortPlans; Inlining = [] }
+               SortPlans = prep.SortPlans; LuOf = luFactorsOf prep.Stmts; Inlining = [] }
 
     // cotangent declarations for function-level diff LOCALS (params' array
     // cotangents are mut parameters; scalar-param cotangents are locals).
@@ -393,6 +429,9 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
                  // come from the surface literals; its flow is the gather
                  // arm of GradSweeps.adjointOfInit).
                  | { Kind = ExprKind.ExprBinOp (_, OpApply, _, _) } when Map.containsKey n dimsEnv -> None
+                 // A solve against LU factors: shaped like its right-hand side,
+                 // flowed by GradSweeps.adjointOfInit's lu arm.
+                 | { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, _) } when isLuSolveName op && Map.containsKey n dimsEnv -> None
                  // The `pure`/`compute`/annotation wrappers are transparent
                  // to WHICH combinator this is, so the specific arms below
                  // look through them: `a <|:> b |> compute` parses with the
@@ -433,8 +472,24 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
 
     // seed: adjoint of the final expression with cotangent 1.0. The seed is
     // d(loss)/d(loss) -- DIMENSIONLESS, whatever the loss measures; every
-    // cotangent below it acquires <loss>/<value> through the partials.
-    adjointOf rc finalE (fLit 1.0) |> Result.bind (fun seed ->
+    // cotangent below it acquires <loss>/<value> through the partials. vjp
+    // seeds with the caller's cotangent of the output instead.
+    (if vjp then
+        // The seed is an ARRAY: accumulate it cell by cell onto the output's
+        // cotangent buffer (a whole-array `+=` inside a function body is not
+        // an emitter shape; the indexed loop is exactly what every other
+        // array cotangent flow emits).
+        match finalE.Kind with
+        | ExprKind.ExprVar y when Set.contains y diff ->
+            (match Map.tryFind y dimsEnv with
+             | Some dims ->
+                 Ok (accumLoop ctx dims
+                        (fun idx -> syn (ExprApp (v (dName y), idx)))
+                        (fun idx -> syn (ExprApp (v seedName, idx))))
+             | None -> err fname "vjp: the returned array needs statically-known dims to seed its cotangent (v1)")
+        | _ -> Ok []   // an inactive output: nothing depends on the parameters
+     else adjointOf rc finalE (fLit 1.0))
+    |> Result.bind (fun seed ->
     // reverse sweep over the statements
     let folded =
         List.rev stmts
@@ -459,8 +514,12 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
         | [] -> fd.ReturnType
         | ss -> Some (TyTuple ((Option.defaultValue TyFloat64 fd.ReturnType)
                                :: (ss |> List.map (fun p -> cotangentTy ctx lossUnit (paramTyOf p)))))
+    let seedParams =
+        if vjp then [ { Name = seedName; Type = fd.ReturnType; Mutability = Immutable; Default = None; NameSpan = noSpan } ]
+        else []
     let gradParams =
         fd.Params
+        @ seedParams
         @ (prep.Classes |> List.choose (fun (p, c) ->
              match c with
              | DiffArray ->
@@ -468,14 +527,20 @@ let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, stri
                         Type = p.Type |> Option.map (cotangentTy ctx lossUnit)
                         Mutability = Mutable; Default = None; NameSpan = noSpan }
              | _ -> None))
-    { Name = fname + gradSuffix
+    { Name = fname + suffix
       TypeParams = fd.TypeParams
       Params = gradParams
       WhereClause = adBodyWhere
       ReturnType = retTy
       Body = inheritSpan fd.Body (ExprBlock (fwd @ cotDecls @ revStmts, Some retExpr))
       IsStatic = false
-      NameSpan = noSpan })))))))))
+      NameSpan = noSpan }))))))))))
+
+let private synthesize (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, string> =
+    synthesizeRev ctx fd false
+
+let private synthesizeVjp (ctx: Ctx) (fd: FunctionDecl) : Result<FunctionDecl, string> =
+    synthesizeRev ctx fd true
 
 // Synthesize f__jvp -- forward mode at grad parity (v1)
 //
@@ -508,8 +573,20 @@ let private synthesizeJvp (ctx: Ctx) (trusted: bool) (fd: FunctionDecl) : Result
     // composition routes. The jvp return interleaves flat:
     // components, then their tangents.
     | Some (TyTuple ts) when ts |> List.forall (fun t -> isFloatish (resolveTy ctx t)) -> Ok ()
-    | Some _ -> err fname "jvp requires a function returning Float (or an all-Float tuple) (v1)"
-    | None -> err fname "jvp requires an explicit `-> Float` return annotation"
+    // ARRAY-VALUED returns (plan-fortran-killer-2 section 6.3): the tangent
+    // of an array local IS an array expression already (every array let
+    // carries its `__t_` twin through the sweep), so a body whose value is
+    // an array (or a tuple mixing arrays and scalars) returns `(y, dy)` the
+    // same way -- components then tangents, flat. The array-output JVP is
+    // the forward half of a matrix-free linearization; `ad.vjp` is the
+    // reverse half.
+    | Some (TyArray (elem, _)) when isFloatish (resolveTy ctx elem) -> Ok ()
+    | Some (TyTuple ts) when ts |> List.forall (fun t ->
+                                    match resolveTy ctx t with
+                                    | TyArray (elem, _) -> isFloatish (resolveTy ctx elem)
+                                    | rt -> isFloatish rt) -> Ok ()
+    | Some _ -> err fname "jvp requires a function returning Float, an array of Float, or a tuple of those (v1)"
+    | None -> err fname "jvp requires an explicit `-> Float` (or `-> Array<...>`) return annotation"
     |> Result.bind (fun () ->
     // Tuple-returning sources (f__grad's `(primal, dscalars...)`) sweep
     // per component; the surrogate keeps taint/validation walks off the
@@ -557,7 +634,7 @@ let private synthesizeJvp (ctx: Ctx) (trusted: bool) (fd: FunctionDecl) : Result
     // one's operands.
     let rc = { Fname = fname; Ctx = ctx; Diff = diff; Arrays = arrays; Known = prep.Known
                ArrayIdxTys = prep.ArrayIdxTys; LoopBindings = Map.empty
-               Dims = Map.empty; SortPlans = prep.SortPlans; Inlining = [] }
+               Dims = Map.empty; SortPlans = prep.SortPlans; LuOf = luFactorsOf prep.Stmts; Inlining = [] }
 
     // tangent-interleaved body + (primal, tangent) return
     let sweptR = tangentOfStmts rc stmts
@@ -608,7 +685,7 @@ let rec private rewriteExpr (requestsOrdered: ResizeArray<string * string>)
     // Qualified: `alias.grad(f)` / `alias.jvp(f)` with alias bound by
     // `import ad`. Bare `grad(...)` is not recognized -- the AD surface is
     // a module, not a language-wide name (same rule as the ml/ppl surfaces).
-    | ExprKind.ExprApp ({ Kind = ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, (("grad" | "jvp") as which)) }, args) when Set.contains alias aliases ->
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, (("grad" | "jvp" | "vjp") as which)) }, args) when Set.contains alias aliases ->
         (match args with
          | [arg0] ->
              // Rewrite the argument FIRST so composition works: the inner
@@ -617,7 +694,7 @@ let rec private rewriteExpr (requestsOrdered: ResizeArray<string * string>)
              r arg0 |> Result.bind (fun arg0' ->
                  match arg0'.Kind with
                  | ExprKind.ExprVar fname when Set.contains fname declNames || anticipated.Contains fname ->
-                     let suffix = if which = "grad" then gradSuffix else jvpSuffix
+                     let suffix = if which = "grad" then gradSuffix elif which = "vjp" then vjpSuffix else jvpSuffix
                      requestsOrdered.Add (which, fname)
                      anticipated.Add (fname + suffix) |> ignore
                      Ok (re (ExprVar (fname + suffix)))
@@ -823,7 +900,7 @@ let private expandModule (decls: Located<Decl> list) : Result<Located<Decl> list
                 |> Seq.distinct
                 |> Seq.fold (fun acc (mode, fname) ->
                     acc |> Result.bind (fun () ->
-                        let suffix = if mode = "grad" then gradSuffix else jvpSuffix
+                        let suffix = if mode = "grad" then gradSuffix elif mode = "vjp" then vjpSuffix else jvpSuffix
                         let synthName = fname + suffix
                         if madeMap.ContainsKey synthName then Ok ()
                         else
@@ -843,6 +920,7 @@ let private expandModule (decls: Located<Decl> list) : Result<Located<Decl> list
                             let trusted = not (Map.containsKey fname funcDecls)
                             let result =
                                 if mode = "grad" then synthesize ctx2 fd
+                                elif mode = "vjp" then synthesizeVjp ctx2 fd
                                 else synthesizeJvp ctx2 trusted fd
                             result |> Result.map (fun gd ->
                                 // BLADE_GRAD_DUMP=1: print the synthesized declaration
@@ -1023,7 +1101,7 @@ let expand (program: Program) : Result<Program, Blade.Diagnostics.Diagnostic lis
             let code =
                 if isPack then "BL5502"
                 elif msg.StartsWith "jvp" then "BL5501"
-                else "BL5500"
+                else "BL5500"   // grad's and vjp's (the seeded reverse mode shares grad's subset and code)
             [ Blade.Diagnostics.mkError code (Blade.Diagnostics.Codes.phaseOfCode code) Blade.Ast.synthSpan msg ])
     // Reset AFTER the diagnostic is built (the span is the failing decl's),
     // so no stamp leaks into later passes.

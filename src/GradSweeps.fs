@@ -43,6 +43,9 @@ type internal RevCtx = {
     /// beside it. Both sweeps read the SAME entry, which is what keeps the
     /// primal, the tangent gather, and the adjoint gather on one permutation.
     SortPlans: Map<string, SortPlan>
+    /// LU factors kept as values (`let f = m.lu(A)`): factor name -> matrix
+    /// name, read by the lu_solve arms of both sweeps (GradCommon.luFactorsOf).
+    LuOf: Map<string, string>
     /// The chain of same-module functions currently being substituted INTO a
     /// kernel body, innermost first (see `kernelCallBody`). Statement-level
     /// calls are inlined before either sweep runs and are capped by
@@ -422,6 +425,43 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
                      (Ok (0, []))
                  |> Result.map snd
              | [] -> err rc.Fname "internal: join initializer with no dims")
+        // LU derivative action, reverse (plan-fortran-killer-2 section 6.3):
+        // for x = A^{-1} b with cotangent xbar,
+        //   bbar += A^{-T} xbar            -- the TRANSPOSED solve, same factors
+        //   Abar(i, j) += -(A^{-T} xbar)(i) * x(j)
+        // and for x = A^{-T} b the roles swap: bbar += A^{-1} xbar,
+        // Abar(i, j) += -x(i) * (A^{-1} xbar)(j). The cotangent is read whole
+        // by name (as gram's), so only the identity reader may reach here.
+        | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, _) when isLuSolveName op && not cotIdent ->
+            err rc.Fname "the adjoint of lu_solve nested under transpose/guard/stack/join is not supported (v1); bind it to its own let first (`let x = m.lu_solve(f, b)` then wrap `x`), which gives it an identity cotangent and differentiates today"
+        | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, [ luE; pivE; bE ]) when isLuSolveName op ->
+            (match luFactorMatrix rc.LuOf luE, bE.Kind with
+             | None, _ -> err rc.Fname luFactorMsg
+             | Some aName, ExprKind.ExprVar bName ->
+                 let dimsA =
+                     if Set.contains aName rc.Diff then
+                         match Map.tryFind aName denv with
+                         | Some ds -> Ok (Some ds)
+                         | None -> err rc.Fname "differentiating lu_solve with respect to the matrix needs its statically-known dims (v1)"
+                     else Ok None
+                 dimsA |> Result.map (fun dimsA ->
+                     let lb = fresh ctx "__lb"
+                     let flows = ResizeArray<NStmt>()
+                     flows.Add (NLet (lb, false, syn (ExprApp (v (luTransposedOf op), [ luE; pivE; v (dName xname) ]))))
+                     if Set.contains bName rc.Diff then
+                         for st in accumLoop ctx dims (fun idx -> syn (ExprApp (v (dName bName), idx))) (fun idx -> syn (ExprApp (v lb, idx))) do flows.Add st
+                     (match dimsA with
+                      | Some dimsA ->
+                          for st in accumLoop ctx dimsA
+                                        (fun idx -> syn (ExprApp (v (dName aName), idx)))
+                                        (fun idx ->
+                                            match idx with
+                                            | [ i; j ] when op = "__math_lu_solve" -> neg (mul (syn (ExprApp (v lb, [ i ]))) (syn (ExprApp (v xname, [ j ]))))
+                                            | [ i; j ] -> neg (mul (syn (ExprApp (v xname, [ i ]))) (syn (ExprApp (v lb, [ j ]))))
+                                            | _ -> fLit 0.0) do flows.Add st
+                      | None -> ())
+                     List.ofSeq flows)
+             | Some _, _ -> err rc.Fname "differentiating lu_solve needs a NAMED right-hand side (v1); bind it first")
         | ExprKind.ExprGram _ when not cotIdent ->
             // The arm below reads `__g_<xname>` whole. Reaching it through a
             // wrapper would drop that wrapper's reindexing on the floor --
@@ -531,6 +571,11 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
         (match Map.tryFind xname denv with
          | Some dims -> Some (flow true (fun idx -> syn (ExprApp (v (dName xname), idx))) dims value)
          | None -> Some (err rc.Fname "this combinator initializer needs statically-known dims to differentiate (v1)"))
+    // a solve against LU factors (its flow arm is above, with gram's)
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, _) when isLuSolveName op ->
+        (match Map.tryFind xname denv with
+         | Some dims -> Some (flow true (fun idx -> syn (ExprApp (v (dName xname), idx))) dims value)
+         | None -> Some (err rc.Fname "lu_solve needs a right-hand side with statically-known dims to differentiate (v1)"))
     // pure/compute/guard over an ARRAY use the reindexing flow; the scalar
     // case falls through to adjointOf, which has pass-through arms
     | ExprKind.ExprGuard _ | ExprKind.ExprPure _ | ExprKind.ExprCompute _
@@ -1220,6 +1265,44 @@ and internal tangentOfStmt (rc: RevCtx) (s: NStmt) : Result<NStmt list, string> 
             (match value with
              | { Kind = ExprKind.ExprArrayLit _ } ->
                  tangentOfLit rc value |> Result.map (fun t -> [s; NLet (tName x, isMut, t)])
+             // LU derivative action, forward: x = A^{-1} b (or A^{-T} b)
+             // gives  A dx = db - dA x  -- one more solve against the SAME
+             // factors, the matrix never re-factored (plan-fortran-killer-2
+             // section 6.3). The factor binding itself carries no tangent;
+             // `-(dA x)` is a row map over dA (dA^T for the transposed solve),
+             // each row's negated dot with the primal solution, bound to a
+             // temp so the solve reads a NAME (as gram's tangent terms are).
+             | { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, [ luE; pivE; bE ]) } when isLuSolveName op ->
+                 (match luFactorMatrix rc.LuOf luE with
+                  | None -> err rc.Fname luFactorMsg
+                  | Some aName ->
+                 tangentOfExpr rc bE |> Result.map (fun tb ->
+                     let ta = if Set.contains aName rc.Diff then v (tName aName) else fLit 0.0
+                     let negMatVec () =
+                         let rname = fresh rc.Ctx "__lr"
+                         let rows = if op = "__math_lu_solve" then ta else syn (ExprTranspose (ta, 0, 1))
+                         syn (ExprCompute (syn (ExprBinOp (Elementwise, OpApply,
+                                                            syn (ExprMethodFor [ rows ]),
+                                                            syn (ExprLambda ([ { Name = rname; Type = None; Default = None; NameSpan = noSpan } ], None,
+                                                                             sub (fLit 0.0) (syn (ExprApp (v "prodsum", [ v rname; v x ])))))))))
+                     let solveOf (rhs: Expr) = syn (ExprApp (v op, [ luE; pivE; rhs ]))
+                     let named (e: Expr) : NStmt list * Expr =
+                         match e.Kind with
+                         | ExprKind.ExprVar _ -> [], e
+                         | _ -> let t = fresh rc.Ctx "__lq" in [ NLet (t, false, e) ], v t
+                     match isZeroLit tb, isZeroLit ta with
+                     | true, true -> [ s ]
+                     | false, true ->
+                         let pre, tbN = named tb
+                         [ s ] @ pre @ [ NLet (tName x, isMut, solveOf tbN) ]
+                     | true, false ->
+                         let m = fresh rc.Ctx "__lm"
+                         [ s; NLet (m, false, negMatVec ()); NLet (tName x, isMut, solveOf (v m)) ]
+                     | false, false ->
+                         let m = fresh rc.Ctx "__lm"
+                         let pre, tbN = named tb
+                         let r = fresh rc.Ctx "__lq"
+                         [ s ] @ pre @ [ NLet (m, false, negMatVec ()); NLet (r, false, add tbN (v m)); NLet (tName x, isMut, solveOf (v r)) ]))
              // gram: bind each bilinear term to its own temp -- an
              // array-add whose operands are gram NODES (not vars) hits the
              // flat-elementwise emitter's unnamed-operand hazard

@@ -431,8 +431,7 @@ tuple already refuses cell reads. Pins: `tests/corpus/math/083-086` (the exact 3
 factor values, two right-hand sides, the two-halves spelling, the transpose solve,
 `d = 0` against `solve`; the extent refusal; the singular abort at factor time; the
 function-body shape) and `tests/LapackTests.fs` (both gates, the rejection, the policy
-rows). Not done: the derivative actions (`A dx = db - dA x` and the transpose solve as
-the reverse action) -- they are the 6.3 linearization's business and wait on it; the
+rows). The derivative actions landed with 6.3 the same day (below). Not done: the
 checked result (residual / conditioning / status) and mixed-precision refinement.
 
 Gate the initial demonstrator on several RHS vectors plus a derivative action:
@@ -458,7 +457,35 @@ together; the node exists so that design has a concrete consumer and a fixture f
 
 ### 6.3 Matrix-free linearization: a later extension with its own gate
 
-`ad.jvp` currently requires scalar or all-scalar-tuple returns (`Grad.fs:280`), so
+**Landed (2026-09-07), the JVP/VJP primitive.** `ad.jvp(f)` accepts ARRAY-valued
+returns (and tuples mixing arrays and scalars): `f__jvp(args..., seeds...)` returns
+`(y, J v)`, the tangent of an array local being the array expression the sweep already
+carried. `ad.vjp(f)` is the SEEDED reverse mode for an array-valued `f`:
+`f__vjp(args..., w, buffers...)` takes the output's cotangent `w` (typed as the return)
+after the original parameters, accumulates `Jᵀ w` into the same `mut` cotangent buffers
+`ad.grad` uses, and returns the primal array; the body's value must be a NAMED array
+(`let y = ...` then `y`), because the seed is accumulated cell by cell onto that name's
+cotangent buffer. Same reverse sweep as grad (`Grad.synthesizeRev`, one code path, mode
+flag), same subset, same BL5500 family. The pair is one resolved function's forward and
+adjoint actions with no Jacobian formed; `dot(w, J v) = Σ dot(Jᵀ w, v)` is pinned
+exactly on `gram_apply` (corpus `ad-jvp-comb/110`, values by hand) and on the LU
+solves (`113`).
+
+The LU derivative actions (6.2's open item) ride the same sweeps: a body that factors
+once (`let f = m.lu(A)`) and applies the factors differentiates by MORE SOLVES against
+the same factors, never by differentiating the factorization -- forward
+`A dx = db − dA x` (one row map for `dA x`, one `lu_solve`), reverse
+`bbar += A⁻ᵀ xbar` (the transposed solve IS the reverse action) and
+`Abar += −(A⁻ᵀ xbar) xᵀ`; roles swap for `lu_solve_t`. The factor binding is
+structural (no tangent, no cotangent buffer: `GradNormalize.analyze` skips it,
+`GradCommon.luFactorsOf` maps factor → matrix for the arms). Refused with a named
+message: a factor the sweep cannot trace to a named matrix (an alias; the two-halves
+spelling dies earlier on the tuple-pattern rule) -- `ad-jvp-comb/114`. Pins: `113`
+(grad / jvp / vjp through `lu_solve` and `lu_solve_t`, exact 3×3 values, both
+transpose identities). Not done: the linearization VALUE grouping the actions, the
+Newton-GMRES demonstrator, implicit adjoints of a declared residual equation.
+
+`ad.jvp` previously required scalar or all-scalar-tuple returns (`Grad.fs:280`), so
 an array residual cannot directly supply a Jacobian-vector product. A vector-output
 pullback surface is also missing; `ad.grad` is scalar-loss oriented. First expose
 array-output JVP and seeded VJP actions from one resolved residual function, using

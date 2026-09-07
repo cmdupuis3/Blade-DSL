@@ -895,6 +895,7 @@ let internal analyze (fname: string) (ctx: Ctx)
     : Result<Set<string> * Set<string>, string> =
     let mutable diff = diffParams
     let mutable arrays = arrayParams
+    let luOf = luFactorsOf stmts
     let touches (e: Expr) : Result<bool, string> =
         let mutable hit = false
         walkExpr fname ctx (fun n -> if Set.contains n diff then hit <- true) false e
@@ -902,6 +903,20 @@ let internal analyze (fname: string) (ctx: Ctx)
     let rec pass (ss: NStmt list) : Result<unit, string> =
         ss |> iterR (fun s ->
             match s with
+            // An LU factor (`let f = m.lu(A)`, elaborated `__math_lu(A)`) is
+            // STRUCTURAL: it carries no taint of its own -- the solve arms
+            // consult the matrix it was taken from (GradSweeps' lu arms) --
+            // and a tuple is neither an array nor a scalar carrier.
+            | NLet (_, _, { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_lu" }, _) }) -> Ok ()
+            // A solve against a factor is active when its right-hand side is
+            // OR the factored matrix is (the factor itself never is).
+            | NLet (name, _, { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, [ luE; _; bE ]) }) when isLuSolveName op ->
+                arrays <- Set.add name arrays
+                let viaMatrix =
+                    match luFactorMatrix luOf luE with
+                    | Some a -> Set.contains a diff
+                    | None -> false
+                touches bE |> Result.map (fun t -> if t || viaMatrix then diff <- Set.add name diff)
             | NLet (name, _, value) ->
                 (match value with
                  | { Kind = ExprKind.ExprArrayLit _ } | ConstFill _ -> arrays <- Set.add name arrays

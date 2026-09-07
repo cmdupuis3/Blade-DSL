@@ -1,0 +1,51 @@
+// TEST: Matrix-free linearization: array-valued jvp and the seeded vjp
+// One resolved function, two actions, no Jacobian formed
+// (plan-fortran-killer-2 section 6.3). `ad.jvp(fwd)` on an ARRAY-valued
+// function returns `(y, J v)`; `ad.vjp(fwd)` takes the output's cotangent
+// `w` after the original parameters and ACCUMULATES `J^T w` into the same
+// mut buffers `ad.grad` uses, returning the primal array. The two are the
+// same transpose pair, so `dot(w, J v) = sum over params dot(J^T w, v)`
+// exactly -- the differential gate for every accepted program.
+//
+// y = gram_apply(a, b, x) = a (b^T x); t = b^T x = [12, 9], y = [30, 72, 114].
+// J v = sa t + a (sb^T x) + a (b^T sx) = [-3, 21, -4.5] + [28, 59, 90] + [4.5, 13.5, 22.5]
+//     = [29.5, 93.5, 108]
+// With w = [2, 0, 1] (ad-jvp-comb/109's ybar): J^T w is the same triple
+// (xbar = [7, 10, 17, 24], abar = [[24, 18], [0, 0], [12, 9]],
+// bbar = [[7, 10], [14, 20], [21, 30], [28, 40]]), and both contractions are 167.
+import ad as ad
+
+type I = Idx<3>
+type J = Idx<4>
+type K = Idx<2>
+
+function fwd(a: Array<Float like I, K>, b: Array<Float like J, K>, x: Array<Float like J>) -> Array<Float like I> = {
+    let y = gram_apply(a, b, x)
+    y
+}
+
+let a0 = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+let b0 = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]]
+let x0 = [1.0, 2.0, 3.0, 4.0]
+let sa = [[0.5, -1.0], [0.25, 2.0], [0.0, -0.5]]
+let sb = [[1.0, 1.0], [0.0, -1.0], [2.0, 0.5], [-1.0, 3.0]]
+let sx = [1.0, -2.0, 0.5, 1.5]
+let (y, dy) = ad.jvp(fwd)(a0, b0, x0, sa, sb, sx)
+// EXPECT: y = [30, 72, 114]
+// EXPECT: dy = [29.5, 93.5, 108]
+
+let w = [2.0, 0.0, 1.0]
+let mut da = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+let mut db = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+let mut dx = [0.0, 0.0, 0.0, 0.0]
+let yv = ad.vjp(fwd)(a0, b0, x0, w, da, db, dx)
+// EXPECT: yv = [30, 72, 114]
+// EXPECT: da = [[24, 18], [0, 0], [12, 9]]
+// EXPECT: db = [[7, 10], [14, 20], [21, 30], [28, 40]]
+// EXPECT: dx = [7, 10, 17, 24]
+
+// The transpose identity, exactly.
+let lhs = reduce(w * dy, (+))
+let rhs = reduce(reduce(da * sa, (+)), (+)) + reduce(reduce(db * sb, (+)), (+)) + reduce(dx * sx, (+))
+// EXPECT: lhs = 167
+// EXPECT: rhs = 167

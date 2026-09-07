@@ -704,9 +704,41 @@ let internal (|LinearForm|_|) (e: Expr) : (Expr list * (Expr list -> Expr)) opti
 /// linear combinator is tracked as an ARRAY. Under-reporting here is a
 /// silent-zero bug (an element read of an untracked array yields no
 /// tangent), so the forms are listed exhaustively rather than inferred.
+// The LU derivative actions (plan-fortran-killer-2 section 6.3). A body
+// that factors once (`let f = m.lu(A)`, elaborated `__math_lu(A)`) and
+// applies the factors (`m.lu_solve(f, b)` -> `__math_lu_solve(f[0], f[1], b)`)
+// differentiates by MORE SOLVES against the same factors, never by
+// differentiating the factorization: forward, `A dx = db - dA x`; reverse,
+// `bbar += A^{-T} xbar` and `Abar += -(A^{-T} xbar) x^T` (roles swapped for
+// the transposed solve). The factor binding is STRUCTURAL -- no tangent, no
+// cotangent -- and the solve arms find the matrix through this map.
+let internal isLuSolveName (n: string) = n = "__math_lu_solve" || n = "__math_lu_solve_t"
+let internal luTransposedOf (n: string) = if n = "__math_lu_solve" then "__math_lu_solve_t" else "__math_lu_solve"
+/// factor name -> matrix name, for every `let f = __math_lu(A)` in a body
+/// (loop bodies included; a factor taken from a non-name is not recorded and
+/// the solve arms refuse it).
+let rec internal luFactorsOf (stmts: NStmt list) : Map<string, string> =
+    stmts |> List.fold (fun acc s ->
+        match s with
+        | NLet (f, _, { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_lu" }, [ { Kind = ExprKind.ExprVar a } ]) }) ->
+            Map.add f a acc
+        | NFor (_, _, _, body) -> Map.fold (fun m k v -> Map.add k v m) acc (luFactorsOf body)
+        | _ -> acc) Map.empty
+/// The matrix behind a solve's factor operand: `f[0]` with `f` a recorded
+/// factor. Anything else (the two-halves spelling, a factor from outside the
+/// body) is not traceable and the arms refuse with `luFactorMsg`.
+let internal luFactorMatrix (luOf: Map<string, string>) (luE: Expr) : string option =
+    match luE.Kind with
+    | ExprKind.ExprTupleIndex ({ Kind = ExprKind.ExprVar f }, { Kind = ExprKind.ExprLit (LitInt 0L) }) -> Map.tryFind f luOf
+    | _ -> None
+let internal luFactorMsg =
+    "differentiating lu_solve needs the factor as a let-bound `let f = m.lu(A)` in the same body applied as `m.lu_solve(f, b)` (v1); the two-halves spelling `m.lu_solve(LU, piv, b)` and a factor taken outside the function are not traceable to their matrix"
+
 let rec internal producesArray (arrays: Set<string>) (e: Expr) : bool =
     match e.Kind with
     | ExprKind.ExprArrayLit _ -> true
+    // a solve against LU factors is a vector shaped like its right-hand side
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar n }, _) when isLuSolveName n -> true
     | ExprKind.ExprVar n -> Set.contains n arrays
     | ExprKind.ExprStack _ | ExprKind.ExprSequence _ | ExprKind.ExprJoin _
     | ExprKind.ExprReplicate _ | ExprKind.ExprTranspose _ | ExprKind.ExprDecompact _

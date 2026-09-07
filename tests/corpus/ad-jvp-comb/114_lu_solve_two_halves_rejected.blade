@@ -1,0 +1,24 @@
+// TEST: LU derivative actions refuse a factor with no named matrix behind it (rejects)
+// ERROR: BL5500
+// ERROR-CONTAINS: differentiating lu_solve needs the factor as a let-bound `let f = m.lu(A)`
+// The derivative actions solve against the factors of a NAMED matrix (its
+// tangent and cotangent buffer are what the rules read and write), traced
+// through the `let f = m.lu(a)` binding the solve names. An alias of the
+// factor has no matrix behind it, so it is refused rather than
+// differentiated as if the factors were constants. (The two-halves spelling
+// `let (LU, piv) = m.lu(a)` is refused one step earlier, by the sweep's
+// rule against tuple patterns; `m.lu` of an expression, by the elaborator.)
+import ad as ad
+import math as m
+type N = Idx<3>
+function solve_loss(a: Array<Float64 like N, N>, b: Array<Float64 like N>) -> Float64 = {
+    let f = m.lu(a)
+    let g = f
+    let x = m.lu_solve(g, b)
+    x(0) * 2.0 + x(2)
+}
+let A: Array<Float64 like N, N> = [[1.0, 1.0, 1.0], [2.0, 4.0, 1.0], [1.0, 0.0, 2.0]]
+let b: Array<Float64 like N> = [6.0, 13.0, 7.0]
+let mut da: Array<Float64 like N, N> = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+let mut db: Array<Float64 like N> = [0.0, 0.0, 0.0]
+let gv = ad.grad(solve_loss)(A, b, da, db)

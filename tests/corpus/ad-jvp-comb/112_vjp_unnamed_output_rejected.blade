@@ -1,0 +1,20 @@
+// TEST: ad.vjp requires the body's value to be a named array (rejects)
+// ERROR: BL5500
+// ERROR-CONTAINS: vjp requires the body's value to be a NAMED array
+// The seed must be accumulated onto a cotangent buffer, and only a named
+// array has one; the fix is one `let`.
+import ad as ad
+type I = Idx<3>
+type J = Idx<4>
+type K = Idx<2>
+function fwd(a: Array<Float like I, K>, b: Array<Float like J, K>, x: Array<Float like J>) -> Array<Float like I> = {
+    gram_apply(a, b, x)
+}
+let a0 = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+let b0 = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]]
+let x0 = [1.0, 2.0, 3.0, 4.0]
+let w = [2.0, 0.0, 1.0]
+let mut da = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+let mut db = [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+let mut dx = [0.0, 0.0, 0.0, 0.0]
+let yv = ad.vjp(fwd)(a0, b0, x0, w, da, db, dx)

@@ -1,0 +1,14 @@
+// TEST: ad.vjp refuses a scalar-valued function (rejects)
+// ERROR: BL5500
+// ERROR-CONTAINS: vjp requires a function returning an array of Float
+// The seeded reverse mode is for array-valued functions; a scalar loss is
+// `ad.grad`'s (seed 1.0), and the message says so.
+import ad as ad
+type J = Idx<4>
+function loss(x: Array<Float like J>) -> Float = {
+    x(0) * 2.0 + x(3)
+}
+let x0 = [1.0, 2.0, 3.0, 4.0]
+let mut dx = [0.0, 0.0, 0.0, 0.0]
+let w = 1.0
+let r = ad.vjp(loss)(x0, w, dx)
