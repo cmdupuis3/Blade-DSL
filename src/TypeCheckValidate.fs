@@ -380,6 +380,7 @@ let rec internal collectGroupKeysEscapes (subst: Subst) (pos: string option) (ex
     let describe (e: TypedExpr) =
         match e.Kind with
         | TExprGroupKeys _ -> "a `group_keys(...)` call"
+        | TExprSegments (_, _, Some _) -> "a `files(...)` call"
         | TExprSegments _ -> "a `segments(...)` call"
         | TExprVar (n, _, _) -> $"the group_keys binding '{n}'"
         | _ -> "a group_keys result"

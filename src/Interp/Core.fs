@@ -844,7 +844,7 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
 
     // ---- ungroup(G) -> the rows of a segment-grouped array over the source
     //      axis (docs/plans/structural/07 §3.3). Same backend route.
-    | IRUngroup _ ->
+    | IRUngroup _ | IRUngroupRows _ ->
         evalArrayNode st env expr
 
     // ---- extents(gk) -> a dense rank-1 Int64 array of per-group sizes.

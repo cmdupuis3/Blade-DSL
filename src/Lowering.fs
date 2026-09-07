@@ -789,6 +789,9 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
 
     | TExprUngroup (grouped, source) ->
         IRUngroup (lowerTypedExpr env grouped, source)
+
+    | TExprUngroupRows (rows, offsets, source) ->
+        IRUngroupRows (rows |> List.map (lowerTypedExpr env), offsets, source)
     
     | TExprSort (array, key) ->
         IRSort (lowerTypedExpr env array, lowerTypedExpr env key)

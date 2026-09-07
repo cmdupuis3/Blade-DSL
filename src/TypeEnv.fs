@@ -108,7 +108,11 @@ type MutualGroupInfo = {
 /// a regular chunk grid, or stores tiling the axis in declaration order.
 type SegLevel =
     | SegRegular of edge: int64
-    | SegFiles of (string * int64) list
+    /// Stores tiling the axis in declaration order: (label, extent, that
+    /// file's own chunk edge if it is chunked). The per-file edge is what
+    /// makes the chunk level DEPENDENT on the file level (§2.7): two files
+    /// may be chunked differently.
+    | SegFiles of (string * int64 * int64 option) list
 
 /// The segmentation registered beside a `type A = Chunked<I, spec>`: the
 /// axis it partitions (I's own record -- the alias IS I), I's static extent,
@@ -136,10 +140,12 @@ let segmentationOffsets (s: Segmentation) : int64 list =
             let runs' =
                 runs |> List.collect (fun (lo, hi) ->
                     let mutable at = lo
-                    [ for (_, ext) in files do
-                        let r = (at, min hi (at + ext))
+                    [ for (_, ext, edge) in files do
+                        let flo, fhi = at, min hi (at + ext)
                         at <- at + ext
-                        yield r ])
+                        match edge with
+                        | Some k -> yield! List.pairwise (flo :: regular flo fhi k @ [ fhi ])
+                        | None -> yield (flo, fhi) ])
             go runs' rest
         | SegRegular edge :: rest ->
             let runs' =
@@ -156,7 +162,16 @@ let segmentationOffsets (s: Segmentation) : int64 list =
 /// `EnumIdx` states of a file-segmented axis (decision D3).
 let segmentationLabels (s: Segmentation) : string list option =
     match s.Levels with
-    | SegFiles files :: _ -> Some (files |> List.map fst)
+    | SegFiles files :: _ -> Some (files |> List.map (fun (l, _, _) -> l))
+    | _ -> None
+
+/// The FILE-level run boundaries `[0; ..; N]` of a file-segmented axis (the
+/// outer grouping of §2.7), or None when the axis has no file level.
+let segmentationFileOffsets (s: Segmentation) : int64 list option =
+    match s.Levels with
+    | SegFiles files :: _ ->
+        let cuts = files |> List.scan (fun at (_, ext, _) -> at + ext) 0L
+        Some cuts
     | _ -> None
 
 type TypeModuleExport = {

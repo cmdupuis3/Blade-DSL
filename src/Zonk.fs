@@ -195,6 +195,7 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         | TExprGroupBucket gk -> TExprGroupBucket (z gk)
         | TExprSegments _ -> expr.Kind
         | TExprUngroup (g, src) -> TExprUngroup (z g, src)
+        | TExprUngroupRows (rows, offs, src) -> TExprUngroupRows (zs rows, offs, src)
         | TExprSort (a, k) -> TExprSort (z a, z k)
         | TExprReduce (a, k, i) -> TExprReduce (z a, z k, Option.map z i)
         | TExprProdSum args -> TExprProdSum (List.map z args)

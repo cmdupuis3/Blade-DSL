@@ -147,6 +147,7 @@ type IRExpr =
     | IRGroupKeys of keys: IRExpr list               // group_keys(keys1, keys2, ...) - CSR grouping; multi-key => compound dispatch
     | IRGroupBucket of grouping: IRExpr              // group_bucket(gk) - row -> bucket over the source index space, -1 for dropped rows
     | IRSegments of offsets: int64 list * labels: string list option  // segments(A): structural grouping, run boundaries [0; ..; N], identity permutation
+    | IRUngroupRows of rows: IRExpr list * offsets: int64 list * source: IRIndexTypeG<IRExpr>  // ungroup([r1..rF], A): per-file arrays assembled over the tiled axis
     | IRUngroup of grouped: IRExpr * source: IRIndexTypeG<IRExpr>  // ungroup(G): rows of a segment-grouped array reassembled over the source axis
     | IRGroupSizes of grouping: IRExpr               // extents(gk) - per-group sizes over the group axis; no gather
     | IRSort of array: IRExpr * key: IRExpr          // sort(arr, key) - stable ascending sort by key
@@ -1904,6 +1905,8 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRGroupBucket gk -> [gk], (function [gk'] -> IRGroupBucket gk' | _ -> badChildren "IRGroupBucket")
     | IRSegments _ -> [], (fun _ -> expr)
     | IRUngroup (g, src) -> [g], (function [g'] -> IRUngroup (g', src) | _ -> badChildren "IRUngroup")
+    | IRUngroupRows (rows, offs, src) ->
+        rows, (fun rows' -> if rows'.Length = rows.Length then IRUngroupRows (rows', offs, src) else badChildren "IRUngroupRows")
     | IRGroupSizes gk -> [gk], (function [gk'] -> IRGroupSizes gk' | _ -> badChildren "IRGroupSizes")
     | IRSort (a, k) -> [a; k], (function [a'; k'] -> IRSort (a', k') | _ -> badChildren "IRSort")
     | IRReduce (a, k, None) -> [a; k], (function [a'; k'] -> IRReduce (a', k', None) | _ -> badChildren "IRReduce")
@@ -2691,6 +2694,15 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
              valsTy)
     | IRGroupKeys _ -> IRTUnit  // GroupKeys is an opaque structure, not a runtime value with a simple type
     | IRSegments _ -> IRTUnit   // the structural grouping: same opaque sentinel as group_keys
+    | IRUngroupRows (rows, _, src) ->
+        // Each row is [file axis; rest...] over elem; the result is
+        // [source; rest...] over elem.
+        (match rows with
+         | r :: _ ->
+             (match typeOf r with
+              | IRTArrow (slots, res, x) when not slots.IsEmpty -> IRTArrow (SIdx src :: List.tail slots, res, x)
+              | other -> other)
+         | [] -> IRTUnit)
     | IRUngroup (g, src) ->
         // The grouped operand is [outer; member; rest...] over elem; the
         // result is [source; rest...] over elem.

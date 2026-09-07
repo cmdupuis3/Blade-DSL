@@ -54,6 +54,8 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genSegmentsBinding ctx binding offsets
     | IRUngroup (g, src) ->
         genUngroupBinding ctx binding g src
+    | IRUngroupRows (rows, offsets, src) ->
+        genUngroupRowsBinding ctx binding rows offsets src
     | IRGroupBy (vals, gk) ->
         genGroupByBinding ctx binding builder vals gk
     | IRGroupBucket gk ->
@@ -2219,6 +2221,33 @@ and genUngroupBinding (ctx: CodeGenContext) (binding: IRBinding) (g: IRExpr) (sr
         registerPoolAlloc AllocDense elemStr 1 "nullptr" (name + "_extents") name ownedExtents
         let ctx' = addVarName binding.Id name ctx
         (code, ctx')
+
+/// ungroup([r1, .., rF], A): per-file arrays copied at their file offsets
+/// into one buffer over the tiled axis (§2.7). Rows are bare names by
+/// construction (inferUngroupRows) and the offsets are static.
+and genUngroupRowsBinding (ctx: CodeGenContext) (binding: IRBinding) (rows: IRExpr list) (offsets: int64 list) (src: IRIndexType) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> elemTypeToCpp at.ElemType
+        | _ -> "double"
+    let total = List.last offsets
+    let (extentsDecl, ownedExtents) =
+        emitExtentsTable ind (name + "_extents") 1 [($"{total}UL", false)]
+    let copies =
+        List.zip rows (List.pairwise offsets)
+        |> List.collect (fun (r, (lo, hi)) ->
+            let rName = exprToCppCtx ctx r
+            [ $$"""{{ind}}for (size_t __k = 0; __k < {{hi - lo}}UL; __k++) {{name}}[{{lo}}UL + __k] = {{rName}}[__k];""" ])
+    let code =
+        [ $"{ind}// ungroup: {rows.Length} per-file array(s) assembled over the tiled axis ({total} cells)" ]
+        @ extentsDecl
+        @ [ $$"""{{ind}}Array<{{elemStr}}, 1> {{name}} = { allocate<promote<{{elemStr}}, 1>::type>({{name}}_extents), {{name}}_extents };""" ]
+        @ copies
+    registerPoolAlloc AllocDense elemStr 1 "nullptr" (name + "_extents") name ownedExtents
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
 
 and genGroupBucketBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) (gk: IRExpr) : string list * CodeGenContext =
     let ind = indentStr ctx

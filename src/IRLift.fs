@@ -21,7 +21,7 @@ open Blade.IR
 let isInlineForm (e: IRExpr) : bool =
     match e with
     | IRMask _ | IRSort _ | IRIntersect _ | IRUnion _ | IRUnique _
-    | IRGroupBy _ | IRGroupKeys _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRUngroup _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _
+    | IRGroupBy _ | IRGroupKeys _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRUngroup _ | IRUngroupRows _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _
     | IRReduceCompute _ | IRMatmul _ | IREigh _ | IRSolve _ -> true
     | IRCompute (IRApplyCombinator _) -> true
     | _ -> false
@@ -62,7 +62,7 @@ let isStatementShaped (e: IRExpr) : bool =
     | IRArrayNegate _ | IRArrayConjugate _ -> true
     // Grouping: the `group_keys` CSR tables and the two accessors that read
     // them back out. All four hang a name-suffix ABI off the binding's name.
-    | IRGroupKeys _ | IRGroupBy _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRUngroup _ -> true
+    | IRGroupKeys _ | IRGroupBy _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRUngroup _ | IRUngroupRows _ -> true
     // Array literals: extents table + allocate + per-element init.
     | IRArrayLit _ -> true
     // The DEFERRING family. `genBinding` answers these with a comment and a
@@ -560,6 +560,7 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
     | IRGroupKeys ks -> IRGroupKeys (List.map (liftExpr builder) ks)
     | IRSegments _ -> expr
     | IRUngroup (g, src) -> IRUngroup (liftExpr builder g, src)
+    | IRUngroupRows (rows, offs, src) -> IRUngroupRows (List.map (liftExpr builder) rows, offs, src)
     // The gk operand is a bare name by construction (inferGroupBucket refuses
     // anything else), so there is nothing to lift out of it.
     | IRGroupBucket gk -> IRGroupBucket (liftExpr builder gk)

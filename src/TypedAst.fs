@@ -304,6 +304,12 @@ and TypedExprKind =
     /// ungroup(G): the inverse of `group_by(_, segments(A))` -- G's rows
     /// reassembled over the SOURCE axis `source` (§2.3, §3.3).
     | TExprUngroup of grouped: TypedExpr * source: IRIndexType
+    /// ungroup([r1, .., rF], A): the per-file arrays of a file-segmented axis
+    /// assembled over the axis (§2.7: the inverse of `files(A)` applied to
+    /// explicit rows -- how a variable that lives in several stores is
+    /// named over the tiled axis). Rows are bare names; `offsets` are the
+    /// file boundaries.
+    | TExprUngroupRows of rows: TypedExpr list * offsets: int64 list * source: IRIndexType
     | TExprSort of array: TypedExpr * key: TypedExpr
     | TExprReduce of array: TypedExpr * kernel: TypedExpr * init: TypedExpr option
     | TExprProdSum of args: TypedExpr list  // prodsum(x1..xk): fused sum_t prod_l x_l(t) over rank-1 arrays

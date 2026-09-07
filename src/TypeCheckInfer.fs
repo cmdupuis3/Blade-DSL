@@ -645,6 +645,12 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
         inferSegments env alias
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, _) when (lookupVar "segments" env).IsNone ->
         Error (Other "segments takes exactly one argument: the name of a `Chunked<..>` index alias")
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "files" }, [ { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "files" env).IsNone ->
+        inferFiles env alias
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "files" }, _) when (lookupVar "files" env).IsNone ->
+        Error (Other "files takes exactly one argument: the name of a file-segmented `Chunked<..>` index alias")
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "ungroup" }, [ { Kind = ExprKind.ExprArrayLit rows }; { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "ungroup" env).IsNone ->
+        inferUngroupRows env rows alias
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "ungroup" }, [ g ]) when (lookupVar "ungroup" env).IsNone ->
         inferUngroup env g None
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "ungroup" }, [ g; { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "ungroup" env).IsNone ->
@@ -4086,6 +4092,68 @@ and inferSegments (env: TypeEnv) (alias: string) : TypeResult<TypedExpr> =
         let enumValues = labels |> Option.map (List.map EVString)
         let gkType = IRTGroupKeys (outer, seg.Source, enumValues)
         Ok (mkTyped (TExprSegments (alias, offsets, labels)) gkType)
+
+/// files(A): the FILE-level grouping of a file-segmented axis (§2.7): one
+/// run per store, in declaration order, the outer slot labelled by the
+/// store names (the `EnumIdx` states of decision D3, carried as the
+/// grouping's enum values). Same structural machinery as `segments(A)`,
+/// which for such an axis is the innermost (per-file chunk) level.
+and inferFiles (env: TypeEnv) (alias: string) : TypeResult<TypedExpr> =
+    match Map.tryFind alias env.Segmentations with
+    | None -> Error (Other $"files({alias}): '{alias}' is not a `Chunked<..>` index alias in scope")
+    | Some seg ->
+        match segmentationFileOffsets seg, segmentationLabels seg with
+        | Some offsets, Some labels ->
+            let f = int64 (offsets.Length - 1)
+            let outer = {
+                Id = env.Builder.FreshId(); Rank = 1
+                Extent = IRLit (IRLitInt f)
+                Symmetry = SymNone; Tag = Some ("__segments|" + alias); IxKind = IxKPlain
+                Kind = SDimension; Dependencies = []
+            }
+            let gkType = IRTGroupKeys (outer, seg.Source, Some (labels |> List.map EVString))
+            Ok (mkTyped (TExprSegments (alias, offsets, Some labels)) gkType)
+        | _ -> Error (Other $"files({alias}): '{alias}' has no file level; it is a regular chunk grid -- use segments({alias})")
+
+/// ungroup([r1, .., rF], A): the per-file arrays of a file-segmented axis
+/// assembled over the axis (§2.7). This is how a variable that lives in
+/// several stores is named over the tiled axis: the inverse of `files(A)`
+/// applied to explicit rows, one per store in declaration order, each a
+/// bare name over its own store's axis with that store's extent.
+and inferUngroupRows (env: TypeEnv) (rows: Expr list) (alias: string) : TypeResult<TypedExpr> =
+    match Map.tryFind alias env.Segmentations with
+    | None -> Error (Other $"ungroup([..], {alias}): '{alias}' is not a `Chunked<..>` index alias in scope")
+    | Some seg ->
+        match segmentationFileOffsets seg with
+        | None -> Error (Other $"ungroup([..], {alias}): '{alias}' has no file level; ungroup takes a grouped array for a regular chunk grid")
+        | Some offsets ->
+            let extents = offsets |> List.pairwise |> List.map (fun (lo, hi) -> hi - lo)
+            if rows.Length <> extents.Length then
+                Error (Other $"ungroup([..], {alias}): {alias} tiles {extents.Length} store(s) but {rows.Length} row(s) were given")
+            else
+            rows |> List.map (fun r ->
+                match r.Kind with
+                | ExprKind.ExprVar _ -> inferExpr env r
+                | _ -> Error (Other "ungroup([..], A): each row must be a bare name (bind each store's array first)"))
+            |> List.fold (fun acc r -> acc |> Result.bind (fun xs -> r |> Result.map (fun x -> xs @ [ x ]))) (Ok [])
+            |> Result.bind (fun tRows ->
+                let checkRow (i: int) (tr: TypedExpr) : TypeResult<unit> =
+                    match env.Subst.Resolve tr.Type with
+                    | ArrayElem at when not at.IndexTypes.IsEmpty ->
+                        (match at.IndexTypes.Head.Extent with
+                         | IRLit (IRLitInt n) when n = extents.[i] -> Ok ()
+                         | IRLit (IRLitInt n) -> Error (Other $"ungroup([..], {alias}): row {i} has extent {n} but store {i} of {alias} has extent {extents.[i]}")
+                         | _ -> Ok ())
+                    | _ -> Error (Other $"ungroup([..], {alias}): row {i} is not an array")
+                tRows |> List.mapi checkRow
+                |> List.fold (fun acc r -> acc |> Result.bind (fun () -> r)) (Ok ())
+                |> Result.bind (fun () ->
+                    match env.Subst.Resolve tRows.Head.Type with
+                    | ArrayElem at ->
+                        let rest = at.IndexTypes |> List.tail
+                        let resultType = mkArrayArrow (seg.Source :: rest) at.ElemType None
+                        Ok (mkTyped (TExprUngroupRows (tRows, offsets, seg.Source)) resultType)
+                    | _ -> Error (Other "ungroup([..], A): rows must be arrays")))
 
 /// ungroup(G[, A]): rows of a segment-grouped array reassembled over the
 /// source axis (§2.3, §3.3) -- the only materializing operation of the
@@ -14081,11 +14149,70 @@ and registerTypeDecl (env: TypeEnv) (typeDecl: TypeDecl) : TypeResult<TypeEnv> =
                                       | None ->
                                           Error (Other $"Chunked<{path}, store>: '{binding}' is not a store binding whose provider exposes chunk edges (zarr does); write the edge as a literal"))
                                  | _ -> Error (Other "Chunked<I, store> inherits the chunk grid of a STORE axis: the inner must be `<store>.index.<dim>`"))
-                            | ExprKind.ExprArrayLit _ ->
-                                Error (Other "Chunked<I, [[store, chunking], ..]> (a file-segmented axis) is not supported yet; write a single regular edge for now")
+                            | ExprKind.ExprArrayLit entries ->
+                                // the FILE level (§2.7, decisions D1/D5): stores tiling the
+                                // dimension named by the inner store axis, in order, each
+                                // with its own chunking -- a literal edge, `store` (that
+                                // file's grid), or none. Every fact comes from the modules
+                                // the load sites recorded; no store is re-opened.
+                                let dimName =
+                                    match inner with
+                                    | TyNamed (path, []) when path.Split('.').Length >= 3 && path.Split('.').[1] = "index" ->
+                                        Ok (String.concat "." (path.Split('.') |> Array.skip 2))
+                                    | _ -> Error (Other "Chunked<I, [[store, chunking], ..]>: the inner must be a store axis `<store>.index.<dim>` naming the dimension the stores tile")
+                                dimName |> Result.bind (fun dim ->
+                                    let parseEntry (e: Expr) : TypeResult<string * Expr option> =
+                                        match e.Kind with
+                                        | ExprKind.ExprArrayLit [ { Kind = ExprKind.ExprVar s }; f ] -> Ok (s, Some f)
+                                        | ExprKind.ExprArrayLit [ { Kind = ExprKind.ExprVar s } ] -> Ok (s, None)
+                                        | ExprKind.ExprVar s -> Ok (s, None)
+                                        | _ -> Error (Other "Chunked<I, [..]>: each entry is `[store, chunking]` (chunking a literal edge or `store`) or a bare store name")
+                                    let resolveEntry (s: string, f: Expr option) : TypeResult<string * int64 * int64 option> =
+                                        let extent =
+                                            match Blade.ProviderRegistry.IdeStores.tryFind s with
+                                            | None -> Error (Other $"Chunked<I, [..]>: '{s}' is not a data-provider store binding in scope")
+                                            | Some pm ->
+                                                (match pm.Types |> List.tryPick (function IRTDIndexType (n, idx) when n = dim -> Some idx | _ -> None) with
+                                                 | Some idx ->
+                                                     (match idx.Extent with
+                                                      | IRLit (IRLitInt n) -> Ok n
+                                                      | _ -> Error (Other $"Chunked<I, [..]>: the store '{s}' has no static extent for '{dim}'"))
+                                                 | None -> Error (Other $"Chunked<I, [..]>: the store '{s}' has no dimension '{dim}'"))
+                                        extent |> Result.bind (fun ext ->
+                                            match f with
+                                            | None -> Ok (s, ext, None)
+                                            | Some { Kind = ExprKind.ExprLit (LitInt k) } when k >= 1L && k <= ext -> Ok (s, ext, Some k)
+                                            | Some { Kind = ExprKind.ExprLit (LitInt k) } ->
+                                                Error (Other $"Chunked<I, [..]>: the chunk edge {k} for '{s}' is outside 1..{ext}")
+                                            | Some { Kind = ExprKind.ExprVar "store" } ->
+                                                (match Blade.ProviderRegistry.DimChunks.tryFind s dim with
+                                                 | Some k -> Ok (s, ext, Some k)
+                                                 | None -> Error (Other $"Chunked<I, [..]>: the store '{s}' does not chunk '{dim}' uniformly (or its provider exposes no chunk edges); write its edge as a literal"))
+                                            | Some _ -> Error (Other "Chunked<I, [..]>: a file's chunking is a literal edge or `store`"))
+                                    entries |> List.map parseEntry
+                                    |> List.fold (fun acc r -> acc |> Result.bind (fun xs -> r |> Result.map (fun x -> xs @ [ x ]))) (Ok [])
+                                    |> Result.bind (fun parsed ->
+                                        if parsed.IsEmpty then Error (Other "Chunked<I, [..]>: at least one store is needed")
+                                        else
+                                            parsed |> List.map resolveEntry
+                                            |> List.fold (fun acc r -> acc |> Result.bind (fun xs -> r |> Result.map (fun x -> xs @ [ x ]))) (Ok [])
+                                            |> Result.map (fun files -> [ SegFiles files ])))
                             | _ -> Error (Other "Chunked<I, spec>: the spec must be a literal chunk edge, `store`, or a list of [store, chunking] pairs")
                         levels |> Result.map (fun lv ->
-                            Some (idx, { Alias = name; Source = idx; Extent = n; Levels = lv })))
+                            match lv with
+                            | [ SegFiles files ] ->
+                                // a file-segmented axis is a NEW logical axis over the summed
+                                // extent, named by the alias; the inner only named the dimension
+                                let total = files |> List.sumBy (fun (_, ext, _) -> ext)
+                                let axis = {
+                                    Id = env.Builder.FreshId(); Rank = 1
+                                    Extent = IRLit (IRLitInt total)
+                                    Symmetry = SymNone; Tag = Some name; IxKind = ixKindOfTag (Some name)
+                                    Kind = SDimension; Dependencies = []
+                                }
+                                Some (axis, { Alias = name; Source = axis; Extent = total; Levels = lv })
+                            | _ ->
+                                Some (idx, { Alias = name; Source = idx; Extent = n; Levels = lv })))
             | _ -> Ok None
         let defInfoResult =
             match chasedBody with

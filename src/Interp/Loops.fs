@@ -2050,6 +2050,21 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
                       Data = A.storeOfValues g.ElemType cells }
          | _ -> raise (InterpUnsupported "ungroup: operand is not a ragged (grouped) array"))
 
+    // -- ungroup([r1..rF], A): per-file arrays assembled over the tiled axis
+    //    (genUngroupRowsBinding's twin).
+    | IRUngroupRows (rowExprs, _, src) ->
+        let rows = rowExprs |> List.map (forceInputArray st env)
+        (match rows with
+         | [] -> raise (InterpUnsupported "ungroup: no rows")
+         | first :: _ ->
+             let cells =
+                 rows |> List.toArray |> Array.collect (fun r ->
+                     Array.init (int r.Extents.[0]) (fun k -> A.readCell r [ int64 k ]))
+             VArray { ElemType = first.ElemType
+                      IndexTypes = [ src ]
+                      Extents = [| int64 cells.Length |]
+                      Data = A.storeOfValues first.ElemType cells })
+
     // -- group_bucket(gk): the CSR pair inverted into a dense row -> bucket map
     //    (genGroupBucketBinding). Same VGroupKeys operand as group_by; typecheck
     //    has already refused anything but a bare gk name.

@@ -720,6 +720,105 @@ type CX = Chunked<sample.index.x, store>
     inheritedSegmentationE2E ()
 
     // ---------------------------------------------------------------
+    // 10d. The FILE level (docs/plans/structural/07 §2.7, decisions D1/D3/D5):
+    // `type T = Chunked<s1.index.x, [[s1, store], [s2, store]]>` tiles x over
+    // two stores in order, each keeping its own chunk grid (a dependent chunk
+    // level: 3-cell chunks in the first file, 2-cell in the second). `files(T)`
+    // is the file grouping (labelled by the store names), `segments(T)` the
+    // innermost chunk grouping, and `ungroup([a1, a2], T)` names a variable
+    // that lives in both stores over the tiled axis. Provider-agnostic: only
+    // the stores' extents and edges are consulted, never a coordinate value.
+    // ---------------------------------------------------------------
+    printfn "
+--- file level: Chunked<s1.index.x, [[s1, store], [s2, store]]> ---"
+    let fileLevelE2E () =
+        let st1 = fixStore "zarr_tile_a"
+        let st2 = fixStore "zarr_tile_b"
+        let mk (name: string) (n: int) (lo: int) (edge: int64) : ZarrWrite.WriteVar list =
+            [ { Name = "A"; DimNames = Some ["x"]; Shape = [int64 n]; Chunks = [edge]
+                FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in lo .. lo + n - 1 -> float i |]; OmitChunks = []; Blade = None } ]
+        for (store, vars) in [ (st1, mk "A" 6 1 3L); (st2, mk "A" 4 7 2L) ] do
+            let inDir = Path.Combine(e2eDir, store)
+            (try Directory.Delete(store, true) with _ -> ())
+            (try Directory.Delete(inDir, true) with _ -> ())
+            ZarrWrite.writeStoreV3 store vars
+            ZarrWrite.writeStoreV3 inDir vars
+        let src = sprintf """
+import zarr as z
+
+let s1 = z.load("%s")
+let s2 = z.load("%s")
+type T = Chunked<s1.index.x, [[s1, store], [s2, store]]>
+let a1 = s1.vars.A |> z.read
+let a2 = s2.vars.A |> z.read
+let a = ungroup([a1, a2], T)
+let fs = files(T)
+let fsizes = extents(fs)
+let seg = segments(T)
+let ssizes = extents(seg)
+let gf = group_by(a, fs)
+let fsums = method_for(gf) <@> lambda(r) -> reduce(r, (+)) |> compute
+let gs = group_by(a, seg)
+let ssums = method_for(gs) <@> lambda(r) -> reduce(r, (+)) |> compute
+let back = ungroup(gs)
+"""
+                            st1 st2
+        try
+            match lower src with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_files"
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_files.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "file level: the tiled variable" (has "a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]") runOut
+                          check "file level: files(T) sizes = [6, 4]" (has "fsizes = [6, 4]") runOut
+                          check "file level: segments(T) sizes = [3, 3, 2, 2] (per-file chunk grids)" (has "ssizes = [3, 3, 2, 2]") runOut
+                          check "file level: per-file sums" (has "fsums = [21, 34]") runOut
+                          check "file level: per-chunk sums" (has "ssums = [6, 15, 15, 19]") runOut
+                          check "file level: ungroup of the chunk grouping restores the axis" (has "back = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]") runOut
+                      | Ok (code, out) -> check "file level: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "file level: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP file level (compile skipped): %s" e
+                     else check "file level: compiles" false e)
+            | Error e -> check "file level: lowers" false e
+        with ex -> check "file level" false ex.Message
+        // refusals: a wrong row count, and a store without the dimension
+        let bad1 = sprintf """
+import zarr as z
+
+let s1 = z.load("%s")
+let s2 = z.load("%s")
+type T = Chunked<s1.index.x, [[s1, store], [s2, store]]>
+let a1 = s1.vars.A |> z.read
+let a = ungroup([a1], T)
+"""
+                             st1 st2
+        (match lower bad1 with
+         | Error e -> check "file level: wrong row count refuses" (e.Contains "tiles 2 store(s) but 1 row(s)") e
+         | Ok _ -> check "file level: wrong row count refuses" false "lowered")
+        let bad2 = sprintf """
+import zarr as z
+
+let s1 = z.load("%s")
+let s2 = z.load("%s")
+type T = Chunked<s1.index.x, [[s1, store], [s2, 3]]>
+let a1 = s1.vars.A |> z.read
+let a2 = s2.vars.A |> z.read
+let a = ungroup([a2, a1], T)
+"""
+                             st1 st2
+        (match lower bad2 with
+         | Error e -> check "file level: a row of the wrong extent refuses" (e.Contains "has extent 4 but store 0") e
+         | Ok _ -> check "file level: a row of the wrong extent refuses" false "lowered")
+    fileLevelE2E ()
+
+    // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
     //
     // Every store dimension derives a named index type, and codegen emits one
