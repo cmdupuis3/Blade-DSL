@@ -26,8 +26,17 @@ storage level (distributed P0) when layout depends on it. (2) The two-level axis
 exposed one level at a time (`files(T)` = the file runs, `segments(T)` = the innermost
 per-file chunk runs, with each file's own edge) rather than as the nested
 `[file_outer; chunk_outer(file); member]` shape of §2.7, because a slot-aware nested
-`group_by` is not built. NOT built: streaming of rank >= 2 variables and of netcdf/icechunk stores
-(the hooks exist; zarr implements rank 1); a stencil streaming more than one source;
+`group_by` is not built. Also built afterwards: ELEMENTWISE consumers of a streamed source (StreamingIONotes
+v1's "not stream-eligible" refusal was mechanical -- its only in-nest read was a whole
+fiber at a site -- and the segment run loop with zero reach is the missing mechanism),
+and RANK-2 streaming: the tile grouping over a streamed rank-2 variable reads one
+rectangular window per tile (one chunk file when the edges are the store's), and an
+elementwise consumer runs one band of rows at a time behind a row-pointer alias; a
+6 x 8 store chunked 3 x 4 stands in for four files decomposed along lat and lon (zarr
+lane 10i). The traversal order is the store's own, as the user asked.
+NOT built: streaming of rank >= 3 variables, a rank-2 stencil (the halo map over a
+rank-2 streamed source hits the array-valued-kernel refusal before the run loop), and
+netcdf/icechunk streaming (the hooks exist); a stencil streaming more than one source;
 the NESTED `[file_outer; chunk_outer(file); member]` shape of §2.7 (the two levels are
 exposed one at a time) and the 2-D mosaic-of-stores declaration, which is where the
 cross-slot refusal of §4.0 would first have content (with two single-slot

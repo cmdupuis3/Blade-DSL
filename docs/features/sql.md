@@ -385,10 +385,13 @@ let fs  = files(T)                            // the FILE level of a tiled axis:
 let v   = ungroup([v1, v2], T)                // a variable living in both stores, named over T
 let tiles = segments(C0, C1)                  // a rank-2 array's TILE grouping: one group per (g0, g1), slot order
 let t2  = segments(a)                         // the same, read off a's own annotation `Array<T like C0, C1>`
-let A: Array<Float like CX> = s.vars.A |> z.stream   // rank-1: NOT materialized; consumers below stream it
+let A: Array<Float like CX> = s.vars.A |> z.stream   // NOT materialized; consumers below stream it
 let total = reduce(A, (+))                    // block-by-block in storage order: bitwise the flat fold
-let g = group_by(A, segments(A))              // one run read per group
+let g = group_by(A, segments(A))              // one run read per group (rank 2: one TILE window per group)
 let d = method_for(halo<CX, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1)) |> compute   // run + ghost cells per segment
+let e = A * 2.0                               // elementwise: one block (rank 2: one band of rows) at a time
+let T: Array<Float like CLat, CLon> = s.vars.T |> z.stream    // a 2-D variable chunked in both dims
+let tiles = group_by(T, segments(T))          // each tile one window read; with inherited edges, one chunk file
 ```
 
 - `Chunked<I, spec>` **is** `I`: the alias adopts I's record, so arrays over `CI` and
@@ -426,10 +429,16 @@ let d = method_for(halo<CX, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1)) |> 
   folds the cells in storage order -- the same operation sequence as the flat
   fold, so bitwise the same answer, no reorder licence (an `omp` on the kernel is
   noted and ignored); `group_by(A, segments(..))` reads one run per group into
-  its row; a halo map over `A`'s axis runs one segment at a time, reading each
-  run plus the ghost cells its reach demands (docs/plans/structural/07 §2.3). A
-  key grouping over a streamed variable, and every other consumer, keep the
-  `.stream` refusals. Zarr today; the hooks exist for the other providers.
+  its row (a rank-2 variable's tile grouping reads one rectangular window per
+  tile, which is exactly one chunk file when the edges are the store's); an
+  ELEMENTWISE consumer -- a map, a scalar-broadcast binop, a zip with a
+  materialized array -- runs one block of the leading chunk edge at a time (a
+  band of rows above rank 1), each streamed operand its own window; a halo map
+  over `A`'s axis runs one segment at a time, reading each run plus the ghost
+  cells its reach demands (docs/plans/structural/07 §2.3). The traversal order is
+  the store's own. A fiber kernel over a streamed rank-2 variable keeps the older
+  fiber path; a key grouping over a streamed variable keeps its refusal. Zarr
+  today; the hooks exist for the other providers.
 - `ungroup(G)` restores the axis from a `group_by(_, segments(A))` result;
   `ungroup(G, A)` names the axis when G derives from one (a map over it keeps
   neither the outer id nor the grouping registration). `ungroup([r1, .., rF], A)`
@@ -443,14 +452,14 @@ A per-segment fold is what `group_by(a, segments(A))` and an explicit combine
 spell; nothing implicit exists to refuse.
 
 Not yet: an elementwise map over a grouped array (the ragged-map emitter's
-standing refusal, so the per-segment elementwise idiom is `ungroup` then map, or
-map then `group_by`); streaming of rank >= 2 variables and of netcdf/icechunk
-stores (zarr, rank 1 today); a stencil streaming MORE than one source; a
-two-dimensional mosaic of stores; string-label indexing of the `files` outer
-axis; static `segments` for provider axes; chunk edges for netcdf and icechunk
-(zarr only). Tests: `tests/corpus/segments/`, and `blade test zarr` sections 10c
-(inherited edge), 10d (two stores), 10e (streamed runs), 10f (streamed fold),
-10g (stencil over segments).
+standing refusal; stream the source instead, or `ungroup` then map); streaming
+of rank >= 3 variables, of a rank-2 stencil, and of netcdf/icechunk stores (zarr
+today); a stencil streaming MORE than one source; a two-dimensional mosaic of
+stores; string-label indexing of the `files` outer axis; static `segments` for
+provider axes; chunk edges for netcdf and icechunk (zarr only). Tests:
+`tests/corpus/segments/`, and `blade test zarr` sections 10c (inherited edge),
+10d (two stores), 10e (streamed runs), 10f (streamed fold), 10g (stencil over
+segments), 10h (elementwise consumers), 10i (rank 2: tiles and row bands).
 
 ## 8. `group_by(values, gk)` — ragged grouped view
 
