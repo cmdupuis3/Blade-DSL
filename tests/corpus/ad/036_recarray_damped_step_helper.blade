@@ -1,0 +1,28 @@
+// TEST: AD Recursive Array, Damped Nonlinear Step Through A Helper Function
+import ad as ad
+// ============================================================================
+// The step is a named function, `step(prev, k) = prev - k * prev^2`, called
+// on the predecessor: the inliner hoists its body beside the carry, so the
+// loop body's LETS read s(t-1) too -- the shape milestone B's recognizer
+// admits (a let may mention the buffer only as `s(t - 1)`). s0 = x = 1,
+// k = 0.25: s = [1, 0.75, 0.609375, 0.51654052734375], loss = s(3).
+//   ds/dx: 1 -> 0.5 -> 0.3125 -> 0.21728515625      (factor 1 - 2 k s_t)
+//   ds/dk: 0 -> -1 -> -1.1875 -> -1.197021484375 (-s_t^2 + (1 - 2 k s_t) ds_t/dk)
+// ============================================================================
+function step(prev: Float, k: Float) -> Float = prev - k * prev * prev
+function f(x: Float, k: Float) -> Float = {
+    let rec s: Array<Float like Idx<4>> =
+        match s with
+        | zero -> zero
+        | zero :: n -> zero :: x
+        | prefix :: n -> prefix :: step(prefix(n - 1), k)
+    s(3)
+}
+let (gv, gx, gk) = ad.grad(f)(1.0, 0.25)
+// EXPECT: gv = 0.51654052734375
+// EXPECT: gx = 0.21728515625
+// EXPECT: gk = -1.197021484375
+let (fx, tx) = ad.jvp(f)(1.0, 0.25, 1.0, 0.0)
+let (fk, tk) = ad.jvp(f)(1.0, 0.25, 0.0, 1.0)
+// EXPECT: tx = 0.21728515625
+// EXPECT: tk = -1.197021484375

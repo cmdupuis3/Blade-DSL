@@ -1052,16 +1052,22 @@ let internal checkWriteAfterRead (fname: string) (ctx: Ctx) (stmts: NStmt list) 
                 checkBody body))
 
 /// `for t in lo..hi { lets*; s(t) = s(t - 1) + INC }` -- the additive carry
-/// the recursive-array pre-pass emits (GradExpand.expandRecArray), with INC
-/// and the lets free of `s`. Its adjoint is the same loop run BACKWARDS: the
+/// the recursive-array pre-pass emits (GradExpand.expandRecArray) -- and,
+/// since milestone B (docs/plans/structural/01, 2.3), any FIRST-ORDER slice
+/// `s(t) = g(s(t-1), ..)`: the rhs and the lets may mention `s` only as the
+/// read `s(t - 1)`. Its adjoint is the same loop run BACKWARDS: the
 /// general-overwrite rule saves and zeros `__g_s(t)`, the array-read rule
-/// scatters the saved cotangent into `__g_s(t - 1)`, and INC's adjoint
-/// follows -- every step is already right, only the ORDER was not (the
-/// generic `NFor` adjoint replays ascending). GradSweeps' `NFor` arm uses
-/// this to emit the descending sweep; checkLoopDiscipline uses it to exempt
-/// the buffer from the "array recurrence" refusal. Structural, so it
-/// survives the inliner's renaming (a name-keyed table would not).
-/// Returns (buffer, step var, lo, hi, leading lets, increment).
+/// scatters `c * dg/ds` into `__g_s(t - 1)` with `dg/ds` evaluated at the
+/// primal `s(t-1)` (final at that point of the descending sweep -- the
+/// trajectory buffer is the tape), and the other operands' adjoints follow
+/// -- every step is already right, only the ORDER was not (the generic
+/// `NFor` adjoint replays ascending). GradSweeps' `NFor` arm uses this to
+/// emit the descending sweep; checkLoopDiscipline uses it to exempt the
+/// buffer from the "array recurrence" refusal. Structural, so it survives
+/// the inliner's renaming (a name-keyed table would not).
+/// Returns (buffer, step var, lo, hi, leading lets, step expression): the
+/// step expression is INC for the additive shape and the whole rhs
+/// otherwise (its only use is the discipline walk against OTHER accumulators).
 let internal (|CarryLoop|_|) (s: NStmt) : (string * string * Expr * Expr * NStmt list * Expr) option =
     match s with
     | NFor (t, lo, hi, body) when not body.IsEmpty ->
@@ -1077,18 +1083,43 @@ let internal (|CarryLoop|_|) (s: NStmt) : (string * string * Expr * Expr * NStmt
             | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar b }, [idx]) -> b = buf && isStepMinusOne idx
             | _ -> false
         let isLitOne (e: Expr) = match e.Kind with ExprKind.ExprLit (LitInt 1L) -> true | _ -> false
+        // `e` mentions `buf` only as the read `buf(t - 1)`. Conservative over
+        // the expression forms a slice can contain (the same set
+        // expandRecArray's `onlyPrevReads` admits, plus a tuple projection);
+        // an unknown form answers false and the loop keeps the generic
+        // "array recurrence" refusal.
+        let rec readsOnlyPrev (buf: string) (e: Expr) : bool =
+            match e.Kind with
+            | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar b }, [ idx ]) when b = buf -> isStepMinusOne idx
+            | ExprKind.ExprVar b -> b <> buf
+            | ExprKind.ExprLit _ -> true
+            | ExprKind.ExprTyped (inner, _) | ExprKind.ExprUnaryOp (_, inner) -> readsOnlyPrev buf inner
+            | ExprKind.ExprBinOp (_, _, l, r) | ExprKind.ExprDotDot (l, r) | ExprKind.ExprTupleIndex (l, r) ->
+                readsOnlyPrev buf l && readsOnlyPrev buf r
+            | ExprKind.ExprApp (fh, args) -> readsOnlyPrev buf fh && List.forall (readsOnlyPrev buf) args
+            | ExprKind.ExprArrayLit es -> List.forall (readsOnlyPrev buf) es
+            | ExprKind.ExprIf (c, a, b) -> readsOnlyPrev buf c && readsOnlyPrev buf a && readsOnlyPrev buf b
+            | _ -> not (mentionsVar buf e)
         (match last with
          | [ NAssign ({ Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar buf }, [ { Kind = ExprKind.ExprVar tv } ]) }, rhs) ]
                 when tv = t && allLets && isLitOne lo ->
-             let inc =
+             let letsMention = lets |> List.exists (function NLet (_, _, value) -> mentionsVar buf value | _ -> false)
+             let step =
                  match (strip rhs).Kind with
+                 // the additive carry: the increment alone is the step expression
                  | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevRead buf a && not (mentionsVar buf b) -> Some b
                  | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevRead buf b && not (mentionsVar buf a) -> Some a
+                 // any other first-order slice: the whole rhs. The carry may
+                 // pass through a hoisted let (`let prev = s(t - 1)` from an
+                 // inlined step function), in which case the rhs itself need
+                 // not mention the buffer; a loop that mentions it nowhere is
+                 // plain construction, not a carry, and keeps the generic arm.
+                 | _ when readsOnlyPrev buf rhs && (mentionsVar buf rhs || letsMention) -> Some rhs
                  | _ -> None
-             let letsFree =
-                 lets |> List.forall (function NLet (_, _, value) -> not (mentionsVar buf value) | _ -> false)
-             (match inc with
-              | Some inc when letsFree -> Some (buf, t, lo, hi, lets, inc)
+             let letsOk =
+                 lets |> List.forall (function NLet (_, _, value) -> readsOnlyPrev buf value | _ -> false)
+             (match step with
+              | Some step when letsOk -> Some (buf, t, lo, hi, lets, step)
               | _ -> None)
          | _ -> None)
     | _ -> None

@@ -1,0 +1,25 @@
+// TEST: AD Recursive Array, Geometric (Non-Additive) Recurrence In Reverse
+import ad as ad
+// ============================================================================
+// The first-order recurrence s(n) = 0.5 * s(n-1) + x differentiated in
+// REVERSE mode through the direct loop (docs/plans/structural/01, milestone
+// B): the adjoint is the same loop run backwards, the trajectory buffer is
+// the tape, and `dg/ds = 0.5` is read at the primal. Same function and seed
+// as ad-jvp/016, whose forward tangent is the pin here: with s0 = x and
+// loss = sum s(n) over four steps, dL/dx = 1 + 1.5 + 1.75 + 1.875 = 6.125
+// exactly, primal 12.25 at x = 2.
+// ============================================================================
+function f(x: Float) -> Float = {
+    let rec s: Array<Float like Idx<4>> =
+        match s with
+        | zero -> zero
+        | zero :: n -> zero :: x
+        | prefix :: n -> prefix :: prefix(n - 1) * 0.5 + x
+    reduce(s, (+))
+}
+let (gv, gx) = ad.grad(f)(2.0)
+// EXPECT: gv = 12.25
+// EXPECT: gx = 6.125
+let (fv, ft) = ad.jvp(f)(2.0, 1.0)
+// EXPECT: fv = 12.25
+// EXPECT: ft = 6.125

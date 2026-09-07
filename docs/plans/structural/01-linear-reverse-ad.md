@@ -1,6 +1,16 @@
 # Structural opportunity 01: linear reverse AD through additive recurrences
 
-Status: DESIGN, 2026-09-06. Nothing here is built. Elaborates item 1 of
+Status: milestone A **landed** 2026-09-06 (`tests/corpus/ad/027-029`,
+`OptimizeTests.recarray_grad_linear_emission`); milestone B **landed** 2026-09-07
+(section 5 below: the additive-only gate in reverse mode is gone, `CarryLoop`
+admits any first-order slice whose rhs and lets mention the buffer only as
+`s(t - 1)`, `dg/ds` is read off the trajectory buffer; `tests/corpus/ad/034-036`
+-- the geometric recurrence of ad-jvp/016 in reverse, the logistic map with
+two parameters, a damped step through a helper function whose hoisted lets
+read `s(t-1)` -- with exact dyadic pins that both modes reproduce;
+`OptimizeTests.recarray_grad_nonlinear_emission` counts the same three loops
+as 008). Milestone C (bounded lags) stays blocked. Originally: DESIGN,
+2026-09-06. Elaborates item 1 of
 [plan-structural-performance-opportunities.md](../plan-structural-performance-opportunities.md)
 ("Preserve recurrences through reverse AD"); the companion round-two audit's
 Arc 6 framing is [plan-fortran-killer.md](../plan-fortran-killer.md) section 6
@@ -690,7 +700,8 @@ depend on it.
    were already missing from the index); `examples/04:70-75` comment;
    `docs/features.md` if it describes the triangular route (not checked).
 
-**Milestone B (Arc 6, first step; +1 day, mostly tests).** Drop the
+**Milestone B (Arc 6, first step; +1 day, mostly tests) -- landed 2026-09-07
+as described.** Drop the
 `additiveRest` requirement in grad mode and widen the recognizer's rhs to
 "mentions `buf` only as `buf(t-1)`". The descending arm is already the
 correct adjoint (2.3): the general-overwrite branch evaluates `dg/ds` at the

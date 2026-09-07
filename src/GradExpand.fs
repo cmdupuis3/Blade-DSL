@@ -1145,16 +1145,18 @@ let internal mentionsVar (name: string) (e: Expr) : bool =
 ///     `zero :: n` seed arm) -> the DIRECT loop `s(0) = seed; for n in 1..N
 ///     { s(n) = SLICE[prefix := s] }`, in BOTH modes. Forward mode
 ///     differentiates it in place (the tangent recurrence mirrors it).
-///     Reverse mode admits the additive shape `prefix(n-1) + INC` (INC
-///     prefix-free): its adjoint is the same loop run BACKWARDS -- the
-///     `CarryLoop` recognizer (GradNormalize) exempts it from the loop
-///     discipline and the `NFor` adjoint arm (GradSweeps) emits the
-///     descending sweep, O(n) work (docs/plans/structural/01). The
+///     Reverse mode admits any smooth first-order slice `g(prefix(n-1), ..)`:
+///     its adjoint is the same loop run BACKWARDS -- the `CarryLoop`
+///     recognizer (GradNormalize) exempts it from the loop discipline and
+///     the `NFor` adjoint arm (GradSweeps) emits the descending sweep, O(n)
+///     work (docs/plans/structural/01, milestones A and B). The trajectory
+///     buffer is the tape: at descending step t the general-overwrite rule
+///     evaluates `dg/ds` at the primal `s(t-1)`, which is final. The
 ///     triangular scatter-add this used to unroll into was O(n^2) in both
-///     the replayed primal and the adjoint.
+///     the replayed primal and the adjoint, and admitted the additive shape
+///     only.
 ///   * prefix-free construction `prefix :: f(n)` -> direct element writes.
-///   * anything else (nonlinear recurrence in reverse mode, deeper lags,
-///     rank >= 2, no seed) is rejected.
+///   * anything else (deeper lags, rank >= 2, no seed) is rejected.
 let internal expandRecArray (fname: string) (ctx: Ctx)
                            (name: string) (annot: TypeExpr) (def: RecArrayDef)
     : Result<Stmt list * int, string> =
@@ -1202,22 +1204,15 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
                  | _ -> false)
             | _ -> false
         let hasPrefix (e: Expr) = mentionsVar prefixVar e
-        // additive-prefix slice `prefix(n-1) + REST` / `REST + prefix(n-1)`,
-        // REST prefix-free -> Some REST (the per-step increment).
-        let additiveRest =
-            match def.SliceExpr.Kind with
-            | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevPrefixRead a && not (hasPrefix b) -> Some b
-            | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevPrefixRead b && not (hasPrefix a) -> Some a
-            | _ -> None
         if hasPrefix def.SliceExpr then
             // A genuine recurrence lowers to the DIRECT element-write loop in
             // both modes. Forward mode differentiates it in place (the
-            // tangent recurrence mirrors it) and admits any smooth slice;
-            // reverse mode admits the additive shape, whose adjoint is the
-            // same loop run backwards (the CarryLoop arm in GradSweeps).
-            // Prefix reads become reads of the buffer being built; v1 admits
-            // the immediate predecessor only -- deeper lags rely on the
-            // implicit-zero reads a plain loop cannot supply.
+            // tangent recurrence mirrors it); reverse mode runs the same loop
+            // backwards (the CarryLoop arm in GradSweeps), the trajectory
+            // buffer serving as the tape. Both admit any smooth slice of the
+            // immediate predecessor. Prefix reads become reads of the buffer
+            // being built; v1 admits the immediate predecessor only -- deeper
+            // lags rely on the implicit-zero reads a plain loop cannot supply.
             let rec onlyPrevReads (x: Expr) : bool =
                 match x.Kind with
                 | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar p }, [idx]) when p = prefixVar ->
@@ -1237,8 +1232,6 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
             | Some (seedStep, seedExpr) ->
                 if not (onlyPrevReads def.SliceExpr) then
                     err fname $"recursive array '{name}': a differentiable recurrence may read the immediate predecessor `prefix(n - 1)` only (deeper lags rely on implicit-zero reads a direct loop cannot supply, v1)"
-                elif errMode.Value <> "jvp" && additiveRest.IsNone then
-                    err fname $"recursive array '{name}' is not differentiable (v1): only additive prefix recurrences `prefix :: prefix(n-1) + <increment>` (with a `zero :: n` seed arm and a prefix-free increment) and prefix-free construction are supported"
                 else
                     let sliceB = subst prefixVar bufVar def.SliceExpr
                     let seedWrite = [ StmtExpr (syn (ExprAssign (sAt (iLit 0L), subst seedStep (iLit 0L) seedExpr))) ]
@@ -1248,8 +1241,6 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
                                    [ StmtExpr (syn (ExprAssign (sAt (v stepVar), sliceB))) ])
                     Ok (bufLet :: (seedWrite @ [loop]), n)
         else
-        match additiveRest, def.SeedArm with
-        | None, _ when not (hasPrefix def.SliceExpr) ->
             // Pure construction (no carried state): direct element writes.
             let loopStart, seedStmts =
                 match def.SeedArm with
@@ -1261,8 +1252,6 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
                            syn (ExprDotDot (iLit loopStart, iLit (int64 n))),
                            [ StmtExpr (syn (ExprAssign (sAt (v stepVar), def.SliceExpr))) ])
             Ok (bufLet :: (seedStmts @ [loop]), n)
-        | _ ->
-            err fname $"recursive array '{name}' is not differentiable (v1): only additive prefix recurrences `prefix :: prefix(n-1) + <increment>` (with a `zero :: n` seed arm and a prefix-free increment) and prefix-free construction are supported"
     | Some (true, exts) ->
         err fname $"recursive array '{name}': only rank-1 (scalar-slice) recursive arrays are differentiable (v1); a rank-{exts.Length} recursive array is not supported"
 

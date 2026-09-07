@@ -233,6 +233,48 @@ let private recarrayGradEmission () =
             resultLine Fail name ($"expected 3 counted loops, no __rk/__rm, a descending index; got {loops} loop(s), triangular={triangular}, descending={descending}")
             false
 
+/// Milestone B of the same design: a NONLINEAR first-order recurrence (the
+/// logistic map, tests/corpus/ad/035) takes the same route -- one direct
+/// loop, a replay, a descending adjoint -- with `dg/ds` read off the
+/// trajectory buffer, so the emission shape is 008's exactly.
+let private recarrayGradNonlinearEmission () =
+    let name = "recarray_grad_nonlinear_emission"
+    // 035's function and gradient call alone (the corpus file also takes
+    // two jvps, whose own loops would be counted).
+    let src =
+        "import ad as ad
+"
+        + "function f(x: Float, r: Float) -> Float = {
+"
+        + "    let rec s: Array<Float like Idx<4>> =
+"
+        + "        match s with
+"
+        + "        | zero -> zero
+"
+        + "        | zero :: n -> zero :: x
+"
+        + "        | prefix :: n -> prefix :: r * prefix(n - 1) * (1.0 - prefix(n - 1))
+"
+        + "    s(3)
+"
+        + "}
+"
+        + "let (gv, gx, gr) = ad.grad(f)(0.25, 2.0)
+"
+    match cppOfSource name src with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        let loops = System.Text.RegularExpressions.Regex.Matches(cpp, @"for \(int64_t ").Count
+        let triangular = cpp.Contains "__rk" || cpp.Contains "__rm"
+        let descending = System.Text.RegularExpressions.Regex.IsMatch(cpp, @"- 1L\) - __k\d+\)")
+        if loops = 3 && not triangular && descending then
+            resultLine Pass name "3 counted loops (primal, replay, descending adjoint); no triangular ordinals"
+            true
+        else
+            resultLine Fail name ($"expected 3 counted loops, no __rk/__rm, a descending index; got {loops} loop(s), triangular={triangular}, descending={descending}")
+            false
+
 /// The dense-halo carousel's tail prefetch must be guarded: on the last
 /// step it read one cell past the array (docs/plans/structural/02, 1.5).
 /// The guard compares the ordinal against the windowed array's extent.
@@ -487,6 +529,7 @@ let runOptimizeTests () =
               "elementwise-fusion applied"
           // Reverse-mode AD of an additive recurrence is O(n): loop count pin.
           recarrayGradEmission ()
+          recarrayGradNonlinearEmission ()
           // The halo carousel's last-step prefetch stays inside the pool.
           haloCarouselTailGuarded ()
           // Streaming reductions (structural/03): the join share read by a

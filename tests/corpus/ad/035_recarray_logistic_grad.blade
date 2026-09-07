@@ -1,0 +1,30 @@
+// TEST: AD Recursive Array, Logistic Map In Reverse With Two Parameters
+import ad as ad
+// ============================================================================
+// s(n) = r * s(n-1) * (1 - s(n-1)), s0 = x: a genuinely nonlinear
+// first-order recurrence, where the carry c_{t-1} = c_t * r (1 - 2 s_{t-1})
+// needs the PRIMAL trajectory (docs/plans/structural/01, 2.3). Reverse mode
+// runs the direct loop backwards and reads s(t-1) off the buffer. Dyadic
+// values keep every pin exact: r = 2, x = 0.25 gives s = [0.25, 0.375,
+// 0.46875, 0.498046875]; loss = s(3).
+//   ds3/dx = prod_t r (1 - 2 s_t) = 1 * 0.5 * 0.125 = 0.0625
+//   ds3/dr = s2 (1 - s2) + r (1 - 2 s2) ds2/dr, ds2/dr = s1 (1 - s1) + r (1 - 2 s1) s0 (1 - s0)
+//          = 0.2490234375 + 0.125 * 0.328125 = 0.2900390625
+// The forward tangents along (1, 0) and (0, 1) are the same numbers.
+// ============================================================================
+function f(x: Float, r: Float) -> Float = {
+    let rec s: Array<Float like Idx<4>> =
+        match s with
+        | zero -> zero
+        | zero :: n -> zero :: x
+        | prefix :: n -> prefix :: r * prefix(n - 1) * (1.0 - prefix(n - 1))
+    s(3)
+}
+let (gv, gx, gr) = ad.grad(f)(0.25, 2.0)
+// EXPECT: gv = 0.498046875
+// EXPECT: gx = 0.0625
+// EXPECT: gr = 0.2900390625
+let (fx, tx) = ad.jvp(f)(0.25, 2.0, 1.0, 0.0)
+let (fr, tr) = ad.jvp(f)(0.25, 2.0, 0.0, 1.0)
+// EXPECT: tx = 0.0625
+// EXPECT: tr = 0.2900390625
