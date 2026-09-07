@@ -2321,6 +2321,10 @@ let lowerTypedModule (env: TypedLowerEnv) (modul: TypedModule) (rawDecls: Locate
 
 /// Lower a typed program (with optional raw program for static evaluation)
 let lowerTypedProgram (program: TypedProgram) (rawProgram: Program option) (builder: IRBuilder) : IRProgram =
+    // The scratch-reuse plan is keyed by let id and let ids restart per
+    // compile, so a stale plan from an earlier program in this flow (the test
+    // harness compiles hundreds) must never reach this one.
+    Blade.Types.PoolReuseTable.reset ()
     // The raw decl list callers hand us is the program they PARSED, not the
     // one `TypeCheck.typeCheck` desugared inside itself -- so the icechunk
     // checkout rewrite is applied again here, ahead of Phase 0's
@@ -2461,6 +2465,12 @@ let lowerTypedProgram (program: TypedProgram) (rawProgram: Program option) (buil
                 Functions =
                     irModule.Functions
                     |> List.map (fun f -> { f with Body = forceCallableBody f.Body }) }
+        // Scratch reuse across barriers (Blade.Optimize.planPoolReuse): runs
+        // HERE, after the second S2/S4 application, because its candidates
+        // are the forced (`IRCompute`-wrapped) body-local applies and the
+        // bare ones left behind are exactly the deferred join operands it
+        // must see through. Records into Types.PoolReuseTable for codegen.
+        Optimize.planPoolReuse irModule
         // mask+contains fusion always runs a linear scan; the semijoin
         // hash-set is a separate, not-yet-implemented optimization.
         irModule)

@@ -193,6 +193,30 @@ The planner should report peak live bytes, unavoidable barriers, and why each
 candidate pool is retained. Optimize whole-function lifetimes before attempting
 global scheduling or distributed reuse.
 
+**Landed (2026-09-07), gate 2 in its first form: scratch reuse inside a function
+body.** `Blade.Optimize.planPoolReuse` (run at the end of module lowering, after the
+second forcing pass) plans, per body, which fresh dense pools can take an earlier
+pool that is DEAD (nothing at or after that point reads it -- liveness sees
+through deferred join operands and callable captures) and UNALIASED (every position
+naming it is a fresh-pool form or a call-free scalar; a view, an alias, a tuple, a
+call to a declared callable, an assignment or a loop declines it), of the same
+element type and the same LITERAL extents. The RETURN position is a reuser too. The
+plan lives in `Types.PoolReuseTable`; codegen rewrites the reuser's declaration into
+`{ donor.data, own_extents }` (`rewritePoolAlias`, anchored on the name so every
+emitter's line qualifies) and spares the right scope free, and an escaping reuser
+carries its donor into the escape set. Every body with two or more candidate pools
+records a `pool-reuse` decision with the pairs and the peak live pool bytes before
+and after (literal extents only) -- the planner's report, for `blade plan`. Found and
+fixed on the way: `computeScopeEscapes` propagated through SCALAR lets, so a kernel
+capturing `m = reduce(y, (+)) / n` pinned `y` and leaked it per call (the demean /
+normalize shape); a scalar holds no storage and is now a barrier like a fresh pool.
+Pins: `tests/OptimizeTests.fs` (the return alias, the chain's two reusers per body,
+the leak, the decision) and `tests/corpus/memfree/022` (values in both lanes -- the
+interpreter never reuses -- including the view-alias negative). Not done: runtime
+extents (the generic body of a `T^1` function keeps its allocations), the second half
+of gate 2 (reuse across REPEATED executions, i.e. per-call scratch that survives the
+frame), and peak RSS measurement against a Fortran baseline.
+
 ### Demonstrator and gates
 
 Use a dense signal-processing pipeline with a real whole-array dependency between

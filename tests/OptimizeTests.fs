@@ -310,6 +310,103 @@ let private outerProductPartialFoldStreams () =
             resultLine Fail name ($"expected no Array<double, 2>, no __pfrow/__pfsrc, a fused exp fold; got pools={pools}, rowMode={rowMode}, fusedFold={fusedFold}")
             false
 
+/// SCRATCH REUSE (plan-fortran-killer-2 section 4, gate 2;
+/// Blade.Optimize.planPoolReuse). The demean shape: `y`, a reduce of `y`, `z
+/// = y - m`, and the return `z * 0.5`. The return is written into `y`'s dead
+/// pool: its declaration is an alias of `y.data`, and `y`'s scope free is
+/// spared while `z`'s stays. One reuse in the whole program (only the
+/// shape-specialized body has literal extents).
+let private poolReuseSrc =
+    "type I = Idx<1000>\n"
+    + "let v = method_for(range<I>) <@> lambda(i) -> 0.01 * Float64(i) |> compute\n"
+    + "function demean(x: T^1) -> T^1 = {\n"
+    + "    let y = x * 2.0 + 1.0\n"
+    + "    let m = reduce(y, (+)) / Float64(extents(y))\n"
+    + "    let z = y - m\n"
+    + "    z * 0.5\n"
+    + "}\n"
+    + "let out = demean(v)\n"
+    + "let s = reduce(out, (+))\n"
+
+let private poolReuseReturnTakesDeadPool () =
+    let name = "pool_reuse_return_takes_dead_pool"
+    match cppOfSource name poolReuseSrc with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        let aliases = System.Text.RegularExpressions.Regex.Matches(cpp, @"pool reuse: ").Count
+        let retAlias = System.Text.RegularExpressions.Regex.IsMatch(cpp, @"Array<double, 1> __ret\d+ = \{ __v\d+\.data, __ret\d+_extents \};")
+        if aliases = 1 && retAlias then
+            resultLine Pass name "the specialized body's return aliases the dead pool; one reuse in the program"
+            true
+        else
+            resultLine Fail name ($"expected exactly one pool-reuse alias on a __ret declaration; got aliases={aliases}, retAlias={retAlias}")
+            false
+
+/// Two let-bound temporaries share one root pool in a chain (`p`, then `q`
+/// after `p` is dead, then `s` after `q` is dead; `r` reads `q` so it keeps
+/// its own), and the decision record says so: pools 4 -> 2.
+let private poolReuseChainSrc =
+    "type I = Idx<1000>\n"
+    + "let v = method_for(range<I>) <@> lambda(i) -> 0.01 * Float64(i) |> compute\n"
+    + "function chain(x: T^1) -> Float64 = {\n"
+    + "    let p = x * 2.0\n"
+    + "    let m = reduce(p, (+)) + 0.0\n"
+    + "    let q = x - m\n"
+    + "    let r = q * 3.0\n"
+    + "    let k = reduce(r, (+)) + 0.0\n"
+    + "    let s = x + k\n"
+    + "    reduce(s, (+))\n"
+    + "}\n"
+    + "let r = chain(v)\n"
+
+let private poolReuseChainSharesRoot () =
+    let name = "pool_reuse_chain_shares_root"
+    match cppOfSource name poolReuseChainSrc with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        // Both the generic and the specialized body qualify here (the
+        // extents are literal in both), so two bodies x two reusers.
+        let aliases = System.Text.RegularExpressions.Regex.Matches(cpp, @"pool reuse: __v\d+ takes __v\d+'s dead pool").Count
+        if aliases = 4 then
+            resultLine Pass name "two reusers per body take the root's pool"
+            true
+        else
+            resultLine Fail name ($"expected 4 pool-reuse aliases (2 bodies x 2 reusers); got {aliases}")
+            false
+
+/// The escape-analysis leak the same work found: a kernel capturing a scalar
+/// that was computed FROM an array (`m = reduce(y, (+)) + 0.0`, then `y - m`)
+/// used to pin `y` (propagation walked into the scalar's value) so it leaked
+/// on every call. A scalar holds no storage; now every function-body pool in
+/// this program is freed: deallocate count = allocate count - 1 (the one
+/// module-level pool is never scope-freed). No reuse fires here: `z` reads
+/// `y` and the return is a scalar.
+let private scalarCaptureSrc =
+    "type I = Idx<1000>\n"
+    + "let v = method_for(range<I>) <@> lambda(i) -> 0.01 * Float64(i) |> compute\n"
+    + "function f9(x: T^1) -> Float64 = {\n"
+    + "    let y = x * 2.0\n"
+    + "    let m = reduce(y, (+)) + 0.0\n"
+    + "    let z = y - m\n"
+    + "    reduce(z, (+))\n"
+    + "}\n"
+    + "let r = f9(v)\n"
+
+let private scalarCaptureNoLongerPinsSource () =
+    let name = "scalar_capture_no_longer_pins_source"
+    match cppOfSource name scalarCaptureSrc with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        let allocs = System.Text.RegularExpressions.Regex.Matches(cpp, @"(?<!de)allocate<typename promote").Count
+        let frees = System.Text.RegularExpressions.Regex.Matches(cpp, @"deallocate<typename promote").Count
+        let aliases = cpp.Contains "pool reuse:"
+        if frees = allocs - 1 && not aliases then
+            resultLine Pass name ($"{frees} frees for {allocs} allocations (module pool excepted); no reuse")
+            true
+        else
+            resultLine Fail name ($"expected frees = allocs - 1 and no reuse; got allocs={allocs}, frees={frees}, aliases={aliases}")
+            false
+
 let private runCase (name: string) (src: string) (wantBreaks: int) (wantAborts: int) =
     match cppOfSource name src with
     | Error e -> resultLine Fail name e; false
@@ -358,7 +455,15 @@ let runOptimizeTests () =
           // Streaming reductions (structural/03): the join share read by a
           // direct-fold leg, and the deferred outer product's partial fold.
           joinShareReadByDirectFold ()
-          outerProductPartialFoldStreams () ]
+          outerProductPartialFoldStreams ()
+          // Scratch reuse across barriers (fortran-killer-2 section 4, gate
+          // 2): the alias declarations, the decision record, and the
+          // escape-analysis leak the work found.
+          poolReuseReturnTakesDeadPool ()
+          poolReuseChainSharesRoot ()
+          scalarCaptureNoLongerPinsSource ()
+          decisionCase "decision_pool_reuse_applied" poolReuseChainSrc "pool-reuse" applied
+              "pool-reuse applied" ]
     let passed = results |> List.filter id |> List.length
     let failed = results.Length - passed
     printFooter "Optimization Layer" [$"{passed} passed"; $"{failed} failed"]

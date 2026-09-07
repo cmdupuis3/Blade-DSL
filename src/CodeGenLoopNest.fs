@@ -3467,13 +3467,29 @@ let computeScopeEscapes (ctx: CodeGenContext) (kind: ScopeKind) (scopeLets: (IRI
                 match inferExprType retExpr with
                 | IRTScalar _ | IRTUnit -> []
                 | _ -> collectVarRefsIR retExpr |> Set.toList
+    // A SCALAR-typed let holds no storage, so nothing it read can be aliased
+    // through it: propagation stops there exactly as at a fresh pool. Without
+    // this barrier a kernel capturing `m` in `let m = reduce(y, (+)) / n`
+    // seeded m (capture seed), propagation walked into m's value, and y --
+    // merely READ to compute a scalar -- was pinned and leaked on every call
+    // (measured: the demean / normalize shape leaked its input-sized pool
+    // per invocation).
+    let scalarValued (value: IRExpr) =
+        match inferExprType value with
+        | IRTScalar _ | IRTUnit -> true
+        | _ -> false
     let rec propagate (acc: Set<IRId>) =
         let acc' =
             scopeLets |> List.fold (fun s (id, value) ->
-                if Set.contains id s && not (isFreshPoolForm value)
+                if Set.contains id s && not (isFreshPoolForm value) && not (scalarValued value)
                 then Set.union s (collectVarRefsIR value)
                 else s) acc
-        if acc' = acc then acc else propagate acc'
+        // Scratch reuse: an escaping reuser's storage IS its donor's, so the
+        // donor escapes with it (chains resolve to the root by iteration).
+        let acc'' =
+            Blade.Types.PoolReuseTable.donors ()
+            |> Map.fold (fun s reuser donor -> if Set.contains reuser s then Set.add donor s else s) acc'
+        if acc'' = acc then acc else propagate acc''
     propagate (Set.ofList (assignSeeds @ captureSeeds @ providerSeeds @ retSeeds))
 
 /// Hoist FreshPool-returning calls out of ARGUMENT position into fresh lets.
@@ -3777,6 +3793,30 @@ let registerStreamBufDecls (names: string list) : unit =
         for n in names do
             frame.StreamBufNames <- Set.add n frame.StreamBufNames
             registerAlloc (RawAlloc (n, None))
+
+/// SCRATCH REUSE (Blade.Optimize.planPoolReuse, Types.PoolReuseTable): turn
+/// `name`'s pool declaration -- `Array<E, R> name = { allocate<typename
+/// promote<E, R>::type, nullptr>(ext), ext };`, the one line every dense
+/// allocation site emits for a plan-admitted shape -- into an alias of the
+/// donor's data with the reuser's own extents table. Anchored on the NAME,
+/// so it is indifferent to which emitter wrote the line. The flag says
+/// whether a line matched: the caller spares a scope free ONLY then, so an
+/// unexpected declaration shape keeps its own pool and its own free rather
+/// than leaking.
+let rewritePoolAlias (lines: string list) (name: string) (donor: string) : string list * bool =
+    let pat =
+        System.Text.RegularExpressions.Regex(
+            @"^(\s*)Array<(.+?), (\d+)> " + System.Text.RegularExpressions.Regex.Escape name
+            + @" = \{ allocate<typename promote<.+?>::type, nullptr>\((\w+)\), (\w+) \};\s*$")
+    let mutable matched = false
+    let out =
+        lines |> List.map (fun l ->
+            let m = pat.Match l
+            if m.Success && not matched then
+                matched <- true
+                $"{m.Groups.[1].Value}Array<{m.Groups.[2].Value}, {m.Groups.[3].Value}> {name} = {{ {donor}.data, {m.Groups.[4].Value} }}; /* pool reuse: {name} takes {donor}'s dead pool */"
+            else l)
+    (out, matched)
 
 /// Exempt one emitted C++ name from this scope's frees (used for the lifted
 /// `__retN` return temporaries, whose storage leaves with the return value).

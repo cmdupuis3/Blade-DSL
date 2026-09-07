@@ -1,0 +1,61 @@
+// TEST: Memfree Scratch Reuse Of Dead Pools
+// ============================================================================
+// Scratch reuse across barriers (plan-fortran-killer-2 section 4, gate 2;
+// Blade.Optimize.planPoolReuse). Inside a function body a fresh dense pool
+// that is DEAD (nothing after some point reads it) and UNALIASED takes the
+// place of a later allocation of the same element type and literal extents:
+// the tail of `demean` (`z * 0.5`) is written straight into `y`'s pool, and
+// in `chain` two of the four temporaries share one root pool. Values are
+// untouched by construction -- a dead pool's bits are never read again --
+// and tests/OptimizeTests.fs pins the emission (the alias declaration, the
+// spared free, the decision record). This file is the VALUE side, in both
+// lanes: the interpreter never reuses, so byte-parity is the check that a
+// reused pool was really dead. Called twice with different inputs, so a
+// stale pool would show.
+//
+// `viewed` is the guard's negative: `row` is a VIEW of `y` (rank-2 partial
+// read aliases the pool), so `y` is never a donor even though nothing after
+// `row`'s definition names `y` -- reusing it would overwrite the row the
+// return reads.
+// ============================================================================
+type I = Idx<7>
+type J = Idx<3>
+type K = Idx<5>
+
+function demean(x: Array<Float like I>) -> Array<Float like I> = {
+    let y = x * 2.0 + 1.0
+    let m = reduce(y, (+)) / Float64(extents(y))
+    let z = y - m
+    z * 0.5
+}
+let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+let b = [7.0, 5.0, 3.0, 1.0, -1.0, -3.0, -5.0]
+let da = demean(a)
+let db = demean(b)
+// EXPECT: da = [-3, -2, -1, 0, 1, 2, 3]
+// EXPECT: db = [6, 4, 2, 0, -2, -4, -6]
+
+function chain(x: Array<Float like I>) -> Float = {
+    let p = x * 2.0
+    let m = reduce(p, (+)) + 0.0
+    let q = x - m
+    let r = q * 3.0
+    let k = reduce(r, (+)) + 0.0
+    let s = x + k
+    reduce(s, (+))
+}
+let ca = chain(a)
+let cb = chain(b)
+// EXPECT: ca = -7616
+// EXPECT: cb = -1904
+
+function viewed(x: Array<Float like J, K>) -> Float = {
+    let y = x * 2.0
+    let row = y((1 : J))
+    let w = x + 1.0
+    let t = reduce(reduce(w, (+)), (+))
+    reduce(row, (+)) + t
+}
+let g: Array<Float like J, K> = [[1.0, 2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0, 10.0], [11.0, 12.0, 13.0, 14.0, 15.0]]
+let vg = viewed(g)
+// EXPECT: vg = 215

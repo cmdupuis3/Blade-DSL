@@ -361,6 +361,37 @@ module SegmentTable =
     let tryFind (alias: string) : int64 list option = Map.tryFind alias (entries ())
     let reset () = table.Value <- Map.empty
 
+/// SCRATCH REUSE ACROSS BARRIERS (plan-fortran-killer-2 section 4, gate 2):
+/// the plan `Blade.Optimize.planPoolReuse` computes per function body and
+/// codegen consumes. A let whose fresh dense pool has the same element type
+/// and literal extents as an earlier, DEAD, unaliased pool in the same body
+/// takes that pool instead of allocating -- `Donors` maps the reuser's let id
+/// to the ROOT let whose `allocate<>` it inherits; `ReturnDonors` does the
+/// same for a body's return position, keyed by the callable's id;
+/// `CurrentReturnDonor` is the one for the body codegen is emitting.
+/// Codegen applies the plan by rewriting the reuser's emitted declaration
+/// (`CodeGenLoopNest.rewritePoolAlias`) and sparing the right scope free.
+/// AsyncLocal like SegmentTable; reset once per program, in
+/// `lowerTypedProgram`, because let ids restart per compile.
+module PoolReuseTable =
+    open System.Threading
+    type State =
+        { Donors: Map<IRId, IRId>
+          ReturnDonors: Map<IRId, IRId>
+          CurrentReturnDonor: IRId option }
+    let private empty =
+        { Donors = Map.empty; ReturnDonors = Map.empty; CurrentReturnDonor = None }
+    let private cell = new AsyncLocal<State>()
+    let private get () = match box cell.Value with null -> empty | _ -> cell.Value
+    let reset () = cell.Value <- empty
+    let record (reuser: IRId) (donor: IRId) = cell.Value <- { get () with Donors = Map.add reuser donor (get ()).Donors }
+    let tryDonor (reuser: IRId) : IRId option = Map.tryFind reuser (get ()).Donors
+    let donors () : Map<IRId, IRId> = (get ()).Donors
+    let recordReturn (func: IRId) (donor: IRId) = cell.Value <- { get () with ReturnDonors = Map.add func donor (get ()).ReturnDonors }
+    let tryReturnDonor (func: IRId) : IRId option = Map.tryFind func (get ()).ReturnDonors
+    let setCurrentReturnDonor (d: IRId option) = cell.Value <- { get () with CurrentReturnDonor = d }
+    let currentReturnDonor () : IRId option = (get ()).CurrentReturnDonor
+
 /// The center's first valid ordinal for a halo slot (a projection of the
 /// record; kept for its call sites).
 let haloStartOffsetOfTag (tag: string) : int64 option =

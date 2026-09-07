@@ -687,6 +687,24 @@ body-level let RHS of that shape in IRCompute; emitting nothing here would regis
             let valStr = exprToCpp currentNames value
             currentNames <- Map.add id varName currentNames
             [$"{indent}auto {varName} = {valStr};"])
+    // Scratch reuse: a let the plan gave a donor takes the donor's pool -- its
+    // `allocate<>` declaration is rewritten into an alias of the donor's data
+    // (its own extents table stays), and its scope free is spared; the donor's
+    // registration frees the storage once, at scope exit (or never, when the
+    // reuser escapes: computeScopeEscapes carries an escaping reuser over to
+    // its donor). Only a rewrite that MATCHED spares the free.
+    let stmts =
+        lets |> List.fold (fun (acc: string list) (id, _) ->
+            match Blade.Types.PoolReuseTable.tryDonor id with
+            | Some d ->
+                (match Map.tryFind d currentNames with
+                 | Some dn ->
+                     let name = $"__v{id}"
+                     let (acc', matched) = rewritePoolAlias acc name dn
+                     if matched then suppressAllocName name
+                     acc'
+                 | None -> acc)
+            | None -> acc) stmts
     // Return-arm emissions carry NO owner: a __retN temporary must not be matched
     // against some let's escape status by accident. It is exempted by NAME below.
     setAllocOwner None
@@ -717,6 +735,17 @@ body-level let RHS of that shape in IRCompute; emitting nothing here would regis
             let retVarName = $"__ret{builder.FreshId()}"
             let bodyCtx = { ctx with VarNames = currentNames; Indent = ctx.Indent + 1; GroupedArrays = currentGrouped; TupleChildren = currentTupleChildren }
             let combCode = genApplyCombinator bodyCtx retVarName info builder
+            // Scratch reuse at the RETURN position: the returned value takes
+            // its donor's pool, which leaves with it, so the donor's scope
+            // free is spared exactly like the `__retN` name below -- but only
+            // when the declaration actually rewrote.
+            let combCode =
+                match Blade.Types.PoolReuseTable.currentReturnDonor () |> Option.bind (fun d -> Map.tryFind d currentNames) with
+                | Some dn ->
+                    let (rewritten, matched) = rewritePoolAlias combCode retVarName dn
+                    if matched then suppressAllocName dn
+                    rewritten
+                | None -> combCode
             // The returned pool leaves with the value; free everything else.
             suppressAllocName retVarName
             stmts @ combCode @ popAllocScopeFrees indent @ [$"{indent}return {retVarName};"]
@@ -1317,15 +1346,20 @@ let genFuncDef (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFuncDef) :
     // BLAS/LAPACK/cuBLAS classification while depth > 0), and the definition
     // carries BLADE_REPRO_FN (noinline + fp-contract off on GCC). try/finally
     // so a codegen exception cannot leave the scope stuck on.
+    // Scratch reuse: the plan's donor for THIS body's return position, read
+    // by genFuncBody's return arm; cleared after so no other body sees it.
+    Blade.Types.PoolReuseTable.setCurrentReturnDonor (Blade.Types.PoolReuseTable.tryReturnDonor funcDef.Id)
     let bodyStmts =
-        if funcDef.IsRepro then
-            Blade.LinAlgPatterns.reproScopeDepth.Value <-
-                Blade.LinAlgPatterns.reproScopeDepth.Value + 1
-            try genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
-            finally
+        try
+            if funcDef.IsRepro then
                 Blade.LinAlgPatterns.reproScopeDepth.Value <-
-                    Blade.LinAlgPatterns.reproScopeDepth.Value - 1
-        else genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+                    Blade.LinAlgPatterns.reproScopeDepth.Value + 1
+                try genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+                finally
+                    Blade.LinAlgPatterns.reproScopeDepth.Value <-
+                        Blade.LinAlgPatterns.reproScopeDepth.Value - 1
+            else genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+        finally Blade.Types.PoolReuseTable.setCurrentReturnDonor None
     // Shadow-stack frame: named as the Blade function so a runtime
     // panic prints a Blade call stack. file/line are nullptr/0 because
     // IRCallable carries no span (adding one touches TypeCheck.fs's IRCallable
@@ -1407,15 +1441,20 @@ let genFuncDefAsLambda (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFu
     // cannot carry the GCC `optimize` attribute, so the contraction half of
     // the demand is NOT dischargeable here. Say so in the emitted text --
     // never silently -- rather than refuse the whole program.
+    // Scratch reuse: the plan's donor for THIS body's return position, read
+    // by genFuncBody's return arm; cleared after so no other body sees it.
+    Blade.Types.PoolReuseTable.setCurrentReturnDonor (Blade.Types.PoolReuseTable.tryReturnDonor funcDef.Id)
     let bodyStmts =
-        if funcDef.IsRepro then
-            Blade.LinAlgPatterns.reproScopeDepth.Value <-
-                Blade.LinAlgPatterns.reproScopeDepth.Value + 1
-            try genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
-            finally
+        try
+            if funcDef.IsRepro then
                 Blade.LinAlgPatterns.reproScopeDepth.Value <-
-                    Blade.LinAlgPatterns.reproScopeDepth.Value - 1
-        else genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+                    Blade.LinAlgPatterns.reproScopeDepth.Value + 1
+                try genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+                finally
+                    Blade.LinAlgPatterns.reproScopeDepth.Value <-
+                        Blade.LinAlgPatterns.reproScopeDepth.Value - 1
+            else genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+        finally Blade.Types.PoolReuseTable.setCurrentReturnDonor None
     let reproNote =
         if funcDef.IsRepro
         then [$"{bodyInd}// [repro] main-local emission: routing vetoed, but the contraction attribute cannot attach to a lambda -- bind this function's inputs at module level to restore the full guarantee"]
