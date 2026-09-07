@@ -1,9 +1,15 @@
 # 07 — Segmented domains: chunks and files as a structural grouping of one axis
 
 Status: BUILT 2026-09-06 on `feat/segmented-domains` (decisions D1-D10 resolved by the
-user; D6 read as: a flat fold over a `Chunked` axis is the plain flat fold and a
-per-segment fold is only ever spelled through the grouping, so nothing implicit is
-licensed or refused). Landed, in five commits: the surface type in all three forms,
+user; D6 confirmed: a fold over a segmented axis is the plain flat fold at the API,
+xarray parity, and the COMPILER chooses how it runs -- over a streamed rank-1 variable
+it walks the store block by block in storage order, bitwise the materialized fold;
+recorded for `blade plan` as `segment-streaming`, with the group_by and stencil
+choices beside it). Also built: the STENCIL over segments (§2.3): a halo map over a
+streamed `Chunked` axis runs one segment at a time, reading each run plus the ghost
+cells its reach demands (the halo indices say which cells to materialize, as the user
+framed it); and `segments(a)` off a value's declared `Chunked` slots, so an array
+whose slots are both `Chunked` states its 2-D tiling without repeating the aliases. Landed, in five commits: the surface type in all three forms,
 the structural groupings `segments(A)` and `files(A)` with no CSR, `ungroup` in its
 grouped and row forms, static `segments`, zarr's inherited chunk edges, the deletion of
 `blocked<I, K>`, PER-SEGMENT STREAMED READS (`group_by(A |> z.stream, segments(X))`
@@ -20,15 +26,15 @@ storage level (distributed P0) when layout depends on it. (2) The two-level axis
 exposed one level at a time (`files(T)` = the file runs, `segments(T)` = the innermost
 per-file chunk runs, with each file's own edge) rather than as the nested
 `[file_outer; chunk_outer(file); member]` shape of §2.7, because a slot-aware nested
-`group_by` is not built. NOT built: per-segment streamed reads of rank >= 2 variables and of
-netcdf/icechunk stores (the hooks exist; zarr implements rank 1); the NESTED
-`[file_outer; chunk_outer(file); member]` shape of §2.7 (the two levels are exposed
-one at a time) and the 2-D mosaic-of-stores declaration, which is where the cross-slot
-refusal of §4.0 would first have content (with two single-slot segmentations it holds
-by construction, and a tile grouping over a file-tiled axis refuses with that
-reason); halo ghost strips across segments (§2.3); string-label indexing of the
-`files` outer axis; netcdf/icechunk chunk-edge readers; static `segments` over
-provider axes.
+`group_by` is not built. NOT built: streaming of rank >= 2 variables and of netcdf/icechunk stores
+(the hooks exist; zarr implements rank 1); a stencil streaming more than one source;
+the NESTED `[file_outer; chunk_outer(file); member]` shape of §2.7 (the two levels are
+exposed one at a time) and the 2-D mosaic-of-stores declaration, which is where the
+cross-slot refusal of §4.0 would first have content (with two single-slot
+segmentations it holds by construction, and a tile grouping over a file-tiled axis
+refuses with that reason); a COST model for the streaming choice (today it is by
+consumer shape, recorded but not costed); string-label indexing of the `files` outer
+axis; netcdf/icechunk chunk-edge readers; static `segments` over provider axes.
 Found in passing: an elementwise map over any `group_by` result is refused by the
 ragged-map emitter (pre-existing BL7004), which is what blocks the per-segment
 elementwise idiom as a nested map. Reframes item 4 of

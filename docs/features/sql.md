@@ -384,7 +384,11 @@ let back = ungroup(g)                         // Array<Float like I>: the runs r
 let fs  = files(T)                            // the FILE level of a tiled axis: one run per store, labelled
 let v   = ungroup([v1, v2], T)                // a variable living in both stores, named over T
 let tiles = segments(C0, C1)                  // a rank-2 array's TILE grouping: one group per (g0, g1), slot order
-let A = s.vars.A |> z.stream                  // rank-1: NOT materialized; group_by(A, seg) reads one run at a time
+let t2  = segments(a)                         // the same, read off a's own annotation `Array<T like C0, C1>`
+let A: Array<Float like CX> = s.vars.A |> z.stream   // rank-1: NOT materialized; consumers below stream it
+let total = reduce(A, (+))                    // block-by-block in storage order: bitwise the flat fold
+let g = group_by(A, segments(A))              // one run read per group
+let d = method_for(halo<CX, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1)) |> compute   // run + ghost cells per segment
 ```
 
 - `Chunked<I, spec>` **is** `I`: the alias adopts I's record, so arrays over `CI` and
@@ -411,10 +415,21 @@ let A = s.vars.A |> z.stream                  // rank-1: NOT materialized; group
   source is two-dimensional). The cross-slot condition of the design's §4.0 holds
   by construction here, since both slots are single-slot segmentations; a
   two-dimensional mosaic of stores has no declaration form yet.
-- `group_by(A, segments(X))` over a rank-1 variable bound with `.stream` reads
-  each run from the store straight into that group's row: the whole variable is
-  never materialized (the emitted C++ has no buffer for it). A key grouping over a
-  streamed variable, and every other consumer, keep the `.stream` refusals.
+- `segments(a)` over a VALUE reads the tiling its annotation declared: an array
+  whose slots name `Chunked` aliases already says its tiling, so one slot gives the
+  rank-1 grouping and two the tile grouping. An unannotated value is refused with
+  both spellings that work.
+- A rank-1 variable bound with `.stream` on a `Chunked` axis is never
+  materialized; its consumers stream it, and each choice is recorded for
+  `blade plan` under the rule `segment-streaming`:
+  `reduce(A, k)` walks the store one block at a time (the store's chunk edge) and
+  folds the cells in storage order -- the same operation sequence as the flat
+  fold, so bitwise the same answer, no reorder licence (an `omp` on the kernel is
+  noted and ignored); `group_by(A, segments(..))` reads one run per group into
+  its row; a halo map over `A`'s axis runs one segment at a time, reading each
+  run plus the ghost cells its reach demands (docs/plans/structural/07 §2.3). A
+  key grouping over a streamed variable, and every other consumer, keep the
+  `.stream` refusals. Zarr today; the hooks exist for the other providers.
 - `ungroup(G)` restores the axis from a `group_by(_, segments(A))` result;
   `ungroup(G, A)` names the axis when G derives from one (a map over it keeps
   neither the outer id nor the grouping registration). `ungroup([r1, .., rF], A)`
@@ -429,12 +444,13 @@ spell; nothing implicit exists to refuse.
 
 Not yet: an elementwise map over a grouped array (the ragged-map emitter's
 standing refusal, so the per-segment elementwise idiom is `ungroup` then map, or
-map then `group_by`); per-segment streamed reads of rank >= 2 variables and of
-netcdf/icechunk stores (zarr, rank 1 today); string-label indexing of the `files`
-outer axis; static `segments` for provider axes; chunk edges for netcdf and
-icechunk (zarr only); halo ghost strips across segment boundaries. Tests:
-`tests/corpus/segments/`, and `blade test zarr` sections 10c (inherited edge),
-10d (two stores), 10e (streamed runs).
+map then `group_by`); streaming of rank >= 2 variables and of netcdf/icechunk
+stores (zarr, rank 1 today); a stencil streaming MORE than one source; a
+two-dimensional mosaic of stores; string-label indexing of the `files` outer
+axis; static `segments` for provider axes; chunk edges for netcdf and icechunk
+(zarr only). Tests: `tests/corpus/segments/`, and `blade test zarr` sections 10c
+(inherited edge), 10d (two stores), 10e (streamed runs), 10f (streamed fold),
+10g (stencil over segments).
 
 ## 8. `group_by(values, gk)` — ragged grouped view
 
