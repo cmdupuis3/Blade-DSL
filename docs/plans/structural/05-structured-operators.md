@@ -573,6 +573,12 @@ five touch points including `protocol/` (memory: adding-a-bl-diagnostic-code) â€
   the checker sees `method_for(decompact(gram(A, A), 0)) <@> prodsum(row, v)`: "an
   NÃ—N matrix is formed and applied once; `gram_apply(A, A, v)` declares the factored
   action". Fits the fastest-way P3 channel; off by default until that channel exists.
+  **Built 2026-09-07 as a decision record, not a diagnostic**: `Blade.Optimize.
+  recordGramApplyAdvisory` matches the module-level shape (a same-array `gram`, its
+  `decompact` at axis 0, an apply over it whose kernel is `prodsum(row, v)`) and records
+  rule `gram-apply-advisory` as DECLINED "left as written (advise, never rewrite)" with
+  the `gram_apply(A, A, v)` spelling in the evidence, so `blade plan` shows it and the
+  P3 channel can lift it verbatim. Pinned in `tests/OptimizeTests.fs`.
 
 ### 3.4 Deliberately excluded from step 1, and how it composes later
 

@@ -2470,6 +2470,9 @@ let lowerTypedProgram (program: TypedProgram) (rawProgram: Program option) (buil
         // are the forced (`IRCompute`-wrapped) body-local applies and the
         // bare ones left behind are exactly the deferred join operands it
         // must see through. Records into Types.PoolReuseTable for codegen.
+        // Let-level CSE over repeatable values first (fewer lets, fewer
+        // pools), then the scratch-reuse plan over what remains.
+        let irModule = Optimize.cseModule irModule
         Optimize.planPoolReuse irModule
         // mask+contains fusion always runs a linear scan; the semijoin
         // hash-set is a separate, not-yet-implemented optimization.

@@ -407,6 +407,43 @@ let private scalarCaptureNoLongerPinsSource () =
             resultLine Fail name ($"expected frees = allocs - 1 and no reuse; got allocs={allocs}, frees={frees}, aliases={aliases}")
             false
 
+/// Let-level CSE: `reduce(y, (+))` computed twice in one body (once for the
+/// mean, once again for the scale) runs once; the second let is dropped and
+/// its reads go to the first. Pinned as the count of scalar-fold IIFEs per
+/// program (two bodies, one fold each after CSE) plus the decision.
+let private cseSrc =
+    "type I = Idx<1000>\n"
+    + "let v = method_for(range<I>) <@> lambda(i) -> 0.01 * Float64(i) |> compute\n"
+    + "function twice(x: T^1) -> Float64 = {\n"
+    + "    let y = x * 2.0\n"
+    + "    let s1 = reduce(y, (+))\n"
+    + "    let s2 = reduce(y, (+))\n"
+    + "    s1 * 0.5 + s2 * 0.25\n"
+    + "}\n"
+    + "let r = twice(v)\n"
+
+let private cseDropsRepeatedFold () =
+    let name = "cse_drops_repeated_fold"
+    match cppOfSource name cseSrc with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        let folds = System.Text.RegularExpressions.Regex.Matches(cpp, @"double __r = ").Count
+        if folds = 2 then
+            resultLine Pass name "one scalar fold per body (generic + specialized); the duplicate was dropped"
+            true
+        else
+            resultLine Fail name ($"expected 2 scalar folds in the program (one per body), got {folds}")
+            false
+
+/// The structural/05 D7 advisory: gram, decompact, a row prodsum -- recorded
+/// as left-as-written with the `gram_apply` spelling in the evidence.
+let private gramAdvisorySrc =
+    "let A: Array<Float64 like Idx<3>, Idx<2>> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]\n"
+    + "let v: Array<Float64 like Idx<3>> = [1.0, 2.0, 3.0]\n"
+    + "let G = gram(A, A)\n"
+    + "let Gd = decompact(G, 0)\n"
+    + "let y = method_for(Gd) <@> lambda(row) -> prodsum(row, v) |> compute\n"
+
 let private runCase (name: string) (src: string) (wantBreaks: int) (wantAborts: int) =
     match cppOfSource name src with
     | Error e -> resultLine Fail name e; false
@@ -463,7 +500,13 @@ let runOptimizeTests () =
           poolReuseChainSharesRoot ()
           scalarCaptureNoLongerPinsSource ()
           decisionCase "decision_pool_reuse_applied" poolReuseChainSrc "pool-reuse" applied
-              "pool-reuse applied" ]
+              "pool-reuse applied"
+          // Let-level CSE over repeatable values, and its decision.
+          cseDropsRepeatedFold ()
+          decisionCase "decision_cse_applied" cseSrc "cse" applied "cse applied"
+          // The gram_apply advisory: left as written, spelled in the evidence.
+          decisionCase "decision_gram_apply_advisory" gramAdvisorySrc "gram-apply-advisory"
+              (declinedMentioning "gram_apply(A, A, v)") "advisory names gram_apply(A, A, v)" ]
     let passed = results |> List.filter id |> List.length
     let failed = results.Length - passed
     printFooter "Optimization Layer" [$"{passed} passed"; $"{failed} failed"]

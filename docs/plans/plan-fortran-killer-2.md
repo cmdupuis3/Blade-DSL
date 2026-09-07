@@ -124,8 +124,16 @@ callees). Both passes record a `Blade.Effects.Decision` -- rule, version, subjec
 span, applied or declined with the first reason, evidence -- into a per-flow
 collector; `blade plan <file> [--json]` installs it, lowers, and prints the record.
 Not done: the IDE-protocol exposure (the protocol package is shared with external
-clients and a new message is a surface decision), CSE / destination-reuse consumers,
-and callee purity for lambdas (they stay Unknown; fusion's IR walk still covers them).
+clients and a new message is a surface decision), and callee purity for lambdas
+(they stay Unknown; fusion's IR walk still covers them). **Landed (2026-09-07)**,
+the two consumers this paragraph named: let-level CSE over REPEATABLE values
+(`Blade.Optimize.cseModule`: straight-line bodies only, a body with any assignment or
+loop declines wholesale, deferred join operands untouched, callees judged by their
+summary; rule `cse`, `tests/OptimizeTests.fs` + `tests/corpus/functions/132`) and
+destination reuse in the form of scratch reuse (section 4, gate 2 below; rule
+`pool-reuse`). The `segment-streaming` record (v2) now also states what the
+streamed variable would hold materialized, the first number a cost model for that
+choice needs.
 
 The equivalence registry should be ordered and bounded, with stable tie breaking.
 An explicit greedy ordering is a useful v1; an unrestricted e-graph or exhaustive

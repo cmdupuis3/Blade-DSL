@@ -261,9 +261,29 @@ let private recordSegmentStreaming (modul: IRModule) : unit =
             modul.Bindings
             |> List.choose (fun b -> match b.Value with IRSegments _ | IRSegmentsGrid _ -> Some b.Id | _ -> None)
             |> Set.ofList
+        // The one number a cost model needs first: what materializing the
+        // variable would hold in memory (literal extents only; a symbolic
+        // extent says so). The choice itself stays by consumer shape.
+        let materializedBytes (s: ProviderReadSpec) : string =
+            let elem =
+                match stripUnits s.VarType.ElemType with
+                | IRTScalar (ETFloat64 | ETInt64) -> Some 8L
+                | IRTScalar (ETFloat32 | ETInt32) -> Some 4L
+                | IRTScalar ETComplex128 -> Some 16L
+                | IRTScalar ETComplex64 -> Some 8L
+                | IRTScalar ETBool -> Some 1L
+                | _ -> None
+            let cells =
+                s.VarType.IndexTypes |> List.fold (fun acc ix ->
+                    match acc, ix.Extent with
+                    | Some a, IRLit (IRLitInt n) -> Some (a * n)
+                    | _ -> None) (Some 1L)
+            match elem, cells with
+            | Some e, Some c -> $"materialized it would hold {e * c} B"
+            | _ -> "materialized size not static"
         let decide (subject: string) (outcome: Blade.Effects.DecisionOutcome) (evidence: string list) =
             Blade.Effects.Decisions.record
-                { Blade.Effects.Rule = "segment-streaming"; Version = 1
+                { Blade.Effects.Rule = "segment-streaming"; Version = 2
                   Span = Blade.Ast.noSpan; Subject = subject
                   Outcome = outcome; Evidence = evidence }
         for b in modul.Bindings do
@@ -271,7 +291,8 @@ let private recordSegmentStreaming (modul: IRModule) : unit =
             | IRReduce (IRVar (vid, _), _, _) when Map.containsKey vid streamed ->
                 let s = streamed.[vid]
                 decide b.Name Blade.Effects.Applied
-                    [ $"fold over the streamed variable '{s.VarName}' walks the store one block at a time, in storage order: the same operation sequence as the flat fold, so the answer is bitwise the materialized one" ]
+                    [ $"fold over the streamed variable '{s.VarName}' walks the store one block at a time, in storage order: the same operation sequence as the flat fold, so the answer is bitwise the materialized one"
+                      materializedBytes s ]
             | value when
                     (let mutable halo = false
                      iterIRExpr (fun e ->
@@ -281,7 +302,8 @@ let private recordSegmentStreaming (modul: IRModule) : unit =
                      halo && (streamedReadOf modul streamed value).IsSome) ->
                 let s = (streamedReadOf modul streamed value).Value
                 decide b.Name Blade.Effects.Applied
-                    [ $"the stencil over the streamed variable '{s.VarName}' runs one segment at a time; each run is read with the ghost cells its halo reach demands, nothing else of the variable is ever in memory" ]
+                    [ $"the stencil over the streamed variable '{s.VarName}' runs one segment at a time; each run is read with the ghost cells its halo reach demands, nothing else of the variable is ever in memory"
+                      materializedBytes s ]
             | value when
                     (let mutable found = false
                      iterIRExpr (fun e ->
@@ -298,14 +320,16 @@ let private recordSegmentStreaming (modul: IRModule) : unit =
                         (match info.Arrays |> List.tryPick (function IRVar (vid, _) when Map.containsKey vid streamed -> Some streamed.[vid] | _ -> None) with
                          | Some s ->
                              decide b.Name Blade.Effects.Applied
-                                 [ $"the elementwise consumer of the streamed variable '{s.VarName}' runs one block of the store's chunk edge at a time (a band of rows above rank 1), each block its own window; nothing else of the variable is ever in memory" ]
+                                 [ $"the elementwise consumer of the streamed variable '{s.VarName}' runs one block of the store's chunk edge at a time (a band of rows above rank 1), each block its own window; nothing else of the variable is ever in memory"
+                                   materializedBytes s ]
                          | None -> ())
                     | _ -> ()) value
             | IRGroupBy (IRVar (vid, _), IRVar (gid, _)) when Map.containsKey vid streamed ->
                 let s = streamed.[vid]
                 if Set.contains gid structural then
                     decide b.Name Blade.Effects.Applied
-                        [ $"group_by over the streamed variable '{s.VarName}' under a structural grouping reads one run per group straight into its row; the whole variable is never materialized" ]
+                        [ $"group_by over the streamed variable '{s.VarName}' under a structural grouping reads one run per group straight into its row; the whole variable is never materialized"
+                          materializedBytes s ]
                 else
                     decide b.Name (Blade.Effects.Declined "a key grouping needs every cell before any row is known")
                         [ $"'{s.VarName}' is streamed but the grouping is by keys; bind it with .read" ]
@@ -540,7 +564,197 @@ let planPoolReuse (modul: IRModule) : unit =
                 decide f.Name (Blade.Effects.Declined "no candidate pool is both dead and unaliased when a pool of the same shape is allocated")
                     [ $"{candidates.Length} candidate pools, peak live pool bytes {before}" ]
 
+/// A kernel reference resolved through the module's own function table
+/// (the AsyncLocal CallablesTable is not installed at this point in the
+/// pipeline, as the fusion pass notes).
+let private resolveCallableIn (funcs: Map<IRId, IRCallable>) (k: IRExpr) : IRCallable option =
+    match k with
+    | IRVar (fid, _) -> Map.tryFind fid funcs
+    | _ -> None
+
+/// LET-LEVEL COMMON-SUBEXPRESSION ELIMINATION over REPEATABLE values -- the
+/// P0 consumer plan-fortran-killer-2 section 3 listed ("reuse the facts for
+/// ... later CSE") and did not build. Straight-line only: inside one
+/// function body, a let whose value is structurally identical to an EARLIER
+/// let's value is dropped and every later reference reads the earlier one.
+/// Equality of values is equality of results only when the value is
+/// REPEATABLE (no assignment, no display, no unknown call -- a called
+/// callable's `Blade.Effects` summary is the fact, exactly as the fusion
+/// pass reads it) and nothing between the two evaluations changed an input:
+/// a body containing any assignment or loop declines wholesale, which is
+/// cheap and sound. A MayFail value is fine: the first evaluation already
+/// ran, so the second could not newly fail. Deferred lets (a bare apply left
+/// for a join) are never touched -- their identity is the join's sharing
+/// declaration, and dropping one would change what the join emits. Trivial
+/// values (a literal, a variable) are not worth a record. Every body with a
+/// hit records `cse` (applied, the pairs); nothing otherwise.
+let private cseValueRepeatable (funcs: Map<IRId, IRCallable>) (v: IRExpr) : bool =
+    let mutable ok = true
+    iterIRExpr (fun e ->
+        if ok then
+            match e with
+            | IRDisplayEmit _ | IRAssign _ | IRForRange _ -> ok <- false
+            | IRApp (IRVar (fid, _), _, _) ->
+                (match Map.tryFind fid funcs with
+                 | Some callee -> if callee.IsStatic || not (Blade.Effects.isRepeatable callee.Effects) then ok <- false
+                 | None -> ok <- false)
+            | IRApp _ -> ok <- false
+            | _ -> ()) v
+    ok
+
+let cseModule (modul: IRModule) : IRModule =
+    let funcs = modul.Functions |> List.map (fun f -> (f.Id, f)) |> Map.ofList
+    // Two references to callables are the SAME value when the callables are
+    // structurally identical: same parameter types, same captures, and the
+    // same body once each one's own parameter ids are replaced by their
+    // positions. Every `(+)` section and every inline lambda is lifted to
+    // its own callable, so two identical folds name different ids; this is
+    // the identity the comparison needs. `canonId` maps a callable to the
+    // first structurally identical one (by id order).
+    let canonKey (f: IRCallable) : string =
+        let subst = f.Params |> List.mapi (fun i p -> (p.VarId, -(i + 1))) |> Map.ofList
+        let body =
+            mapIRExpr (fun e ->
+                match e with
+                | IRVar (id, t) when Map.containsKey id subst -> IRVar (subst.[id], t)
+                | _ -> e) f.Body
+        sprintf "%A|%A|%A" (f.Params |> List.map (fun p -> p.Type)) (f.Captures |> List.map (fun c -> c.Id)) body
+    let canonId : Map<IRId, IRId> =
+        let byKey = System.Collections.Generic.Dictionary<string, IRId>()
+        modul.Functions
+        |> List.sortBy (fun f -> f.Id)
+        |> List.map (fun f ->
+            let k = canonKey f
+            match byKey.TryGetValue k with
+            | true, first -> (f.Id, first)
+            | _ -> byKey.[k] <- f.Id; (f.Id, f.Id))
+        |> Map.ofList
+    let canon (e: IRExpr) : IRExpr =
+        mapIRExpr (fun n ->
+            match n with
+            | IRVar (id, t) when Map.containsKey id canonId && canonId.[id] <> id -> IRVar (canonId.[id], t)
+            | _ -> n) e
+    let rec unroll (e: IRExpr) : (IRId * IRExpr) list * IRExpr =
+        match e with
+        | IRLet (id, v, body) ->
+            let (iv, vf) = unroll v
+            let (rb, rf) = unroll body
+            (match iv with
+             | [] -> ((id, v) :: rb, rf)
+             | _ -> (iv @ [ (id, vf) ] @ rb, rf))
+        | _ -> ([], e)
+    let trivial (v: IRExpr) =
+        match v with
+        | IRLit _ | IRVar _ | IRParam _ -> true
+        | IRApplyCombinator _ | IRComposeApply _ -> true   // deferred: a join's sharing declaration
+        | _ -> false
+    let hasBarrier (e: IRExpr) =
+        let mutable found = false
+        iterIRExpr (fun n -> match n with IRAssign _ | IRForRange _ -> found <- true | _ -> ()) e
+        found
+    let moduleSubst = System.Collections.Generic.Dictionary<IRId, IRId>()
+    let rewriteBody (f: IRCallable) : IRCallable =
+        let (lets, ret) = unroll f.Body
+        if lets.Length < 2 || hasBarrier f.Body then f
+        else
+            let subst = System.Collections.Generic.Dictionary<IRId, IRId>()
+            let applySubst (e: IRExpr) =
+                if subst.Count = 0 then e
+                else
+                    mapIRExpr (fun n ->
+                        match n with
+                        | IRVar (id, t) when subst.ContainsKey id -> IRVar (subst.[id], t)
+                        | _ -> n) e
+            let kept = ResizeArray<IRId * IRExpr>()
+            let pairs = ResizeArray<IRId * IRId>()
+            for (id, v0) in lets do
+                let v = applySubst v0
+                let dup =
+                    if trivial v || not (cseValueRepeatable funcs v) then None
+                    else
+                        let cv = canon v
+                        kept |> Seq.tryFind (fun (_, kv) -> canon kv = cv) |> Option.map fst
+                match dup with
+                | Some earlier ->
+                    subst.[id] <- earlier
+                    pairs.Add((id, earlier))
+                | None -> kept.Add((id, v))
+            if pairs.Count = 0 then f
+            else
+                let ret' = applySubst ret
+                let body' = Seq.foldBack (fun (id, v) acc -> IRLet (id, v, acc)) kept ret'
+                // A dropped let may be CAPTURED by a kernel lambda lifted out of
+                // this body: that callable's capture list and body name the
+                // dropped id, and codegen forwards captures by name, so both
+                // are rewritten too (ids are program-global, so this is exact).
+                for (j, i) in pairs do moduleSubst.[j] <- i
+                Blade.Effects.Decisions.record
+                    { Blade.Effects.Rule = "cse"; Version = 1
+                      Span = Blade.Ast.noSpan; Subject = f.Name
+                      Outcome = Blade.Effects.Applied
+                      Evidence = pairs |> Seq.map (fun (j, i) -> $"__v{j} is the same repeatable value as __v{i}: dropped, its reads go to __v{i}") |> List.ofSeq }
+                { f with Body = body' }
+    let rewritten = modul.Functions |> List.map rewriteBody
+    if moduleSubst.Count = 0 then { modul with Functions = rewritten }
+    else
+        let fix (e: IRExpr) =
+            mapIRExpr (fun n ->
+                match n with
+                | IRVar (id, t) when moduleSubst.ContainsKey id -> IRVar (moduleSubst.[id], t)
+                | _ -> n) e
+        { modul with
+            Functions =
+                rewritten |> List.map (fun g ->
+                    { g with
+                        Body = fix g.Body
+                        Captures = g.Captures |> List.map (fun c -> if moduleSubst.ContainsKey c.Id then { c with Id = moduleSubst.[c.Id] } else c) }) }
+
+/// The structural/05 D7 ADVISORY, never a rewrite: the checker/optimizer sees
+/// `gram(A, A)` decompacted and applied to a vector by a row `prodsum` -- an
+/// N x N matrix formed and read once -- and records that `gram_apply(A, A,
+/// v)` declares the same action without the matrix. Recorded as a DECLINED
+/// decision ("left as written") so `blade plan` shows it beside the others;
+/// the fastest-way P3 advisory channel, when it exists, can lift it.
+let private recordGramApplyAdvisory (modul: IRModule) : unit =
+    let funcs = modul.Functions |> List.map (fun f -> (f.Id, f)) |> Map.ofList
+    let values = modul.Bindings |> List.map (fun b -> (b.Id, b)) |> Map.ofList
+    let rec collapse (e: IRExpr) = match e with IRCompute i -> collapse i | e -> e
+    for b in modul.Bindings do
+        match collapse b.Value with
+        | IRApplyCombinator info ->
+            (match info.Arrays, resolveCallableIn funcs info.Kernel with
+             | [ IRVar (gdId, _) ], Some k ->
+                // prodsum's two operands arrive in either order (the checker
+                // may canonicalize them): one is the row parameter, the other
+                // the vector.
+                let rowAndVec (p: IRParam) (body: IRExpr) =
+                    match body with
+                    | IRProdSum [ IRVar (a, _); IRVar (b, _) ] when a = p.VarId -> Some b
+                    | IRProdSum [ IRVar (a, _); IRVar (b, _) ] when b = p.VarId -> Some a
+                    | _ -> None
+                (match Map.tryFind gdId values, k.Params, k.Params |> List.tryHead |> Option.bind (fun p -> rowAndVec p k.Body) with
+                 | Some gd, [ _ ], Some vid ->
+                    (match gd.Value with
+                     | IRDecompact (IRVar (gId, _), 0) ->
+                        (match Map.tryFind gId values with
+                         | Some g ->
+                            (match g.Value with
+                             | IRGram (IRVar (aId, _), IRVar (a2, _), true) when aId = a2 ->
+                                let nameOf id = modul.Bindings |> List.tryFind (fun x -> x.Id = id) |> Option.map (fun x -> x.Name) |> Option.defaultValue $"__v{id}"
+                                Blade.Effects.Decisions.record
+                                    { Blade.Effects.Rule = "gram-apply-advisory"; Version = 1
+                                      Span = Blade.Ast.noSpan; Subject = b.Name
+                                      Outcome = Blade.Effects.Declined $"left as written (advise, never rewrite): `gram_apply({nameOf aId}, {nameOf aId}, {nameOf vid})` declares the same action without the N x N pool"
+                                      Evidence = [ $"`{b.Name}` forms the Gram matrix of `{nameOf aId}` (gram, decompact) and applies it once by a row prodsum against `{nameOf vid}`; `gram_apply({nameOf aId}, {nameOf aId}, {nameOf vid})` declares the same action with two rank-1 temporaries and no N x N pool (docs/plans/structural/05)" ] }
+                             | _ -> ())
+                         | None -> ())
+                     | _ -> ())
+                 | _ -> ())
+             | _ -> ())
+        | _ -> ()
+
 let optimizeModule (builder: IRBuilder) (modul: IRModule) : IRModule =
+    recordGramApplyAdvisory modul
     recordSegmentStreaming modul
     modul
     |> foldConstMatchesModule

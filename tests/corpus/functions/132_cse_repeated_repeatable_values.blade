@@ -1,0 +1,38 @@
+// TEST: Functions CSE Of Repeated Repeatable Values
+// Let-level common-subexpression elimination (Blade.Optimize.cseModule): in
+// one function body a let whose value is identical to an earlier let's is
+// dropped and its reads go to the earlier one -- for a scalar fold computed
+// twice and for an array map spelled twice -- when the value is REPEATABLE
+// (no assignment, no output, no unknown call) and nothing in the body could
+// change an input between the two. tests/OptimizeTests.fs pins the emission
+// (one fold per body, the decision record); this file is the value side in
+// both lanes (the interpreter runs every let as written).
+type I = Idx<7>
+function twice(x: Array<Float like I>) -> Float = {
+    let y = x * 2.0
+    let s1 = reduce(y, (+))
+    let s2 = reduce(y, (+))
+    s1 * 0.5 + s2 * 0.25
+}
+function doubled(x: Array<Float like I>) -> Float = {
+    let p = x * 2.0
+    let q = x * 2.0
+    let both = p + q
+    reduce(both, (+))
+}
+let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+let t = twice(a)
+let d = doubled(a)
+// EXPECT: t = 42
+// EXPECT: d = 112
+// A body with an assignment declines CSE wholesale: both folds run, and the
+// second sees the mutated array.
+function mutated(x: Array<Float like I>) -> Float = {
+    let mut y = x * 2.0
+    let s1 = reduce(y, (+))
+    y((0 : I)) = 100.0
+    let s2 = reduce(y, (+))
+    s2 - s1
+}
+let m = mutated(a)
+// EXPECT: m = 98
