@@ -558,6 +558,36 @@ It makes reproducing a result practical, but is not a mathematical guarantee of
 cross-platform equality. Provide logical input names so records need not expose
 machine-specific paths.
 
+**Landed (2026-09-07): the manifest and the run record, v1.** `src/RunRecord.fs`
+derives the INPUT MANIFEST of a lowered program: one entry per provider read
+(`IRModule.ProviderReads`, named by its receiving binding -- provider, path, variable,
+element type, ordered axes with static extents, storage interpretation
+dense/packed/compound/window/stream, units when the element carries one) plus one per
+input the COMPILER folded (`let static ... |> alias.read`; `ProviderStatics` logs
+each compilation's folds with the SHA-256 the fold was taken over). The identity
+policy is recorded per entry: `content` for a fold (the hash IS the identity the
+executable's values depend on), `version` for a runtime read (size + mtime observed
+at run; the values depend on content nobody hashed). `blade plan` prints the manifest
+after the decisions (`--json` adds an `inputs` array). Codegen bakes the same table
+into every program as a static row table plus a file-scope `blade_rr::AtExit`
+(`src/cpp/blade_run_record.hpp`) whose destructor runs on the normal return and on the
+runtime's failure exit alike; when `BLADE_RUN_RECORD=<path>` is set (or `blade run
+--run-record path`) it writes ONE JSON object: program, status (`ok`, or the BLxxxx
+code + message `blade_rt::panic` left behind), executable path/size/mtime + the
+toolchain (`__VERSION__`) + the compiler version, the build policy (march,
+fp-contract, reassoc) and the library routes actually linked (BLAS / LAPACK / cuBLAS)
+-- these travel as `-DBLADE_RR_*` defines on the g++ command line so the emitted
+.cpp carries no environment and the executable cache keys on them -- the RNG
+generator when the program draws (`philox4x32-10` v1), and per input the manifest
+row plus what the run observed (exists, file/directory, size or entry count,
+mtime). Rank 0 writes under MPI. Pins: `tests/RunRecordTests.fs` (manifest,
+renderings, folded identity, emission determinism and environment-freedom, and with
+g++ the ok record, the no-pin no-file case, and the BL8007 abort record); `blade
+test run-record`. Not done: RNG stream keys (runtime values), a content hash on
+runtime reads (policy, not omission), coordinate identity (equal shapes on a
+different grid), a schema-compatibility check on resume -- the demo's "reject a
+swapped-axis input" is BL8012's today, at the read, not the manifest's.
+
 ### Restartable recursive arrays
 
 Use the already explicit step ordinal and lag reads to derive a restart envelope:

@@ -2660,6 +2660,7 @@ let genIncludes () : string list =
      "#include \"rand_runtime.hpp\""
      "#include <exception>"                 // std::exception for main()'s BL8005 catch
      "#include \"blade_runtime.hpp\""        // blade_rt::panic + BLADE_FRAME shadow stack
+     "#include \"blade_run_record.hpp\""     // BLADE_RUN_RECORD: manifest + observed inputs + status at exit
      ]
     // Memcheck instrumentation (BLADE_MEMCHECK=1 only): appended as an extra
     // element, never a placeholder comment, so default output stays
@@ -2785,6 +2786,10 @@ let runtimeHeaderNames : string list =
       // BLADE_FRAME macro. Header-only, host-only (device passes see
       // no-op stubs); deployed unconditionally and included by every program.
       "blade_runtime.hpp"
+      // The run record (BLADE_RUN_RECORD): the baked input manifest paired
+      // at exit with what the run observed and how it ended. Header-only,
+      // host-only; deployed unconditionally and included by every program.
+      "blade_run_record.hpp"
       // Dense linear-algebra dispatch: blade_gemm / blade_syrk plus the
       // gram/matmul adapters, resolving to cblas under -DBLADE_HAS_BLAS and to
       // native fallbacks otherwise. INCLUDED only by programs that actually
@@ -2905,6 +2910,7 @@ let genIncludesExternal () : string list =
      "#include \"rand_runtime.hpp\""
      "#include <exception>"                 // std::exception for main()'s BL8005 catch
      "#include \"blade_runtime.hpp\""        // blade_rt::panic + BLADE_FRAME shadow stack
+     "#include \"blade_run_record.hpp\""     // BLADE_RUN_RECORD: manifest + observed inputs + status at exit
      ]
     // Memcheck instrumentation -- see the sibling include block above.
     @ (if memcheckEnabled () then ["#include \"blade_memcheck.hpp\""] else [])

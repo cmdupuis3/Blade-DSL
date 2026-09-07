@@ -2659,6 +2659,11 @@ let rec internal dispatchTest (rest: string list) : int =
         // on the fly by IcechunkWrite; only the e2e compile+run block needs
         // g++ and skips without it.
         Blade.Tests.IcechunkTests.runIcechunkTests ()
+    | [ "run-record" ] | [ "runrecord" ] ->
+        // Input manifests + run records (plan-fortran-killer-2 section 7).
+        // Also in the default suite (RunAll.fs yields `runRecord`).
+        let failed = (Blade.Tests.RunRecordTests.runRunRecordTests ()).Failed
+        if failed = 0 then 0 else 1
     | [ "provider-desugar" ] | [ "providerdesugar" ] ->
         // The icechunk checkout desugar (src/ProviderDesugar.fs). Pure
         // in-process AST rewrite; no toolchain, no fixtures, never skips.

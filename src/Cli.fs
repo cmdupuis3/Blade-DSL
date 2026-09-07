@@ -100,6 +100,15 @@ let private dispatchInner (args: string[]) : int =
                  | true, v when v > 0 -> mpiRanks <- Some v; parse tl
                  | _ -> bad <- Some $"--mpi expects a positive rank count, got '{n}'")
             | ["--mpi"] -> bad <- Some "--mpi requires a rank count (e.g. run prog.blade --mpi 4)"
+            | "--run-record" :: p :: tl when not (p.StartsWith "--") ->
+                // The executable writes its run record (input manifest +
+                // observed identities + status) to this path at exit. A
+                // process-level pin, as --memcheck is: the child inherits
+                // the environment, and the exe runs with ITS directory as
+                // cwd, so the path is made absolute here.
+                System.Environment.SetEnvironmentVariable("BLADE_RUN_RECORD", System.IO.Path.GetFullPath p)
+                parse tl
+            | ["--run-record"] | "--run-record" :: _ -> bad <- Some "--run-record requires a destination path (e.g. run prog.blade --run-record run.json)"
             | f :: tl when file.IsNone && not (f.StartsWith "--") -> file <- Some f; parse tl
             | f :: _ -> bad <- Some $"unexpected argument '{f}'"
         parse rest

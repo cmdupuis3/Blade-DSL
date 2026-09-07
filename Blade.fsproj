@@ -177,6 +177,10 @@
          data reader into StaticEval's provider hook (fold + provenance).
          Must follow both NetcdfProvider.fs and StaticEval.fs. -->
     <Compile Include="src/ProviderStatics.fs" />
+    <!-- Input manifests + run records (plan-fortran-killer-2 section 7): the
+         provider-read table `blade plan` prints and codegen bakes for
+         blade_run_record.hpp. Needs IR/Types only; used by CodeGen and the CLI. -->
+    <Compile Include="src/RunRecord.fs" />
     <!-- Constrained records as index types, stage C1 — the COUNTING half
          (retired constrained-index-types plan, §7). Box enumeration over the
          per-field inclusive bounds, the flat-filter vs arrow-heads
@@ -569,6 +573,9 @@
     <Compile Include="tests/NetcdfTests.fs" />
     <Compile Include="tests/ZarrTests.fs" />
     <Compile Include="tests/CsvTests.fs" />
+    <!-- Input manifests + run records: the manifest table, its emission, and
+         (with g++) the record a run writes, ok and aborting. -->
+    <Compile Include="tests/RunRecordTests.fs" />
     <Compile Include="tests/IcechunkTests.fs" />
     <!-- The checkout-desugar pass's own pins (src/ProviderDesugar.fs). Pure
          in-process AST rewrite: no store, no registry, no g++, never skips. -->
@@ -710,6 +717,10 @@
     </None>
     <None Include="src/cpp/blade_runtime.hpp">
       <Link>cpp/blade_runtime.hpp</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="src/cpp/blade_run_record.hpp">
+      <Link>cpp/blade_run_record.hpp</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="src/cpp/blade_linalg.hpp">

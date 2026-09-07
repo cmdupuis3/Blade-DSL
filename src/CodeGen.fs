@@ -2637,6 +2637,20 @@ let private netcdfFinalizeLines : string list =
 let private netcdfRegisterLines : string list =
     [ "    std::atexit(__blade_nc_finalize);" ]
 
+/// The run record's file-scope lines (Blade.RunRecord.cppLines): the input
+/// manifest of this module -- its provider reads plus the folds this
+/// compilation logged -- and the static writer. `emitted` is the program
+/// text assembled so far, sniffed for the `rand` runtime so the record can
+/// name the generator. Every program carries the record (a getenv at exit
+/// when BLADE_RUN_RECORD is unset), so byte-identity across builds of the
+/// same program is unaffected and no environment reaches the emitted text.
+let private runRecordLines (modul: IRModule) (testName: string) (mpiOn: bool) (emitted: string list) : string list =
+    let folds = Blade.ProviderStatics.drainFoldLog ()
+    let entries = Blade.RunRecord.manifestOf [ modul ] folds
+    let usesRng = emitted |> List.exists (fun (l: string) -> l.Contains "blade_rand::")
+    let rankExpr = if mpiOn then "&__blade_mpi_rank" else "nullptr"
+    Blade.RunRecord.cppLines testName Blade.RunRecord.bladeVersion usesRng rankExpr entries @ [ "" ]
+
 let genMainWrapper (mpi: bool, mpiThreaded: bool, netcdf: bool) (testName: string) (bodyIndented: string list) (printCode: string list) : string list =
     let header =
         if mpi then
@@ -2864,8 +2878,9 @@ let genMainProgram (modul: IRModule) (testName: string) : string =
 
     let bodyIndented = bindCode |> List.map (fun s -> "    " + s)
     let mainFunc = genMainWrapper (mpiOn, mpiOn && moduleHybridMpiOmp modul, moduleUsesNetcdf modul) testName bodyIndented []
+    let rrLines = runRecordLines modul testName mpiOn (funcDefs @ mainFunc)
 
-    (includes @ [""] @ mpiDecls @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainFunc) |> String.concat "\n"
+    (includes @ [""] @ mpiDecls @ rrLines @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainFunc) |> String.concat "\n"
 
 /// The .cu file content for the most recently assembled program, or None if no
 /// CUDA kernel was emitted. Call AFTER genMainProgram/genProgramFromIR (the
@@ -3076,7 +3091,8 @@ let genSelfContainedProgram (modul: IRModule) (testName: string) : string =
     // S0: module-level bindings promoted to namespace scope (declaration only).
     let moduleGlobalDecls = (moduleGlobalDeclsCell ()).Value
 
-    (includes @ typeDefs @ [""] @ mpiDecls @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainBody) |> String.concat "\n"
+    let rrLines = runRecordLines modul testName mpiOn (funcDefs @ mainBody)
+    (includes @ typeDefs @ [""] @ mpiDecls @ rrLines @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainBody) |> String.concat "\n"
 
 /// Generate a C++ program with external runtime header
 /// Returns (mainFileContent, headerFileContent)
@@ -3141,7 +3157,8 @@ let genProgramWithExternalRuntime (modul: IRModule) (testName: string) : string 
 
     // S0: module-level bindings promoted to namespace scope (declaration only).
     let moduleGlobalDecls = (moduleGlobalDeclsCell ()).Value
-    let mainFile = (includes @ typeDefs @ [""] @ mpiDecls @ moduleGlobalDecls @ funcDefs @ mainFunc) |> String.concat "\n"
+    let rrLines = runRecordLines modul testName mpiOn (funcDefs @ mainFunc)
+    let mainFile = (includes @ typeDefs @ [""] @ mpiDecls @ rrLines @ moduleGlobalDecls @ funcDefs @ mainFunc) |> String.concat "\n"
     let headerFile = genRuntimeHeader ()
     (mainFile, headerFile)
 

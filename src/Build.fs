@@ -884,7 +884,19 @@ let compileCppWithExtraSource (srcText: string option) (extraLinkInputs: string 
         | Ok deviceInputs ->
 
         let extraFlags = (extraLinkInputs @ deviceInputs) |> List.map (fun p -> $" \"{Path.GetFullPath p}\"") |> String.concat ""
-        let args = $"-std=c++17 {optFlags ()} {ompFlag} {safetyFlags}{blasCompileFlags} -o \"{exeFullPath}\" \"{cppFullPath}\"{extraFlags}{netcdfFlags}{mpiFlags}{blasLinkFlags}"
+        // The run record's build policy and library routes (blade_run_record.hpp
+        // stringizes these). On the COMMAND LINE, not in the emitted text, so
+        // the .cpp stays environment-free; the executable cache keys on args.
+        let rrDefines =
+            let tok (frag: string) =
+                match frag.IndexOf '=' with
+                | -1 -> "off"
+                | i -> frag.Substring(i + 1).Trim()
+            let march = (let f = marchFlag () in if f = "" then "off" else tok f)
+            let fpc = tok (fpContractFlag ())
+            let flag (b: bool) = if b then "1" else "0"
+            $" -DBLADE_RR_MARCH={march} -DBLADE_RR_FPC={fpc} -DBLADE_RR_REASSOC={flag (Blade.CodeGenState.fpReassocEnabled ())} -DBLADE_RR_BLAS={flag wantsBlas} -DBLADE_RR_LAPACK={flag wantsLapack} -DBLADE_RR_CUBLAS={flag (not (List.isEmpty deviceInputs))}"
+        let args = $"-std=c++17 {optFlags ()}{rrDefines} {ompFlag} {safetyFlags}{blasCompileFlags} -o \"{exeFullPath}\" \"{cppFullPath}\"{extraFlags}{netcdfFlags}{mpiFlags}{blasLinkFlags}"
         
         // The executable cache (Stage 4.1, above). v1 scope, deliberately
         // narrow -- every excluded lane is one whose inputs are not fully

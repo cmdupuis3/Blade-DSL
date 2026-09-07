@@ -100,7 +100,34 @@ let netcdfSpec : Blade.ProviderRegistry.ProviderSpec = {
 let private foldCache =
     System.Collections.Concurrent.ConcurrentDictionary<string * string * string * int64, Result<StaticValue, string>>()
 
-let private readAndFoldUncached (provider: string) (path: string) (varName: string) : Result<StaticValue, string> =
+/// The content hash each cached fold was taken over, keyed as `foldCache` is,
+/// so a cache HIT can still be logged with its identity.
+let private foldHashes =
+    System.Collections.Concurrent.ConcurrentDictionary<string * string * string * int64, string>()
+
+/// Per-compilation log of folded inputs -- `(provider, path, variable,
+/// sha256)` -- the manifest's `content`-identity entries (Blade.RunRecord).
+/// Reset by `TypeCheck.typeCheck` at the start of every program and drained
+/// by the plan verb and by codegen's assembly, so a harness compiling many
+/// programs in one process attributes each fold to its own program. A cache
+/// hit logs too: the fold IS an input of this program whether or not the
+/// bytes were re-read. Async-local like Effects.Decisions.
+let private foldLog = System.Threading.AsyncLocal<ResizeArray<string * string * string * string>>()
+let resetFoldLog () = foldLog.Value <- ResizeArray()
+let drainFoldLog () : (string * string * string * string) list =
+    match foldLog.Value with
+    | null -> []
+    | l ->
+        let xs = List.ofSeq l
+        l.Clear()
+        xs
+let private logFold (entry: string * string * string * string) =
+    (match foldLog.Value with
+     | null -> foldLog.Value <- ResizeArray()
+     | _ -> ())
+    if not (foldLog.Value.Contains entry) then foldLog.Value.Add entry
+
+let private readAndFoldUncached (provider: string) (path: string) (varName: string) (key: string * string * string * int64) : Result<StaticValue, string> =
     match Blade.ProviderRegistry.tryFind provider with
     | None ->
         Error $"provider '{provider}' is not registered -- was ProviderStatics.install () run?"
@@ -115,6 +142,7 @@ let private readAndFoldUncached (provider: string) (path: string) (varName: stri
             else
                 let h = spec.Fingerprint path
                 provenance.Add((path, varName, h))
+                foldHashes.[key] <- h
                 eprintfn "[provenance] folded %s from %s@%s" varName path (h.Substring(0, min 12 h.Length))
                 match data.Payload with
                 | Blade.ProviderRegistry.PFloats xs -> Ok (shapeValue data.DimLengths (fun i -> SVFloat xs.[i]))
@@ -125,7 +153,12 @@ let private readAndFold (provider: string) (path: string) (varName: string) : Re
         match Blade.ProviderRegistry.tryFind provider with
         | Some spec -> spec.VersionStamp path
         | None -> 0L
-    foldCache.GetOrAdd((provider, path, varName, stamp), fun _ -> readAndFoldUncached provider path varName)
+    let key = (provider, path, varName, stamp)
+    let r = foldCache.GetOrAdd(key, fun _ -> readAndFoldUncached provider path varName key)
+    (match r, foldHashes.TryGetValue key with
+     | Ok _, (true, h) -> logFold (provider, path, varName, h)
+     | _ -> ())
+    r
 
 /// Axis extents of a store: dim name -> extent, read from the provider's
 /// own metadata module -- the same read TypeCheck performs at `let store =

@@ -8,7 +8,7 @@ open System.IO
 open Blade.Build
 open Blade.Lowering
 
-let compilerVersion = "0.20.0"
+let compilerVersion = Blade.RunRecord.bladeVersion
 
 let printUsage () =
     printfn "Blade Compiler v%s" compilerVersion
@@ -745,14 +745,22 @@ let planFile (filePath: string) (json: bool) : int =
         | Error ds, sm ->
             Blade.Effects.Decisions.drain () |> ignore
             reportFailure (Blade.Diagnostics.Render.renderAll useColor (Some sm) ds)
-        | Ok _, _ ->
+        | Ok (program, _), _ ->
             let ds = Blade.Effects.Decisions.drain ()
+            // The input manifest (docs/plans/plan-fortran-killer-2.md section 7):
+            // runtime provider reads plus the inputs this compilation folded.
+            let inputs = Blade.RunRecord.manifestOf program.Modules (Blade.ProviderStatics.drainFoldLog ())
             if json then
-                printfn "%s" (Blade.Effects.Decisions.renderJson filePath ds)
+                let js = Blade.Effects.Decisions.renderJson filePath ds
+                // `{"file":..,"decisions":[..]}` -> add the manifest as a sibling.
+                printfn "%s" (js.Substring(0, js.Length - 1) + ",\"inputs\":" + Blade.RunRecord.renderJson inputs + "}")
             else
                 printfn "plan: %s -- %d optimization decision(s)" filePath ds.Length
                 for d in ds do
                     printfn "  %s" (Blade.Effects.Decisions.render d)
+                printfn "inputs: %d (identity policy: `content` = folded at compile time, hashed; `version` = read at run time, size + mtime observed -- BLADE_RUN_RECORD=<path> writes the run record)" inputs.Length
+                for e in inputs do
+                    printfn "  %s" (Blade.RunRecord.renderEntry e)
             0
 
 let checkFile (filePath: string) (strictPins: bool) : int =

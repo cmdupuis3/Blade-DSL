@@ -417,6 +417,12 @@ let runAllTestsFullWith (extraBlocks: (unit -> Blade.Tests.TestHarness.BlockResu
     // unconditional here rather than reachable only through the standalone
     // verb. (Also reachable standalone as `blade test provider-desugar`.)
     let providerDesugar = Blade.Tests.ProviderDesugarTests.runProviderDesugarBlock ()
+    // Input manifests + run records (src/RunRecord.fs, blade_run_record.hpp):
+    // the manifest of a CSV-reading program, its baked emission, and -- with
+    // g++ -- the JSON a run writes to BLADE_RUN_RECORD, on the ok path and
+    // on a BL8007 abort. The e2e halves skip without g++. (Also `blade test
+    // run-record`.)
+    let runRecord = Blade.Tests.RunRecordTests.runRunRecordTests ()
     // OpenMP thread-coverage: verifies emitted pragmas form genuine parallel
     // regions when cores are available. Opt-in (see FullSuiteOptions).
     let omp =
@@ -504,7 +510,7 @@ let runAllTestsFullWith (extraBlocks: (unit -> Blade.Tests.TestHarness.BlockResu
         [ yield r1; yield r2; yield attrs; yield subst
           yield normalize; yield unify; yield validateArrow; yield displayFrames; yield grRender
           yield shape; yield oracles; yield orbRank; yield wigner; yield symPower; yield polyOracle; yield lieTables; yield permSpec; yield permOracle; yield structIdxSpec; yield structIdxOracle; yield pointSpec; yield pgOracle; yield cartBridge; yield spans; yield diagCore; yield diagCorpus; yield certSuggest; yield repDiff; yield repCheck; yield repReject; yield alloc; yield orbWreath
-          yield ompPragma; yield linalgEmit; yield linalgProbe; yield blasTier; yield doctorBlock; yield setupBlock; yield factoryFlat; yield gatherElision; yield lapackEmit; yield shapeSpec; yield flatPath; yield optimizeLayer; yield randMirror; yield accessLayer; yield moduleResolve; yield providerDesugar
+          yield ompPragma; yield linalgEmit; yield linalgProbe; yield blasTier; yield doctorBlock; yield setupBlock; yield factoryFlat; yield gatherElision; yield lapackEmit; yield shapeSpec; yield flatPath; yield optimizeLayer; yield randMirror; yield accessLayer; yield moduleResolve; yield providerDesugar; yield runRecord
           match omp with Some b -> yield b | None -> ()
           match ompReduce with Some b -> yield b | None -> ()
           yield bufType

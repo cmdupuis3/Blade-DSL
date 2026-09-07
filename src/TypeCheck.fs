@@ -285,6 +285,9 @@ let typeCheck (program: Program) : Result<TypedProgram * IRBuilder * string list
     // ANY resolveStatics pass runs (the ML and PPL elaborations each run
     // their own; all inherit the fold through StaticEval's hook).
     Blade.ProviderStatics.install ()
+    // A fresh fold log for this program (the run record's `content`-identity
+    // inputs; see ProviderStatics.resetFoldLog).
+    Blade.ProviderStatics.resetFoldLog ()
     // The constrained-index counting layer's `idx_card(R)` builtin, on the
     // same footing and for the same reason: registered before ANY
     // resolveStatics pass, so every elaboration's own statics can size
