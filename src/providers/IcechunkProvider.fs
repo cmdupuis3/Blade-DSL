@@ -2781,6 +2781,8 @@ let spec : Blade.ProviderRegistry.ProviderSpec = {
     GenWriteVar = CppIcechunk.genWriteVar
     GenStreamOpen = None       // `.stream`: deferred (the baked table makes fiber reads easy later)
     GenStreamFiber = None
+    GenStreamRowsOpen = None
+    GenStreamRows = None
     Includes = CppIcechunk.genIncludes
     VarDimNames = fun path varName ->
         // Must not throw on an unreadable store: writers fall back to

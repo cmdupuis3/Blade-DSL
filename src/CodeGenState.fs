@@ -74,6 +74,10 @@ type CodeGenContext = {
     /// Streamed provider reads whose prologue is already emitted, keyed by cpp name:
     /// a hit means inline a fiber read at the S/T boundary instead of peeling.
     StreamedArrays: Map<string, ProviderReadSpec>
+    /// Groupings emitted by genSegmentsBinding (structural: static offsets,
+    /// identity accessor), by cpp name. A group_by over a STREAMED rank-1
+    /// variable and one of these reads per run (docs/plans/structural/07 §3.4).
+    StructuralGroupings: Set<string>
     /// Deferred random-fill constructors keyed by binding id (from IRModule.RandomInits);
     /// genBinding emits allocate<> + a pool fill from the RandomFillSpec.
     RandomInits: Map<IRId, RandomFillSpec>
@@ -1111,6 +1115,7 @@ let emptyContext () = {
     ProviderReads = Map.empty
     ProviderWrites = Map.empty
     StreamedArrays = Map.empty
+    StructuralGroupings = Set.empty
     RandomInits = Map.empty
     CompoundInits = Map.empty
     SparseInits = Map.empty

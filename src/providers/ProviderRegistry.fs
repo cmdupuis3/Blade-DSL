@@ -77,6 +77,16 @@ type ProviderSpec = {
     /// index expressions. Handles are read-only, left open for the program's lifetime.
     GenStreamOpen: (string -> string -> string -> IRArrayType -> string list) option
     GenStreamFiber: (string -> string -> string -> string -> string list -> IRArrayType -> string list) option
+    /// PER-SEGMENT streamed reads of a RANK-1 dense variable (docs/plans/
+    /// structural/07 §3.4): `group_by(A, segments(X))` over `A = s.vars.A |>
+    /// alias.stream` reads each run's cells straight into that group's row --
+    /// no whole-array buffer ever exists. Open args: path, varName,
+    /// cppVarName, arrType (the prologue: metadata probe, chunk scratch
+    /// buffer, fill value). Rows args: path, varName, cppVarName, destination
+    /// pointer expression, lo and hi C++ expressions (the run [lo, hi) in
+    /// the variable's own ordinals), arrType. None: rank-1 streams refuse.
+    GenStreamRowsOpen: (string -> string -> string -> IRArrayType -> string list) option
+    GenStreamRows: (string -> string -> string -> string -> string -> string -> IRArrayType -> string list) option
     /// #include lines injected when a module reads/writes via this provider
     /// (packed/simplex reads also pull linearized_storage.hpp separately).
     Includes: unit -> string list

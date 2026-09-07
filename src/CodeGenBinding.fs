@@ -1362,9 +1362,21 @@ and genProviderReadBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: 
         // per-fiber reads via ctx.StreamedArrays; nothing named `name`
         // exists as an array, so any non-nest consumer fails to compile --
         // and the eligible-shape checks in the nest fail loudly first.
-        match pspec.GenStreamOpen with
+        // A RANK-1 stream has no fiber to read by site: it streams per
+        // SEGMENT under a structural grouping (docs/plans/structural/07
+        // §3.4), through the provider's rows prologue.
+        let rank1 = spec.VarType.IndexTypes.Length = 1
+        let opener =
+            if rank1 then
+                match pspec.GenStreamRowsOpen with
+                | Some g -> Some g
+                | None -> None
+            else pspec.GenStreamOpen
+        match opener with
         | None ->
-            raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"provider '{spec.Provider}' does not support streamed reads (variable '{spec.VarName}' -- bind with .read)")))
+            raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan (
+                if rank1 then $"provider '{spec.Provider}' does not support per-segment streamed reads of a rank-1 variable ('{spec.VarName}' -- bind with .read)"
+                else $"provider '{spec.Provider}' does not support streamed reads (variable '{spec.VarName}' -- bind with .read)")))
         | Some gen ->
             let code = gen spec.FilePath spec.VarName name spec.VarType
             let ctx' = addVarName binding.Id name ctx
@@ -2077,6 +2089,55 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
     // pointer for downstream peeling. Print's inner-loop bound of 0
     // means no values printed, matching prior behavior.
     //
+    // PER-SEGMENT STREAM (docs/plans/structural/07 §3.4): the values are a
+    // rank-1 variable bound with `.stream` (no array named after it exists)
+    // and the grouping is structural (static run boundaries), so each row
+    // is read from the store directly into its slot of the pool -- the
+    // whole variable is never materialized. Any other consumer of a
+    // streamed variable, and a key grouping over one, keep the standing
+    // refusals.
+    let streamedVals =
+        match vals with
+        | IRVar (vid, _) ->
+            (match Map.tryFind vid ctx.VarNames with
+             | Some vn -> Map.tryFind vn ctx.StreamedArrays |> Option.map (fun s -> (vn, s))
+             | None -> None)
+        | _ -> None
+    match streamedVals with
+    | Some (valsName, spec) ->
+        let gkName = exprToCppCtx ctx gk
+        if not (Set.contains gkName ctx.StructuralGroupings) then
+            let ctx' = addVarName binding.Id name ctx
+            (codegenError ctx ind $"group_by over the streamed variable '{spec.VarName}' needs a structural grouping (`segments(..)` / `files(..)`), which reads one run at a time; a key grouping needs the whole variable -- bind it with .read", ctx')
+        else
+        let pspec = (Blade.ProviderRegistry.tryFind spec.Provider).Value
+        match pspec.GenStreamRows with
+        | None ->
+            let ctx' = addVarName binding.Id name ctx
+            (codegenError ctx ind $"provider '{spec.Provider}' does not support per-segment streamed reads ('{spec.VarName}' -- bind with .read)", ctx')
+        | Some genRows ->
+            let elemStr = elemTypeToCpp spec.VarType.ElemType
+            let extentsDecl =
+                fst (emitExtentsTable ind (name + "_extents") 2
+                         [($"{gkName}__ngroups", false); ("0 /* inner extent is ragged */", false)])
+            let rowRead =
+                genRows spec.FilePath spec.VarName valsName ($"{name}__pool + __off") $"{gkName}__offsets[__g]" $"{gkName}__offsets[__g + 1]" spec.VarType
+                |> List.map (fun s -> ind + "    " + s)
+            let code =
+                [ $"{ind}// group_by: per-segment STREAMED rows of '{spec.VarName}' -- each run read from the store into its slot; no whole-array buffer" ]
+                @ extentsDecl
+                @ [ $$"""{{ind}}Array<{{elemStr}}*, 1> {{name}} = { new {{elemStr}}*[{{gkName}}__ngroups], {{name}}_extents };"""
+                    $"{ind}{elemStr}* {name}__pool = new {elemStr}[{gkName}__offsets[{gkName}__ngroups]];"
+                    $$"""{{ind}}for (size_t __g = 0; __g < {{gkName}}__ngroups; __g++) {"""
+                    $"{ind}    size_t __off = {gkName}__offsets[__g];"
+                    $"{ind}    {name}[__g] = {name}__pool + __off;" ]
+                @ rowRead
+                @ [ $"{ind}}}" ]
+            registerShapedAlloc name "deallocate_ragged_storage"
+            let ctx' = addVarName binding.Id name ctx
+            let ctx' = { ctx' with GroupedArrays = Map.add name gkName ctx'.GroupedArrays }
+            (code, ctx')
+    | None ->
     // group_by's copy loop indexes vals by name, so it needs a MATERIALIZED
     // input; the shared helper forces a still-deferred or inline vals first.
     let (forceCode, ctx, vals) = forceDeferredArrayInput ctx builder ($"{name}__vals") vals
@@ -2183,6 +2244,7 @@ and genSegmentsBinding (ctx: CodeGenContext) (binding: IRBinding) (offsets: int6
           $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
           $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets (structural: no __perm)" ]
     let ctx' = addVarName binding.Id name ctx
+    let ctx' = { ctx' with StructuralGroupings = Set.add name ctx'.StructuralGroupings }
     (code, ctx')
 
 /// ungroup(G): the rows of a segment-grouped array written back over the

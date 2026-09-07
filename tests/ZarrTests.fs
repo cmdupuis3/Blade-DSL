@@ -819,6 +819,77 @@ let a = ungroup([a2, a1], T)
     fileLevelE2E ()
 
     // ---------------------------------------------------------------
+    // 10e. PER-SEGMENT streamed reads (docs/plans/structural/07 §3.4): a rank-1
+    // variable bound with `.stream` and grouped by a structural grouping is
+    // read one run at a time, straight into each group's row -- the emitted
+    // C++ has no whole-array buffer for it. A KEY grouping over a streamed
+    // variable keeps refusing with a steer to `.read`.
+    // ---------------------------------------------------------------
+    printfn "
+--- per-segment stream: group_by(s.vars.A |> z.stream, segments(CX)) ---"
+    let streamedSegmentsE2E () =
+        let segStore = fixStore "zarr_segments"    // written by 10c (10 cells, chunked at 4)
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+let g = group_by(A, seg)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+let counts = method_for(g) <@> lambda(r) -> extents(r) |> compute
+"""
+                            segStore
+        try
+            match lower src with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed"
+                check "per-segment stream: rows are read per run (marker present)"
+                    (cppCode.Contains "per-segment STREAMED rows") ""
+                check "per-segment stream: no whole-array buffer for A"
+                    (not (cppCode.Contains "A_flat = new") && not (cppCode.Contains "Array<double, 1> A = ")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_streamed.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "per-segment stream: per-run sums" (has "sums = [10, 26, 19]") runOut
+                          check "per-segment stream: per-run counts" (has "counts = [4, 4, 2]") runOut
+                      | Ok (code, out) -> check "per-segment stream: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "per-segment stream: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP per-segment stream (compile skipped): %s" e
+                     else check "per-segment stream: compiles" false e)
+            | Error e -> check "per-segment stream: lowers" false e
+        with ex -> check "per-segment stream" false ex.Message
+        // a key grouping over a streamed variable still refuses
+        let bad = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+let A = sample.vars.A |> z.stream
+let keys = [0, 0, 1, 1, 2, 2, 0, 1, 2, 0]
+let gk = group_keys(keys)
+let g = group_by(A, gk)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+"""
+                            segStore
+        (match lower bad with
+         | Ok ir ->
+             (try
+                 let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_bad"
+                 let refusals = CodeGen.takeCodegenRefusalDiagnostics cppCode
+                 check "per-segment stream: a key grouping over a streamed variable refuses with a steer"
+                     (refusals |> List.exists (fun r -> (string r).Contains "needs a structural grouping") || cppCode.Contains "needs a structural grouping") cppCode
+              with ex -> check "per-segment stream: a key grouping over a streamed variable refuses with a steer" (ex.Message.Contains "needs a structural grouping") ex.Message)
+         | Error e -> check "per-segment stream: key grouping program lowers" false e)
+    streamedSegmentsE2E ()
+
+    // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
     //
     // Every store dimension derives a named index type, and codegen emits one

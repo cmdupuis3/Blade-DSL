@@ -1903,6 +1903,84 @@ module CppZarr =
           $"{diskCpp}* {v}_fseg = new {diskCpp}[{ctT}];" ]
         @ fillDecl
 
+    /// PER-SEGMENT streaming of a RANK-1 dense variable (docs/plans/structural/07
+    /// §3.4): the prologue probes the metadata, allocates one chunk's scratch
+    /// buffer and the fill value. Nothing of the variable itself is read here.
+    let genStreamRowsOpen (storePath: string) (varName: string) (cppVarName: string) (arrType: IRArrayType) : string list =
+        let store = load storePath
+        let meta =
+            match tryFindArray store varName with
+            | Some m -> m
+            | None -> failwith $"Zarr codegen: variable '{varName}' not found in store '{storePath}'"
+        if meta.Blade.IsSome then
+            failwith $"Zarr stream of '{varName}': packed variables are not streamable (bind with .read)"
+        if meta.Shape.Length <> 1 then
+            failwith $"Zarr per-segment stream of '{varName}': rank-1 dense variables only (a rank-{meta.Shape.Length} variable streams by fiber)"
+        let v = cppVarName
+        let elemCpp = elemCppOf arrType.ElemType
+        let diskCpp = diskCppOf meta.Dtype.Code
+        let k = List.head meta.Chunks
+        let arrayDir =
+            let rel = Path.GetRelativePath(store.Path, meta.ArrayDir)
+            normPath (if rel = "." then storePath else Path.Combine(storePath, rel))
+        let metaFile = if meta.Version = 3 then "zarr.json" else ".zarray"
+        let fillDecl =
+            match meta.FillValue with
+            | FillFloat f -> [ $"{elemCpp} {v}_fillv = ({elemCpp}){fmtF f};" ]
+            | FillInt fi -> [ $"{elemCpp} {v}_fillv = ({elemCpp}){fi}LL;" ]
+            | FillNone -> []
+        [ $"// Stream {varName} from zarr store {normPath storePath} per SEGMENT (rank-1 chunk-range reads; no whole-array buffer)"
+          $"{{ std::ifstream {v}_zm(\"{arrayDir}/{metaFile}\"); if (!{v}_zm) {{ std::cerr << \"Zarr error: array '{varName}' not found in store '{(normPath storePath)}' (missing {metaFile})\" << std::endl; std::exit(1); }} }}"
+          $"{diskCpp}* {v}_rseg = new {diskCpp}[{k}];" ]
+        @ fillDecl
+
+    /// The run [lo, hi) of a rank-1 dense variable read into `destBuf[0 ..
+    /// hi-lo)`: one file open per chunk the run intersects, one seek+read of
+    /// the intersection, fill (or a loud failure under a null fill_value) for
+    /// a missing chunk. `lo`/`hi` are C++ expressions, so the group loop can
+    /// drive them from the grouping's offsets.
+    let genStreamRows (storePath: string) (varName: string) (cppVarName: string) (destBuf: string) (lo: string) (hi: string) (arrType: IRArrayType) : string list =
+        let store = load storePath
+        let meta =
+            match tryFindArray store varName with
+            | Some m -> m
+            | None -> failwith $"Zarr codegen: variable '{varName}' not found in store '{storePath}'"
+        if meta.Shape.Length <> 1 then
+            failwith $"Zarr per-segment stream of '{varName}': rank-1 dense variables only"
+        let v = cppVarName
+        let elemCpp = elemCppOf arrType.ElemType
+        let bs = meta.Dtype.ByteSize
+        let n = List.head meta.Shape
+        let k = List.head meta.Chunks
+        let arrayDir =
+            let rel = Path.GetRelativePath(store.Path, meta.ArrayDir)
+            normPath (if rel = "." then storePath else Path.Combine(storePath, rel))
+        let sep = meta.ChunkKeySep
+        let keyExpr =
+            if meta.ChunkKeyPrefix = "" then $"std::to_string({v}_rc)"
+            else $"std::string(\"{meta.ChunkKeyPrefix}{sep}\") + std::to_string({v}_rc)"
+        let missingBranch =
+            match meta.FillValue with
+            | FillNone ->
+                [ $"    }} else {{ std::cerr << \"Zarr error: chunk '\" << {v}_key << \"' of '{varName}' is missing and fill_value is null\" << std::endl; std::exit(1); }}" ]
+            | _ ->
+                [ "    } else {"
+                  $"        for (size_t {v}_q = 0; {v}_q < {v}_rlen; {v}_q++) ({destBuf})[{v}_rs - ({lo}) + {v}_q] = {v}_fillv;"
+                  "    }" ]
+        [ $"for (size_t {v}_rc = (size_t)({lo}) / {k}; {v}_rc * {k} < (size_t)({hi}); {v}_rc++) {{"
+          $"    size_t {v}_rs = {v}_rc * {k}; if ({v}_rs < (size_t)({lo})) {v}_rs = (size_t)({lo});"
+          $"    size_t {v}_re = ({v}_rc + 1) * {k}; if ({v}_re > (size_t)({hi})) {v}_re = (size_t)({hi}); if ({v}_re > {n}) {v}_re = {n};"
+          $"    size_t {v}_rlen = {v}_re - {v}_rs;"
+          $"    std::string {v}_key = {keyExpr};"
+          $"    std::ifstream {v}_cf(std::string(\"{arrayDir}/\") + {v}_key, std::ios::binary);"
+          $"    if ({v}_cf) {{"
+          $"        {v}_cf.seekg((std::streamoff)(({v}_rs - {v}_rc * {k}) * {bs}));"
+          $"        {v}_cf.read((char*){v}_rseg, {v}_rlen * {bs});"
+          $"        if ({v}_cf.gcount() != (std::streamsize)({v}_rlen * {bs})) {{ std::cerr << \"Zarr error: chunk '\" << {v}_key << \"' of '{varName}' is short -- a compressed or corrupt store?\" << std::endl; std::exit(1); }}"
+          $"        for (size_t {v}_q = 0; {v}_q < {v}_rlen; {v}_q++) ({destBuf})[{v}_rs - ({lo}) + {v}_q] = ({elemCpp}){v}_rseg[{v}_q];" ]
+        @ missingBranch
+        @ [ "}" ]
+
     /// STREAMED fiber reads, in-nest: assemble one trailing-axis fiber at the
     /// given site coordinates, one seek+read per t-chunk (contiguous WITHIN a
     /// chunk since the fiber axis is innermost). Missing chunks fill (or fail loudly under a null fill_value).
@@ -2359,6 +2437,8 @@ let spec : Blade.ProviderRegistry.ProviderSpec = {
     GenWriteVar = CppZarr.genWriteVar
     GenStreamOpen = Some CppZarr.genStreamOpen
     GenStreamFiber = Some CppZarr.genStreamFiber
+    GenStreamRowsOpen = Some CppZarr.genStreamRowsOpen
+    GenStreamRows = Some CppZarr.genStreamRows
     Includes = CppZarr.genIncludes
     VarDimNames = fun path varName ->
         try

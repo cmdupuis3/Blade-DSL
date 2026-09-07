@@ -74,6 +74,8 @@ let netcdfSpec : Blade.ProviderRegistry.ProviderSpec = {
     GenWriteVar = Blade.NetcdfProvider.CppNetcdf.genWriteVar
     GenStreamOpen = Some Blade.NetcdfProvider.CppNetcdf.genStreamOpen
     GenStreamFiber = Some Blade.NetcdfProvider.CppNetcdf.genStreamFiber
+    GenStreamRowsOpen = None
+    GenStreamRows = None
     Includes = Blade.NetcdfProvider.CppNetcdf.genIncludes
     VarDimNames = fun path varName ->
         try
