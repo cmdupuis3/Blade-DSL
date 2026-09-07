@@ -164,6 +164,7 @@ let private axisExtent (provider: string) (path: string) (root: string) (dim: st
 let install () =
     Blade.ProviderRegistry.register netcdfSpec
     Blade.ProviderRegistry.register Blade.ZarrProvider.spec
+    Blade.ProviderRegistry.DimChunks.registerReader "zarr" Blade.ZarrProvider.dimChunkEdges
     Blade.ProviderRegistry.register Blade.CsvProvider.spec
     Blade.ProviderRegistry.register Blade.IcechunkProvider.spec
     registerProviderReader readAndFold

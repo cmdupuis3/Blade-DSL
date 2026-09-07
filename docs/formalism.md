@@ -788,9 +788,6 @@ reverse<I>     // reversed
 parser arm and is gone. Block structure is a property of the AXIS: `Chunked<I, K>`
 and `segments(A)`, plans/structural/07.)
 
-```blade
-```
-
 `range<CompoundIdx<...>>` emits mask-true tuples. Virtual and real arrays
 compose in one loop:
 `method_for(range<I>, A, B) <@> lambda(i.., a, b) -> ...` — this is how

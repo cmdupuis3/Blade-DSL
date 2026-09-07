@@ -12710,6 +12710,8 @@ and checkDecl (env: TypeEnv) (decl: Decl) : TypeResult<TypedDecl * TypeEnv> =
                             // Record for the IDE hover path (Ide.collectProviderStores)
                             // so it never has to re-open the store.
                             Blade.ProviderRegistry.IdeStores.record name pm
+                            // and the dimension chunk edges `Chunked<name.index.d, store>` inherits
+                            Blade.ProviderRegistry.DimChunks.record name pname path
                             let (envM, moduleTy) = registerProviderModule env name pm
                             (envM, { tValue with Type = moduleTy })
                         with
@@ -14063,7 +14065,22 @@ and registerTypeDecl (env: TypeEnv) (typeDecl: TypeDecl) : TypeResult<TypeEnv> =
                             | ExprKind.ExprLit (LitInt k) ->
                                 Error (Other $"Chunked<.., {k}>: the chunk edge must be between 1 and the axis extent {n}")
                             | ExprKind.ExprVar "store" ->
-                                Error (Other "Chunked<I, store> (the provider's own chunk grid) is not supported yet; write the edge as a literal for now")
+                                // provider inheritance: the inner must be a store axis
+                                // `<binding>.index.<dim>`, whose chunk edge the load
+                                // site recorded (ProviderRegistry.DimChunks)
+                                (match inner with
+                                 | TyNamed (path, []) when path.Split('.').Length >= 3 && path.Split('.').[1] = "index" ->
+                                     let parts = path.Split('.')
+                                     let binding = parts.[0]
+                                     let dim = String.concat "." (parts |> Array.skip 2)
+                                     (match Blade.ProviderRegistry.DimChunks.tryFind binding dim with
+                                      | Some edge when edge >= 1L && edge <= n -> Ok [ SegRegular edge ]
+                                      | Some edge -> Error (Other $"Chunked<{path}, store>: the store chunks '{dim}' at {edge}, outside 1..{n}")
+                                      | None when Blade.ProviderRegistry.DimChunks.hasStore binding ->
+                                          Error (Other $"Chunked<{path}, store>: the store does not chunk '{dim}' uniformly across its variables (or does not chunk it at all); write the edge as a literal")
+                                      | None ->
+                                          Error (Other $"Chunked<{path}, store>: '{binding}' is not a store binding whose provider exposes chunk edges (zarr does); write the edge as a literal"))
+                                 | _ -> Error (Other "Chunked<I, store> inherits the chunk grid of a STORE axis: the inner must be `<store>.index.<dim>`"))
                             | ExprKind.ExprArrayLit _ ->
                                 Error (Other "Chunked<I, [[store, chunking], ..]> (a file-segmented axis) is not supported yet; write a single regular edge for now")
                             | _ -> Error (Other "Chunked<I, spec>: the spec must be a literal chunk edge, `store`, or a list of [store, chunking] pairs")

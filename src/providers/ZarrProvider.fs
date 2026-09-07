@@ -1078,6 +1078,23 @@ let private resolvedDimNames (a: ZarrArrayMeta) : string list =
         failwith $"Zarr array '{a.Name}': {ns.Length} dimension names for rank {a.Shape.Length}"
     | None -> a.Shape |> List.mapi (fun i _ -> $"{a.Name}_dim{i}")
 
+/// The chunk edge of every dimension the store chunks UNIFORMLY across its
+/// dense variables (docs/plans/structural/07 §3.1): what `Chunked<s.index.d,
+/// store>` inherits. A dimension two variables chunk differently is absent
+/// (the declaration then refuses with a steer rather than guessing), as is a
+/// blade-packed variable's pool dimension.
+let dimChunkEdges (storePath: string) : Map<string, int64> =
+    let store = load storePath
+    let seen = System.Collections.Generic.Dictionary<string, int64 option>()
+    for a in store.Arrays do
+        if a.Blade.IsNone && a.Chunks.Length = a.Shape.Length then
+            for (dn, edge) in List.zip (resolvedDimNames a) a.Chunks do
+                match seen.TryGetValue dn with
+                | true, Some prev when prev <> edge -> seen.[dn] <- None
+                | true, _ -> ()
+                | _ -> seen.[dn] <- Some edge
+    seen |> Seq.choose (fun kv -> kv.Value |> Option.map (fun e -> (kv.Key, e))) |> Map.ofSeq
+
 /// Converts a ZarrStore into an IRModule using structs for dims/vars, the
 /// same shape ncFileToModule produces:
 ///

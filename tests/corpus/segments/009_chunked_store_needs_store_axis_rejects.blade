@@ -1,0 +1,9 @@
+// TEST: Store-Inherited Chunking Needs A Store Axis (rejects)
+// `Chunked<I, store>` reads the chunk edge the provider recorded for a
+// STORE dimension at its load site; a plain `Idx<n>` alias has no store to
+// inherit from. (The inheritance itself is exercised in the zarr lane,
+// `blade test zarr`, section 10c: a generated store chunked at four.)
+// ERROR: BL3999
+// ERROR-CONTAINS: inherits the chunk grid of a STORE axis
+type I = Idx<10>
+type CI = Chunked<I, store>

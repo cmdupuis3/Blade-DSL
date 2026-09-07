@@ -643,6 +643,83 @@ let out = method_for(A) <@> lambda(x) -> x + x |> compute
         with ex -> check ($"e2e v{version}") false ex.Message
 
     // ---------------------------------------------------------------
+    // 10c. Provider-inherited segmentation (docs/plans/structural/07 §3.1):
+    // `type CX = Chunked<sample.index.x, store>` takes the store's own chunk
+    // edge on x (recorded at the load site by ProviderRegistry.DimChunks),
+    // and the structural grouping / ungroup pipeline runs over it. A store
+    // whose variables chunk x differently refuses at the declaration.
+    // ---------------------------------------------------------------
+    printfn "
+--- inherited segmentation: Chunked<sample.index.x, store> ---"
+    let inheritedSegmentationE2E () =
+        let segStore = fixStore "zarr_segments"
+        let segInDir = Path.Combine(e2eDir, segStore)
+        let segVars : ZarrWrite.WriteVar list = [
+            { Name = "A"; DimNames = Some ["x"]; Shape = [10L]; Chunks = [4L]
+              FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in 1 .. 10 -> float i |]; OmitChunks = []; Blade = None } ]
+        (try Directory.Delete(segStore, true) with _ -> ())
+        (try Directory.Delete(segInDir, true) with _ -> ())
+        ZarrWrite.writeStoreV3 segStore segVars
+        ZarrWrite.writeStoreV3 segInDir segVars
+        let segSource = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A = sample.vars.A |> z.read
+let seg = segments(CX)
+let sizes = extents(seg)
+let g = group_by(A, seg)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+let back = ungroup(g)
+"""
+                            segStore
+        try
+            match lower segSource with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_inherited"
+                check "inherited segmentation: emits the structural grouping (no __perm)"
+                    (cppCode.Contains "structural" && not (cppCode.Contains "seg__perm")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_inherited.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "inherited segmentation: sizes = [4, 4, 2]" (has "sizes = [4, 4, 2]") runOut
+                          check "inherited segmentation: per-segment sums" (has "sums = [10, 26, 19]") runOut
+                          check "inherited segmentation: ungroup restores the axis" (has "back = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]") runOut
+                      | Ok (code, out) -> check "inherited segmentation: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "inherited segmentation: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP inherited segmentation (compile skipped): %s" e
+                     else check "inherited segmentation: compiles" false e)
+            | Error e -> check "inherited segmentation: lowers" false e
+        with ex -> check "inherited segmentation" false ex.Message
+        // the refusal: two variables chunk x differently
+        let mixStore = fixStore "zarr_segments_mixed"
+        (try Directory.Delete(mixStore, true) with _ -> ())
+        ZarrWrite.writeStoreV3 mixStore [
+            { Name = "A"; DimNames = Some ["x"]; Shape = [10L]; Chunks = [4L]
+              FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in 1 .. 10 -> float i |]; OmitChunks = []; Blade = None }
+            { Name = "B"; DimNames = Some ["x"]; Shape = [10L]; Chunks = [5L]
+              FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in 1 .. 10 -> float i |]; OmitChunks = []; Blade = None } ]
+        let mixSource = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+"""
+                            mixStore
+        (match lower mixSource with
+         | Error e -> check "inherited segmentation: non-uniform chunking refuses with a steer" (e.Contains "does not chunk 'x' uniformly") e
+         | Ok _ -> check "inherited segmentation: non-uniform chunking refuses with a steer" false "lowered")
+
+    inheritedSegmentationE2E ()
+
+    // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
     //
     // Every store dimension derives a named index type, and codegen emits one
