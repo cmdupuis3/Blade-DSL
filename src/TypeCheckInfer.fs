@@ -791,12 +791,23 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
     // __rand_* -- e.g. the ppl module -- is held to the same arity.
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar (("__rand_uniform" | "__rand_normal" | "__rand_exponential"
                                                    | "__rand_gamma" | "__rand_poisson" | "__rand_bernoulli"
-                                                   | "__rand_beta" | "__rand_categorical") as fn) }, (keyE :: rest)) when not rest.IsEmpty ->
+                                                   | "__rand_beta" | "__rand_categorical"
+                                                   | "__rand_uniform_at" | "__rand_normal_at" | "__rand_exponential_at"
+                                                   | "__rand_gamma_at" | "__rand_poisson_at" | "__rand_bernoulli_at"
+                                                   | "__rand_beta_at" | "__rand_categorical_at") as fn) }, (keyE :: rest)) when not rest.IsEmpty ->
         // nPars = scalar Float64 parameters; hasWeights = the array channel.
         // No family uses both today, but the two are counted independently so
         // the argument split does not assume that.
-        let kind, nPars, hasWeights =
-            match fn with
+        //
+        // The `_at` families (plan-fortran-killer-2 section 5) are the same
+        // eight transforms ADDRESSED per sample: two more Int64 arguments
+        // right after the key -- the stream key and the sample offset -- and
+        // the runtime kind is the base kind with the suffix, so codegen and
+        // the interpreter mirror dispatch on the name alone.
+        let indexed = fn.EndsWith "_at"
+        let baseFn = if indexed then fn.Substring(0, fn.Length - 3) else fn
+        let kind0, nPars, hasWeights =
+            match baseFn with
             | "__rand_uniform"     -> "uniform", 0, false
             | "__rand_normal"      -> "normal", 0, false
             | "__rand_exponential" -> "exponential", 1, false
@@ -805,7 +816,15 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
             | "__rand_bernoulli"   -> "bernoulli", 1, false
             | "__rand_categorical" -> "categorical", 0, true
             | _                    -> "beta", 2, false
-        // Surface order is key, [weights], scalar pars.., shape.
+        let kind = if indexed then kind0 + "_at" else kind0
+        // The address channel: (stream, offset) right after the key.
+        let addrArgs, rest =
+            if indexed && List.length rest >= 2 then List.splitAt 2 rest
+            else ([], rest)
+        if indexed && addrArgs.Length <> 2 then
+            Error (Other $"rand.{kind}: expected rand.{kind}(key, stream, offset, ..., shape) -- the stream key and the sample offset follow the key")
+        else
+        // Surface order is key, [stream, offset], [weights], scalar pars.., shape.
         let nLead = nPars + (if hasWeights then 1 else 0)
         if List.length rest <= nLead then
             Error (Other $"rand.{kind}: expected {nLead} distribution parameter(s) and a shape")
@@ -870,7 +889,27 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
                     acc |> Result.bind (fun ps ->
                         checkExpr env (IRTScalar ETFloat64) p |> Result.map (fun tp -> ps @ [tp])))
                     (Ok [])
+            // The address channel: both Int64; a literal stream outside one
+            // counter word or a literal negative offset is refused here (the
+            // runtime aborts on the non-literal ones, BL8001, both lanes).
+            let addrResult : TypeResult<(TypedExpr * TypedExpr) option> =
+                match addrArgs with
+                | [ sE; oE ] ->
+                    let literalBad =
+                        match sE.Kind, oE.Kind with
+                        | ExprKind.ExprLit (LitInt s), _ when s < 0L || s > 4294967295L ->
+                            Some $"rand.{kind}: the stream key must be in [0, 2^32) (got {s}) -- it occupies one 32-bit word of the Philox counter"
+                        | _, ExprKind.ExprLit (LitInt o) when o < 0L ->
+                            Some $"rand.{kind}: the sample offset must be non-negative (got {o})"
+                        | _ -> None
+                    (match literalBad with
+                     | Some m -> Error (Other m)
+                     | None ->
+                        checkExpr env (IRTScalar ETInt64) sE |> Result.bind (fun tS ->
+                        checkExpr env (IRTScalar ETInt64) oE |> Result.map (fun tO -> Some (tS, tO))))
+                | _ -> Ok None
             parResults |> Result.bind (fun tPars ->
+            addrResult |> Result.bind (fun tAddr ->
             checkExpr env (IRTScalar ETInt64) keyE |> Result.map (fun tKey ->
                 let indices =
                     dims |> List.map (fun n ->
@@ -878,9 +917,9 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
                           Symmetry = SymNone; Tag = None; IxKind = IxKPlain; Kind = SDimension; Dependencies = [] })
                 // Element type: Int64 for categorical (its draws are indices),
                 // Float64 for every other family.
-                let elemTy = if kind = "categorical" then IRTScalar ETInt64 else IRTScalar ETFloat64
+                let elemTy = if kind0 = "categorical" then IRTScalar ETInt64 else IRTScalar ETFloat64
                 let arrTy = mkArrayArrow indices elemTy None
-                mkTyped (TExprRandGen (kind, tKey, tPars, tWeights, dims)) arrTy)))
+                mkTyped (TExprRandGen (kind, tKey, tPars, tWeights, tAddr, dims)) arrTy))))
 
     // ---- __display_emit(head, quoted, data, metaTail): display module ----
     // Compiler-internal (double-underscore reserved): emitted by the `display`

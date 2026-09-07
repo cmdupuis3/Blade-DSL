@@ -1647,10 +1647,10 @@ and genProviderWriteBinding (ctx: CodeGenContext) (binding: IRBinding) (builder:
 and genRandGenBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
     let ind = indentStr ctx
     let name = bindingCppName binding
-    let kind, keyExpr, parExprs, weightsExpr =
+    let kind, keyExpr, parExprs, weightsExpr, addressExpr =
         match ctx.RandomInits.[binding.Id] with
-        | RandGen (k, key, pars, weights) -> k, key, pars, weights
-        | FillModulus _ -> "uniform", IRLit (IRLitInt 0L), [], None  // unreachable: dispatch guards this
+        | RandGen (k, key, pars, weights, address) -> k, key, pars, weights, address
+        | FillModulus _ -> "uniform", IRLit (IRLitInt 0L), [], None, None  // unreachable: dispatch guards this
     match binding.Type with
     | ArrayElem arrTy ->
         let elemCpp = elemTypeToCpp arrTy.ElemType
@@ -1677,9 +1677,34 @@ and genRandGenBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                 parExprs
                 |> List.map (fun p -> $", (double)({(exprToCpp ctx.VarNames p)})")
                 |> String.concat ""
+            // The `_at` address channel sits right after the key: the stream
+            // key and the sample offset, both int64, before the weights/pars.
+            // Bound to locals and RANGE-CHECKED HERE, in the emitted text --
+            // the stream key occupies one 32-bit counter word, the offset is
+            // an unsigned sample id -- because a runtime header must never
+            // reach blade_rt::panic on its own (codegen elides the shadow
+            // frame of a body whose text cannot panic; Test_Diagnostics pins
+            // that rule). The interpreter mirror carries the same two guards.
+            let addressLines, addressArgs =
+                match addressExpr with
+                | None -> [], ""
+                | Some (sExpr, oExpr) ->
+                    let sName = $"{name}__stream"
+                    let oName = $"{name}__offset"
+                    ([ $"{ind}const int64_t {sName} = (int64_t)({(exprToCpp ctx.VarNames sExpr)});"
+                       $"{ind}const int64_t {oName} = (int64_t)({(exprToCpp ctx.VarNames oExpr)});"
+                       $$"""{{ind}}if ({{sName}} < 0 || (((uint64_t){{sName}}) >> 32) != 0) {"""
+                       $"{ind}    std::cerr << \"Blade runtime: rand: the stream key of an _at family must be in [0, 2^32) (got \" << {sName} << \")\" << std::endl;"
+                       $"{ind}    blade_rt::panic(\"BL8001\", \"rand stream key out of range\", nullptr, 0);"
+                       $"{ind}}}"
+                       $$"""{{ind}}if ({{oName}} < 0) {"""
+                       $"{ind}    std::cerr << \"Blade runtime: rand: the sample offset of an _at family must be non-negative (got \" << {oName} << \")\" << std::endl;"
+                       $"{ind}    blade_rt::panic(\"BL8001\", \"rand sample offset negative\", nullptr, 0);"
+                       $"{ind}}}" ],
+                     $", {sName}, {oName}")
             let fillLine =
-                $"{ind}blade_rand::{kind}(nested_array_utilities::pool_base({name}.data), (size_t){card}LL, (int64_t)({(exprToCpp ctx.VarNames keyExpr)}){weightsArgs}{parArgs});"
-            ([extentsArr; allocLine; fillLine], addVarName binding.Id name ctx)
+                $"{ind}blade_rand::{kind}(nested_array_utilities::pool_base({name}.data), (size_t){card}LL, (int64_t)({(exprToCpp ctx.VarNames keyExpr)}){addressArgs}{weightsArgs}{parArgs});"
+            ([extentsArr; allocLine] @ addressLines @ [fillLine], addVarName binding.Id name ctx)
     | _ ->
         ([refusalErrorLine ind ($"rand binding '{name}' is not an array type")], addVarName binding.Id name ctx)
 

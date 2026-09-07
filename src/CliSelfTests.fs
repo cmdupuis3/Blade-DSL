@@ -2350,6 +2350,11 @@ let rec internal dispatchTest (rest: string list) : int =
         // programs. Emission pins run everywhere; the differential needs g++.
         let failed = (Blade.Tests.AccessTests.runAccessTests ()).Failed
         if failed = 0 then 0 else 1
+    | [ "rand-mirror" ] ->
+        // The RNG mirror's Philox4x32-10 generator against Random123's
+        // published known-answer vectors, and the `_at` address identities.
+        let failed = (Blade.Tests.RandMirrorTests.runRandMirrorTests ()).Failed
+        if failed = 0 then 0 else 1
     | [ "optimize" ] ->
         // The semantic-equivalence layer's emission pins: freeze-idiom
         // recognition derives the break without the abort, `while` keeps

@@ -2164,14 +2164,15 @@ let lowerTypedModule (env: TypedLowerEnv) (modul: TypedModule) (rawDecls: Locate
             // The categorical weights array lowers in the same env for the same
             // reason -- it is always an earlier binding -- and carries the
             // checker-pinned static extent through unchanged.
-            let kind, keyIR, parIRs, weightsIR =
+            let kind, keyIR, parIRs, weightsIR, addressIR =
                 match binding.Value.Kind with
-                | TExprRandGen (k, key, pars, weights, _) ->
+                | TExprRandGen (k, key, pars, weights, address, _) ->
                     k,
                     lowerTypedExpr currentEnv key,
                     (pars |> List.map (lowerTypedExpr currentEnv)),
-                    (weights |> Option.map (fun (w, n) -> (lowerTypedExpr currentEnv w, n)))
-                | _ -> "uniform", IRLit (IRLitInt 0L), [], None  // unreachable: guarded by the `when` above
+                    (weights |> Option.map (fun (w, n) -> (lowerTypedExpr currentEnv w, n))),
+                    (address |> Option.map (fun (s, o) -> (lowerTypedExpr currentEnv s, lowerTypedExpr currentEnv o)))
+                | _ -> "uniform", IRLit (IRLitInt 0L), [], None, None  // unreachable: guarded by the `when` above
             let bd = {
                 Id = binding.VarId
                 Name = binding.Name
@@ -2182,7 +2183,7 @@ let lowerTypedModule (env: TypedLowerEnv) (modul: TypedModule) (rawDecls: Locate
             }
             bindings <- bindings @ [bd]
             currentEnv <- bindTypedVar binding.Name binding.VarId currentEnv
-            currentEnv <- { currentEnv with RandomInits = Map.add binding.VarId (RandGen (kind, keyIR, parIRs, weightsIR)) currentEnv.RandomInits }
+            currentEnv <- { currentEnv with RandomInits = Map.add binding.VarId (RandGen (kind, keyIR, parIRs, weightsIR, addressIR)) currentEnv.RandomInits }
         | TDeclLet binding when (match binding.Value.Kind with TExprCompound _ -> true | _ -> false) ->
             // Compound-construction constructor: materialized via P0
             // (genCompoundIndexFromMask) + a dense->compact scatter (the

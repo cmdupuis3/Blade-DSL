@@ -554,6 +554,10 @@
          Parity pins: the anonymous range must decide as `range<I>` does. -->
     <Compile Include="tests/FlatPathTests.fs" />
     <Compile Include="tests/OptimizeTests.fs" />
+    <!-- The interpreter's RNG mirror against Random123's Philox4x32-10
+         known-answer vectors, plus the address identities (chunk / order /
+         subrange invariance) on the generator alone. No toolchain. -->
+    <Compile Include="tests/RandMirrorTests.fs" />
     <Compile Include="tests/AccessTests.fs" />
     <!-- Eigensolver dispatch emission + the inferEigh rejections (Phase 6 /
          Round B2). Separate block from LinAlgTests because the two gates,

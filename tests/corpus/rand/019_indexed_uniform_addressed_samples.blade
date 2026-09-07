@@ -1,0 +1,50 @@
+// TEST: Rand Indexed Uniform: samples are addressed, not sequenced
+// rand.uniform_at(key, stream, offset, n): cell i is LOGICAL SAMPLE offset + i
+// of stream `stream` under experiment key `key`, and its value is a pure
+// function of that address (Philox4x32-10 counter mode, plan-fortran-killer-2
+// section 5). So the twelve samples drawn whole, in three uneven chunks, in
+// reverse chunk order, and as a subrange are the same bits -- no prefix is
+// replayed to reach a late chunk, no full array is needed to draw sample 8.
+// The pinned values are a change-detector for the address layout and the
+// generator (the known-answer vectors live in tests/RandMirrorTests.fs); the
+// zero differences are the identity claim.
+import rand as r
+let whole = r.uniform_at(12345, 7, 0, 12)
+// EXPECT: whole = [0.902240796843615, 0.631736146677231, 0.0958510291085241, 0.77727048413232, 0.499890972608356, 0.763231823234597, 0.59615090690598, 0.450859546118179, 0.112129852171726, 0.260392849237905, 0.0409828851902844, 0.246015902956492]
+// Uneven chunks, written in reverse order: order of evaluation is irrelevant.
+let c3 = r.uniform_at(12345, 7, 8, 4)
+let c2 = r.uniform_at(12345, 7, 5, 3)
+let c1 = r.uniform_at(12345, 7, 0, 5)
+// EXPECT: c3 = [0.112129852171726, 0.260392849237905, 0.0409828851902844, 0.246015902956492]
+// EXPECT: c2 = [0.763231823234597, 0.59615090690598, 0.450859546118179]
+// EXPECT: c1 = [0.902240796843615, 0.631736146677231, 0.0958510291085241, 0.77727048413232, 0.499890972608356]
+let d1 = c1(0) - whole(0) + c1(4) - whole(4)
+let d2 = c2(0) - whole(5) + c2(2) - whole(7)
+let d3 = c3(0) - whole(8) + c3(3) - whole(11)
+// EXPECT: d1 = 0.0
+// EXPECT: d2 = 0.0
+// EXPECT: d3 = 0.0
+// A subrange, drawn on its own.
+let sub = r.uniform_at(12345, 7, 3, 4)
+// EXPECT: sub = [0.77727048413232, 0.499890972608356, 0.763231823234597, 0.59615090690598]
+let ds = sub(0) - whole(3) + sub(1) - whole(4) + sub(2) - whole(5) + sub(3) - whole(6)
+// EXPECT: ds = 0.0
+// A different stream under the same key, and a different key under the same
+// stream, are different samples; the same address twice is the same sample.
+let other_stream = r.uniform_at(12345, 8, 0, 12)
+let other_key = r.uniform_at(12346, 7, 0, 12)
+let again = r.uniform_at(12345, 7, 0, 12)
+let stream_differs = reduce(method_for(zip(whole, other_stream)) <@> lambda(a, b) -> if a == b then 1.0 else 0.0 |> compute, (+))
+let key_differs = reduce(method_for(zip(whole, other_key)) <@> lambda(a, b) -> if a == b then 1.0 else 0.0 |> compute, (+))
+let same_again = reduce(method_for(zip(whole, again)) <@> lambda(a, b) -> if a == b then 1.0 else 0.0 |> compute, (+))
+// EXPECT: stream_differs = 0
+// EXPECT: key_differs = 0
+// EXPECT: same_again = 12
+// Every draw lies in [0, 1).
+let in_range = reduce(method_for(whole) <@> lambda(u) -> if u >= 0.0 && u < 1.0 then 1.0 else 0.0 |> compute, (+))
+// EXPECT: in_range = 12
+// A rank-2 shape addresses its cells in row-major order: cell (i, j) of a
+// [3, 4] fill is sample 4 i + j, the same as the flat fill's.
+let grid = r.uniform_at(12345, 7, 0, [3, 4])
+let dg = grid(1)(2) - whole(6) + grid(2)(3) - whole(11)
+// EXPECT: dg = 0.0

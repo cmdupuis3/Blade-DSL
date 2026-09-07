@@ -274,7 +274,7 @@ let private weightsPool (v: Value) (k: int) : float[] =
 /// every other family an SFloat store from `float[]` draws. Routing categorical
 /// through the float path would print its indices as `0` vs `0.0`-formatted
 /// doubles and break byte-parity with the binary.
-let private materializeRandGen (state: Core.InterpState) (root: Env) (binding: IRBinding) (kind: string) (keyExpr: IRExpr) (parExprs: IRExpr list) (weightsExpr: (IRExpr * int) option) : Value =
+let private materializeRandGen (state: Core.InterpState) (root: Env) (binding: IRBinding) (kind: string) (keyExpr: IRExpr) (parExprs: IRExpr list) (weightsExpr: (IRExpr * int) option) (addressExpr: (IRExpr * IRExpr) option) : Value =
     match binding.Type with
     | ArrayElem arrTy ->
         let extents =
@@ -291,12 +291,21 @@ let private materializeRandGen (state: Core.InterpState) (root: Env) (binding: I
         let pars = parExprs |> List.map (fun p -> parToFloat (Core.evalExpr state root p))
         // .NET arrays are int-indexed, so the draw count is int-bounded exactly
         // as the pool it fills; card stays int64 to match codegen's `1L` fold.
+        // The `_at` address channel: stream key and sample offset, cast as
+        // codegen casts them (`(int64_t)`), evaluated once like the key.
+        let address =
+            addressExpr |> Option.map (fun (sExpr, oExpr) ->
+                (keyToInt64 (Core.evalExpr state root sExpr), keyToInt64 (Core.evalExpr state root oExpr)))
         let store =
-            match weightsExpr with
-            | Some (wExpr, k) ->
+            match weightsExpr, address with
+            | Some (wExpr, k), None ->
                 let w = weightsPool (Core.evalExpr state root wExpr) k
                 SInt (RandMirror.drawsCategorical kind key w (int card))
-            | None -> SFloat (RandMirror.draws kind key pars (int card))
+            | Some (wExpr, k), Some (s, o) ->
+                let w = weightsPool (Core.evalExpr state root wExpr) k
+                SInt (RandMirror.drawsCategoricalAt kind key s o w (int card))
+            | None, Some (s, o) -> SFloat (RandMirror.drawsAt kind key s o pars (int card))
+            | None, None -> SFloat (RandMirror.draws kind key pars (int card))
         state.Cells <- state.Cells + card
         VArray (ArrayOps.mkDenseArray arrTy.ElemType arrTy.IndexTypes (Array.ofList extents) store)
     | _ -> raise (Core.InterpUnsupported "rand binding is not an array type")
@@ -534,8 +543,8 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
                     raise (Core.InterpUnsupported "provider write (alias.write -- side effect; flag-gated later)")
                 | None ->
                 match Map.tryFind b.Id m.RandomInits with
-                | Some (RandGen (kind, keyExpr, parExprs, weightsExpr)) ->
-                    materializeRandGen state root b kind keyExpr parExprs weightsExpr
+                | Some (RandGen (kind, keyExpr, parExprs, weightsExpr, addressExpr)) ->
+                    materializeRandGen state root b kind keyExpr parExprs weightsExpr addressExpr
                 | Some (FillModulus _) ->
                     // fill_random(mod) fills with C `rand() % mod`: nondeterministic
                     // and NOT mirrored by RandMirror (only the deterministic

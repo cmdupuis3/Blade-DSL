@@ -2650,7 +2650,7 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprDotDot (lo, hi) -> [lo; hi]
         | TExprPure e | TExprCompute e | TExprRead e | TExprFillRandom e | TExprRank e
         | TExprExtents e | TExprReynolds (e, _) -> [e]
-        | TExprRandGen (_, key, pars, weights, _) -> (key :: pars) @ (weights |> Option.map fst |> Option.toList)
+        | TExprRandGen (_, key, pars, weights, address, _) -> (key :: pars) @ (address |> Option.map (fun (s, o) -> [s; o]) |> Option.defaultValue []) @ (weights |> Option.map fst |> Option.toList)
         | TExprGuard (c, b) -> [c; b]
         | TExprMask (a, p) | TExprIntersect (a, p) | TExprUnion (a, p)
         | TExprGroupBy (a, p) | TExprSort (a, p)

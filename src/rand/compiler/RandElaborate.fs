@@ -14,6 +14,14 @@
 ///   rand.beta(key, a, b, n)              -- Beta(a, b), from two gammas
 ///   rand.categorical(key, W, n)          -- index in [0,|W|), P(i) ~ W_i; Int64 elements
 ///
+/// INDEXED families (plan-fortran-killer-2 section 5): every row above with an `_at` suffix and two more
+/// leading Int64 arguments, `rand.<fam>_at(key, stream, offset, params.., shape)`. Cell i of the result is
+/// LOGICAL SAMPLE `offset + i` of stream `stream` under experiment key `key`, and its value is a pure
+/// function of that address (Philox4x32-10 counter mode, cpp/rand_runtime.hpp): the same samples drawn
+/// whole, in uneven chunks, in any chunk order, or as a subrange are the same bits, with no prefix
+/// replay. `stream` must lie in [0, 2^32) and `offset` must be non-negative (literal violations are
+/// refused, runtime ones abort with BL8001 in both lanes).
+///
 /// `key` is an Int64 stream key (same key => same draws). The distribution parameters are ordinary RUNTIME Float64
 /// expressions -- they need not be static, and are evaluated once per fill. `shape` is a static int or a list of static
 /// ints (`let static` names or literals) and is always the LAST argument. Every family yields Float64 elements,
@@ -95,7 +103,23 @@ let private ops : (string * string * int) list =
       "poisson",     "__rand_poisson",     1   // lam
       "bernoulli",   "__rand_bernoulli",   1   // p
       "beta",        "__rand_beta",        2   // a, b
-      "categorical", "__rand_categorical", 1 ] // weights (ARRAY, not a scalar)
+      "categorical", "__rand_categorical", 1   // weights (ARRAY, not a scalar)
+      // The INDEXED families: the same rows, ADDRESSED per sample. Two more
+      // leading Int64 arguments -- `rand.<fam>_at(key, stream, offset, ..,
+      // shape)` -- and cell i is sample `offset + i` of the (key, stream)
+      // stream, a pure function of that address (plan-fortran-killer-2
+      // section 5; cpp/rand_runtime.hpp `philox_stream`).
+      "uniform_at",     "__rand_uniform_at",     0
+      "normal_at",      "__rand_normal_at",      0
+      "exponential_at", "__rand_exponential_at", 1
+      "gamma_at",       "__rand_gamma_at",       2
+      "poisson_at",     "__rand_poisson_at",     1
+      "bernoulli_at",   "__rand_bernoulli_at",   1
+      "beta_at",        "__rand_beta_at",        2
+      "categorical_at", "__rand_categorical_at", 1 ]
+
+/// The `_at` families take (stream, offset) right after the key.
+let private addressArity (op: string) : int = if op.EndsWith "_at" then 2 else 0
 
 /// Per-op parameter names, for the arity error message only.
 let private paramNames (op: string) : string list =
@@ -115,18 +139,21 @@ let private elabOp (statics: StaticEnv) (op: string) (args: Expr list) : Result<
     | None ->
         Error ($"""rand: unknown op '{op}' (available: {(ops |> List.map (fun (o, _, _) -> o) |> String.concat ", ")})""")
     | Some (_, fn, nPars) ->
-        // key + nPars distribution params + exactly one shape argument.
-        if List.length args <> nPars + 2 then
-            Error (sprintf "rand.%s: expected rand.%s(key%s, shape) where shape is a static int or list of static ints"
-                       op op (paramNames op |> List.map (sprintf ", %s") |> String.concat ""))
+        // key [+ stream, offset] + nPars distribution params + exactly one shape argument.
+        let nAddr = addressArity op
+        if List.length args <> nAddr + nPars + 2 then
+            Error (sprintf "rand.%s: expected rand.%s(key%s%s, shape) where shape is a static int or list of static ints"
+                       op op (if nAddr = 2 then ", stream, offset" else "")
+                       (paramNames (if nAddr = 2 then op.Substring(0, op.Length - 3) else op) |> List.map (sprintf ", %s") |> String.concat ""))
         else
             let keyE = List.head args
-            let parEs = args |> List.skip 1 |> List.take nPars
+            let addrEs = args |> List.skip 1 |> List.take nAddr
+            let parEs = args |> List.skip (1 + nAddr) |> List.take nPars
             let shapeE = List.last args
             resolveShape statics $"rand.{op}" shapeE
             |> Result.map (fun dims ->
                 let dimEs = dims |> List.map (fun n -> syn (ExprLit (LitInt (int64 n))))
-                syn (ExprApp (v fn, (keyE :: parEs) @ dimEs)))
+                syn (ExprApp (v fn, (keyE :: addrEs) @ parEs @ dimEs)))
 
 // Rewrite walker (same shape as MathElaborate.rewriteExpr)
 let rec private rewriteExpr (statics: StaticEnv) (aliases: Set<string>) (e: Expr) : Result<Expr, string> =

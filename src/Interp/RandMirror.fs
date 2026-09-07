@@ -56,6 +56,12 @@ let mix64 (z0: uint64) : uint64 =
     let z = (z ^^^ (z >>> 27)) * 0x94D049BB133111EBUL
     z ^^^ (z >>> 31)
 
+/// The raw 64-bit source every transform below consumes: the sequenced
+/// engine (mt19937_64) or a per-sample Philox stream (`PhiloxStream`). One
+/// interface so the transforms exist once, as the header's templates do.
+type IRaw64 =
+    abstract Next: unit -> uint64
+
 /// std::mt19937_64: MT19937-64 with the single-uint64 seed constructor
 /// (bit-exact per the C++ standard).
 type Mt19937_64(seed: uint64) =
@@ -84,6 +90,64 @@ type Mt19937_64(seed: uint64) =
         y <- y ^^^ ((y <<< 17) &&& 0x71D67FFFEDA60000UL)
         y <- y ^^^ ((y <<< 37) &&& 0xFFF7EEE000000000UL)
         y ^^^ (y >>> 43)
+    interface IRaw64 with
+        member g.Next() = g.Next()
+
+// Philox4x32-10 (rand_runtime.hpp `philox4x32_10`): the counter-based engine
+// behind the `_at` families. Known-answer vectors (Random123 kat_vectors) are
+// pinned in tests/RandMirrorTests.fs; the address layout is the header's.
+let private philoxM0 = 0xD2511F53u
+let private philoxM1 = 0xCD9E8D57u
+let private philoxW0 = 0x9E3779B9u
+let private philoxW1 = 0xBB67AE85u
+
+let philox4x32_10 (c0: uint32, c1: uint32, c2: uint32, c3: uint32) (k0: uint32, k1: uint32) : uint32 * uint32 * uint32 * uint32 =
+    let mutable c0 = c0
+    let mutable c1 = c1
+    let mutable c2 = c2
+    let mutable c3 = c3
+    let mutable k0 = k0
+    let mutable k1 = k1
+    for _ in 0 .. 9 do
+        let p0 = uint64 philoxM0 * uint64 c0
+        let p1 = uint64 philoxM1 * uint64 c2
+        let hi0 = uint32 (p0 >>> 32)
+        let lo0 = uint32 p0
+        let hi1 = uint32 (p1 >>> 32)
+        let lo1 = uint32 p1
+        let n0 = hi1 ^^^ c1 ^^^ k0
+        let n2 = hi0 ^^^ c3 ^^^ k1
+        c0 <- n0
+        c1 <- lo1
+        c2 <- n2
+        c3 <- lo0
+        k0 <- k0 + philoxW0
+        k1 <- k1 + philoxW1
+    (c0, c1, c2, c3)
+
+/// rand_runtime.hpp `philox_stream`: the per-sample raw stream -- two raw
+/// words per block, then the next block (draw counter + 1).
+type PhiloxStream(key: int64, stream: uint32, sample: uint64) =
+    let k0 = uint32 (uint64 key)
+    let k1 = uint32 ((uint64 key) >>> 32)
+    let s0 = uint32 sample
+    let s1 = uint32 (sample >>> 32)
+    let buf = Array.zeroCreate<uint32> 4
+    let mutable draw = 0u
+    let mutable left = 0
+    interface IRaw64 with
+        member _.Next() =
+            if left = 0 then
+                let (a, b, c, d) = philox4x32_10 (s0, s1, stream, draw) (k0, k1)
+                buf.[0] <- a
+                buf.[1] <- b
+                buf.[2] <- c
+                buf.[3] <- d
+                draw <- draw + 1u
+                left <- 2
+            left <- left - 1
+            let b = if left = 1 then 0 else 2
+            (uint64 buf.[b] <<< 32) ||| uint64 buf.[b + 1]
 
 /// 2^-53 = 1.0 / 9007199254740992.0 (rand_runtime.hpp scale/floor constant).
 let private twoPow53Inv : float = 1.0 / 9007199254740992.0
@@ -93,14 +157,14 @@ let bitsToUnit (x: uint64) : float =
     float (x >>> 11) * twoPow53Inv
 
 /// rand_runtime.hpp `next_uniform`: one uniform draw from the engine.
-let inline private nextUniform (g: Mt19937_64) : float =
+let inline private nextUniform (g: IRaw64) : float =
     bitsToUnit (g.Next())
 
 /// rand_runtime.hpp `next_normal`: Box-Muller, TWO uniforms -> one N(0,1).
 /// u1 is floored away from 0 so log(u1) stays finite. The sin partner is NOT
 /// produced or cached: every call consumes exactly two fresh uniform draws and
 /// returns only the cos branch. Arithmetic/order/literal match the header.
-let private nextNormal (g: Mt19937_64) : float =
+let private nextNormal (g: IRaw64) : float =
     let twoPi = 6.283185307179586476925286766559
     let mutable u1 = nextUniform g
     let u2 = nextUniform g
@@ -111,7 +175,7 @@ let private nextNormal (g: Mt19937_64) : float =
 /// The prefix `-` binds tighter than `/` in F# exactly as in C++, so this is
 /// `(-log(1-u)) / rate`, not `-(log(1-u)/rate)` -- the two differ in the sign of
 /// a zero result and would print differently.
-let private nextExponential (g: Mt19937_64) (rate: float) : float =
+let private nextExponential (g: IRaw64) (rate: float) : float =
     let u = nextUniform g
     -(log (1.0 - u)) / rate
 
@@ -119,7 +183,7 @@ let private nextExponential (g: Mt19937_64) (rate: float) : float =
 /// The `while` loop reproduces the header's `for(;;)` with `continue` on
 /// v <= 0: that rejection consumes the normal (two uniforms) and NOTHING else,
 /// which is why the uniform draw sits inside the v > 0 branch.
-let private nextGammaGe1 (g: Mt19937_64) (shape: float) : float =
+let private nextGammaGe1 (g: IRaw64) (shape: float) : float =
     let d = shape - (1.0 / 3.0)
     let c = 1.0 / sqrt (9.0 * d)
     let mutable result = 0.0
@@ -141,7 +205,7 @@ let private nextGammaGe1 (g: Mt19937_64) (shape: float) : float =
 
 /// rand_runtime.hpp `next_gamma`: any shape > 0. shape < 1 takes the boost
 /// branch (Gamma(shape+1) THEN one uniform, in that draw order).
-let private nextGamma (g: Mt19937_64) (shape: float) (rate: float) : float =
+let private nextGamma (g: IRaw64) (shape: float) (rate: float) : float =
     if shape < 1.0 then
         let gg = nextGammaGe1 g (shape + 1.0)
         let u = nextUniform g
@@ -157,7 +221,7 @@ let private poissonKnuthMaxLam = 10.0
 /// rand_runtime.hpp `next_poisson_knuth`: Knuth's product-of-uniforms.
 /// Consumes lam+1 uniforms in expectation; the count is returned as a float,
 /// matching the header's `double k`.
-let private nextPoissonKnuth (g: Mt19937_64) (lam: float) : float =
+let private nextPoissonKnuth (g: IRaw64) (lam: float) : float =
     let L = exp (-lam)
     let mutable p = 1.0
     let mutable k = 0.0
@@ -204,7 +268,7 @@ let private poissonLoggam (x: float) : float =
 /// accept, k < 0 / tiny-us reject, exact log test -- so the two streams stay
 /// in step through every rejection. `us` = 0 (a zero uniform) gives k = -inf
 /// and the k < 0 reject, on both sides, without a trap.
-let private nextPoissonPtrs (g: Mt19937_64) (lam: float) : float =
+let private nextPoissonPtrs (g: IRaw64) (lam: float) : float =
     let slam = sqrt lam
     let loglam = log lam
     let b = 0.931 + 2.53 * slam
@@ -230,17 +294,17 @@ let private nextPoissonPtrs (g: Mt19937_64) (lam: float) : float =
     result
 
 /// rand_runtime.hpp `next_poisson`: the split, nothing else.
-let private nextPoisson (g: Mt19937_64) (lam: float) : float =
+let private nextPoisson (g: IRaw64) (lam: float) : float =
     if lam >= poissonKnuthMaxLam then nextPoissonPtrs g lam
     else nextPoissonKnuth g lam
 
 /// rand_runtime.hpp `next_bernoulli`: ONE uniform, 1.0 iff u < p.
-let private nextBernoulli (g: Mt19937_64) (p: float) : float =
+let private nextBernoulli (g: IRaw64) (p: float) : float =
     if nextUniform g < p then 1.0 else 0.0
 
 /// rand_runtime.hpp `next_beta`: g1/(g1+g2) from two unit-rate gammas drawn in
 /// the order (a, then b).
-let private nextBeta (g: Mt19937_64) (a: float) (b: float) : float =
+let private nextBeta (g: IRaw64) (a: float) (b: float) : float =
     let g1 = nextGamma g a 1.0
     let g2 = nextGamma g b 1.0
     let s = g1 + g2
@@ -250,8 +314,8 @@ let private nextBeta (g: Mt19937_64) (a: float) (b: float) : float =
 
 /// Run one fill: seed a fresh engine from `key` and draw `n` values with
 /// `next`, exactly as every `blade_rand::<kind>` body does.
-let inline private fill (key: int64) (n: int) (next: Mt19937_64 -> float) : float[] =
-    let g = Mt19937_64(mix64 (uint64 key))
+let inline private fill (key: int64) (n: int) (next: IRaw64 -> float) : float[] =
+    let g = (Mt19937_64(mix64 (uint64 key)) :> IRaw64)
     Array.init n (fun _ -> next g)
 
 /// blade_rand::uniform(out, n, key): `n` draws ~ U[0,1) for stream `key`.
@@ -289,7 +353,7 @@ let beta (key: int64) (a: float) (b: float) (n: int) : float[] =
 /// clamp. Note this fill does NOT go through `fill`: it returns int64 and it
 /// hoists a per-call scan the way the C++ body does.
 let categorical (key: int64) (weights: float[]) (n: int) : int64[] =
-    let g = Mt19937_64(mix64 (uint64 key))
+    let g = (Mt19937_64(mix64 (uint64 key)) :> IRaw64)
     let k = weights.Length
     let cum = Array.zeroCreate<float> k
     let mutable acc = 0.0
@@ -341,6 +405,64 @@ let drawsCategorical (kind: string) (key: int64) (weights: float[]) (n: int) : i
     match kind with
     | "categorical" -> categorical key weights n
     | other -> failwith $"RandMirror.drawsCategorical: unknown int64 rand kind '{other}' (expected categorical)"
+
+// The `_at` families (rand_runtime.hpp `fill_at` / `categorical_at`): one
+// Philox stream per sample, sample id = offset + i, the same transforms.
+
+/// rand_runtime.hpp `stream_word`: the stream key occupies one counter word.
+let private streamWord (stream: int64) : uint32 =
+    if stream < 0L || ((uint64 stream) >>> 32) <> 0UL then
+        raise (Blade.Interp.Value.InterpPanic ("BL8001", "rand stream key out of range -- the stream key of an _at family must be in [0, 2^32)", None, 0))
+    uint32 stream
+
+/// rand_runtime.hpp `check_offset`.
+let private checkOffset (offset: int64) : unit =
+    if offset < 0L then
+        raise (Blade.Interp.Value.InterpPanic ("BL8001", "rand sample offset negative -- the sample offset of an _at family must be non-negative", None, 0))
+
+let inline private fillAt (key: int64) (stream: int64) (offset: int64) (n: int) (next: IRaw64 -> float) : float[] =
+    let s = streamWord stream
+    checkOffset offset
+    Array.init n (fun i -> next (PhiloxStream(key, s, uint64 offset + uint64 i) :> IRaw64))
+
+/// `draws` for the `_at` kinds: same transforms, addressed per sample.
+let drawsAt (kind: string) (key: int64) (stream: int64) (offset: int64) (pars: float list) (n: int) : float[] =
+    match kind, pars with
+    | "uniform_at", []          -> fillAt key stream offset n nextUniform
+    | "normal_at", []           -> fillAt key stream offset n nextNormal
+    | "exponential_at", [rate]  -> fillAt key stream offset n (fun g -> nextExponential g rate)
+    | "gamma_at", [shape; rate] -> fillAt key stream offset n (fun g -> nextGamma g shape rate)
+    | "poisson_at", [lam]       -> fillAt key stream offset n (fun g -> nextPoisson g lam)
+    | "bernoulli_at", [p]       -> fillAt key stream offset n (fun g -> nextBernoulli g p)
+    | "beta_at", [a; b]         -> fillAt key stream offset n (fun g -> nextBeta g a b)
+    | other, _ ->
+        failwith $"RandMirror.drawsAt: unknown indexed rand kind '{other}' with {List.length pars} parameter(s)"
+
+/// `drawsCategorical` for `categorical_at`: the scan once, one uniform per
+/// sample from that sample's own stream.
+let drawsCategoricalAt (kind: string) (key: int64) (stream: int64) (offset: int64) (weights: float[]) (n: int) : int64[] =
+    if kind <> "categorical_at" then
+        failwith $"RandMirror.drawsCategoricalAt: unknown int64 indexed rand kind '{kind}'"
+    let s = streamWord stream
+    checkOffset offset
+    let k = weights.Length
+    let cum = Array.zeroCreate<float> k
+    let mutable acc = 0.0
+    for i in 0 .. k - 1 do
+        acc <- acc + (if weights.[i] > 0.0 then weights.[i] else 0.0)
+        cum.[i] <- acc
+    let total = acc
+    let degenerate = not (total > 0.0)
+    if not degenerate then
+        for i in 0 .. k - 1 do cum.[i] <- cum.[i] / total
+    Array.init n (fun i ->
+        let g = (PhiloxStream(key, s, uint64 offset + uint64 i) :> IRaw64)
+        let u = nextUniform g
+        if degenerate then 0L
+        else
+            let mutable j = 0
+            while j + 1 < k && u >= cum.[j] do j <- j + 1
+            int64 j)
 
 // RandomFillSpec executor.
 

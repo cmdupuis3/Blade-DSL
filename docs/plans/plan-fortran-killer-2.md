@@ -258,6 +258,30 @@ thread/rank counts and checkpoint restart without changing logical addresses.
 Test address collisions/overflow, multiple streams, and the generator's reference
 vectors. Statistical validation supplements these tests; it does not prove independence.
 
+**Landed (2026-09-07): the indexed families.** `rand.<fam>_at(key, stream, offset,
+params.., shape)` for every family (uniform, normal, exponential, gamma, poisson,
+bernoulli, beta, categorical): cell i is logical sample `offset + i` and its value
+is a pure function of the address (algorithm "philox4x32-10 v1": Philox key = the
+64-bit experiment key; counter = [sample lo, sample hi, 32-bit stream key, per-sample
+draw counter]; one block = two raw 64-bit words mapped to [0, 1) as an mt19937_64
+word is). The eight transforms are shared with the sequenced families -- they became
+templates on the raw source in `cpp/rand_runtime.hpp`, an interface in the F#
+mirror -- so a rejection sampler is chunk-invariant because each sample owns its
+draw counter, not because anything was rewritten. The stream key must lie in
+[0, 2^32) and the offset be non-negative (literals refused at typecheck, runtime
+values abort BL8001 in both lanes). Pins: the three Random123 `kat_vectors` lines
+for philox4x32-10 against the F# twin (`tests/RandMirrorTests.fs`, `blade test
+rand-mirror`), the interpreter differential tying the C++ header to that twin, and
+`tests/corpus/rand/019-022` (whole vs uneven chunks vs reverse order vs subrange
+identical to the bit for uniform; the same for every other family including the
+rejection samplers; stream / key separation; the two guards). Not done: the
+sequenced families keep their pinned mt19937_64 streams (no migration); the
+checkpoint/restart story (section 7) and thread/rank-count invariance need only the
+address, which is what landed. The framing chosen with the user -- rand as a MODULE
+that is a thin wrapper over a C++ generator -- is the shape it took: the module
+rewrites the call, the header owns the generator, and nothing in Blade source can
+see the bits.
+
 Before extension, fix the existing Poisson defect in Appendix B. Use a suitable
 large-parameter algorithm or an explicit supported-domain refusal. Identical outputs
 from the two implementations are not a probability-distribution accuracy test.

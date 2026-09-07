@@ -18,6 +18,16 @@
 //   blade_rand::beta       (double* out, size_t n, int64_t key, double a, double b)
 //   blade_rand::categorical(int64_t* out, size_t n, int64_t key, const double* w, size_t k)
 //
+// INDEXED (`_at`) FAMILIES -- the same eight transforms addressed per SAMPLE
+// instead of sequenced per fill (docs/plans/plan-fortran-killer-2.md section 5):
+//   blade_rand::uniform_at    (double* out, size_t n, int64_t key, int64_t stream, int64_t offset)
+//   blade_rand::normal_at     (..., int64_t key, int64_t stream, int64_t offset)
+//   blade_rand::exponential_at(..., key, stream, offset, double rate)   and so on for gamma / poisson /
+//   bernoulli / beta, and categorical_at(int64_t* out, n, key, stream, offset, const double* w, size_t k).
+// Cell i of the fill is sample `offset + i`, and its value is a pure function of the ADDRESS
+// (algorithm philox4x32-10 v1, key, stream, sample, draw counter): the same sample drawn whole, in
+// uneven chunks, in any chunk order or as a subrange is the same bits. See `philox_stream`.
+//
 // ELEMENT TYPE. Every fill EXCEPT `categorical` writes `double`, including the
 // two integer-valued families (poisson counts, bernoulli 0/1). That is
 // deliberate: one `double*` out-pointer contract keeps the codegen seam
@@ -78,13 +88,13 @@ inline double bits_to_unit(uint64_t x) {
     return static_cast<double>(x >> 11) * (1.0 / 9007199254740992.0); // 2^-53
 }
 
-inline double next_uniform(std::mt19937_64& g) {
+template <class G> inline double next_uniform(G& g) {
     return bits_to_unit(g());
 }
 
 // Box-Muller (our own; NOT std::normal_distribution). Two uniforms -> one
 // standard normal. u1 is floored away from 0 so log(u1) stays finite.
-inline double next_normal(std::mt19937_64& g) {
+template <class G> inline double next_normal(G& g) {
     const double two_pi = 6.283185307179586476925286766559;
     double u1 = next_uniform(g);
     double u2 = next_uniform(g);
@@ -95,7 +105,7 @@ inline double next_normal(std::mt19937_64& g) {
 // Exp(rate) by inverse CDF: -log(1-u)/rate. ONE uniform per draw. u in [0,1)
 // => 1-u in (0,1], so log() is finite without a floor (the u==0 endpoint that
 // would be the singular one is unreachable from the OPEN end of the interval).
-inline double next_exponential(std::mt19937_64& g, double rate) {
+template <class G> inline double next_exponential(G& g, double rate) {
     double u = next_uniform(g);
     return -std::log(1.0 - u) / rate;
 }
@@ -107,7 +117,7 @@ inline double next_exponential(std::mt19937_64& g, double rate) {
 // as published. This ordering is part of the mirror contract: RandMirror.fs
 // must branch on the same conditions in the same sequence or the two streams
 // desynchronize after the first rejection.
-inline double next_gamma_ge1(std::mt19937_64& g, double shape) {
+template <class G> inline double next_gamma_ge1(G& g, double shape) {
     const double d = shape - (1.0 / 3.0);
     const double c = 1.0 / std::sqrt(9.0 * d);
     for (;;) {
@@ -126,7 +136,7 @@ inline double next_gamma_ge1(std::mt19937_64& g, double shape) {
 // Marsaglia-Tsang BOOST: draw Gamma(shape+1, 1) and scale by u^(1/shape). Draw
 // order is gamma-THEN-uniform (the mirror replicates it verbatim). `rate` is an
 // inverse-scale, applied last by division.
-inline double next_gamma(std::mt19937_64& g, double shape, double rate) {
+template <class G> inline double next_gamma(G& g, double shape, double rate) {
     if (shape < 1.0) {
         double gg = next_gamma_ge1(g, shape + 1.0);
         double u = next_uniform(g);
@@ -170,7 +180,7 @@ inline double next_gamma(std::mt19937_64& g, double shape, double rate) {
 // underflow (that needs lam in the hundreds).
 constexpr double kPoissonKnuthMaxLam = 10.0;
 
-inline double next_poisson_knuth(std::mt19937_64& g, double lam) {
+template <class G> inline double next_poisson_knuth(G& g, double lam) {
     const double L = std::exp(-lam);
     double p = 1.0;
     double k = 0.0;
@@ -247,7 +257,7 @@ BLADE_RAND_NO_CONTRACT inline double poisson_loggam(double x) {
 // them statement for statement. `us` can be exactly 0 when U == -0.5 (a
 // zero uniform): 2a/us is then +inf, k is -inf, and the k < 0 branch
 // rejects -- no trap, same on both sides.
-BLADE_RAND_NO_CONTRACT inline double next_poisson_ptrs(std::mt19937_64& g, double lam) {
+template <class G> BLADE_RAND_NO_CONTRACT inline double next_poisson_ptrs(G& g, double lam) {
     BLADE_RAND_FP_CONTRACT_OFF_BODY
     const double slam = std::sqrt(lam);
     const double loglam = std::log(lam);
@@ -269,7 +279,7 @@ BLADE_RAND_NO_CONTRACT inline double next_poisson_ptrs(std::mt19937_64& g, doubl
 }
 
 // The dispatcher every `poisson` fill calls: the split above, nothing else.
-inline double next_poisson(std::mt19937_64& g, double lam) {
+template <class G> inline double next_poisson(G& g, double lam) {
     if (lam >= kPoissonKnuthMaxLam) return next_poisson_ptrs(g, lam);
     return next_poisson_knuth(g, lam);
 }
@@ -278,7 +288,7 @@ inline double next_poisson(std::mt19937_64& g, double lam) {
 // element-type note in the header comment). Note this transform involves no
 // libm call at all -- only a comparison -- so it is the one family whose draws
 // are bit-identical between mirror and binary by construction.
-inline double next_bernoulli(std::mt19937_64& g, double p) {
+template <class G> inline double next_bernoulli(G& g, double p) {
     return next_uniform(g) < p ? 1.0 : 0.0;
 }
 
@@ -286,7 +296,7 @@ inline double next_bernoulli(std::mt19937_64& g, double p) {
 // that order. The s <= 0 guard catches the degenerate case where both gammas
 // underflow to 0 (only reachable for very small a and b); 0.0 is returned
 // rather than a NaN so the fill stays printable.
-inline double next_beta(std::mt19937_64& g, double a, double b) {
+template <class G> inline double next_beta(G& g, double a, double b) {
     double g1 = next_gamma(g, a, 1.0);
     double g2 = next_gamma(g, b, 1.0);
     double s = g1 + g2;
@@ -380,6 +390,146 @@ inline void categorical(int64_t* out, size_t n, int64_t key, const double* w, si
     // Zero-weight indices are unreachable: they leave cum flat, and the strict
     // `u >= cum[j]` step walks past every flat run.
     for (size_t i = 0; i < n; ++i) {
+        double u = next_uniform(g);
+        if (degenerate) { out[i] = 0; continue; }
+        size_t j = 0;
+        while (j + 1 < k && u >= cum[j]) ++j;
+        out[i] = static_cast<int64_t>(j);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INDEXED families: Philox4x32-10 (Salmon, Moraes, Dror, Shaw, "Parallel random
+// numbers: as easy as 1, 2, 3", SC 2011). A counter-based generator: the block
+// for counter c under key k is a bijection of c, so sample number s can be
+// produced without producing samples 0 .. s-1. That is what makes a draw a
+// function of its ADDRESS rather than of the fill it happened to be in.
+//
+// ADDRESS (algorithm "philox4x32-10 v1"; changing any line of it is a NEW
+// family name, never a silent change of pinned streams):
+//   key     = (uint32)key, (uint32)(key >> 32)          -- the 64-bit experiment key, unmixed
+//   counter = [ (uint32)sample, (uint32)(sample >> 32),  -- the 64-bit logical sample id
+//               stream,                                   -- a 32-bit stream key ([0, 2^32); refused outside)
+//               draw ]                                    -- per-sample block counter, from 0
+// One block yields four 32-bit words = TWO raw 64-bit values, (w0 << 32 | w1)
+// then (w2 << 32 | w3), each mapped to [0, 1) by `bits_to_unit` exactly as an
+// mt19937_64 word is. A transform that needs more uniforms (Box-Muller: 2;
+// gamma / poisson: data-dependent) advances `draw` per block; the per-sample
+// stream is what every `next_*` above consumes, so the `_at` families and the
+// sequenced ones share ONE copy of each transform (they are templates on the
+// engine). Known-answer vectors from Random123's `kat_vectors` are pinned in
+// tests/RandMirrorTests.fs against the F# twin, and the interpreter
+// differential ties this header to that twin.
+constexpr uint32_t kPhiloxM0 = 0xD2511F53u;
+constexpr uint32_t kPhiloxM1 = 0xCD9E8D57u;
+constexpr uint32_t kPhiloxW0 = 0x9E3779B9u;
+constexpr uint32_t kPhiloxW1 = 0xBB67AE85u;
+
+inline void philox4x32_10(const uint32_t ctr[4], const uint32_t key[2], uint32_t out[4]) {
+    uint32_t c0 = ctr[0], c1 = ctr[1], c2 = ctr[2], c3 = ctr[3];
+    uint32_t k0 = key[0], k1 = key[1];
+    for (int r = 0; r < 10; ++r) {
+        const uint64_t p0 = static_cast<uint64_t>(kPhiloxM0) * c0;
+        const uint64_t p1 = static_cast<uint64_t>(kPhiloxM1) * c2;
+        const uint32_t hi0 = static_cast<uint32_t>(p0 >> 32), lo0 = static_cast<uint32_t>(p0);
+        const uint32_t hi1 = static_cast<uint32_t>(p1 >> 32), lo1 = static_cast<uint32_t>(p1);
+        const uint32_t n0 = hi1 ^ c1 ^ k0;
+        const uint32_t n2 = hi0 ^ c3 ^ k1;
+        c0 = n0; c1 = lo1; c2 = n2; c3 = lo0;
+        k0 += kPhiloxW0; k1 += kPhiloxW1;
+    }
+    out[0] = c0; out[1] = c1; out[2] = c2; out[3] = c3;
+}
+
+// The per-sample raw stream: `operator()` hands out the two raw words of a
+// block, then the next block (draw counter + 1). Drop-in for std::mt19937_64
+// in every `next_*` template above.
+struct philox_stream {
+    uint32_t key[2];
+    uint32_t ctr[4];
+    uint32_t buf[4];
+    int left;
+    philox_stream(int64_t k, uint32_t stream, uint64_t sample) {
+        const uint64_t uk = static_cast<uint64_t>(k);
+        key[0] = static_cast<uint32_t>(uk);
+        key[1] = static_cast<uint32_t>(uk >> 32);
+        ctr[0] = static_cast<uint32_t>(sample);
+        ctr[1] = static_cast<uint32_t>(sample >> 32);
+        ctr[2] = stream;
+        ctr[3] = 0u;
+        buf[0] = buf[1] = buf[2] = buf[3] = 0u;
+        left = 0;
+    }
+    uint64_t operator()() {
+        if (left == 0) {
+            philox4x32_10(ctr, key, buf);
+            ctr[3] += 1u;
+            left = 2;
+        }
+        left -= 1;
+        const int b = (left == 1) ? 0 : 2;
+        return (static_cast<uint64_t>(buf[b]) << 32) | static_cast<uint64_t>(buf[b + 1]);
+    }
+};
+
+// The stream key occupies ONE counter word and the offset is an unsigned
+// sample id. Their range guards (stream in [0, 2^32), offset >= 0; BL8001)
+// are EMITTED by codegen right before the fill call, not written here: a
+// runtime header must never reach the runtime panic itself, because codegen
+// elides a body's shadow frame when no call in the body's own text can
+// panic (tests/Test_Diagnostics.fs pins that rule). So this is a plain cast
+// of an already-checked value.
+inline uint32_t stream_word(int64_t stream) {
+    return static_cast<uint32_t>(stream);
+}
+
+template <class F>
+inline void fill_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset, F&& draw) {
+    const uint32_t s = stream_word(stream);
+    for (size_t i = 0; i < n; ++i) {
+        philox_stream g(key, s, static_cast<uint64_t>(offset) + static_cast<uint64_t>(i));
+        out[i] = draw(g);
+    }
+}
+
+inline void uniform_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset) {
+    fill_at(out, n, key, stream, offset, [](philox_stream& g) { return next_uniform(g); });
+}
+inline void normal_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset) {
+    fill_at(out, n, key, stream, offset, [](philox_stream& g) { return next_normal(g); });
+}
+inline void exponential_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset, double rate) {
+    fill_at(out, n, key, stream, offset, [rate](philox_stream& g) { return next_exponential(g, rate); });
+}
+inline void gamma_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset, double shape, double rate) {
+    fill_at(out, n, key, stream, offset, [shape, rate](philox_stream& g) { return next_gamma(g, shape, rate); });
+}
+inline void poisson_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset, double lam) {
+    fill_at(out, n, key, stream, offset, [lam](philox_stream& g) { return next_poisson(g, lam); });
+}
+inline void bernoulli_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset, double p) {
+    fill_at(out, n, key, stream, offset, [p](philox_stream& g) { return next_bernoulli(g, p); });
+}
+inline void beta_at(double* out, size_t n, int64_t key, int64_t stream, int64_t offset, double a, double b) {
+    fill_at(out, n, key, stream, offset, [a, b](philox_stream& g) { return next_beta(g, a, b); });
+}
+// categorical_at: the sequenced body's scan, then ONE uniform per sample from
+// that sample's own stream (draw budget 1, unconditionally, as above).
+inline void categorical_at(int64_t* out, size_t n, int64_t key, int64_t stream, int64_t offset, const double* w, size_t k) {
+    const uint32_t s = stream_word(stream);
+    std::vector<double> cum(k);
+    double acc = 0.0;
+    for (size_t i = 0; i < k; ++i) {
+        acc += (w[i] > 0.0) ? w[i] : 0.0;
+        cum[i] = acc;
+    }
+    const double total = acc;
+    const bool degenerate = !(total > 0.0);
+    if (!degenerate) {
+        for (size_t i = 0; i < k; ++i) cum[i] /= total;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        philox_stream g(key, s, static_cast<uint64_t>(offset) + static_cast<uint64_t>(i));
         double u = next_uniform(g);
         if (degenerate) { out[i] = 0; continue; }
         size_t j = 0;

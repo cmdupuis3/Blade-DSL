@@ -1429,7 +1429,10 @@ type RandomFillSpec =
     | FillModulus of IRExpr              // fill_random(mod)
     // rand.<kind>(key, pars..[, weights]); kind = uniform | normal | exponential
     // | gamma | poisson | bernoulli | beta | categorical
-    | RandGen of kind: string * key: IRExpr * pars: IRExpr list * weights: (IRExpr * int) option
+    // `address` is the `_at` families' (stream, offset) channel, `Some` only
+    // for kinds ending in `_at`: two Int64 expressions evaluated once at the
+    // binding, emitted right after the key.
+    | RandGen of kind: string * key: IRExpr * pars: IRExpr list * weights: (IRExpr * int) option * address: (IRExpr * IRExpr) option
 
 type IRModule = {
     Name: string

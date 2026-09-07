@@ -248,7 +248,7 @@ and TypedExprKind =
     // checker off the argument's own type. It rides along rather than being
     // re-read from the TypedExpr's type downstream so that the "is this extent
     // static?" question is asked (and refused) in exactly one place.
-    | TExprRandGen of kind: string * key: TypedExpr * pars: TypedExpr list * weights: (TypedExpr * int) option * dims: int list
+    | TExprRandGen of kind: string * key: TypedExpr * pars: TypedExpr list * weights: (TypedExpr * int) option * address: (TypedExpr * TypedExpr) option * dims: int list
     | TExprGuard of cond: TypedExpr * body: TypedExpr
     | TExprZero
     | TExprReynolds of kernel: TypedExpr * isAntisymmetric: bool
