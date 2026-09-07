@@ -301,6 +301,14 @@ and TypedExprKind =
     /// `labels` the file labels of a file-segmented axis. No key array,
     /// no CSR: the permutation is the identity.
     | TExprSegments of alias: string * offsets: int64 list * labels: string list option
+    /// segments(C0, C1): the PRODUCT grouping of two segmented slots of a
+    /// rank-2 array (docs/plans/structural/07 §4.1b): one group per tile
+    /// (g0, g1) in slot order, the member the tile's cells row-major.
+    /// `bounds` are the per-slot run boundaries `[0; ..; N_d]`.
+    | TExprSegmentsGrid of aliases: string list * bounds: int64 list list
+    /// ungroup(G) of a grid grouping: the tiles written back over the two
+    /// source axes.
+    | TExprUngroupGrid of grouped: TypedExpr * sources: IRIndexType list * bounds: int64 list list
     /// ungroup(G): the inverse of `group_by(_, segments(A))` -- G's rows
     /// reassembled over the SOURCE axis `source` (§2.3, §3.3).
     | TExprUngroup of grouped: TypedExpr * source: IRIndexType

@@ -2050,6 +2050,33 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
                       Data = A.storeOfValues g.ElemType cells }
          | _ -> raise (InterpUnsupported "ungroup: operand is not a ragged (grouped) array"))
 
+    // -- ungroup(G) of a tile grouping: tiles back over the two axes
+    //    (genUngroupGridBinding's twin).
+    | IRUngroupGrid (gExpr, srcs, bounds) ->
+        let g = forceInputArray st env gExpr
+        let b0, b1 = Array.ofList bounds.[0], Array.ofList bounds.[1]
+        let n0, n1 = int b0.[b0.Length - 1], int b1.[b1.Length - 1]
+        let g1 = b1.Length - 1
+        let cells : Value[] = Array.zeroCreate (n0 * n1)
+        (match g.Data with
+         | SRagged (rows, _, _) ->
+             for t in 0 .. rows.Length - 1 do
+                 let t0, t1 = t / g1, t % g1
+                 let lo0, hi0 = int b0.[t0], int b0.[t0 + 1]
+                 let lo1, hi1 = int b1.[t1], int b1.[t1 + 1]
+                 let w = hi1 - lo1
+                 for i in lo0 .. hi0 - 1 do
+                     for j in lo1 .. hi1 - 1 do
+                         cells.[i * n1 + j] <- A.readCell g [ int64 t; int64 ((i - lo0) * w + (j - lo1)) ]
+         | _ -> raise (InterpUnsupported "ungroup: operand is not a ragged (grouped) array"))
+        // a rank-2 dense value is NESTED rows in the interpreter (peelDim's
+        // view contract), not a flat pool
+        let rows = Array.init n0 (fun i -> A.storeOfValues g.ElemType cells.[i * n1 .. i * n1 + n1 - 1])
+        VArray { ElemType = g.ElemType
+                 IndexTypes = srcs
+                 Extents = [| int64 n0; int64 n1 |]
+                 Data = SNested rows }
+
     // -- ungroup([r1..rF], A): per-file arrays assembled over the tiled axis
     //    (genUngroupRowsBinding's twin).
     | IRUngroupRows (rowExprs, _, src) ->

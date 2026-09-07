@@ -1752,7 +1752,7 @@ let buildGroupKeys (keyArrays: BladeArray list) (gkCase: GroupKeyCase) : GroupKe
             let g = buckets.[i]
             perm.[int offsets.[g] + fill.[g]] <- int64 i
             fill.[g] <- fill.[g] + 1
-    { Offsets = offsets; Members = perm }
+    { Offsets = offsets; Members = perm; Coords = None }
 
 /// group_bucket(gk): invert the CSR pair into a dense row -> bucket map over the
 /// source index space (genGroupBucketBinding). Rows the permutation never names
@@ -1792,7 +1792,10 @@ let buildGroupBy (idxTys: IRIndexType list) (gk: GroupKeysValue) (vals: BladeArr
         Array.init ngroups (fun g ->
             let lo = int gk.Offsets.[g]
             let hi = int gk.Offsets.[g + 1]
-            let vs = Array.init (hi - lo) (fun k -> readCell vals [ gk.Members.[lo + k] ])
+            let vs =
+                match gk.Coords with
+                | Some coords -> Array.init (hi - lo) (fun k -> readCell vals coords.[lo + k])
+                | None -> Array.init (hi - lo) (fun k -> readCell vals [ gk.Members.[lo + k] ])
             storeOfValues vals.ElemType vs)
     let lens = Array.init ngroups (fun g -> gk.Offsets.[g + 1] - gk.Offsets.[g])
     { ElemType = vals.ElemType

@@ -787,6 +787,12 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
     | TExprSegments (_, offsets, labels) ->
         IRSegments (offsets, labels)
 
+    | TExprSegmentsGrid (_, bounds) ->
+        IRSegmentsGrid bounds
+
+    | TExprUngroupGrid (grouped, sources, bounds) ->
+        IRUngroupGrid (lowerTypedExpr env grouped, sources, bounds)
+
     | TExprUngroup (grouped, source) ->
         IRUngroup (lowerTypedExpr env grouped, source)
 

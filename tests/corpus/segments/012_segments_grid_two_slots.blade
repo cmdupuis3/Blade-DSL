@@ -1,0 +1,24 @@
+// TEST: Tile Grouping Over Two Segmented Slots
+// ============================================================================
+// `segments(C0, C1)` is the PRODUCT grouping of a rank-2 array's two
+// segmented slots (docs/plans/structural/07 §4.1b), in slot order (decision
+// D8/D10): one group per tile, row-major over the 3 x 2 tile grid, each
+// member the tile's cells row-major. A 10 x 6 array at edges 4 and 4 has
+// tiles of 16, 8, 16, 8, 8, 4 cells; `ungroup` puts them back over both axes.
+// ============================================================================
+type I0 = Idx<10>
+type I1 = Idx<6>
+type C0 = Chunked<I0, 4>
+type C1 = Chunked<I1, 4>
+let a: Array<Float like I0, I1> = method_for(range<I0>, range<I1>) <@> lambda(i, j) -> Float64(i) * 10.0 + Float64(j) |> compute
+let tiles = segments(C0, C1)
+let sizes = extents(tiles)
+// EXPECT: sizes = [16, 8, 16, 8, 8, 4]
+let g = group_by(a, tiles)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+// EXPECT: sums = [264, 156, 904, 476, 692, 358]
+let firsts = method_for(g) <@> lambda(r) -> r(0) |> compute
+// EXPECT: firsts = [0, 4, 40, 44, 80, 84]
+let back = ungroup(g)
+let dev = reduce(back - a, (+), axes = 2)
+// EXPECT: dev = 0

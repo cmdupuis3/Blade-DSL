@@ -643,8 +643,10 @@ and inferExprInner (env: TypeEnv) (expr: Expr) : TypeResult<TypedExpr> =
     // intrinsics: a user binding of the same name shadows them.
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, [ { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "segments" env).IsNone ->
         inferSegments env alias
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, [ { Kind = ExprKind.ExprVar a0 }; { Kind = ExprKind.ExprVar a1 } ]) when (lookupVar "segments" env).IsNone ->
+        inferSegmentsGrid env [ a0; a1 ]
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "segments" }, _) when (lookupVar "segments" env).IsNone ->
-        Error (Other "segments takes exactly one argument: the name of a `Chunked<..>` index alias")
+        Error (Other "segments takes the name of a `Chunked<..>` index alias, or two of them for the tile grouping of a rank-2 array")
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "files" }, [ { Kind = ExprKind.ExprVar alias } ]) when (lookupVar "files" env).IsNone ->
         inferFiles env alias
     | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "files" }, _) when (lookupVar "files" env).IsNone ->
@@ -3891,6 +3893,43 @@ and inferGroupBy (env: TypeEnv) values grouping : TypeResult<TypedExpr> =
     inferExpr env values |> Result.bind (fun tVals ->
     inferExpr env grouping |> Result.bind (fun tGrouping ->
         requireArrayArg env tVals "group_by" |> Result.bind (fun arrTy ->
+            // A GRID grouping (`segments(C0, C1)`): the values must be rank 2
+            // over exactly those two axes, in slot order; the result is one
+            // ragged row per tile (docs/plans/structural/07 §4.1b).
+            let gridCase =
+                match env.Subst.Resolve(tGrouping.Type) with
+                | IRTGroupKeys (outer, _, _) ->
+                    (match outer.Tag with
+                     | Some t when t.StartsWith "__segmentsgrid|" -> Some (outer, t.Substring "__segmentsgrid|".Length)
+                     | _ -> None)
+                | _ -> None
+            match gridCase with
+            | Some (outer, aliasKey) ->
+                let aliases = aliasKey.Split(',') |> List.ofArray
+                let segs = aliases |> List.choose (fun a -> Map.tryFind a env.Segmentations)
+                if arrTy.IndexTypes.Length <> 2 then
+                    Error (Other $"group_by over segments({aliasKey}): the values must be a rank-2 array over those two axes (got rank {arrTy.IndexTypes.Length})")
+                elif segs.Length <> 2 then
+                    Error (Other $"group_by over segments({aliasKey}): an alias is no longer in scope")
+                else
+                    let slotMatches (d: int) =
+                        let ix = arrTy.IndexTypes.[d]
+                        let src = segs.[d].Source
+                        ix.Id = src.Id || (ix.Tag.IsSome && ix.Tag = src.Tag) || (match ix.Extent, src.Extent with IRLit (IRLitInt a), IRLit (IRLitInt b) -> a = b && ix.Tag.IsNone | _ -> false)
+                    if not (slotMatches 0 && slotMatches 1) then
+                        Error (Other $"group_by over segments({aliasKey}): the values' slots must be the segmented axes {aliasKey}, in that order")
+                    else
+                        let member_ = {
+                            Id = env.Builder.FreshId(); Rank = 1
+                            Extent = IRParam ("__groupsz", 0, IRTNat None)
+                            Symmetry = SymNone; Tag = Some "__group_member"; IxKind = IxKGroupMember
+                            Kind = SDimension; Dependencies = []
+                        }
+                        let outer' = { outer with Id = env.Builder.FreshId(); Tag = Some "__group_outer"; IxKind = IxKGroupOuter }
+                        env.SegmentedOuters.[outer'.Id] <- aliasKey
+                        let resultType = mkArrayArrow [outer'; member_] arrTy.ElemType None
+                        Ok (mkTyped (TExprGroupBy (tVals, tGrouping)) resultType)
+            | None ->
             // Extract group structure from GroupKeys type, or fall back for raw key arrays
             let (outerIdx, memberIdx) =
                 match env.Subst.Resolve(tGrouping.Type) with
@@ -4093,6 +4132,36 @@ and inferSegments (env: TypeEnv) (alias: string) : TypeResult<TypedExpr> =
         let gkType = IRTGroupKeys (outer, seg.Source, enumValues)
         Ok (mkTyped (TExprSegments (alias, offsets, labels)) gkType)
 
+/// segments(C0, C1): the PRODUCT grouping of two segmented slots (docs/
+/// plans/structural/07 §4.1b, the multi-dimensional case in the fixed slot
+/// order of decisions D8/D10): one group per tile (g0, g1), row-major over
+/// the tile grid, the member the tile's cells row-major. Both slots are
+/// single-slot segmentations, so every step's table depends only on its
+/// own slot and the cross-slot condition of §4.0 holds by construction;
+/// a two-dimensional mosaic of stores (where it could fail) has no
+/// declaration form yet and is refused where it would arise.
+and inferSegmentsGrid (env: TypeEnv) (aliases: string list) : TypeResult<TypedExpr> =
+    let segs = aliases |> List.map (fun a -> Map.tryFind a env.Segmentations)
+    match segs with
+    | [ Some s0; Some s1 ] ->
+        if (segmentationLabels s0).IsSome || (segmentationLabels s1).IsSome then
+            Error (Other "segments(C0, C1): a tile grouping over a FILE-tiled axis (a two-dimensional store mosaic) has no declaration form yet; both slots must be regular or store-inherited grids")
+        else
+        let b0 = segmentationOffsets s0
+        let b1 = segmentationOffsets s1
+        let g = int64 ((b0.Length - 1) * (b1.Length - 1))
+        let outer = {
+            Id = env.Builder.FreshId(); Rank = 1
+            Extent = IRLit (IRLitInt g)
+            Symmetry = SymNone; Tag = Some ("__segmentsgrid|" + String.concat "," aliases); IxKind = IxKPlain
+            Kind = SDimension; Dependencies = []
+        }
+        let gkType = IRTGroupKeys (outer, s0.Source, None)
+        Ok (mkTyped (TExprSegmentsGrid (aliases, [ b0; b1 ])) gkType)
+    | _ ->
+        let missing = List.zip aliases segs |> List.filter (fun (_, s) -> s.IsNone) |> List.map fst
+        Error (Other $"""segments({String.concat ", " aliases}): {String.concat ", " missing} is not a `Chunked<..>` index alias in scope""")
+
 /// files(A): the FILE-level grouping of a file-segmented axis (§2.7): one
 /// run per store, in declaration order, the outer slot labelled by the
 /// store names (the `EnumIdx` states of decision D3, carried as the
@@ -4175,6 +4244,22 @@ and inferUngroup (env: TypeEnv) (grouped: Expr) (aliasOpt: string option) : Type
                     | true, a -> Ok a
                     | _ -> Error (Other "ungroup(G): G is not (directly) the result of `group_by(_, segments(A))`; if it derives from one, name the axis: ungroup(G, A)")
             alias |> Result.bind (fun a ->
+                if a.Contains "," then
+                    // a grid grouping's result: two axes come back
+                    let aliases = a.Split(',') |> List.ofArray
+                    let segs = aliases |> List.choose (fun x -> Map.tryFind x env.Segmentations)
+                    if segs.Length <> 2 then Error (Other $"ungroup: the tile grouping's axes {a} are not both in scope")
+                    else
+                        let bounds = segs |> List.map segmentationOffsets
+                        let g = int64 ((bounds.[0].Length - 1) * (bounds.[1].Length - 1))
+                        (match outer.Extent with
+                         | IRLit (IRLitInt n) when n <> g -> Error (Other $"ungroup: the outer slot has {n} tiles but segments({a}) has {g}")
+                         | _ ->
+                             let sources = segs |> List.map (fun s -> s.Source)
+                             let rest = arrTy.IndexTypes |> List.skip 2
+                             let resultType = mkArrayArrow (sources @ rest) arrTy.ElemType None
+                             Ok (mkTyped (TExprUngroupGrid (tG, sources, bounds)) resultType))
+                else
                 match Map.tryFind a env.Segmentations with
                 | None -> Error (Other $"ungroup(_, {a}): '{a}' is not a `Chunked<..>` index alias in scope")
                 | Some seg ->
@@ -4191,6 +4276,17 @@ and inferUngroup (env: TypeEnv) (grouped: Expr) (aliasOpt: string option) : Type
         | _ -> Error (Other "ungroup expects a segment-grouped array (rank >= 2: groups x members)"))
 
 and inferGroupBucket (env: TypeEnv) (grouping: Expr) : TypeResult<TypedExpr> =
+    let gridRefusal =
+        match grouping.Kind with
+        | ExprKind.ExprVar n ->
+            (match lookupVar n env with
+             | Some vi ->
+                 (match env.Subst.Resolve vi.Type with
+                  | IRTGroupKeys (outer, _, _) when (match outer.Tag with Some t -> t.StartsWith "__segmentsgrid|" | None -> false) -> true
+                  | _ -> false)
+             | None -> false)
+        | _ -> false
+    if gridRefusal then Error (Other "group_bucket over a tile grouping (`segments(C0, C1)`) is not supported: its source is two-dimensional; use extents(gk) for the tile sizes") else
     requireGroupingName env "group_bucket" grouping
     |> Result.map (fun (tGk, _, sourceIdx) ->
         // Reuse the source slot verbatim (same Id, tag and extent): the bucket

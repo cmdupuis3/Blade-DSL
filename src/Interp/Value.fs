@@ -132,6 +132,10 @@ and LoopObjValue = {
 and [<ReferenceEquality>] GroupKeysValue = {
     Offsets: int64[]
     Members: int64[]
+    /// A GRID grouping (segments(C0, C1)): the coordinates of each member
+    /// position, since the value is rank 2 and `Members` (flat row-major
+    /// indices) cannot address it. None for every other grouping.
+    Coords: int64 list[] option
 }
 
 /// A compound (masked product-space) index value: formalism 4.5 CompoundIdx

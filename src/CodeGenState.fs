@@ -78,6 +78,10 @@ type CodeGenContext = {
     /// identity accessor), by cpp name. A group_by over a STREAMED rank-1
     /// variable and one of these reads per run (docs/plans/structural/07 §3.4).
     StructuralGroupings: Set<string>
+    /// Grid (tile) groupings emitted by genSegmentsGridBinding, by cpp name:
+    /// the per-slot run boundaries. group_by gathers tiles from a rank-2
+    /// value through these; `__at` is not used for them.
+    GridGroupings: Map<string, int64 list list>
     /// Deferred random-fill constructors keyed by binding id (from IRModule.RandomInits);
     /// genBinding emits allocate<> + a pool fill from the RandomFillSpec.
     RandomInits: Map<IRId, RandomFillSpec>
@@ -1116,6 +1120,7 @@ let emptyContext () = {
     ProviderWrites = Map.empty
     StreamedArrays = Map.empty
     StructuralGroupings = Set.empty
+    GridGroupings = Map.empty
     RandomInits = Map.empty
     CompoundInits = Map.empty
     SparseInits = Map.empty

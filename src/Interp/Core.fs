@@ -535,6 +535,7 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
                 let ty = groupKeysTypeInScope id body |> Option.defaultValue IRTUnit
                 buildGroupKeysValue st env keys ty
             | IRSegments (offsets, _) -> segmentsValue offsets
+            | IRSegmentsGrid bounds -> segmentsGridValue bounds
             | _ -> evalExpr st env value
         // Copy semantics for assignable array lets initialized from an
         // existing array (`let mut a = Z` -- st.MutableArrayLets): deep-copy
@@ -844,7 +845,7 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
 
     // ---- ungroup(G) -> the rows of a segment-grouped array over the source
     //      axis (docs/plans/structural/07 §3.3). Same backend route.
-    | IRUngroup _ | IRUngroupRows _ ->
+    | IRUngroup _ | IRUngroupRows _ | IRUngroupGrid _ ->
         evalArrayNode st env expr
 
     // ---- extents(gk) -> a dense rank-1 Int64 array of per-group sizes.
@@ -1143,7 +1144,24 @@ and evalAssign (st: InterpState) (env: Env) (target: IRExpr) (v: Value) : unit =
 and private segmentsValue (offsets: int64 list) : Value =
     let offs = Array.ofList offsets
     let n = int (Array.last offs)
-    VGroupKeys { Offsets = offs; Members = Array.init n int64 }
+    VGroupKeys { Offsets = offs; Members = Array.init n int64; Coords = None }
+
+/// The grid grouping's value: tile-major member order, each position carrying
+/// its (i, j) coordinate (genSegmentsGridBinding's twin).
+and private segmentsGridValue (bounds: int64 list list) : Value =
+    let b0, b1 = Array.ofList bounds.[0], Array.ofList bounds.[1]
+    let coords = ResizeArray<int64 list>()
+    let offs = ResizeArray<int64>()
+    offs.Add 0L
+    for t0 in 0 .. b0.Length - 2 do
+        for t1 in 0 .. b1.Length - 2 do
+            for i in b0.[t0] .. b0.[t0 + 1] - 1L do
+                for j in b1.[t1] .. b1.[t1 + 1] - 1L do
+                    coords.Add [ i; j ]
+            offs.Add (int64 coords.Count)
+    let n1 = b1.[b1.Length - 1]
+    let members = coords |> Seq.map (fun c -> c.[0] * n1 + c.[1]) |> Array.ofSeq
+    VGroupKeys { Offsets = offs.ToArray(); Members = members; Coords = Some (coords.ToArray()) }
 
 and private buildGroupKeysValue (st: InterpState) (env: Env) (keys: IRExpr list) (ty: IRType) : Value =
     let keyArrs =
@@ -1239,6 +1257,7 @@ let evalBinding (st: InterpState) (env: Env) (b: IRBinding) : Value =
     // segments(A): the structural grouping -- static offsets, identity
     // members (docs/plans/structural/07 §3.2; genSegmentsBinding's twin).
     | IRSegments (offsets, _) -> segmentsValue offsets
+    | IRSegmentsGrid bounds -> segmentsGridValue bounds
     | v when shouldDeferBinding env b.Type v ->
         VDeferred (b.Value, env)
     | _ ->

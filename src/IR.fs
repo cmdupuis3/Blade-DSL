@@ -147,6 +147,8 @@ type IRExpr =
     | IRGroupKeys of keys: IRExpr list               // group_keys(keys1, keys2, ...) - CSR grouping; multi-key => compound dispatch
     | IRGroupBucket of grouping: IRExpr              // group_bucket(gk) - row -> bucket over the source index space, -1 for dropped rows
     | IRSegments of offsets: int64 list * labels: string list option  // segments(A): structural grouping, run boundaries [0; ..; N], identity permutation
+    | IRSegmentsGrid of bounds: int64 list list                        // segments(C0, C1): the product grouping of two slots, one group per tile, per-slot boundaries
+    | IRUngroupGrid of grouped: IRExpr * sources: IRIndexTypeG<IRExpr> list * bounds: int64 list list  // ungroup of a grid grouping: tiles back over the two axes
     | IRUngroupRows of rows: IRExpr list * offsets: int64 list * source: IRIndexTypeG<IRExpr>  // ungroup([r1..rF], A): per-file arrays assembled over the tiled axis
     | IRUngroup of grouped: IRExpr * source: IRIndexTypeG<IRExpr>  // ungroup(G): rows of a segment-grouped array reassembled over the source axis
     | IRGroupSizes of grouping: IRExpr               // extents(gk) - per-group sizes over the group axis; no gather
@@ -1904,6 +1906,8 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRGroupBy (v, k) -> [v; k], (function [v'; k'] -> IRGroupBy (v', k') | _ -> badChildren "IRGroupBy")
     | IRGroupBucket gk -> [gk], (function [gk'] -> IRGroupBucket gk' | _ -> badChildren "IRGroupBucket")
     | IRSegments _ -> [], (fun _ -> expr)
+    | IRSegmentsGrid _ -> [], (fun _ -> expr)
+    | IRUngroupGrid (g, srcs, b) -> [g], (function [g'] -> IRUngroupGrid (g', srcs, b) | _ -> badChildren "IRUngroupGrid")
     | IRUngroup (g, src) -> [g], (function [g'] -> IRUngroup (g', src) | _ -> badChildren "IRUngroup")
     | IRUngroupRows (rows, offs, src) ->
         rows, (fun rows' -> if rows'.Length = rows.Length then IRUngroupRows (rows', offs, src) else badChildren "IRUngroupRows")
@@ -2694,6 +2698,11 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
              valsTy)
     | IRGroupKeys _ -> IRTUnit  // GroupKeys is an opaque structure, not a runtime value with a simple type
     | IRSegments _ -> IRTUnit   // the structural grouping: same opaque sentinel as group_keys
+    | IRSegmentsGrid _ -> IRTUnit
+    | IRUngroupGrid (g, srcs, _) ->
+        (match typeOf g with
+         | IRTArrow (slots, res, x) when slots.Length >= 2 -> IRTArrow ((srcs |> List.map SIdx) @ List.skip 2 slots, res, x)
+         | other -> other)
     | IRUngroupRows (rows, _, src) ->
         // Each row is [file axis; rest...] over elem; the result is
         // [source; rest...] over elem.

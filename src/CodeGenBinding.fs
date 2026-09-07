@@ -52,6 +52,10 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genGroupKeysBinding ctx binding builder keys
     | IRSegments (offsets, _) ->
         genSegmentsBinding ctx binding offsets
+    | IRSegmentsGrid bounds ->
+        genSegmentsGridBinding ctx binding bounds
+    | IRUngroupGrid (g, srcs, bounds) ->
+        genUngroupGridBinding ctx binding g srcs bounds
     | IRUngroup (g, src) ->
         genUngroupBinding ctx binding g src
     | IRUngroupRows (rows, offsets, src) ->
@@ -2141,6 +2145,40 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
     // group_by's copy loop indexes vals by name, so it needs a MATERIALIZED
     // input; the shared helper forces a still-deferred or inline vals first.
     let (forceCode, ctx, vals) = forceDeferredArrayInput ctx builder ($"{name}__vals") vals
+    let gridGk =
+        let gkName = exprToCppCtx ctx gk
+        Map.tryFind gkName ctx.GridGroupings |> Option.map (fun b -> (gkName, b))
+    match gridGk with
+    | Some (gkName, bounds) ->
+        // TILE GATHER (docs/plans/structural/07 §4.1b): the values are rank 2,
+        // addressed by coordinates; tile t = (t / G1, t % G1) copies its
+        // window row-major into its slot of the pool.
+        let valsName = exprToCppCtx ctx vals
+        let (elemType, elemErrCode) = inferElemTypeStrict ctx ind vals "group_by"
+        let elemStr = elemTypeToCpp elemType
+        let g1 = bounds.[1].Length - 1
+        let extentsDecl =
+            fst (emitExtentsTable ind (name + "_extents") 2
+                     [($"{gkName}__ngroups", false); ("0 /* inner extent is ragged */", false)])
+        let code =
+            elemErrCode
+            @ [ $"{ind}// group_by: tile gather over a rank-2 value (grid grouping {gkName})" ]
+            @ extentsDecl
+            @ [ $$"""{{ind}}Array<{{elemStr}}*, 1> {{name}} = { new {{elemStr}}*[{{gkName}}__ngroups], {{name}}_extents };"""
+                $"{ind}{elemStr}* {name}__pool = new {elemStr}[{gkName}__offsets[{gkName}__ngroups]];"
+                $$"""{{ind}}for (size_t __t = 0; __t < {{gkName}}__ngroups; __t++) {"""
+                $"{ind}    size_t __t0 = __t / {g1}, __t1 = __t %% {g1};"
+                $"{ind}    size_t __lo0 = {gkName}__b0[__t0], __hi0 = {gkName}__b0[__t0 + 1];"
+                $"{ind}    size_t __lo1 = {gkName}__b1[__t1], __hi1 = {gkName}__b1[__t1 + 1];"
+                $"{ind}    size_t __w = __hi1 - __lo1;"
+                $"{ind}    {name}[__t] = {name}__pool + {gkName}__offsets[__t];"
+                $$"""{{ind}}    for (size_t __i = __lo0; __i < __hi0; __i++) for (size_t __j = __lo1; __j < __hi1; __j++) {{name}}[__t][(__i - __lo0) * __w + (__j - __lo1)] = {{valsName}}[__i][__j];"""
+                $"{ind}}}" ]
+        registerShapedAlloc name "deallocate_ragged_storage" ($"{name}.data, {name}__pool")
+        let ctx' = addVarName binding.Id name ctx
+        let ctx' = { ctx' with GroupedArrays = Map.add name gkName ctx'.GroupedArrays }
+        (forceCode @ code, ctx')
+    | None ->
     let valsName = exprToCppCtx ctx vals
     let gkName = exprToCppCtx ctx gk
     let (elemType, elemErrCode) = inferElemTypeStrict ctx ind vals "group_by"
@@ -2246,6 +2284,73 @@ and genSegmentsBinding (ctx: CodeGenContext) (binding: IRBinding) (offsets: int6
     let ctx' = addVarName binding.Id name ctx
     let ctx' = { ctx' with StructuralGroupings = Set.add name ctx'.StructuralGroupings }
     (code, ctx')
+
+/// segments(C0, C1): the tile grouping of two segmented slots (docs/plans/
+/// structural/07 §4.1b). Same name-suffix ABI; the offsets are the
+/// cumulative tile sizes, tile t = (t / G1, t % G1); the per-slot boundary
+/// tables are emitted for the gather and the scatter. `__at` is the
+/// identity over the tile-major member order (used by nothing today; the
+/// grid gather addresses the rank-2 value by coordinates).
+and genSegmentsGridBinding (ctx: CodeGenContext) (binding: IRBinding) (bounds: int64 list list) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let b0, b1 = bounds.[0], bounds.[1]
+    let g0, g1 = b0.Length - 1, b1.Length - 1
+    let sizes =
+        [ for i in 0 .. g0 - 1 do
+            for j in 0 .. g1 - 1 ->
+                (b0.[i + 1] - b0.[i]) * (b1.[j + 1] - b1.[j]) ]
+    let offsets = sizes |> List.scan (+) 0L
+    let table (xs: int64 list) = xs |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+    let code =
+        [ $"{ind}// segments grid: {g0} x {g1} tiles over {List.last b0} x {List.last b1} cells, structural"
+          $"{ind}size_t {name}__ngroups = {g0 * g1};"
+          $"{ind}const size_t {name}__offsets[{g0 * g1 + 1}] = {{ {table offsets} }};"
+          $"{ind}const size_t {name}__b0[{g0 + 1}] = {{ {table b0} }};"
+          $"{ind}const size_t {name}__b1[{g1 + 1}] = {{ {table b1} }};"
+          $"{ind}size_t {name}__nsrc = {List.last offsets};"
+          $"{ind}auto {name}__at = [](size_t __p) {{ return __p; }};"
+          $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+          $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__b0/__b1 (grid)" ]
+    let ctx' = addVarName binding.Id name ctx
+    let ctx' = { ctx' with StructuralGroupings = Set.add name ctx'.StructuralGroupings
+                           GridGroupings = Map.add name bounds ctx'.GridGroupings }
+    (code, ctx')
+
+/// ungroup(G) of a tile grouping: the tiles written back over the two
+/// source axes into one dense rank-2 array.
+and genUngroupGridBinding (ctx: CodeGenContext) (binding: IRBinding) (g: IRExpr) (srcs: IRIndexType list) (bounds: int64 list list) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let gName = exprToCppCtx ctx g
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> elemTypeToCpp at.ElemType
+        | _ -> "double"
+    match Map.tryFind gName ctx.GroupedArrays with
+    | None ->
+        let ctx' = addVarName binding.Id name ctx
+        (codegenError ctx ind $"ungroup: '{gName}' is not a group_by result this emitter can trace to its grouping (bind `let G = group_by(A, segments(X, Y))` and ungroup that name)", ctx')
+    | Some gkName ->
+        let b0, b1 = bounds.[0], bounds.[1]
+        let n0, n1 = List.last b0, List.last b1
+        let g1 = b1.Length - 1
+        let (extentsDecl, ownedExtents) =
+            emitExtentsTable ind (name + "_extents") 2 [($"{n0}UL", false); ($"{n1}UL", false)]
+        let code =
+            [ $"{ind}// ungroup: tiles of {gName} written back over the two axes ({n0} x {n1})" ]
+            @ extentsDecl
+            @ [ $$"""{{ind}}Array<{{elemStr}}, 2> {{name}} = { allocate<promote<{{elemStr}}, 2>::type>({{name}}_extents), {{name}}_extents };"""
+                $$"""{{ind}}for (size_t __t = 0; __t < {{gkName}}__ngroups; __t++) {"""
+                $"{ind}    size_t __t0 = __t / {g1}, __t1 = __t %% {g1};"
+                $"{ind}    size_t __lo0 = {gkName}__b0[__t0], __hi0 = {gkName}__b0[__t0 + 1];"
+                $"{ind}    size_t __lo1 = {gkName}__b1[__t1], __hi1 = {gkName}__b1[__t1 + 1];"
+                $"{ind}    size_t __w = __hi1 - __lo1;"
+                $$"""{{ind}}    for (size_t __i = __lo0; __i < __hi0; __i++) for (size_t __j = __lo1; __j < __hi1; __j++) {{name}}[__i][__j] = {{gName}}[__t][(__i - __lo0) * __w + (__j - __lo1)];"""
+                $"{ind}}}" ]
+        registerPoolAlloc AllocDense elemStr 2 "nullptr" (name + "_extents") name ownedExtents
+        let ctx' = addVarName binding.Id name ctx
+        (code, ctx')
 
 /// ungroup(G): the rows of a segment-grouped array written back over the
 /// source axis (§3.3). G's grouping is recovered from GroupedArrays (the

@@ -372,7 +372,7 @@ let internal groupKeysLetRhs (b: TypedBinding) : string option * TypedExpr =
     match b.Value.Kind with
     // `segments(A)` is a grouping on the same name-keyed terms as group_keys
     // (docs/plans/structural/07 §3.2): its locals are suffixed off the binding.
-    | TExprGroupKeys _ | TExprSegments _ when List.isEmpty b.SubBindings -> (None, b.Value)
+    | TExprGroupKeys _ | TExprSegments _ | TExprSegmentsGrid _ when List.isEmpty b.SubBindings -> (None, b.Value)
     | _ -> (Some "as another binding's value", b.Value)
 
 let rec internal collectGroupKeysEscapes (subst: Subst) (pos: string option) (expr: TypedExpr) : CompileError list =
@@ -381,7 +381,7 @@ let rec internal collectGroupKeysEscapes (subst: Subst) (pos: string option) (ex
         match e.Kind with
         | TExprGroupKeys _ -> "a `group_keys(...)` call"
         | TExprSegments (_, _, Some _) -> "a `files(...)` call"
-        | TExprSegments _ -> "a `segments(...)` call"
+        | TExprSegments _ | TExprSegmentsGrid _ -> "a `segments(...)` call"
         | TExprVar (n, _, _) -> $"the group_keys binding '{n}'"
         | _ -> "a group_keys result"
     // A block is TRANSPARENT here: its type is its final expression's, and its
