@@ -2976,6 +2976,23 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
         // interior ordinals (the MpiSlab bound variables, defined per run);
         // the carousel stays off, as under any slab. Nothing of the variable
         // exists outside the window.
+        // The run plan: (run boundaries, first/one-past-last centre, reach
+        // below/above, the centre shift the nest applies, the streamed
+        // sources (cpp name, spec)). Two shapes produce one:
+        //   - a HALO map whose window reads go to a streamed rank-1 source:
+        //     runs are the `Chunked` alias's, the reach is the halo's;
+        //   - an ELEMENTWISE map or zip with streamed rank-1 OPERANDS
+        //     (StreamingIONotes v1 refused these: its only in-nest read was a
+        //     whole trailing fiber at a site, and a rank-0 result has no fiber
+        //     to read): runs are blocks of the store's own chunk edge, reach
+        //     zero -- a run is exactly its window, and the traversal order is
+        //     the store's.
+        let streamedOf (e: IRExpr) =
+            match e with
+            | IRVar (aid, _) ->
+                Map.tryFind aid ctx.VarNames
+                |> Option.bind (fun vn -> Map.tryFind vn ctx.StreamedArrays |> Option.map (fun s -> (vn, s)))
+            | _ -> None
         let segmentRun =
             match info.Arrays with
             | [ IRRange ([ ix ], _) ] ->
@@ -2995,7 +3012,10 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                                        |> Option.bind (fun vn -> Map.tryFind vn ctx.StreamedArrays |> Option.map (fun s -> (vn, s, r.Rank))))
                                    |> List.distinctBy (fun (vn, _, _) -> vn)
                                (match streamedReads with
-                                | [ (vn, spec, 1) ] when spec.VarType.IndexTypes.Length = 1 -> Some (h, offsets, vn, spec)
+                                | [ (vn, spec, 1) ] when spec.VarType.IndexTypes.Length = 1 ->
+                                    let n = (match spec.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets)
+                                    let reach = Blade.Types.haloReach h
+                                    Some (offsets, h.Start, n - (h.Shrink - h.Start), int64 (List.min reach), int64 (List.max reach), h.Start, [ (vn, spec) ], "stencil")
                                 | [] -> None
                                 | _ ->
                                     raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan
@@ -3003,11 +3023,27 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                            | None -> None)
                       | _ -> None)
                  | None -> None)
-            | _ -> None
-        // inside the run the streamed variable IS an array (the window alias)
+            | arrays ->
+                let sources = arrays |> List.choose streamedOf |> List.distinctBy fst
+                match sources with
+                | [] -> None
+                | _ when sources |> List.exists (fun (_, s) -> s.VarType.IndexTypes.Length <> 1) ->
+                    raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan
+                        "an elementwise consumer streams rank-1 variables today; bind a higher-rank streamed variable with .read"))
+                | (_, s0) :: _ ->
+                    let n = (match s0.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> 0L)
+                    let pspec = (Blade.ProviderRegistry.tryFind s0.Provider).Value
+                    let block =
+                        match pspec.StreamRowsBlock with
+                        | Some f -> max 1L (f s0.FilePath s0.VarName)
+                        | None -> 4096L
+                    let runs = [ for b in 0L .. block .. n - 1L -> b ] @ [ n ]
+                    Some (runs, 0L, n, 0L, 0L, 0L, sources, "elementwise")
+        // inside the run each streamed source IS an array (its window alias)
         let ctx =
             match segmentRun with
-            | Some (_, _, vn, _) -> { ctx with StreamedArrays = Map.remove vn ctx.StreamedArrays }
+            | Some (_, _, _, _, _, _, sources, _) ->
+                sources |> List.fold (fun c (vn, _) -> { c with StreamedArrays = Map.remove vn c.StreamedArrays }) ctx
             | None -> ctx
         // STREAMED provider inputs (`alias.stream`): no materialized arrays
         // exist -- the nest inlines per-fiber reads at the S/T boundary.
@@ -3255,12 +3291,14 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
             // agreement rather than assume it (Blade's unify does not compare
             // extents).
             let loopCode =
-                match tryGenLinAlgNest streamedMap info.ArrayTypes codeGen
-                                       tempCtx.VarNames tempCtx.Indent with
+                // a segment run loop owns the outer bounds: neither the BLAS
+                // rewrite nor the flat collapse honours them
+                match (if segmentRun.IsSome then None
+                       else tryGenLinAlgNest streamedMap info.ArrayTypes codeGen tempCtx.VarNames tempCtx.Indent) with
                 | Some la -> la
                 | None ->
-                match tryGenFlatElementwiseNest streamedMap info.ArrayTypes codeGen
-                                                tempCtx.VarNames tempCtx.Indent with
+                match (if segmentRun.IsSome then None
+                       else tryGenFlatElementwiseNest streamedMap info.ArrayTypes codeGen tempCtx.VarNames tempCtx.Indent) with
                 | Some flat -> flat
                 | None -> genLoopNestStreamed streamedMap codeGen tempCtx.VarNames tempCtx.Indent
 
@@ -3406,52 +3444,57 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                 let segLoop =
                     match segmentRun with
                     | None -> loopCode
-                    | Some (h, offsets, vn, spec) ->
-                        let pspec = (Blade.ProviderRegistry.tryFind spec.Provider).Value
-                        match pspec.GenStreamRows with
-                        | None ->
-                            recordCodegenRefusal $"provider '{spec.Provider}' does not support per-segment streamed reads ('{spec.VarName}' -- bind with .read)"
+                    | Some (offsets, cMin, cMax, rLo, rHi, start, sources, kind) ->
+                        let missing =
+                            sources |> List.tryFind (fun (_, s) -> ((Blade.ProviderRegistry.tryFind s.Provider).Value).GenStreamRows.IsNone)
+                        match missing with
+                        | Some (_, s) ->
+                            recordCodegenRefusal $"provider '{s.Provider}' does not support per-segment streamed reads ('{s.VarName}' -- bind with .read)"
                             loopCode
-                        | Some genRows ->
-                            let elemCpp = elemTypeToCpp spec.VarType.ElemType
-                            let n =
-                                match spec.VarType.IndexTypes.[0].Extent with
-                                | IRLit (IRLitInt n) -> n
-                                | _ -> List.last offsets
-                            let reach = Blade.Types.haloReach h
-                            let rLo, rHi = int64 (List.min reach), int64 (List.max reach)
-                            let cMin = h.Start                       // first valid centre
-                            let cMax = n - (h.Shrink - h.Start)      // one past the last
+                        | None ->
                             let g = offsets.Length - 1
                             let table = offsets |> List.map (fun b -> $"{b}UL") |> String.concat ", "
                             let maxWin =
                                 List.pairwise offsets
                                 |> List.map (fun (lo, hi) -> (min hi cMax) - (max lo cMin) + (rHi - rLo))
                                 |> List.fold max 1L
-                            // scratch names are per OUTPUT: two stencils may share one source
+                            // scratch names are per OUTPUT and per source: two
+                            // consumers may share one source, one zip may hold two
                             let runs = $"{name}__runs"
-                            let ext = $"{name}__srcext"
-                            let win = $"{name}__win"
-                            let rowRead =
-                                genRows spec.FilePath spec.VarName vn win "__w_lo" "__w_hi" spec.VarType
-                                |> List.map (fun s -> ind + "    " + s)
-                            [ $"{ind}// stencil over segments: '{spec.VarName}' streamed one run at a time, each run read with its ghost cells [{rLo}, {rHi}] (HaloAccess.haloDemand); no whole-array buffer"
-                              $"{ind}const size_t {runs}[{g + 1}] = {{ {table} }};"
-                              $"{ind}size_t {ext}[1] = {{ {n}UL }};"
-                              $"{ind}{elemCpp}* {win} = new {elemCpp}[{maxWin}];"
-                              $$"""{{ind}}for (size_t __seg = 0; __seg < {{g}}; __seg++) {"""
-                              $"{ind}    size_t __c_lo = {runs}[__seg] < {cMin}UL ? {cMin}UL : {runs}[__seg];"
-                              $"{ind}    size_t __c_hi = {runs}[__seg + 1] > {cMax}UL ? {cMax}UL : {runs}[__seg + 1];"
-                              $"{ind}    if (__c_lo >= __c_hi) continue;"
-                              $"{ind}    size_t __w_lo = __c_lo + ({rLo}L); size_t __w_hi = __c_hi + ({rHi}L);"
-                              $"{ind}    if (__w_hi > {n}UL) __w_hi = {n}UL;" ]
-                            @ rowRead
-                            @ [ $"{ind}    Array<{elemCpp}, 1> {vn} = {{ {win} - __w_lo, {ext} }};"
-                                $"{ind}    size_t __blade_mpi_lo_{name} = __c_lo - {h.Start}UL;"
-                                $"{ind}    size_t __blade_mpi_hi_{name} = __c_hi - {h.Start}UL;" ]
+                            let windows =
+                                sources |> List.mapi (fun k (vn, spec) ->
+                                    let genRows = ((Blade.ProviderRegistry.tryFind spec.Provider).Value).GenStreamRows.Value
+                                    let elemCpp = elemTypeToCpp spec.VarType.ElemType
+                                    let n = (match spec.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets)
+                                    let ext = $"{name}__srcext{k}"
+                                    let win = $"{name}__win{k}"
+                                    let decl =
+                                        [ $"{ind}size_t {ext}[1] = {{ {n}UL }};"
+                                          $"{ind}{elemCpp}* {win} = new {elemCpp}[{maxWin}];" ]
+                                    let read =
+                                        (genRows spec.FilePath spec.VarName vn win "__w_lo" "__w_hi" spec.VarType
+                                         |> List.map (fun s -> ind + "    " + s))
+                                        @ [ $"{ind}    Array<{elemCpp}, 1> {vn} = {{ {win} - __w_lo, {ext} }};" ]
+                                    (decl, read, [ $"{ind}delete[] {win};" ]))
+                            let what = sources |> List.map (fun (_, s) -> $"'{s.VarName}'") |> String.concat ", "
+                            let lastN = sources |> List.map (fun (_, s) -> match s.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets) |> List.min
+                            [ (if kind = "stencil"
+                               then $"{ind}// stencil over segments: {what} streamed one run at a time, each run read with its ghost cells [{rLo}, {rHi}] (HaloAccess.haloDemand); no whole-array buffer"
+                               else $"{ind}// elementwise over segments: {what} streamed one run at a time (the store's chunk edge), each run its own window; no whole-array buffer")
+                              $"{ind}const size_t {runs}[{g + 1}] = {{ {table} }};" ]
+                            @ (windows |> List.collect (fun (d, _, _) -> d))
+                            @ [ $$"""{{ind}}for (size_t __seg = 0; __seg < {{g}}; __seg++) {"""
+                                $"{ind}    size_t __c_lo = {runs}[__seg] < {cMin}UL ? {cMin}UL : {runs}[__seg];"
+                                $"{ind}    size_t __c_hi = {runs}[__seg + 1] > {cMax}UL ? {cMax}UL : {runs}[__seg + 1];"
+                                $"{ind}    if (__c_lo >= __c_hi) continue;"
+                                $"{ind}    size_t __w_lo = __c_lo + ({rLo}L); size_t __w_hi = __c_hi + ({rHi}L);"
+                                $"{ind}    if (__w_hi > {lastN}UL) __w_hi = {lastN}UL;" ]
+                            @ (windows |> List.collect (fun (_, r, _) -> r))
+                            @ [ $"{ind}    size_t __blade_mpi_lo_{name} = __c_lo - {start}UL;"
+                                $"{ind}    size_t __blade_mpi_hi_{name} = __c_hi - {start}UL;" ]
                             @ (loopCode |> List.map (fun s -> "    " + s))
-                            @ [ $"{ind}}}"
-                                $"{ind}delete[] {win};" ]
+                            @ [ $"{ind}}}" ]
+                            @ (windows |> List.collect (fun (_, _, f) -> f))
                 preCode @ streamPrologue @ [""] @ extentDecls @ [""; allocDecl; ""]
                 @ mpiSlabPrologue @ segLoop @ mpiGather
 

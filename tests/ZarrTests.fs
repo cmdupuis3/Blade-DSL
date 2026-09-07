@@ -1001,6 +1001,64 @@ let d2 = method_for(halo<CX, [-2, 0, 2]>) <@> lambda(w) -> A(w(2)) * A(w(-2)) - 
     stencilSegmentsE2E ()
 
     // ---------------------------------------------------------------
+    // 10h. ELEMENTWISE consumers of a streamed source. StreamingIONotes v1
+    // refused these outright ("elementwise consumption is not stream-
+    // eligible") because its only in-nest read was a whole trailing fiber
+    // at a site; the segment run loop (10g) with zero reach is the missing
+    // mechanism: a map, a scalar-broadcast binop and a zip with a
+    // materialized array each run one block of the store's chunk edge at a
+    // time, the source never materialized.
+    // ---------------------------------------------------------------
+    printfn "
+--- elementwise over a streamed source: map, A + 1.0, zip(A, M) ---"
+    let elementwiseStreamE2E () =
+        let segStore = fixStore "zarr_segments"    // 10 cells 1..10, chunked at 4
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A: Array<Float like CX> = sample.vars.A |> z.stream
+let doubled = method_for(A) <@> lambda(x) -> x * 2.0 |> compute
+let shifted = A + 1.0
+let m: Array<Float like CX> = [0.5, 0.5, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 2.0]
+let scaled = method_for(zip(A, m)) <@> lambda(x, w) -> x * w |> compute
+"""
+                            segStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "elementwise stream: `blade plan` records three elementwise decisions"
+                    ((decisions |> List.filter (fun d -> d.Rule = "segment-streaming" && d.Evidence |> List.exists (fun e -> e.Contains "elementwise")) |> List.length) = 3)
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Subject + ":" + (String.concat "|" d.Evidence).Substring(0, 30))))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_elementwise"
+                check "elementwise stream: per-block emission, no whole-array buffer"
+                    (cppCode.Contains "elementwise over segments" && not (cppCode.Contains "A_flat = new")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_elementwise.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "elementwise stream: map" (has "doubled = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]") runOut
+                          check "elementwise stream: scalar broadcast" (has "shifted = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]") runOut
+                          check "elementwise stream: zip with a materialized array" (has "scaled = [0.5, 1, 1.5, 2, 2.5, 12, 14, 16, 18, 20]") runOut
+                      | Ok (code, out) -> check "elementwise stream: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "elementwise stream: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP elementwise stream (compile skipped): %s" e
+                     else check "elementwise stream: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "elementwise stream: lowers" false e
+        with ex -> check "elementwise stream" false ex.Message
+    elementwiseStreamE2E ()
+
+    // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
     //
     // Every store dimension derives a named index type, and codegen emits one

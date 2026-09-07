@@ -280,6 +280,14 @@ let private recordSegmentStreaming (modul: IRModule) : unit =
                 let s = (streamedReadOf modul streamed value).Value
                 decide b.Name Blade.Effects.Applied
                     [ $"the stencil over the streamed variable '{s.VarName}' runs one segment at a time; each run is read with the ghost cells its halo reach demands, nothing else of the variable is ever in memory" ]
+            | value when
+                    (match value with
+                     | IRCompute (IRApplyCombinator info) | IRApplyCombinator info ->
+                         info.Arrays |> List.exists (function IRVar (vid, _) -> Map.containsKey vid streamed | _ -> false)
+                     | _ -> false) ->
+                let s = (streamedReadOf modul streamed value).Value
+                decide b.Name Blade.Effects.Applied
+                    [ $"the elementwise consumer of the streamed variable '{s.VarName}' runs one block of the store's chunk edge at a time, each block its own window; nothing else of the variable is ever in memory" ]
             | IRGroupBy (IRVar (vid, _), IRVar (gid, _)) when Map.containsKey vid streamed ->
                 let s = streamed.[vid]
                 if Set.contains gid structural then
