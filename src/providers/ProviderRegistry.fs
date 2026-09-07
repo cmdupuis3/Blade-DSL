@@ -87,9 +87,17 @@ type ProviderSpec = {
     /// the variable's own ordinals), arrType. None: rank-1 streams refuse.
     GenStreamRowsOpen: (string -> string -> string -> IRArrayType -> string list) option
     GenStreamRows: (string -> string -> string -> string -> string -> string -> IRArrayType -> string list) option
-    /// The natural block of a rank-1 streamed variable -- its chunk edge --
-    /// which a streamed FOLD walks one block at a time (args: path, varName).
+    /// The natural block of a streamed variable along its LEADING axis --
+    /// its chunk edge there -- which a streamed fold or run loop walks one
+    /// block at a time (args: path, varName).
     StreamRowsBlock: (string -> string -> int64) option
+    /// A rectangular WINDOW of a dense variable of any rank, read into
+    /// `dest` row-major over the window's shape: one file per chunk the
+    /// window intersects, the intersection copied. Args: path, varName,
+    /// cppVarName, dest pointer expression, per-dimension (lo, hi) C++
+    /// expressions, arrType. The tile gather of a rank-2 streamed variable
+    /// and the row bands of its run loop are both this.
+    GenStreamWindow: (string -> string -> string -> string -> (string * string) list -> IRArrayType -> string list) option
     /// #include lines injected when a module reads/writes via this provider
     /// (packed/simplex reads also pull linearized_storage.hpp separately).
     Includes: unit -> string list

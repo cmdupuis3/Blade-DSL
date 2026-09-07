@@ -3025,12 +3025,22 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                  | None -> None)
             | arrays ->
                 let sources = arrays |> List.choose streamedOf |> List.distinctBy fst
+                // a streamed operand bound to a rank-1 KERNEL PARAMETER is the
+                // FIBER stream of StreamingIONotes v1: that path stays as it is.
+                // A rank-0 (cell) parameter over a rank-2 operand is an
+                // elementwise consumer, run one band of rows at a time.
+                let fiberBound =
+                    // index-safe: a multi-slot range is one operand feeding several parameters
+                    let ranks = info.KernelInputRanks
+                    info.Arrays
+                    |> List.mapi (fun i a -> (a, (if i < ranks.Length then ranks.[i] else 0)))
+                    |> List.exists (fun (a, kr) -> (streamedOf a).IsSome && kr > 0)
                 match sources with
                 | [] -> None
-                // a higher-rank streamed operand is the FIBER stream of
-                // StreamingIONotes v1 (a rank-1 kernel parameter over the
-                // trailing axis): that path stays as it is
-                | _ when sources |> List.exists (fun (_, s) -> s.VarType.IndexTypes.Length <> 1) -> None
+                | _ when fiberBound -> None
+                | _ when sources |> List.exists (fun (_, s) -> s.VarType.IndexTypes.Length > 2) ->
+                    raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan
+                        "an elementwise consumer streams rank-1 and rank-2 variables today; bind a higher-rank streamed variable with .read"))
                 | (_, s0) :: _ ->
                     let n = (match s0.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> 0L)
                     let pspec = (Blade.ProviderRegistry.tryFind s0.Provider).Value
@@ -3466,17 +3476,32 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                                 sources |> List.mapi (fun k (vn, spec) ->
                                     let genRows = ((Blade.ProviderRegistry.tryFind spec.Provider).Value).GenStreamRows.Value
                                     let elemCpp = elemTypeToCpp spec.VarType.ElemType
-                                    let n = (match spec.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets)
+                                    let extents =
+                                        spec.VarType.IndexTypes |> List.map (fun ix -> match ix.Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets)
+                                    let n = extents.Head
+                                    let trailing = extents |> List.tail |> List.fold (*) 1L
+                                    let rank = extents.Length
                                     let ext = $"{name}__srcext{k}"
                                     let win = $"{name}__win{k}"
+                                    let rows = $"{name}__rows{k}"
+                                    let extTable = extents |> List.map (fun e -> $"{e}UL") |> String.concat ", "
                                     let decl =
-                                        [ $"{ind}size_t {ext}[1] = {{ {n}UL }};"
-                                          $"{ind}{elemCpp}* {win} = new {elemCpp}[{maxWin}];" ]
+                                        [ $"{ind}size_t {ext}[{rank}] = {{ {extTable} }};"
+                                          $"{ind}{elemCpp}* {win} = new {elemCpp}[{maxWin * trailing}];" ]
+                                        @ (if rank = 2 then [ $"{ind}{elemCpp}** {rows} = new {elemCpp}*[{n}]();" ] else [])
+                                    let alias =
+                                        if rank = 1 then
+                                            // the window shifted back by its start: global subscripts land inside it
+                                            [ $"{ind}    Array<{elemCpp}, 1> {vn} = {{ {win} - __w_lo, {ext} }};" ]
+                                        else
+                                            // a row-pointer table over the full leading extent; only the band's rows are live
+                                            [ $"{ind}    for (size_t __r = __w_lo; __r < __w_hi; __r++) {rows}[__r] = {win} + (__r - __w_lo) * {trailing}UL;"
+                                              $"{ind}    Array<{elemCpp}, 2> {vn} = {{ {rows}, {ext} }};" ]
                                     let read =
                                         (genRows spec.FilePath spec.VarName vn win "__w_lo" "__w_hi" spec.VarType
                                          |> List.map (fun s -> ind + "    " + s))
-                                        @ [ $"{ind}    Array<{elemCpp}, 1> {vn} = {{ {win} - __w_lo, {ext} }};" ]
-                                    (decl, read, [ $"{ind}delete[] {win};" ]))
+                                        @ alias
+                                    (decl, read, [ $"{ind}delete[] {win};" ] @ (if rank = 2 then [ $"{ind}delete[] {rows};" ] else [])))
                             let what = sources |> List.map (fun (_, s) -> $"'{s.VarName}'") |> String.concat ", "
                             let lastN = sources |> List.map (fun (_, s) -> match s.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets) |> List.min
                             [ (if kind = "stencil"

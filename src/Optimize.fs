@@ -253,7 +253,7 @@ let private streamedReadOf (modul: IRModule) (streamed: Map<Blade.Types.IRId, Pr
 let private recordSegmentStreaming (modul: IRModule) : unit =
     let streamed =
         modul.ProviderReads
-        |> Map.filter (fun _ s -> s.Streamed && s.VarType.IndexTypes.Length = 1)
+        |> Map.filter (fun _ s -> s.Streamed && not s.VarType.IndexTypes.IsEmpty)
     if not (Map.isEmpty streamed) then
         let structural =
             modul.Bindings
@@ -281,13 +281,24 @@ let private recordSegmentStreaming (modul: IRModule) : unit =
                 decide b.Name Blade.Effects.Applied
                     [ $"the stencil over the streamed variable '{s.VarName}' runs one segment at a time; each run is read with the ghost cells its halo reach demands, nothing else of the variable is ever in memory" ]
             | value when
-                    (match value with
-                     | IRCompute (IRApplyCombinator info) | IRApplyCombinator info ->
-                         info.Arrays |> List.exists (function IRVar (vid, _) -> Map.containsKey vid streamed | _ -> false)
-                     | _ -> false) ->
-                let s = (streamedReadOf modul streamed value).Value
-                decide b.Name Blade.Effects.Applied
-                    [ $"the elementwise consumer of the streamed variable '{s.VarName}' runs one block of the store's chunk edge at a time, each block its own window; nothing else of the variable is ever in memory" ]
+                    (let mutable found = false
+                     iterIRExpr (fun e ->
+                         match e with
+                         | IRApplyCombinator info when info.Arrays |> List.exists (function IRVar (vid, _) -> Map.containsKey vid streamed | _ -> false) -> found <- true
+                         | _ -> ()) value
+                     found) ->
+                // every apply in the binding (a zip nested under a reduce
+                // included) whose OPERANDS are streamed is an elementwise
+                // consumer run one block at a time
+                iterIRExpr (fun e ->
+                    match e with
+                    | IRApplyCombinator info ->
+                        (match info.Arrays |> List.tryPick (function IRVar (vid, _) when Map.containsKey vid streamed -> Some streamed.[vid] | _ -> None) with
+                         | Some s ->
+                             decide b.Name Blade.Effects.Applied
+                                 [ $"the elementwise consumer of the streamed variable '{s.VarName}' runs one block of the store's chunk edge at a time (a band of rows above rank 1), each block its own window; nothing else of the variable is ever in memory" ]
+                         | None -> ())
+                    | _ -> ()) value
             | IRGroupBy (IRVar (vid, _), IRVar (gid, _)) when Map.containsKey vid streamed ->
                 let s = streamed.[vid]
                 if Set.contains gid structural then

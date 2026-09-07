@@ -77,6 +77,7 @@ let netcdfSpec : Blade.ProviderRegistry.ProviderSpec = {
     GenStreamRowsOpen = None
     GenStreamRows = None
     StreamRowsBlock = None
+    GenStreamWindow = None
     Includes = Blade.NetcdfProvider.CppNetcdf.genIncludes
     VarDimNames = fun path varName ->
         try

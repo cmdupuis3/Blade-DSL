@@ -2784,6 +2784,7 @@ let spec : Blade.ProviderRegistry.ProviderSpec = {
     GenStreamRowsOpen = None
     GenStreamRows = None
     StreamRowsBlock = None
+    GenStreamWindow = None
     Includes = CppIcechunk.genIncludes
     VarDimNames = fun path varName ->
         // Must not throw on an unreadable store: writers fall back to

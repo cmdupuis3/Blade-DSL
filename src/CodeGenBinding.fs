@@ -2115,6 +2115,40 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
             (codegenError ctx ind $"group_by over the streamed variable '{spec.VarName}' needs a structural grouping (`segments(..)` / `files(..)`), which reads one run at a time; a key grouping needs the whole variable -- bind it with .read", ctx')
         else
         let pspec = (Blade.ProviderRegistry.tryFind spec.Provider).Value
+        match Map.tryFind gkName ctx.GridGroupings, pspec.GenStreamWindow with
+        | Some bounds, Some genWindow when spec.VarType.IndexTypes.Length = 2 ->
+            // TILE GATHER over a streamed rank-2 source (§4.1b + §3.4): each
+            // tile is one rectangular window read straight into its slot of
+            // the pool, row-major -- the member layout the grid grouping
+            // defines. With inherited edges a tile is exactly one chunk file.
+            let elemStr = elemTypeToCpp spec.VarType.ElemType
+            let g1 = bounds.[1].Length - 1
+            let extentsDecl =
+                fst (emitExtentsTable ind (name + "_extents") 2
+                         [($"{gkName}__ngroups", false); ("0 /* inner extent is ragged */", false)])
+            let tileRead =
+                genWindow spec.FilePath spec.VarName valsName ($"{name}__pool + {gkName}__offsets[__t]")
+                          [ ($"{gkName}__b0[__t0]", $"{gkName}__b0[__t0 + 1]"); ($"{gkName}__b1[__t1]", $"{gkName}__b1[__t1 + 1]") ]
+                          spec.VarType
+                |> List.map (fun s -> ind + "    " + s)
+            let code =
+                [ $"{ind}// group_by: per-tile STREAMED windows of '{spec.VarName}' -- each tile read from the store into its slot; no whole-array buffer" ]
+                @ extentsDecl
+                @ [ $$"""{{ind}}Array<{{elemStr}}*, 1> {{name}} = { new {{elemStr}}*[{{gkName}}__ngroups], {{name}}_extents };"""
+                    $"{ind}{elemStr}* {name}__pool = new {elemStr}[{gkName}__offsets[{gkName}__ngroups]];"
+                    $$"""{{ind}}for (size_t __t = 0; __t < {{gkName}}__ngroups; __t++) {"""
+                    $"{ind}    size_t __t0 = __t / {g1}, __t1 = __t %% {g1};"
+                    $"{ind}    {name}[__t] = {name}__pool + {gkName}__offsets[__t];" ]
+                @ tileRead
+                @ [ $"{ind}}}" ]
+            registerShapedAlloc name "deallocate_ragged_storage" ($"{name}.data, {name}__pool")
+            let ctx' = addVarName binding.Id name ctx
+            let ctx' = { ctx' with GroupedArrays = Map.add name gkName ctx'.GroupedArrays }
+            (code, ctx')
+        | _ when spec.VarType.IndexTypes.Length <> 1 ->
+            let ctx' = addVarName binding.Id name ctx
+            (codegenError ctx ind $"group_by over the streamed rank-{spec.VarType.IndexTypes.Length} variable '{spec.VarName}' needs its tile grouping (`segments(C0, C1)`); bind it with .read for anything else", ctx')
+        | _, _ ->
         match pspec.GenStreamRows with
         | None ->
             let ctx' = addVarName binding.Id name ctx

@@ -1059,6 +1059,80 @@ let scaled = method_for(zip(A, m)) <@> lambda(x, w) -> x * w |> compute
     elementwiseStreamE2E ()
 
     // ---------------------------------------------------------------
+    // 10i. RANK-2 streaming: one store standing in for four files decomposed
+    // along lat and lon (a 6 x 8 variable chunked 3 x 4 = four chunk files).
+    // `segments(T)` off the annotation's two `Chunked` slots is the tile
+    // grouping; `group_by` over the streamed variable reads each tile as one
+    // window (here, exactly one chunk file) into its row; an elementwise
+    // consumer runs one band of rows (the leading chunk edge) at a time with
+    // a row-pointer alias; `ungroup` puts the tiles back. The traversal order
+    // is the store's own. No whole-array buffer for T anywhere.
+    // ---------------------------------------------------------------
+    printfn "
+--- rank-2 streaming: tiles, row bands, ungroup ---"
+    let rank2StreamE2E () =
+        let tileStore = fixStore "zarr_tiles_2d"
+        let tileInDir = Path.Combine(e2eDir, tileStore)
+        let vars : ZarrWrite.WriteVar list = [
+            { Name = "T"; DimNames = Some ["lat"; "lon"]; Shape = [6L; 8L]; Chunks = [3L; 4L]
+              FillValue = FillFloat 0.0
+              Data = ZarrWrite.WF64 [| for i in 0 .. 5 do for j in 0 .. 7 -> float (10 * i + j) |]
+              OmitChunks = []; Blade = None } ]
+        (try Directory.Delete(tileStore, true) with _ -> ())
+        (try Directory.Delete(tileInDir, true) with _ -> ())
+        ZarrWrite.writeStoreV3 tileStore vars
+        ZarrWrite.writeStoreV3 tileInDir vars
+        let src = sprintf """
+import zarr as z
+
+let s = z.load("%s")
+type CLat = Chunked<s.index.lat, store>
+type CLon = Chunked<s.index.lon, store>
+let T: Array<Float like CLat, CLon> = s.vars.T |> z.stream
+let tiles = segments(T)
+let tsizes = extents(tiles)
+let g = group_by(T, tiles)
+let tsums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+let doubled = T * 2.0
+let back = ungroup(g)
+let dev = reduce(back - T, (+), axes = 2)
+"""
+                            tileStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "rank-2 stream: plan records the tile group_by and the elementwise consumers"
+                    ((decisions |> List.filter (fun d -> d.Rule = "segment-streaming" && d.Outcome = Blade.Effects.Applied) |> List.length) >= 3)
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Subject)))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_rank2"
+                check "rank-2 stream: tile windows and row bands, no whole-array buffer"
+                    (cppCode.Contains "per-tile STREAMED windows" && cppCode.Contains "elementwise over segments" && not (cppCode.Contains "T_flat = new")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_rank2.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "rank-2 stream: tile sizes" (has "tsizes = [12, 12, 12, 12]") runOut
+                          check "rank-2 stream: per-tile sums" (has "tsums = [138, 186, 498, 546]") runOut
+                          check "rank-2 stream: elementwise by row bands" (has "doubled = [[0, 2, 4, 6, 8, 10, 12, 14], [20, 22, 24, 26, 28, 30, 32, 34]") runOut
+                          check "rank-2 stream: ungroup of the tiles restores the variable (zip with the stream)" (has "dev = 0") runOut
+                      | Ok (code, out) -> check "rank-2 stream: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "rank-2 stream: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP rank-2 stream (compile skipped): %s" e
+                     else check "rank-2 stream: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "rank-2 stream: lowers" false e
+        with ex -> check "rank-2 stream" false ex.Message
+    rank2StreamE2E ()
+
+    // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
     //
     // Every store dimension derives a named index type, and codegen emits one
@@ -2749,7 +2823,10 @@ let (m2a, m2b) = (method_for(A, A) <@> lambda(x: Array<Float64 like TimeIdx>, y:
                let (ok, why) = sameCompute out refOut
                check "stream fused <&>: stdout identical to .read" ok why))
 
-     // (f) elementwise consumption of a streamed source: loud reject.
+     // (f) elementwise consumption of a streamed source: ONCE a loud reject
+     // (v1's only in-nest read was a whole fiber at a site); now the segment
+     // run loop reads one band of rows at a time (docs/plans/structural/07
+     // §3.4, zarr lane 10h/10i), so it compiles and says so.
      (let src = """
 import zarr as z
 
@@ -2760,11 +2837,11 @@ let out = method_for(A) <@> lambda(x) -> x + x |> compute
       match lower src with
       | Ok ir ->
           (try
-              CodeGen.genSelfContainedProgramFromIR ir "strm_elem_reject" |> ignore
-              check "stream: elementwise consumption rejected loudly" false "codegen succeeded?"
+              let (cpp, _) = CodeGen.genSelfContainedProgramFromIR ir "strm_elem_bands"
+              check "stream: elementwise consumption runs by row bands (was a loud reject)"
+                  (cpp.Contains "elementwise over segments" && not (cpp.Contains "not stream-eligible")) ""
            with ex ->
-              check "stream: elementwise consumption rejected loudly"
-                  (ex.Message.Contains "not stream-eligible") ex.Message)
+              check "stream: elementwise consumption runs by row bands (was a loud reject)" false ex.Message)
       | Error e -> check "stream: elementwise reject case lowers" false e)
      // (e) netcdf streaming differential (needs sample.nc + libnetcdf).
      if File.Exists "tests/fixtures/sample.nc" then

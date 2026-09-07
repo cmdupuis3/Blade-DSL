@@ -1914,12 +1914,12 @@ module CppZarr =
             | None -> failwith $"Zarr codegen: variable '{varName}' not found in store '{storePath}'"
         if meta.Blade.IsSome then
             failwith $"Zarr stream of '{varName}': packed variables are not streamable (bind with .read)"
-        if meta.Shape.Length <> 1 then
-            failwith $"Zarr per-segment stream of '{varName}': rank-1 dense variables only (a rank-{meta.Shape.Length} variable streams by fiber)"
+        if meta.Shape.Length < 1 then
+            failwith $"Zarr per-segment stream of '{varName}': a rank-0 variable has no runs"
         let v = cppVarName
         let elemCpp = elemCppOf arrType.ElemType
         let diskCpp = diskCppOf meta.Dtype.Code
-        let k = List.head meta.Chunks
+        let chunkCount = meta.Chunks |> List.fold (*) 1L
         let arrayDir =
             let rel = Path.GetRelativePath(store.Path, meta.ArrayDir)
             normPath (if rel = "." then storePath else Path.Combine(storePath, rel))
@@ -1929,10 +1929,89 @@ module CppZarr =
             | FillFloat f -> [ $"{elemCpp} {v}_fillv = ({elemCpp}){fmtF f};" ]
             | FillInt fi -> [ $"{elemCpp} {v}_fillv = ({elemCpp}){fi}LL;" ]
             | FillNone -> []
-        [ $"// Stream {varName} from zarr store {normPath storePath} per SEGMENT (rank-1 chunk-range reads; no whole-array buffer)"
-          $"{{ std::ifstream {v}_zm(\"{arrayDir}/{metaFile}\"); if (!{v}_zm) {{ std::cerr << \"Zarr error: array '{varName}' not found in store '{(normPath storePath)}' (missing {metaFile})\" << std::endl; std::exit(1); }} }}"
-          $"{diskCpp}* {v}_rseg = new {diskCpp}[{k}];" ]
+        ignore diskCpp; ignore chunkCount
+        [ $"// Stream {varName} from zarr store {normPath storePath} per SEGMENT (windowed chunk reads; no whole-array buffer)"
+          $"{{ std::ifstream {v}_zm(\"{arrayDir}/{metaFile}\"); if (!{v}_zm) {{ std::cerr << \"Zarr error: array '{varName}' not found in store '{(normPath storePath)}' (missing {metaFile})\" << std::endl; std::exit(1); }} }}" ]
         @ fillDecl
+
+    /// A rectangular WINDOW of a dense variable of any rank, read into `destBuf`
+    /// row-major over the window's shape (docs/plans/structural/07 §3.4):
+    /// the chunk grid is walked only where the window intersects it, each
+    /// chunk file read once whole (into the `_cbuf` scratch the prologue
+    /// allocated), and the intersection copied; a missing chunk fills, or
+    /// fails loudly under a null fill_value. The window bounds are C++
+    /// expressions so a run loop can drive them.
+    let genStreamWindow (storePath: string) (varName: string) (cppVarName: string) (destBuf: string) (ranges: (string * string) list) (arrType: IRArrayType) : string list =
+        let store = load storePath
+        let meta =
+            match tryFindArray store varName with
+            | Some m -> m
+            | None -> failwith $"Zarr codegen: variable '{varName}' not found in store '{storePath}'"
+        let rank = meta.Shape.Length
+        if ranges.Length <> rank then
+            failwith $"Zarr window of '{varName}': {ranges.Length} bounds for rank {rank}"
+        let v = cppVarName
+        let elemCpp = elemCppOf arrType.ElemType
+        let shape = meta.Shape |> List.map int
+        let chunks = meta.Chunks |> List.map int
+        let chunkCount = chunks |> List.fold (*) 1
+        let chunkBytes = chunkCount * meta.Dtype.ByteSize
+        let cStr = rowMajorStrides chunks
+        let src = zarrChunkFetch storePath store meta v chunkBytes
+        // window bounds and row-major strides of the window's shape
+        let boundDecls =
+            [ for d in 0 .. rank - 1 do
+                let (lo, hi) = ranges.[d]
+                yield $"size_t {v}_wlo{d} = (size_t)({lo}); size_t {v}_whi{d} = (size_t)({hi}); if ({v}_whi{d} > {shape.[d]}UL) {v}_whi{d} = {shape.[d]}UL;" ]
+            @ [ for d in rank - 1 .. -1 .. 0 do
+                  if d = rank - 1 then yield $"size_t {v}_wst{d} = 1;"
+                  else yield $"size_t {v}_wst{d} = {v}_wst{d + 1} * ({v}_whi{d + 1} - {v}_wlo{d + 1});" ]
+        let gridLoops =
+            [ for d in 0 .. rank - 1 ->
+                let ind = String.replicate d "    "
+                $"{ind}for (size_t {v}_c{d} = {v}_wlo{d} / {chunks.[d]}; {v}_c{d} * {chunks.[d]} < {v}_whi{d}; {v}_c{d}++) {{" ]
+        let gInd = String.replicate rank "    "
+        let limDecls =
+            [ for d in 0 .. rank - 1 do
+                yield $"{gInd}size_t {v}_lim{d} = {shape.[d]} - {v}_c{d} * {chunks.[d]};"
+                yield $"{gInd}if ({v}_lim{d} > {chunks.[d]}) {v}_lim{d} = {chunks.[d]};"
+                // clip the copy to the window: local range [from, to) within the chunk
+                yield $"{gInd}size_t {v}_from{d} = {v}_c{d} * {chunks.[d]} < {v}_wlo{d} ? {v}_wlo{d} - {v}_c{d} * {chunks.[d]} : 0;"
+                yield $"{gInd}size_t {v}_to{d} = {v}_whi{d} - {v}_c{d} * {chunks.[d]}; if ({v}_to{d} > {v}_lim{d}) {v}_to{d} = {v}_lim{d};" ]
+        let copyLoops (assign: string) =
+            [ for d in 0 .. rank - 1 ->
+                let ind = gInd + String.replicate (d + 1) "    "
+                $"{ind}for (size_t {v}_l{d} = {v}_from{d}; {v}_l{d} < {v}_to{d}; {v}_l{d}++) {{" ]
+            @ [ gInd + String.replicate (rank + 1) "    " + assign ]
+            @ [ for d in rank - 1 .. -1 .. 0 -> gInd + String.replicate (d + 1) "    " + "}" ]
+        let dIdx =
+            [ for d in 0 .. rank - 1 -> $"({v}_c{d} * {chunks.[d]} + {v}_l{d} - {v}_wlo{d}) * {v}_wst{d}" ]
+            |> String.concat " + "
+        let cIdx =
+            [ for d in 0 .. rank - 1 -> $"{v}_l{d} * {cStr.[d]}" ]
+            |> String.concat " + "
+        let presentBranch =
+            [ gInd + $"if ({src.Present}) {{" ]
+            @ src.Read (gInd + "    ")
+            @ (copyLoops $"({destBuf})[{dIdx}] = ({elemCpp}){v}_cbuf[{cIdx}];")
+        let missingBranch =
+            match meta.FillValue with
+            | FillNone ->
+                [ gInd + "} else {"
+                  gInd + $"    std::cerr << \"Zarr error: chunk '\" << {src.Ident} << \"' of '{varName}' is missing and fill_value is null\" << std::endl; std::exit(1);"
+                  gInd + "}" ]
+            | _ ->
+                [ gInd + "} else {" ]
+                @ (copyLoops $"({destBuf})[{dIdx}] = {v}_fillv;" |> List.map (fun s -> "    " + s))
+                @ [ gInd + "}" ]
+        let gridClose = [ for d in rank - 1 .. -1 .. 0 -> String.replicate d "    " + "}" ]
+        let diskCpp = diskCppOf meta.Dtype.Code
+        // the chunk scratch is this read's own (block-scoped), so the reader
+        // works under either stream prologue
+        let scratch =
+            [ $"std::vector<{diskCpp}> {v}_wbufv({chunkCount});"
+              $"{diskCpp}* {v}_cbuf = {v}_wbufv.data();" ]
+        scratch @ boundDecls @ gridLoops @ limDecls @ src.Locate gInd @ presentBranch @ missingBranch @ gridClose
 
     /// The run [lo, hi) of a rank-1 dense variable read into `destBuf[0 ..
     /// hi-lo)`: one file open per chunk the run intersects, one seek+read of
@@ -1945,41 +2024,9 @@ module CppZarr =
             match tryFindArray store varName with
             | Some m -> m
             | None -> failwith $"Zarr codegen: variable '{varName}' not found in store '{storePath}'"
-        if meta.Shape.Length <> 1 then
-            failwith $"Zarr per-segment stream of '{varName}': rank-1 dense variables only"
-        let v = cppVarName
-        let elemCpp = elemCppOf arrType.ElemType
-        let bs = meta.Dtype.ByteSize
-        let n = List.head meta.Shape
-        let k = List.head meta.Chunks
-        let arrayDir =
-            let rel = Path.GetRelativePath(store.Path, meta.ArrayDir)
-            normPath (if rel = "." then storePath else Path.Combine(storePath, rel))
-        let sep = meta.ChunkKeySep
-        let keyExpr =
-            if meta.ChunkKeyPrefix = "" then $"std::to_string({v}_rc)"
-            else $"std::string(\"{meta.ChunkKeyPrefix}{sep}\") + std::to_string({v}_rc)"
-        let missingBranch =
-            match meta.FillValue with
-            | FillNone ->
-                [ $"    }} else {{ std::cerr << \"Zarr error: chunk '\" << {v}_key << \"' of '{varName}' is missing and fill_value is null\" << std::endl; std::exit(1); }}" ]
-            | _ ->
-                [ "    } else {"
-                  $"        for (size_t {v}_q = 0; {v}_q < {v}_rlen; {v}_q++) ({destBuf})[{v}_rs - ({lo}) + {v}_q] = {v}_fillv;"
-                  "    }" ]
-        [ $"for (size_t {v}_rc = (size_t)({lo}) / {k}; {v}_rc * {k} < (size_t)({hi}); {v}_rc++) {{"
-          $"    size_t {v}_rs = {v}_rc * {k}; if ({v}_rs < (size_t)({lo})) {v}_rs = (size_t)({lo});"
-          $"    size_t {v}_re = ({v}_rc + 1) * {k}; if ({v}_re > (size_t)({hi})) {v}_re = (size_t)({hi}); if ({v}_re > {n}) {v}_re = {n};"
-          $"    size_t {v}_rlen = {v}_re - {v}_rs;"
-          $"    std::string {v}_key = {keyExpr};"
-          $"    std::ifstream {v}_cf(std::string(\"{arrayDir}/\") + {v}_key, std::ios::binary);"
-          $"    if ({v}_cf) {{"
-          $"        {v}_cf.seekg((std::streamoff)(({v}_rs - {v}_rc * {k}) * {bs}));"
-          $"        {v}_cf.read((char*){v}_rseg, {v}_rlen * {bs});"
-          $"        if ({v}_cf.gcount() != (std::streamsize)({v}_rlen * {bs})) {{ std::cerr << \"Zarr error: chunk '\" << {v}_key << \"' of '{varName}' is short -- a compressed or corrupt store?\" << std::endl; std::exit(1); }}"
-          $"        for (size_t {v}_q = 0; {v}_q < {v}_rlen; {v}_q++) ({destBuf})[{v}_rs - ({lo}) + {v}_q] = ({elemCpp}){v}_rseg[{v}_q];" ]
-        @ missingBranch
-        @ [ "}" ]
+        // rows [lo, hi) of the leading axis, every trailing cell
+        let ranges = (lo, hi) :: [ for n in List.tail meta.Shape -> ("0", $"{n}UL") ]
+        genStreamWindow storePath varName cppVarName destBuf ranges arrType
 
     /// STREAMED fiber reads, in-nest: assemble one trailing-axis fiber at the
     /// given site coordinates, one seek+read per t-chunk (contiguous WITHIN a
@@ -2439,6 +2486,7 @@ let spec : Blade.ProviderRegistry.ProviderSpec = {
     GenStreamFiber = Some CppZarr.genStreamFiber
     GenStreamRowsOpen = Some CppZarr.genStreamRowsOpen
     GenStreamRows = Some CppZarr.genStreamRows
+    GenStreamWindow = Some CppZarr.genStreamWindow
     StreamRowsBlock = Some (fun path varName ->
         match tryFindArray (load path) varName with
         | Some m when not m.Chunks.IsEmpty -> List.head m.Chunks
