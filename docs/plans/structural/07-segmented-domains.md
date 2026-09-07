@@ -1,11 +1,17 @@
 # 07 — Segmented domains: chunks and files as a structural grouping of one axis
 
-Status: PARTLY BUILT 2026-09-06 on `feat/segmented-domains` (decisions D1-D5, D7-D10
-resolved by the user; D6 open). Landed, in three commits: the surface type in all
-three forms, the structural groupings `segments(A)` and `files(A)` with no CSR, `ungroup`
-in its grouped and row forms, static `segments`, zarr's inherited chunk edges, the
-deletion of `blocked<I, K>`, corpus `segments/` and zarr-lane sections 10c/10d
-(sql.md §7c is the user-facing summary). Two deviations from the design below, both
+Status: BUILT 2026-09-06 on `feat/segmented-domains` (decisions D1-D10 resolved by the
+user; D6 read as: a flat fold over a `Chunked` axis is the plain flat fold and a
+per-segment fold is only ever spelled through the grouping, so nothing implicit is
+licensed or refused). Landed, in five commits: the surface type in all three forms,
+the structural groupings `segments(A)` and `files(A)` with no CSR, `ungroup` in its
+grouped and row forms, static `segments`, zarr's inherited chunk edges, the deletion of
+`blocked<I, K>`, PER-SEGMENT STREAMED READS (`group_by(A |> z.stream, segments(X))`
+over a rank-1 zarr variable reads one run at a time into the ragged pool; no
+whole-array buffer, §3.4), and the TILE GROUPING `segments(C0, C1)` over a rank-2
+array in slot order with its `ungroup` (§4.1b; the reversed slot order is refused);
+corpus `segments/` (13) and zarr-lane sections 10c/10d/10e (sql.md §7c is the
+user-facing summary). Two deviations from the design below, both
 recorded rather than hidden: (1) the segmentation is carried BESIDE the alias
 (`TypeEnv.Segmentations`), not as a field on the index record -- nothing in this arc
 changes storage layout, so the record needs no field yet, and the alias adopting the
@@ -14,12 +20,15 @@ storage level (distributed P0) when layout depends on it. (2) The two-level axis
 exposed one level at a time (`files(T)` = the file runs, `segments(T)` = the innermost
 per-file chunk runs, with each file's own edge) rather than as the nested
 `[file_outer; chunk_outer(file); member]` shape of §2.7, because a slot-aware nested
-`group_by` is not built. NOT built: per-segment lazy provider reads (§3.4 -- a grouped
-provider read still materializes the whole variable, so the out-of-core claim of §0
-is a per-run *kernel* claim today, not a memory claim); the slot-aware multi-dim
-`group_by` and the cross-slot refusal (§4.0-4.1); halo ghost strips across segments
-(§2.3); licensed per-segment folds (§2.5, D6); string-label indexing of the `files`
-outer axis; netcdf/icechunk chunk-edge readers; static `segments` over provider axes.
+`group_by` is not built. NOT built: per-segment streamed reads of rank >= 2 variables and of
+netcdf/icechunk stores (the hooks exist; zarr implements rank 1); the NESTED
+`[file_outer; chunk_outer(file); member]` shape of §2.7 (the two levels are exposed
+one at a time) and the 2-D mosaic-of-stores declaration, which is where the cross-slot
+refusal of §4.0 would first have content (with two single-slot segmentations it holds
+by construction, and a tile grouping over a file-tiled axis refuses with that
+reason); halo ghost strips across segments (§2.3); string-label indexing of the
+`files` outer axis; netcdf/icechunk chunk-edge readers; static `segments` over
+provider axes.
 Found in passing: an elementwise map over any `group_by` result is refused by the
 ragged-map emitter (pre-existing BL7004), which is what blocks the per-segment
 elementwise idiom as a nested map. Reframes item 4 of
@@ -570,7 +579,7 @@ icechunk mint-table and tag discipline — the alias-laundering review is the ch
 | D3 | file labels | an `EnumIdx`: a limited set of string-valued states |
 | D4 | inverse | add `ungroup`; `join` unchanged — the behaviours stay orthogonal |
 | D5 | multi-store declaration | no provider API: a store's own metadata gives its chunk level; the multi-store level is the D1 type and is **provider-agnostic** (`ungroup` etc. behave the same over any provider) |
-| D6 | unlicensed folds over a segmented axis | **open** — revisit once the rest is settled |
+| D6 | unlicensed folds over a segmented axis | resolved: no eager fold over a segmented dim is ever reassociated -- a flat `reduce` on a `Chunked` axis is the plain flat fold (the alias IS the axis), and a per-segment fold is only spelled through `group_by(a, segments(A))` plus an explicit combine; the deferred-pipeline recognition at `compute` (checking the data was ungrouped) is noted as the place a stronger rule would live |
 | D7 | `blocked<I, K>` | remove, or fold into `Chunked` where relevant; it was the theoretical version of `Chunked` |
 | D8 | multi-dimensional order | slot order |
 | D9 | coordinate variables | **not consulted at all** — they are ordinary arrays in the provider |

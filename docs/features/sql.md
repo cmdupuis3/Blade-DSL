@@ -383,6 +383,8 @@ let g   = group_by(a, seg)                    // groups x members, as for any gr
 let back = ungroup(g)                         // Array<Float like I>: the runs reassembled over I
 let fs  = files(T)                            // the FILE level of a tiled axis: one run per store, labelled
 let v   = ungroup([v1, v2], T)                // a variable living in both stores, named over T
+let tiles = segments(C0, C1)                  // a rank-2 array's TILE grouping: one group per (g0, g1), slot order
+let A = s.vars.A |> z.stream                  // rank-1: NOT materialized; group_by(A, seg) reads one run at a time
 ```
 
 - `Chunked<I, spec>` **is** `I`: the alias adopts I's record, so arrays over `CI` and
@@ -401,6 +403,18 @@ let v   = ungroup([v1, v2], T)                // a variable living in both store
   level; `files` its outermost. In a static position `segments(A)` is the tuple
   of run sizes, so `let static n = length(segments(A))` is a compile-time segment
   count.
+- `segments(C0, C1)` over a rank-2 array whose slots are exactly those axes, in
+  slot order (decisions D8/D10 -- the reversed order is refused, not transposed),
+  is the PRODUCT grouping: one group per tile, row-major over the tile grid, the
+  member the tile's cells row-major; `extents` gives tile sizes and `ungroup`
+  puts the tiles back over both axes. `group_bucket` is refused for it (its
+  source is two-dimensional). The cross-slot condition of the design's §4.0 holds
+  by construction here, since both slots are single-slot segmentations; a
+  two-dimensional mosaic of stores has no declaration form yet.
+- `group_by(A, segments(X))` over a rank-1 variable bound with `.stream` reads
+  each run from the store straight into that group's row: the whole variable is
+  never materialized (the emitted C++ has no buffer for it). A key grouping over a
+  streamed variable, and every other consumer, keep the `.stream` refusals.
 - `ungroup(G)` restores the axis from a `group_by(_, segments(A))` result;
   `ungroup(G, A)` names the axis when G derives from one (a map over it keeps
   neither the outer id nor the grouping registration). `ungroup([r1, .., rF], A)`
@@ -408,13 +422,19 @@ let v   = ungroup([v1, v2], T)                // a variable living in both store
   extents must match the stores'. `join` is untouched: it concatenates into a
   fresh axis, `ungroup` reassembles an existing one.
 
+Folds (decision D6): a flat `reduce` over an array on a `Chunked` axis is the plain
+flat fold -- the alias IS the axis, nothing is reassociated, no license is asked.
+A per-segment fold is what `group_by(a, segments(A))` and an explicit combine
+spell; nothing implicit exists to refuse.
+
 Not yet: an elementwise map over a grouped array (the ragged-map emitter's
 standing refusal, so the per-segment elementwise idiom is `ungroup` then map, or
-map then `group_by`); per-segment lazy reads (a grouped provider read still
-materializes the whole variable); string-label indexing of the `files` outer
-axis; static `segments` for provider axes; chunk edges for netcdf and icechunk
-(zarr only). Tests: `tests/corpus/segments/`, and `blade test zarr` sections 10c
-(inherited edge) and 10d (two stores).
+map then `group_by`); per-segment streamed reads of rank >= 2 variables and of
+netcdf/icechunk stores (zarr, rank 1 today); string-label indexing of the `files`
+outer axis; static `segments` for provider axes; chunk edges for netcdf and
+icechunk (zarr only); halo ghost strips across segment boundaries. Tests:
+`tests/corpus/segments/`, and `blade test zarr` sections 10c (inherited edge),
+10d (two stores), 10e (streamed runs).
 
 ## 8. `group_by(values, gk)` — ragged grouped view
 
