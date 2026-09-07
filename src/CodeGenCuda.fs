@@ -3027,9 +3027,10 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                 let sources = arrays |> List.choose streamedOf |> List.distinctBy fst
                 match sources with
                 | [] -> None
-                | _ when sources |> List.exists (fun (_, s) -> s.VarType.IndexTypes.Length <> 1) ->
-                    raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan
-                        "an elementwise consumer streams rank-1 variables today; bind a higher-rank streamed variable with .read"))
+                // a higher-rank streamed operand is the FIBER stream of
+                // StreamingIONotes v1 (a rank-1 kernel parameter over the
+                // trailing axis): that path stays as it is
+                | _ when sources |> List.exists (fun (_, s) -> s.VarType.IndexTypes.Length <> 1) -> None
                 | (_, s0) :: _ ->
                     let n = (match s0.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> 0L)
                     let pspec = (Blade.ProviderRegistry.tryFind s0.Provider).Value
