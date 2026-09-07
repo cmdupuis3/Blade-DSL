@@ -3642,11 +3642,22 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
              | Some d -> resolveDeferred d
              | None -> e)
         | _ -> e
+    // A leaf that is a NAMED deferred map keeps its id beside the resolved
+    // apply: `reduce(e, (+))` next to `prodsum(e, v)` is the sharing
+    // declaration read from the leg's side (docs/plans/structural/03, D2),
+    // and the id is what ties this leg to the share leaf the slot declares.
     let rec collectLeaves e =
-        match resolveDeferred e with
+        match e with
+        | IRVar (id, _) when Map.containsKey id ctx.DeferredComputations ->
+            (match resolveDeferred e with
+             | IRFusion _ as f -> collectLeaves f
+             | IRApplyCombinator _ as a -> [(a, Some id)]
+             | other -> [(other, None)])
         | IRFusion (l, r) -> collectLeaves l @ collectLeaves r
-        | other -> [other]
-    let leaves = collectLeaves compExpr
+        | other -> [(other, None)]
+    let leafPairs = collectLeaves compExpr
+    let leaves = leafPairs |> List.map fst
+    let leafVarIds = leafPairs |> List.map snd
     let infos = leaves |> List.choose (function IRApplyCombinator i -> Some i | _ -> None)
     let ctx' = addVarName binding.Id name ctx
     if infos.Length <> leaves.Length || infos.Length <> kernelExprs.Length then
@@ -3686,9 +3697,29 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
              | Some (IRApplyCombinator dinfo) -> Some (id, dinfo)
              | _ -> None)
         | _ -> None
+    // Per leg, in traversal order: the leg's own leaf when it is a named map
+    // (collectLeaves), then its operand slots. A slot operand is always a
+    // share (that is how a deferred slot gets a C++ definition at all); a
+    // leaf name is a share only when the join spells it at least twice -- as
+    // a leaf again or as a slot -- so a leg that merely folds a named map on
+    // its own keeps today's inlined nest.
+    let leafDeferred (v: IRId option) : (IRId * ApplyInfo) option =
+        v |> Option.bind (fun id ->
+            match Map.tryFind id ctx.DeferredComputations with
+            | Some (IRApplyCombinator di) -> Some (id, di)
+            | _ -> None)
+    let leafShares = leafVarIds |> List.choose leafDeferred
+    let slotShares = infos |> List.collect (fun info -> info.Arrays |> List.choose deferredOperand)
+    let spelled (id: IRId) =
+        (leafShares |> List.filter (fun (i, _) -> i = id) |> List.length)
+        + (slotShares |> List.filter (fun (i, _) -> i = id) |> List.length)
     let sharedIds =
-        infos
-        |> List.collect (fun info -> info.Arrays |> List.choose deferredOperand)
+        List.zip leafVarIds infos
+        |> List.collect (fun (lv, info) ->
+            (match leafDeferred lv with
+             | Some (id, di) when spelled id >= 2 -> [(id, di)]
+             | _ -> [])
+            @ (info.Arrays |> List.choose deferredOperand))
         |> List.fold (fun acc (id, di) -> if acc |> List.exists (fun (i, _) -> i = id) then acc else acc @ [(id, di)]) []
     let badShare =
         sharedIds |> List.tryPick (fun (id, di) ->
@@ -3773,6 +3804,17 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
     let leafNames = infos |> List.mapi (fun i _ -> $"{name}_{i}")
     let leafCgs =
         List.mapi (fun i (info: ApplyInfo) ->
+            match leafVarIds.[i] |> Option.bind (fun sid -> sharedIds |> List.tryFind (fun (s, _) -> s = sid)) with
+            | Some (sid, di) ->
+                // This leg's traversal IS the shared map: the same nest as the
+                // share leaf (its peels dedup with the share's), whose per-cell
+                // value is the share local itself -- `acc = wrap(acc, <share>)`,
+                // never a second spelling of the producer.
+                let cg0 = routeKernelBodyThroughCall di (buildLoopNestCodeGen di (arrayNamesOf di) leafNames.[i] builder)
+                { cg0 with KernelExpr = IRVar (sid, sharedElemTy sid)
+                           OutputType = callables.[i].RetType
+                           FoldWrapper = Some wnames.[i] }
+            | None ->
             let (info', moved) = repoint info
             let cg0 = routeKernelBodyThroughCall info' (buildLoopNestCodeGen info' (arrayNamesOf info') leafNames.[i] builder)
             // Every param bound by a repointed slot now reads the SHARED local

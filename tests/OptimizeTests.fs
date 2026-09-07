@@ -254,6 +254,62 @@ let private haloCarouselTailGuarded () =
             resultLine Fail name ($"carousel={carousel}, guarded={guarded}")
             false
 
+/// A reduction join's share is read by a DIRECT-FOLD leg (docs/plans/
+/// structural/03, defect D2): `reduce(e, (+))` beside `prodsum(e, v)` over
+/// the named deferred map `e` spells the producer ONCE in the joint loop --
+/// the share's `const` -- and the fold leg accumulates that name. The corpus
+/// (loops/205) proves the values; only an emission pin can tell one
+/// exponential per iteration from two.
+let private joinShareReadByDirectFold () =
+    let name = "join_share_read_by_direct_fold"
+    let src =
+        "type J = Idx<11>\n"
+        + "let k = method_for(range<J>) <@> lambda(j) -> 0.2 * Float64(j) - 0.4 |> compute\n"
+        + "let v = method_for(range<J>) <@> lambda(j) -> 1.0 + 0.1 * Float64(j) |> compute\n"
+        + "let e = method_for(k) <@> lambda(b) -> exp(-b * b)\n"
+        + "let z, u = object_for(<&!>) <@> (reduce(e, (+)), prodsum(e, v))\n"
+    match cppOfSource name src with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        // One in the lifted kernel body, one in the share's per-iteration const.
+        let exps = System.Text.RegularExpressions.Regex.Matches(cpp, @"std::exp\(").Count
+        let shared = cpp.Contains "sharing e per iteration"
+        let legReadsShare = System.Text.RegularExpressions.Regex.IsMatch(cpp, @"_j0\(\w+_0, e\);")
+        if exps = 2 && shared && legReadsShare then
+            resultLine Pass name "2 std::exp sites (kernel body + share const); the fold leg reads `e`"
+            true
+        else
+            resultLine Fail name ($"expected 2 std::exp sites, the share note and `_j0(.., e)`; got exps={exps}, shared={shared}, legReadsShare={legReadsShare}")
+            false
+
+/// `reduce(method_for(q, k) <@> lambda(a, b) -> f(a, b), (+))` under the
+/// default `axes = 1` streams (docs/plans/structural/03, piece D): the
+/// checker rewrites the deferred outer product into an outer apply whose row
+/// kernel is the fused fold over `k`, so the emission has NO rank-2 pool, no
+/// row-mode `__pfrow`/`__pfsrc` scaffolding, and the exponential is applied
+/// inside a fold wrapper. The corpus (loops/206) proves the values.
+let private outerProductPartialFoldStreams () =
+    let name = "outer_product_partial_fold_streams"
+    let src =
+        "type I = Idx<7>\n"
+        + "type J = Idx<11>\n"
+        + "function score(a: Float64, b: Float64) -> Float64 = -(a - b) * (a - b) * 8.0\n"
+        + "let q = method_for(range<I>) <@> lambda(i) -> 0.3 * Float64(i) - 0.5 |> compute\n"
+        + "let k = method_for(range<J>) <@> lambda(j) -> 0.2 * Float64(j) - 0.4 |> compute\n"
+        + "let z = reduce(method_for(q, k) <@> lambda(a, b) -> exp(score(a, b)), (+))\n"
+    match cppOfSource name src with
+    | Error e -> resultLine Fail name e; false
+    | Ok cpp ->
+        let pools = System.Text.RegularExpressions.Regex.Matches(cpp, @"Array<double, 2>").Count
+        let rowMode = cpp.Contains "__pfrow" || cpp.Contains "__pfsrc"
+        let fusedFold = System.Text.RegularExpressions.Regex.IsMatch(cpp, @"= __wrap_\d+_\w+\(\w+, std::exp\(")
+        if pools = 0 && not rowMode && fusedFold then
+            resultLine Pass name "no rank-2 pool, no row-mode scaffolding; exp folded inside the wrapper"
+            true
+        else
+            resultLine Fail name ($"expected no Array<double, 2>, no __pfrow/__pfsrc, a fused exp fold; got pools={pools}, rowMode={rowMode}, fusedFold={fusedFold}")
+            false
+
 let private runCase (name: string) (src: string) (wantBreaks: int) (wantAborts: int) =
     match cppOfSource name src with
     | Error e -> resultLine Fail name e; false
@@ -298,7 +354,11 @@ let runOptimizeTests () =
           // Reverse-mode AD of an additive recurrence is O(n): loop count pin.
           recarrayGradEmission ()
           // The halo carousel's last-step prefetch stays inside the pool.
-          haloCarouselTailGuarded () ]
+          haloCarouselTailGuarded ()
+          // Streaming reductions (structural/03): the join share read by a
+          // direct-fold leg, and the deferred outer product's partial fold.
+          joinShareReadByDirectFold ()
+          outerProductPartialFoldStreams () ]
     let passed = results |> List.filter id |> List.length
     let failed = results.Length - passed
     printFooter "Optimization Layer" [$"{passed} passed"; $"{failed} failed"]

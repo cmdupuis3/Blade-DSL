@@ -723,7 +723,13 @@ the annotation hook only.
   innermost `n` dimensions, `n = 1` by default (rank k in, rank k−n out;
   `n = rank(A)` is the full fold to a scalar); default kernel `(+)`; see
   [features/sql.md](features/sql.md) §10 for typing details, the axis-count
-  rules and the empty-input rule.
+  rules and the empty-input rule. Under the default `n = 1`, an anonymous
+  deferred outer product `reduce(method_for(A, B) <@> lambda(a, b) -> f(a, b),
+  op[, init])` (named rank-1 sources, no `where` clause on the map kernel, a
+  `(+)`/`(*)` section or a seeded fold) is evaluated row by row -- an outer
+  apply over `A` whose row kernel is the fused fold over `B` -- and the
+  |A| × |B| product is never materialized; the values are those of the
+  materialized route (the same left fold per row).
 - `extents(A)` — rank-1: scalar; dense rank-k: tuple, outermost first;
   compound: cardinality. Rejected where a per-dimension scalar doesn't exist
   (ragged/grouped) — use `extents(row)`.
@@ -1194,7 +1200,9 @@ come from the same MethodLoop: they must only agree on the joint index space
 writes no cells and so has no output shape to reconcile.
 
 Legs referring to the same **named deferred** computation evaluate it once per
-joint cell; the name is the declaration. One leg is the identity (a scalar, not
+joint cell; the name is the declaration, whether it stands in an operand slot
+(`prodsum(e, v)`) or is a leg's own traversal (`reduce(e, (+))`) -- the leg
+folds the shared cell, not a second evaluation. One leg is the identity (a scalar, not
 a 1-tuple); zero legs has no index space and is refused. Both spellings are
 `docs/plan-reduction-joins.md`; note that `object_for(<&!>) <@> (c₁, …, c_k)`
 over deferred MAPS keeps its existing reading (n-ary map fusion answering k

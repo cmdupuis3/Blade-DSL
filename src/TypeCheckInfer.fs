@@ -2134,10 +2134,31 @@ and inferReductionJoin (env: TypeEnv) (legs: Expr list) (site: Expr) : TypeResul
     legs |> List.mapi (joinLegSurface env) |> sequenceResults |> Result.bind (fun parts ->
     parts |> List.map (fun (leaf, _, _) -> inferExpr env leaf) |> sequenceResults
     |> Result.bind (fun tLeaves0 ->
-    // RESOLVED leaves, like the `<&!>` chain: the typed node holds the apply
-    // itself, never a variable pointing at one, so lowering and codegen never
-    // chase bindings.
-    let tLeaves = tLeaves0 |> List.map (resolveTypedExpr env)
+    // RESOLVED leaves for the SHAPE judgments below, like the `<&!>` chain.
+    // The leaf SPLICED into the typed node is the resolved apply too -- with
+    // one exception, the join's sharing declaration read from the leg's side:
+    // a leg written `reduce(<name>, op)` over a NAMED deferred map keeps the
+    // NAME as its leaf when the join has several legs. Splicing a copy of the
+    // apply there erased the identity between this leg's traversal and the
+    // operand slot another leg reads (`prodsum(<name>, v)`), so the emitter
+    // declared the per-iteration share for the slot and this leg re-spelled
+    // the producer beside it (docs/plans/structural/03, defect D2). Every
+    // consumer of the node resolves a variable leaf through the deferred
+    // table it already keeps (codegen's `DeferredComputations`, the
+    // interpreter's `VDeferred`, the device and LLVM producers), and lowering
+    // counts the leaf as a join reference so S2 leaves the binding deferred
+    // (`joinDeferrableIdsMany`). A CAPTURED binding keeps the copy: codegen
+    // materializes a deferred capture at the boundary that forwards it, so
+    // the name would no longer resolve to an unforced apply in the body.
+    let tResolved = tLeaves0 |> List.map (resolveTypedExpr env)
+    let tLeaves =
+        if legs.Length < 2 then tResolved
+        else
+            List.map2 (fun (t0: TypedExpr) (r: TypedExpr) ->
+                match t0.Kind, r.Kind with
+                | TExprVar (name, _, _), TExprApply info
+                        when not info.IsComposeApply && not (capturedOuterBinding name env) -> t0
+                | _ -> r) tLeaves0 tResolved
     let leafShape (i: int) (t: TypedExpr) : Result<IRType * IRIndexType list, TypeError> =
         match t.Kind with
         | TExprApply info when not info.IsComposeApply ->
@@ -2154,7 +2175,7 @@ and inferReductionJoin (env: TypeEnv) (legs: Expr list) (site: Expr) : TypeResul
             Error (Other $"reduction-join leg {i + 1} reduces a COMPOSED (>>@/@>>) application, which is not supported yet -- force it with `|> compute` and join over the resulting array.")
         | _ ->
             Error (Other $"reduction-join leg {i + 1} could not be resolved to a traversal -- a join leg must be `prodsum(...)` or `reduce(<computation or array>, op)`.")
-    tLeaves |> List.mapi leafShape |> sequenceResults |> Result.bind (fun shapes ->
+    tResolved |> List.mapi leafShape |> sequenceResults |> Result.bind (fun shapes ->
     // ---- JOINT INDEX SPACE -------------------------------------------------
     // A join emits ONE loop nest, so every leg must walk the SAME cell grid:
     // equal rank, and equal extents wherever both are statically known. Only
@@ -2412,6 +2433,82 @@ and inferReduce (env: TypeEnv) array kernel (init: Expr option) (axes: Expr opti
         match unitGate |> Result.bind (fun () -> compactGate) |> Result.bind (fun () -> emptyGate) with
         | Error e -> Some (Error e)
         | Ok () ->
+        // ---- The deferred OUTER PRODUCT under the default partial fold ------
+        // `reduce(method_for(A1, .., Ar) <@> lambda(p1, .., pr) -> body, op)`
+        // with the default `axes = 1` folds the innermost axis of a rank-r
+        // product NOBODY else reads -- and the route below still built it:
+        // `__pfsrc` forced the whole M x N (x ..) pool, then the row map
+        // folded each row of it (docs/plans/structural/03 section 1.3: two
+        // full passes over a pool the answer never needs). The rewrite is the
+        // per-row shape the idiom package documents (examples/10):
+        //
+        //   (method_for(A1) <@> lambda(p1) ->
+        //        reduce(method_for(A2, .., Ar) <@> lambda(p2, .., pr) -> body,
+        //               op[, init])) |> compute
+        //
+        // an outer apply whose row kernel is the FUSED terminal over the
+        // remaining operands with `p1` captured by value -- routes that exist,
+        // no new IR, emitter or interpreter arm. Per row the fused fold is a
+        // left fold from the identity/init in row-major order, which is the
+        // row-mode fold's order too; the row mode seeds with the first cell
+        // where a `(+)` seeds 0.0, so bits agree except the sign of an
+        // all-negative-zero row (03 section 3.3 D). Admitted narrowly: NAMED
+        // rank-1 plain dense scalar operands (each row kernel reads them by
+        // name), a lambda kernel of exactly r params with no `where` clause
+        // (a `comm` claim is the compact-output refusal's business, and a
+        // parallel licence would be dropped silently), a fold kernel that is
+        // a `(+)`/`(*)` section or carries its init (the fused terminal
+        // cannot seed from its first element), and no licence on the fold.
+        // A NAMED operand (`let S = ..; reduce(S, (+))`) stays on the route
+        // below: it may be printed or read elsewhere. TWO operands only: for
+        // a deeper product the row kernel would answer an ARRAY (the partial
+        // fold of a rank-(r-1) slice), the rank-raising row map, whose result
+        // index records do not yet agree with the row-mode route's (measured:
+        // `t - tr` between the two spellings fails BL3999 on the second
+        // axis); a rank-3 product keeps the materialized route.
+        let outerProductRewrite () : TypeResult<TypedExpr> option =
+            if n <> 1 then None else
+            match array.Kind with
+            | ExprBinOp (Elementwise, OpApply,
+                         { Kind = ExprMethodFor srcs },
+                         { Kind = ExprLambda (parms, None, body) })
+                    when srcs.Length = 2 && parms.Length = srcs.Length
+                         && srcs |> List.forall (fun s -> s.Kind.IsExprVar)
+                         && parms |> List.forall (fun p -> p.Default.IsNone) ->
+                let operandOk =
+                    match tArrCache.Force() |> Result.map (fun t -> env.Subst.Resolve t.Type) with
+                    | Ok (ArrayElem at) ->
+                        at.IndexTypes.Length = r && r = srcs.Length
+                        && at.IndexTypes |> List.forall (fun ix ->
+                               ix.IxKind = IxKPlain && ix.Symmetry = SymNone && ix.Rank = 1)
+                        && (env.Subst.Resolve at.ElemType).IsIRTScalar
+                    | _ -> false
+                let foldLicensed =
+                    match kernel.Kind with
+                    | ExprLambda (_, Some wc, _) -> not (List.isEmpty wc.Parallel)
+                    | ExprVar fn ->
+                        (match env.FuncParallel.TryGetValue fn with
+                         | true, (_, s) -> not (List.isEmpty s)
+                         | _ -> false)
+                    | _ -> false
+                let foldSeeded =
+                    match kernel.Kind with
+                    | ExprSection (OpAdd | OpMul) -> true
+                    | _ -> init.IsSome
+                if not (operandOk && foldSeeded) || foldLicensed then None
+                else
+                    let inner =
+                        synAt (ExprBinOp (Elementwise, OpApply,
+                                          synAt (ExprMethodFor (List.tail srcs)),
+                                          synAt (ExprLambda (List.tail parms, None, body))))
+                    let rowBody = synAt (ExprReduce (inner, kernel, init, None))
+                    let outer = synAt (ExprLambda ([List.head parms], None, rowBody))
+                    Some (inferExpr env (synAt (ExprCompute (
+                        synAt (ExprBinOp (Elementwise, OpApply, synAt (ExprMethodFor [List.head srcs]), outer))))))
+            | _ -> None
+        match outerProductRewrite () with
+        | Some rewritten -> Some rewritten
+        | None ->
         let uid = env.Builder.FreshId()
         let rowName = $"__pfrow{uid}"
         let rowVar = synAt (ExprVar rowName)

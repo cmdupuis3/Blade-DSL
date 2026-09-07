@@ -611,6 +611,15 @@ serial` marker at the fold, naming `axes = rank` as the spelling that threads.
 A multi-axis partial fold (1 < n < rank) additionally
 needs the folded slice to be dense, statically sized, untagged and unitless;
 outside that envelope, write the row-wise form with the slice type spelled out.
+One partial fold never builds its operand: an ANONYMOUS deferred outer product
+under the default `axes = 1` -- `reduce(method_for(A, B) <@> lambda(a, b) ->
+f(a, b), op[, init])` with two named rank-1 plain sources, no `where` clause on
+the map kernel, and a `(+)`/`(*)` section or a seeded fold -- is rewritten into
+an outer apply over `A` whose row kernel is the fused fold over `B`, so the
+|A| x |B| product is never materialized (docs/plans/structural/03, piece D;
+`tests/corpus/loops/206` pins it bit-for-bit against the forced spelling). A
+named operand, a `where comm` map kernel, or three or more sources keep the
+materialized route.
 
 A fused `<&!>` tree terminal (`reduce((L₁ <@> k₁) <&!> (L₂ <@> k₂), (+))`) has
 no partial form and stays the full fold it has always been: its leaves may have

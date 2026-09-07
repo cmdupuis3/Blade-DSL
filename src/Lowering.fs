@@ -314,6 +314,11 @@ let joinDeferrableIdsMany (exprs: IRExpr list) : Set<IRId> =
                         match a with
                         | IRVar (id, _) -> bump joinRefs id
                         | _ -> ()
+                // A leg whose LEAF is the named map itself (`reduce(<name>,
+                // op)` beside `prodsum(<name>, v)`): the typechecker keeps
+                // the name so the emitter binds the share once and this leg
+                // reads it. That read is a join reference like the slot's.
+                | IRVar (id, _) -> bump joinRefs id
                 | _ -> ()
          | _ -> ())
         match e with

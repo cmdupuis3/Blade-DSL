@@ -1,6 +1,12 @@
 # 03 — Streaming across reduction boundaries (bounded-memory pairwise pipelines)
 
-Status: RESEARCHED + MEASURED 2026-09-06; nothing built. Elaborates item 3 of
+Status: RESEARCHED + MEASURED 2026-09-06. All four GO items are BUILT: A (idiom
+package) and B (defect D1) landed in `4a72673`; C (defect D2, the share read by a
+direct-fold leg) and D (the partial-fold rewrite of the deferred outer product) landed
+2026-09-07 on `feat/streaming-reductions-cd` -- each carries a "Landed" note in §3.3, its
+gate in §4 is recorded as met, and `tests/corpus/loops/205` / `206` plus two emission
+pins in `tests/OptimizeTests.fs` hold them. The compiler feature (§3.1) stays DEFERRED
+under §4.3's conditions. Elaborates item 3 of
 [plan-structural-performance-opportunities.md](../plan-structural-performance-opportunities.md)
 ("Make whole reductions compose into bounded-memory execution").
 
@@ -487,6 +493,24 @@ the share variable. Interpreter unaffected (per-iteration CSE of a pure map,
 kernel emits one `std::exp` per iteration; `test interp loops` and the join corpus stay
 green. Effort M (touches typecheck + emitter; ids may shift → golden re-pin).
 
+**Landed (2026-09-07).** Exactly the cheapest route. `inferReductionJoin` keeps a leg's
+leaf as the VARIABLE when the leg is `reduce(<name>, op[, init])`, `<name>` resolves to an
+unforced (non-composed) apply, the join has ≥ 2 legs, and the name is not a captured outer
+binding (codegen materializes a deferred capture at the forwarding boundary, so the copy is
+still right there); the shape judgments still read the resolved apply. Lowering's
+`joinDeferrableIdsMany` counts a variable leaf as a join reference, so S2 leaves the
+body-local binding deferred. The emitter's `collectLeaves` keeps the id beside the resolved
+apply; a leaf name spelled at least twice across leaves and slots joins `sharedIds` in
+traversal order (a name spelled once keeps its inlined nest, byte-identical to before), and
+such a leg's nest is the share's own nest with `KernelExpr = IRVar share` -- `acc =
+wrap(acc, __v31)`. The interpreter, the device join and the LLVM lane resolve a variable leaf
+through the producer tables they already keep; none changed. p2's row kernel now emits ONE
+`std::exp` per iteration (and the spliced copy's second lifted lambda is gone); no golden
+moved. Pins: `tests/corpus/loops/205` (module-level leaf + slot, leaf twice + slot, a name
+spelled once, and the body-local shape inside a function -- every differential against the
+materialized statistics is exactly 0), `OptimizeTests.joinShareReadByDirectFold` (two
+`std::exp` sites in the whole TU: the kernel body and the share const; the leg reads `e`).
+
 **D. The partial-fold rewrite (the one compiler change with a verified payoff).**
 Target: `reduce(<unforced outer-product apply>, op[, init])` with `axes = 1` (default) —
 §1.3's `z`. Today `partialFold` binds the deferred operand to `__pfsrc` (`:2406-2407`).
@@ -510,6 +534,24 @@ reduce(S, (+))`) stay on today's route (they may be printed/read elsewhere — t
 sole-consumer analysis is plan-deferred-combinators D0). `range<I, J>` loops: v2, needs the
 range's tag list split at the surface. Effort M; risk = id-shift golden churn (that plan's
 §3.7). Gate in §4.
+
+**Landed (2026-09-07), for r = 2.** `partialFold` gained `outerProductRewrite`, taken after
+the unit / compact / empty gates and before the `srcIsNamed` split: the operand must be the
+surface `method_for(A₁, A₂) <@> lambda(p₁, p₂) -> body` with both sources NAMED, the lambda
+carrying no `where` clause (a `comm` claim keeps reaching the compact-output refusal
+BL3999, `sql-reduce/015`), the operand typed as rank-2 plain dense scalar, the fold kernel a
+`(+)`/`(*)` section or seeded, and no licence on the fold kernel. It then infers the
+rewritten surface above. TWO operands only: for r ≥ 3 the row kernel is array-valued (the
+rank-raising row map) and its result's index records do not yet agree with the row-mode
+route's (`t - tr` between the two spellings fails BL3999 on the second axis), so a rank-3
+product keeps the materialized route. No IR, emitter or interpreter change. Gate §4.2: (1)
+§1.3's `z` emits no rank-2 pool, no `__pfrow`/`__pfsrc`, and the exponential inside the fold
+wrapper (`OptimizeTests.outerProductPartialFoldStreams`); (2) `tests/corpus/loops/206` pins
+exact differentials against the forced spelling at 7 × 11 and 7 × 5 -- float `(+)`, a seeded
+max, `(*)` over integer-valued data, Int64 cells -- and the rank-3 case as a materialized
+route; (3) the loops category, `test interp loops` and the full suite are green (the totals
+are in the commit); (4) the rewritten `z` IS examples/10's spelling, so the timing claim is
+by construction. Ids shift only in programs that take the rewrite; no existing golden moved.
 
 ### 3.4 Interactions
 
@@ -606,8 +648,8 @@ preference applies: library construction over compiler machinery.
 |---|---|---|---|
 | A idiom package | 1 day | low (docs + pinned examples; interpreter twin of the tuple fold is the one unknown) | `examples/10_pairwise_normalized_sums.blade`, `examples/README.md`, `tests/corpus/loops/200_*.blade`, `tests/corpus/loops/201_*.blade`, `CLAUDE.md` (style table), `docs/quickstart-2.md`, `docs/plans/README.md` (index this doc) |
 | B defect D1 | S–M | medium: second half of the root cause not yet located | `src/TypeCheckInfer.fs:4171-4173` (`inferTupleIndex` pack arm); the apply output-type resolution for `range<…>` loops (to be found); new corpus test in `tests/corpus/tuples/` |
-| C defect D2 | M | medium: identity plumbing across the typecheck splice; golden churn | `src/TypeCheckInfer.fs:2101` (`inferReductionJoin`), `:1764-1783` (`collect`); `src/CodeGenBinding.fs:3302-3325` (`deferredOperand`/`sharedIds`), `:3348-3362` (`repoint`), `:3380-3400` (leg leaves); join corpus (`tests/corpus/loops/1xx` join tests) |
-| D partial-fold rewrite | M (2–4 days) | high on golden churn, low on semantics | `src/TypeCheckInfer.fs:2330-2470` (`partialFold`, new branch before the `srcIsNamed` split at `:2406`); corpus `tests/corpus/loops/202_deferred_outer_product_partial_fold.blade`; `docs/formalism.md` §10.2 note; plan-deferred-combinators §5 (add as D0-adjacent phase) |
+| C defect D2 -- LANDED 2026-09-07 | M | medium: identity plumbing across the typecheck splice; golden churn | `src/TypeCheckInfer.fs:2101` (`inferReductionJoin`), `:1764-1783` (`collect`); `src/CodeGenBinding.fs:3302-3325` (`deferredOperand`/`sharedIds`), `:3348-3362` (`repoint`), `:3380-3400` (leg leaves); join corpus (`tests/corpus/loops/1xx` join tests) |
+| D partial-fold rewrite -- LANDED 2026-09-07 (r = 2) | M (2–4 days) | high on golden churn, low on semantics | `src/TypeCheckInfer.fs:2330-2470` (`partialFold`, new branch before the `srcIsNamed` split at `:2406`); corpus `tests/corpus/loops/202_deferred_outer_product_partial_fold.blade`; `docs/formalism.md` §10.2 note; plan-deferred-combinators §5 (add as D0-adjacent phase) |
 | summary machinery | L | high | deferred — see §4.3 |
 
 Shared-checkout note: the corpus deployed-copy trap applies to new `.blade` files (check the
