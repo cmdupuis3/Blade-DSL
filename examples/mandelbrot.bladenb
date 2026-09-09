@@ -708,59 +708,65 @@ function ref_step(z: Array<Float64 like Idx<4>>, crh: Float64, crl: Float64, cih
 }
 
 /// |Z_m + dz|^2 -- the pixel's current orbit point, from the reference row m.
-function pert_zz(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Float64 = {
+///
+/// The reference is any table of rows whose column 0 is the real part's top
+/// double and whose column `ic` is the imaginary part's: the delta iteration
+/// reads exactly two doubles per step and never learns how many limbs sit
+/// behind them. That is what lets one kernel serve the double-double lens
+/// (rows of 4, `ic` = 2) and the quad-double one (rows of 8, `ic` = 4).
+function pert_zz(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<n>, Idx<w>>, ic: Int64) -> Float64 = {
     let zr = ref(m, 0) + dzr
-    let zi = ref(m, 2) + dzi
+    let zi = ref(m, ic) + dzi
     zr * zr + zi * zi
 }
 /// Rebase onto Z_0 = 0 when the delta has outgrown the orbit it rides
 /// (|z| < |dz|), when the reference itself has escaped, or when the
-/// reference buffer would run out.
-function pert_rebase(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Bool = {
+/// reference buffer would run out (`last` is its final usable row).
+function pert_rebase(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<n>, Idx<w>>, ic: Int64, last: Int64) -> Bool = {
     let zr0 = ref(m, 0)
-    let zi0 = ref(m, 2)
+    let zi0 = ref(m, ic)
     let zr = zr0 + dzr
     let zi = zi0 + dzi
-    zr * zr + zi * zi < dzr * dzr + dzi * dzi || zr0 * zr0 + zi0 * zi0 > 4.0 || m + 1 >= 32767
+    zr * zr + zi * zi < dzr * dzr + dzi * dzi || zr0 * zr0 + zi0 * zi0 > 4.0 || m + 1 >= last
 }
-function pert_next_m(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Int64 =
-    if pert_rebase(m, dzr, dzi, ref) then 1 else m + 1
+function pert_next_m(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<n>, Idx<w>>, ic: Int64, last: Int64) -> Int64 =
+    if pert_rebase(m, dzr, dzi, ref, ic, last) then 1 else m + 1
 /// dz' = 2 Z dz + dz^2 + dc, real and imaginary parts, after the optional rebase.
-function pert_next_r(m: Int64, dzr: Float64, dzi: Float64, dcr: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Float64 = {
-    let rb = pert_rebase(m, dzr, dzi, ref)
+function pert_next_r(m: Int64, dzr: Float64, dzi: Float64, dcr: Float64, ref: Array<Float64 like Idx<n>, Idx<w>>, ic: Int64, last: Int64) -> Float64 = {
+    let rb = pert_rebase(m, dzr, dzi, ref, ic, last)
     let rr = if rb then 0.0 else ref(m, 0)
-    let ri = if rb then 0.0 else ref(m, 2)
+    let ri = if rb then 0.0 else ref(m, ic)
     let wr = if rb then ref(m, 0) + dzr else dzr
-    let wi = if rb then ref(m, 2) + dzi else dzi
+    let wi = if rb then ref(m, ic) + dzi else dzi
     2.0 * (rr * wr - ri * wi) + (wr * wr - wi * wi) + dcr
 }
-function pert_next_i(m: Int64, dzr: Float64, dzi: Float64, dci: Float64, ref: Array<Float64 like Idx<32768>, Idx<4>>) -> Float64 = {
-    let rb = pert_rebase(m, dzr, dzi, ref)
+function pert_next_i(m: Int64, dzr: Float64, dzi: Float64, dci: Float64, ref: Array<Float64 like Idx<n>, Idx<w>>, ic: Int64, last: Int64) -> Float64 = {
+    let rb = pert_rebase(m, dzr, dzi, ref, ic, last)
     let rr = if rb then 0.0 else ref(m, 0)
-    let ri = if rb then 0.0 else ref(m, 2)
+    let ri = if rb then 0.0 else ref(m, ic)
     let wr = if rb then ref(m, 0) + dzr else dzr
-    let wi = if rb then ref(m, 2) + dzi else dzi
+    let wi = if rb then ref(m, ic) + dzi else dzi
     2.0 * (rr * wi + ri * wr) + 2.0 * wr * wi + dci
 }
 /// Smooth escape time of the pixel at C + dc, iterated as a Float64 delta
-/// off the double-double reference orbit. A tail recursion that binds
-/// nothing (see the prose above): g++ compiles it to a loop.
+/// off the reference orbit. A tail recursion that binds nothing (see the
+/// prose above): g++ compiles it to a loop.
 function esc_pert(n: Float64, m: Int64, dzr: Float64, dzi: Float64, dcr: Float64, dci: Float64,
-                  ref: Array<Float64 like Idx<32768>, Idx<4>>, kmax: Float64) -> Float64 =
+                  ref: Array<Float64 like Idx<nr>, Idx<w>>, ic: Int64, last: Int64, kmax: Float64) -> Float64 =
     if n >= kmax then 0.0 else (
-    if pert_zz(m, dzr, dzi, ref) > 4.0 then
-        n + 1.0 - log(0.5 * log(pert_zz(m, dzr, dzi, ref)) / log(2.0)) / log(2.0) else
-    esc_pert(n + 1.0, pert_next_m(m, dzr, dzi, ref), pert_next_r(m, dzr, dzi, dcr, ref),
-             pert_next_i(m, dzr, dzi, dci, ref), dcr, dci, ref, kmax))
+    if pert_zz(m, dzr, dzi, ref, ic) > 4.0 then
+        n + 1.0 - log(0.5 * log(pert_zz(m, dzr, dzi, ref, ic)) / log(2.0)) / log(2.0) else
+    esc_pert(n + 1.0, pert_next_m(m, dzr, dzi, ref, ic, last), pert_next_r(m, dzr, dzi, dcr, ref, ic, last),
+             pert_next_i(m, dzr, dzi, dci, ref, ic, last), dcr, dci, ref, ic, last, kmax))
 
 /// The deep lens: smooth escape grid of the window of half-width r around
 /// the reference's own center, on an N x N canvas whose coordinates are
 /// OFFSETS IN UNITS OF r -- the panel is Float64 too, so the axis it draws
 /// is [-1, 1] and the camera carries the absolute position.
-function deep_grid32(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Array<Float64 like Idx<32>, Idx<32>> = {
+function deep_grid32(ref: Array<Float64 like Idx<n>, Idx<w>>, ic: Int64, last: Int64, r: Float64, kmax: Float64) -> Array<Float64 like Idx<32>, Idx<32>> = {
     let h = 2.0 * r / 32.0
     (method_for(range<Idx<32>, Idx<32>>) <@> lambda(i, j) where omp(i: 1) ->
-        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, ic, last, kmax)) |> compute
 }
 
 // %% [markdown]
@@ -809,7 +815,7 @@ function deep_stats(g: Array<Float64 like Idx<32>, Idx<32>>) -> (Int64, Float64,
 
 let misi_r = 1.0e-20
 let misi_kmax = floor(view_kmax(misi_r))
-let misi20 = deep_grid32(misi_ref, misi_r, misi_kmax)
+let misi20 = deep_grid32(misi_ref, 2, 32767, misi_r, misi_kmax)
 let (misi_black, misi_lo, misi_hi) = deep_stats(misi20)
 // EXPECT: misi_black = 1
 let misi_pins = [misi_lo, misi_hi, reduce(reduce(misi20, (+)), (+))]
@@ -825,7 +831,7 @@ let (direct_black, direct_lo, direct_hi) = deep_stats(misi_direct)
 direct_black
 // EXPECT: direct_black = 1024
 
-let misi30 = deep_grid32(misi_ref, 1.0e-30, floor(view_kmax(1.0e-30)))
+let misi30 = deep_grid32(misi_ref, 2, 32767, 1.0e-30, floor(view_kmax(1.0e-30)))
 let (misi30_black, misi30_lo, misi30_hi) = deep_stats(misi30)
 // EXPECT: misi30_black = 1
 let misi30_pins = [misi30_lo, misi30_hi]
@@ -872,7 +878,7 @@ let rec lens_ref: Array<Float64 like Idx<32768>, Idx<4>> =
 function __deep96(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Float64 = {
     let h = 2.0 * r / 96.0
     let g = (method_for(range<Idx<96>, Idx<96>>) <@> lambda(i, j) where omp(i: 1) ->
-        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, 2, 32767, kmax)) |> compute
     let ax = (method_for(range<Idx<96>>) <@> lambda(j) -> -1.0 + (2.0 / 96.0) * Float64(j)) |> compute
     let (lo, hi) = field_range(g, kmax)
     let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
@@ -883,7 +889,7 @@ function __deep96(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax:
 function __deep192(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Float64 = {
     let h = 2.0 * r / 192.0
     let g = (method_for(range<Idx<192>, Idx<192>>) <@> lambda(i, j) where omp(i: 1) ->
-        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, 2, 32767, kmax)) |> compute
     let ax = (method_for(range<Idx<192>>) <@> lambda(j) -> -1.0 + (2.0 / 192.0) * Float64(j)) |> compute
     let (lo, hi) = field_range(g, kmax)
     let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
@@ -894,7 +900,7 @@ function __deep192(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax
 function __deep256(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax: Float64) -> Float64 = {
     let h = 2.0 * r / 256.0
     let g = (method_for(range<Idx<256>, Idx<256>>) <@> lambda(i, j) where omp(i: 1) ->
-        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, 2, 32767, kmax)) |> compute
     let ax = (method_for(range<Idx<256>>) <@> lambda(j) -> -1.0 + (2.0 / 256.0) * Float64(j)) |> compute
     let (lo, hi) = field_range(g, kmax)
     let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
@@ -915,6 +921,353 @@ lens_sum
 // EXPECT: lens_sum = 530715.372732371
 
 // %% [markdown]
+// ## The lens without a floor: precision as limbs
+//
+// The deep camera stops at about $10^{-32}$, and the reason is worth being
+// exact about, because it is not the arithmetic. A double-double center is
+// two doubles, $hi + lo$, and it can *place* a camera to about 32 digits.
+// Below that, the third and fourth limbs of the true position — the digits
+// that say *which* $10^{-50}$-wide window you are looking at, out of the
+// $10^{18}$ that fit inside one double-double rounding — do not exist in the
+// camera at all. The picture is still a valid picture of the set. It is a
+// picture of a place you did not ask for.
+//
+// So the number of limbs has to be a *parameter*, and everything else has to
+// follow from it. This section makes the camera four limbs — a quad-double,
+// exact to ~64 digits — and shows that nothing else in the lens had to
+// change: the delta iteration reads two doubles per step and never learns
+// how many sit behind them, the reference orbit is the same `let rec` with
+// wider rows, and the gesture is the same gesture over nine bindings instead
+// of five. The next rung, six or eight limbs, is the same edit again.
+//
+// **A quad-double as four non-overlapping doubles.** $l_0 + l_1 + l_2 + l_3$,
+// decreasing in magnitude, each below the rounding unit of the one above.
+// Its one primitive is *grow*: add a double into the expansion by a chain of
+// `two_sum` from the small end (Shewchuk's grow-expansion), which is exact —
+// five limbs come out. Then the subtlety this notebook found by testing, and
+// the reason the naive version is only three limbs precise: Shewchuk
+// guarantees the five are non-overlapping but not free of *zeros*. A term
+// absorbed exactly leaves a zero limb, possibly above a nonzero one, and
+// dropping the fifth limb first throws away a real quantity while keeping a
+// zero. Distilling all five — each limb takes the rounding error of the one
+// above — before dropping the last is what restores the fourth limb. The
+// proof is Newton's method below: with the fix, it gains sixteen digits a
+// step until the sixty-fourth; without it, it stalls at the forty-ninth.
+//
+// **Sums and products as folds.** A sum of doubles is a fold of grow over the
+// terms — spelled the way this language spells folds, each term lifted to a
+// quad-double so the accumulator and the elements share a type. A product of
+// two quad-doubles is a *term vector*: of the sixteen limb products, the ten
+// with $i + j \le 3$ reach the fourth limb, and each contributes its rounded
+// product and its `fma` residual — twenty doubles, one `method_for` over an
+// index, one fold. Every multiply-add is an explicit `fma`, so the whole
+// thing is lane-identical whatever contraction the build chose; the pins
+// below hold under both.
+//
+// **A boundary point to sixty-four digits, computed here.** The demonstration
+// needs a center known past double-double, and it should not be a magic
+// constant. The real root of $c^3 + 2c^2 + 2c + 2 = 0$ is a Misiurewicz
+// point — the tip of the period-3 midget's antenna, $c \approx -1.5437$ — so
+// it is on the boundary, self-similar under its own multiplier at every
+// depth, and *not* a double, which is the point. Newton's method in
+// quad-double finds it: with a Float64 reciprocal of the derivative the
+// iteration is linear, not quadratic, but the rate is the reciprocal's own
+// rounding, so each step still buys sixteen digits and six steps buy them
+// all. The limbs are pinned, and pinned again after eight steps as
+// bit-identical to six: the root is converged, not merely small.
+//
+// %%
+/// Add one double into a quad-double: Shewchuk's grow-expansion from the
+/// small end (exact, five limbs out), then distill the five before dropping
+/// the fifth -- see the prose for why the order matters.
+function qd_grow(e: (Float64, Float64, Float64, Float64), x: Float64) -> (Float64, Float64, Float64, Float64) = {
+    let (l0, l1, l2, l3) = e
+    let (q1, h1) = two_sum(x, l3)
+    let (q2, h2) = two_sum(q1, l2)
+    let (q3, h3) = two_sum(q2, l1)
+    let (q4, h4) = two_sum(q3, l0)
+    let (c0, e0) = two_sum(q4, h4)
+    let (c1, e1) = two_sum(e0, h3)
+    let (c2, e2) = two_sum(e1, h2)
+    let (c3, e3) = two_sum(e2, h1)
+    (c0, c1, c2, c3)
+}
+/// a + b: grow a by b's limbs, smallest first so none is truncated away.
+function qd_add(a: (Float64, Float64, Float64, Float64), b: (Float64, Float64, Float64, Float64)) -> (Float64, Float64, Float64, Float64) = {
+    let (b0, b1, b2, b3) = b
+    qd_grow(qd_grow(qd_grow(qd_grow(a, b3), b2), b1), b0)
+}
+function qd_neg(a: (Float64, Float64, Float64, Float64)) -> (Float64, Float64, Float64, Float64) = {
+    let (a0, a1, a2, a3) = a
+    (0.0 - a0, 0.0 - a1, 0.0 - a2, 0.0 - a3)
+}
+function qd_scale(a: (Float64, Float64, Float64, Float64), k: Float64) -> (Float64, Float64, Float64, Float64) = {
+    let (a0, a1, a2, a3) = a
+    (k * a0, k * a1, k * a2, k * a3)
+}
+function qd_lift(x: Float64) -> (Float64, Float64, Float64, Float64) = (x, 0.0, 0.0, 0.0)
+function qd_limb(a: (Float64, Float64, Float64, Float64), i: Int64) -> Float64 = {
+    let (a0, a1, a2, a3) = a
+    if i == 0 then a0 else (if i == 1 then a1 else (if i == 2 then a2 else a3))
+}
+/// The fold kernel: the accumulator and the lifted term share a type.
+function qd_fold(acc: (Float64, Float64, Float64, Float64), t: (Float64, Float64, Float64, Float64)) -> (Float64, Float64, Float64, Float64) = {
+    let (x, u1, u2, u3) = t
+    qd_grow(acc, x)
+}
+/// The exact sum of a vector of doubles, to four limbs.
+function qd_norm(terms: Array<Float64 like Idx<n>>) -> (Float64, Float64, Float64, Float64) =
+    reduce((method_for(terms) <@> lambda(x) -> qd_lift(x)) |> compute, qd_fold, (0.0, 0.0, 0.0, 0.0))
+
+/// a * b as a term vector: the ten limb products with i + j <= 3, each its
+/// rounded value and its fma residual, folded exactly.
+let __qi = [0, 0, 0, 0, 1, 1, 1, 2, 2, 3]
+let __qj = [0, 1, 2, 3, 0, 1, 2, 0, 1, 0]
+function qd_mul(a: (Float64, Float64, Float64, Float64), b: (Float64, Float64, Float64, Float64)) -> (Float64, Float64, Float64, Float64) = {
+    let terms = (method_for(range<Idx<20>>) <@> lambda(k) -> {
+        let (p, e) = two_prod(qd_limb(a, __qi(k / 2)), qd_limb(b, __qj(k / 2)))
+        if k % 2 == 0 then p else e
+    }) |> compute
+    qd_norm(terms)
+}
+
+// 0.1 x 10 again: the residual lands in the second limb, exactly where the
+// double-double put it. And four scales stay four limbs.
+let (qm0, qm1, qm2, qm3) = qd_mul(qd_lift(0.1), qd_lift(10.0))
+let (qs0, qs1, qs2, qs3) = qd_norm([1.0e-60, 1.0e-40, 1.0e-20, 1.0])
+let qd_top_is_one = qm0 == 1.0
+// EXPECT: qd_top_is_one = true
+let qd_pins = [qm1, qs1, qs2, qs3]
+qd_pins
+// EXPECT: qd_pins = [5.55111512312578e-17, 1e-20, 1e-40, 1e-60]
+
+// %%
+/// p(c) = c^3 + 2c^2 + 2c + 2 by Horner, in quad-double.
+function star_poly(c: (Float64, Float64, Float64, Float64)) -> (Float64, Float64, Float64, Float64) = {
+    let two = qd_lift(2.0)
+    let t1 = qd_mul(qd_add(c, two), c)
+    let t2 = qd_mul(qd_add(t1, two), c)
+    qd_add(t2, two)
+}
+/// Newton with a Float64 reciprocal of p': linear, at the reciprocal's own
+/// rounding rate -- sixteen digits a step.
+function star_newton(c: (Float64, Float64, Float64, Float64), recip: Float64, k: Int64) -> (Float64, Float64, Float64, Float64) =
+    if k == 0 then c else star_newton(qd_add(c, qd_neg(qd_mul(star_poly(c), qd_lift(recip)))), recip, k - 1)
+
+let star_seed = -1.5436890126920764
+let star_recip = 1.0 / (3.0 * star_seed * star_seed + 4.0 * star_seed + 2.0)
+let star = star_newton(qd_lift(star_seed), star_recip, 6)
+let (star0, star1, star2, star3) = star
+let star_limbs = [star0, star1, star2, star3]
+star_limbs
+// EXPECT: star_limbs = [-1.54368901269208, 6.15676673813378e-18, -1.18793187483785e-34, 8.25241642793637e-51]
+
+// Converged, not merely small: two more steps move no limb.
+let (more0, more1, more2, more3) = star_newton(qd_lift(star_seed), star_recip, 8)
+let star_converged = star0 == more0 && star1 == more1 && star2 == more2 && star3 == more3
+star_converged
+// EXPECT: star_converged = true
+
+// ...and the residual sits at the fourth limb's floor, four orders below
+// what double-double could resolve.
+let (res0, res1, res2, res3) = star_poly(star)
+let star_residual_floor = abs(res0) < 1.0e-60 && abs(res1) < 1.0e-60 && abs(res2) < 1.0e-60
+star_residual_floor
+// EXPECT: star_residual_floor = true
+
+// %% [markdown]
+// **The reference orbit, in quad-double.** Rows of eight — four limbs of
+// $\Re Z$, four of $\Im Z$ — and the same `let rec`, the same freeze at
+// $|Z| > 4$. The delta iteration is `esc_pert` unchanged, told that the
+// imaginary part's top double is column 4 and where its buffer ends.
+//
+// **What the extra limbs are for, measured.** The same window rendered
+// twice through the same lens: once with the sixty-four-digit center, once
+// with that center truncated to two limbs — the camera a double-double
+// could have held. The two references are equally *valid*: real-axis orbits
+// near the antenna are bounded, and neither leaves it in four thousand
+// steps. What differs is only where the camera points. The statistic is a
+// count of pixels whose escape time moved by more than one iteration. At
+// $r = 10^{-25}$ it is **zero of 1024**: the truncation, $10^{-34}$, is a
+// hundred-millionth of a pixel. At $r = 10^{-50}$ it is **992 of 1024** —
+// not a noisier picture, a different neighborhood, because the dropped
+// limbs moved the camera by $10^{16}$ window-widths. Both counts are pinned,
+// and so is the one thing that does *not* change: the antenna crosses the
+// window as the same single line of 32 stable pixels at both depths, which
+// is the self-similarity a Misiurewicz point owes its own multiplier. That
+// pair of counts is the whole argument for precision as a parameter: past a
+// depth set by the limb count, the missing digits are not detail, they are
+// *where you are*.
+//
+// %%
+/// One reference step Z -> Z^2 + C in quad-double on a row
+/// (Re l0..l3, Im l0..l3); frozen once |Z| > 4 like its double-double twin.
+function qd_ref_step(z: Array<Float64 like Idx<8>>, cr: (Float64, Float64, Float64, Float64), ci: (Float64, Float64, Float64, Float64)) -> Array<Float64 like Idx<8>> = {
+    let zr = (z(0), z(1), z(2), z(3))
+    let zi = (z(4), z(5), z(6), z(7))
+    let frozen = z(0) * z(0) + z(4) * z(4) > 16.0
+    let rr = qd_mul(zr, zr)
+    let ii = qd_mul(zi, zi)
+    let ri = qd_mul(zr, zi)
+    let (nr0, nr1, nr2, nr3) = qd_add(qd_add(rr, qd_neg(ii)), cr)
+    let (ni0, ni1, ni2, ni3) = qd_add(qd_scale(ri, 2.0), ci)
+    let row = [nr0, nr1, nr2, nr3, ni0, ni1, ni2, ni3]
+    if frozen then z else row
+}
+
+// Two short references at the antenna tip: the full center, and the same
+// center truncated to the two limbs a double-double camera holds.
+let star_trunc = (star0, star1, 0.0, 0.0)
+let qd_zero = (0.0, 0.0, 0.0, 0.0)
+let rec star_ref: Array<Float64 like Idx<4096>, Idx<8>> =
+    match star_ref with
+    | zero -> zero
+    | zero :: s -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    | prefix :: n -> prefix :: qd_ref_step(prefix(n - 1), star, qd_zero)
+let rec trunc_ref: Array<Float64 like Idx<4096>, Idx<8>> =
+    match trunc_ref with
+    | zero -> zero
+    | zero :: s -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    | prefix :: n -> prefix :: qd_ref_step(prefix(n - 1), star_trunc, qd_zero)
+
+/// Pixels whose escape time differs by more than one iteration between two
+/// renders of the same window.
+function flips(a: Array<Float64 like Idx<32>, Idx<32>>, b: Array<Float64 like Idx<32>, Idx<32>>) -> Int64 =
+    reduce(reduce((method_for(zip(a, b)) <@> lambda(x, y) -> if abs(x - y) > 1.0 then 1 else 0) |> compute, (+)), (+))
+
+// The 32^2 window at two depths, through each reference. The cap is 4000
+// here, not the honest one: pixels on the antenna itself report 0 either
+// way, and the comparison is about everything else.
+let g25_full = deep_grid32(star_ref, 4, 4095, 1.0e-25, 4000.0)
+let g25_trunc = deep_grid32(trunc_ref, 4, 4095, 1.0e-25, 4000.0)
+let g50_full = deep_grid32(star_ref, 4, 4095, 1.0e-50, 4000.0)
+let g50_trunc = deep_grid32(trunc_ref, 4, 4095, 1.0e-50, 4000.0)
+let limb_flips = [flips(g25_full, g25_trunc), flips(g50_full, g50_trunc)]
+limb_flips
+// EXPECT: limb_flips = [0, 992]
+
+// The antenna itself: one line of stable pixels, at both depths.
+let (black25, lo25, hi25) = deep_stats(g25_full)
+let (black50, lo50, hi50) = deep_stats(g50_full)
+let antenna_pins = [black25, black50]
+antenna_pins
+// EXPECT: antenna_pins = [32, 32]
+let star_sums = [reduce(reduce(g25_full, (+)), (+)), reduce(reduce(g50_full, (+)), (+))]
+star_sums
+// EXPECT: star_sums = [114974.12988773, 225365.363859113]
+
+// %% [markdown]
+// ## The far camera
+//
+// Nine bindings: four limbs each of the center's real and imaginary parts,
+// then the radius. The plot's axes are offsets in units of $r$, as for the
+// deep lens, so a gesture is still a point in $[-1, 1]^2$; the editor folds
+// it into the four limbs by the same grow-expansion `qd_grow` performs, so
+// the camera it writes is one the program could have computed, exact to the
+// fourth limb. The digits below are Newton's, copied here as literals because
+// a gesture rewrites them.
+//
+// The reference is 8192 steps, and the iteration cap is held to it. At
+// *this* center that changes nothing: near a Misiurewicz point an orbit
+// either leaves within a few hundred steps or is on the antenna, where it is
+// stable whichever orbit it rides — a pixel that outlives the buffer rebases
+// onto the reference and reports stable, the right answer for it. Measured,
+// not argued: `far_sum` below is one pinned number, and it is that number
+// with the cap at 8191 and at the honest 41,194 iterations $r = 10^{-40}$
+// would ask for, in the compiled lane and the interpreter alike. What the
+// honest cap *does* cost is the interpreter's step budget — the frontier
+// the section above pinned, and this is where it bites: at 41,194 a
+// $96^2$ frame does not fit one cell at all, and at 8191 it fits with little
+// to spare, which is why the reference is a cell of its own (the session
+// carries it across, so neither cell is charged for the other) and the first
+// picture is $64^2$ — about half a minute, and the same gesture from there
+// at any size the ladder offers. Near a
+// minibrot, where slow escapers are dense, the cap has to be honest and the
+// buffer long, and that is a compiled render — `blade run` on these cells, or
+// the render fast path, which every gesture already takes. The fourth limb
+// runs out at about $r = 10^{-60}$, and the next one is the same edit
+// again.
+//
+// %%
+let far_re0 = -1.54368901269208
+let far_re1 = 6.15676673813378e-18
+let far_re2 = -1.18793187483785e-34
+let far_re3 = 8.25241642793637e-51
+let far_im0 = 0.0
+let far_im1 = 0.0
+let far_im2 = 0.0
+let far_im3 = 0.0
+let far_r = 1.0e-40
+let far_px = 64
+
+// %%
+let rec far_ref: Array<Float64 like Idx<8192>, Idx<8>> =
+    match far_ref with
+    | zero -> zero
+    | zero :: s -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    | prefix :: n -> prefix :: qd_ref_step(prefix(n - 1), (far_re0, far_re1, far_re2, far_re3), (far_im0, far_im1, far_im2, far_im3))
+
+// %%
+function __far64(ref: Array<Float64 like Idx<8192>, Idx<8>>, r: Float64, kmax: Float64) -> Float64 = {
+    let h = 2.0 * r / 64.0
+    let g = (method_for(range<Idx<64>, Idx<64>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, 4, 8191, kmax)) |> compute
+    let ax = (method_for(range<Idx<64>>) <@> lambda(j) -> -1.0 + (2.0 / 64.0) * Float64(j)) |> compute
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
+        "The far lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-far": plotid, "far_re0,far_re1,far_re2,far_re3,far_im0,far_im1,far_im2,far_im3,far_r": camera)
+    reduce(reduce(g, (+)), (+))
+}
+function __far96(ref: Array<Float64 like Idx<8192>, Idx<8>>, r: Float64, kmax: Float64) -> Float64 = {
+    let h = 2.0 * r / 96.0
+    let g = (method_for(range<Idx<96>, Idx<96>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, 4, 8191, kmax)) |> compute
+    let ax = (method_for(range<Idx<96>>) <@> lambda(j) -> -1.0 + (2.0 / 96.0) * Float64(j)) |> compute
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
+        "The far lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-far": plotid, "far_re0,far_re1,far_re2,far_re3,far_im0,far_im1,far_im2,far_im3,far_r": camera)
+    reduce(reduce(g, (+)), (+))
+}
+function __far192(ref: Array<Float64 like Idx<8192>, Idx<8>>, r: Float64, kmax: Float64) -> Float64 = {
+    let h = 2.0 * r / 192.0
+    let g = (method_for(range<Idx<192>, Idx<192>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, 4, 8191, kmax)) |> compute
+    let ax = (method_for(range<Idx<192>>) <@> lambda(j) -> -1.0 + (2.0 / 192.0) * Float64(j)) |> compute
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
+        "The far lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-far": plotid, "far_re0,far_re1,far_re2,far_re3,far_im0,far_im1,far_im2,far_im3,far_r": camera)
+    reduce(reduce(g, (+)), (+))
+}
+function __far256(ref: Array<Float64 like Idx<8192>, Idx<8>>, r: Float64, kmax: Float64) -> Float64 = {
+    let h = 2.0 * r / 256.0
+    let g = (method_for(range<Idx<256>, Idx<256>>) <@> lambda(i, j) where omp(i: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, 4, 8191, kmax)) |> compute
+    let ax = (method_for(range<Idx<256>>) <@> lambda(j) -> -1.0 + (2.0 / 256.0) * Float64(j)) |> compute
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
+        "The far lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-far": plotid, "far_re0,far_re1,far_re2,far_re3,far_im0,far_im1,far_im2,far_im3,far_r": camera)
+    reduce(reduce(g, (+)), (+))
+}
+/// One camera, one call: iterations from depth, canvas from the px knob --
+/// with the iteration cap held to the reference buffer, which at this center
+/// is the same picture (see the prose above: measured to the bit, both lanes).
+function render_far(ref: Array<Float64 like Idx<8192>, Idx<8>>, r: Float64, px: Int64) -> Float64 = {
+    let kmax = fmin(floor(view_kmax(r)), 8191.0)
+    if px >= 256 then __far256(ref, r, kmax) else (
+    if px >= 192 then __far192(ref, r, kmax) else (
+    if px >= 96 then __far96(ref, r, kmax) else
+    __far64(ref, r, kmax)))
+}
+
+let far_sum = render_far(far_ref, far_r, far_px)
+far_sum
+// EXPECT: far_sum = 954130.557590422
+
+// %% [markdown]
 // ## What the compiler knew
 //
 // A Mandelbrot renderer with no loops: the orbit is a recursion, the image is
@@ -924,10 +1277,14 @@ lens_sum
 // iteration cap following the depth at a measured slope, until Float64
 // itself quantizes, at a pinned, predictable radius — and past that, the
 // perturbation lens: one double-double orbit built on `fma`, every pixel a
-// Float64 delta, a camera of five bindings, and the same gesture.
+// Float64 delta, a camera of five bindings, and the same gesture -- and past
+// *that*, the same lens with the precision turned into a parameter: four
+// limbs, nine bindings, a boundary point computed to sixty-four digits, and
+// the pair of numbers that shows why the digits are not optional.
 //
 // To keep diving: drag-zoom the seahorse plot (with the extension's zoom
 // branch, the gesture rewrites the camera cell and re-runs it), or make that
 // edit by hand — same operation, same result. For frames past the
 // interactive step budget, `blade run` on this file's cells renders them
-// compiled, in milliseconds. Past the Float64 floor, drag the deep lens.
+// compiled, in milliseconds. Past the Float64 floor, drag the deep lens;
+// past double-double, the far one.
