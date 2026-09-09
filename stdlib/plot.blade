@@ -27,9 +27,9 @@
 // makes the decimation ladder shareable across the three of them.
 //
 // COLORMAPS, v1: an Int index into a fixed table (0 = Viridis default,
-// 1 = Plasma, 2 = Cividis, 3 = Greys, 4 = RdBu, 5 = Heat). 0-4 are plotly
-// NAMED scales; 5 is an inline colorscale ARRAY (black -> blue -> red ->
-// yellow -> white), which is why __cmap_json exists: the trace needs a JSON
+// 1 = Plasma, 2 = Cividis, 3 = Greys, 4 = RdBu, 5 = Depth). 0-4 are plotly
+// NAMED scales; 5 is an inline colorscale ARRAY (black -> navy -> blue ->
+// pale blue -> cream), which is why __cmap_json exists: the trace needs a JSON
 // VALUE either way, and for 0-4 that value is the quoted name -- byte-
 // identical to what the module emitted when only names existed. An
 // EnumIdx<["Viridis",...]> upgrade would make the selection nominal AND
@@ -212,14 +212,28 @@ function __cmap_name(c: Int64<cmap>) -> String =
     if c == 1 then "Plasma" else if c == 2 then "Cividis" else if c == 3 then "Greys" else if c == 4 then "RdBu" else "Viridis"
 
 /// Colormap index -> the trace's `"colorscale":` JSON VALUE: a quoted name
-/// for the named half of the table, an inline stop array for 5 (Heat).
-/// Heat's bottom stop is DISCONTINUOUS by design: position 0 is pure black
-/// and position 0.001 jumps to dark blue, so black is reserved for values
-/// AT (or clipped to) the scale floor -- with a fixed [zmin, zmax] range,
-/// that is the in-set / never-escaped pixels -- while the slowest ESCAPED
-/// values start visibly dark blue instead of vanishing into black.
+/// for the named half of the table, an inline stop array for 5 (Depth).
+///
+/// Depth's bottom stop is DISCONTINUOUS by design: position 0 is pure black
+/// and position 0.001 jumps to near-black navy, so black is reserved for
+/// values AT (or clipped to) the scale floor -- with a fixed [zmin, zmax]
+/// range, that is the stable / never-escaped pixels -- while the slowest
+/// ESCAPED values start visibly dark instead of vanishing into black.
+///
+/// The ramp above the floor is deliberately UNSATURATED -- blue through pale
+/// blue to a warm cream, with no pure primaries and no pure white at the top.
+/// A full-intensity ramp (the red/yellow/white one this replaced) is
+/// exhausting on a fractal field, where high values are not a rare highlight
+/// but a filigree threaded through every part of the picture.
+///
+/// The stops CROWD THE BOTTOM because escape-time data does. Measured on the
+/// classic Mandelbrot window, 73% of pixels land in the lowest 5% of the range
+/// and 91% in the lowest 10%: spaced evenly, a ramp spends almost all of its
+/// colour on the few percent of pixels that escape slowly, and renders the
+/// other nine-tenths as one dark mass indistinguishable from the reserved
+/// black. Seven stops below the halfway mark give that crowd somewhere to go.
 function __cmap_json(c: Int64<cmap>) -> String =
-    if c == 5 then "[[0,\"#000000\"],[0.001,\"#000099\"],[0.28,\"#2040ee\"],[0.52,\"#cc0000\"],[0.76,\"#ffdd00\"],[1,\"#ffffff\"]]" else "\"" + __cmap_name(c) + "\""
+    if c == 5 then "[[0,\"#000000\"],[0.001,\"#16324f\"],[0.02,\"#24567f\"],[0.05,\"#3f74a3\"],[0.1,\"#6b9bc0\"],[0.2,\"#9dbdd4\"],[0.45,\"#c8d6dc\"],[1,\"#e8dcc4\"]]" else "\"" + __cmap_name(c) + "\""
 
 // Rank-1 axis resamplers, one per budget. `na` is the SOURCE length; sample
 // k reads source index (k * na) / B. The sample keeps the SOURCE's element

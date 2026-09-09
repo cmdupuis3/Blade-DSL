@@ -30,13 +30,19 @@
 //
 //   -> {"id":N,"cmd":"render","session":"<key>","bindings":["cam_cx",..],
 //       "values":[-0.74,..],"cwd":"<dir>"?}
-//   <- {"event":"display","id":N,"frame":{...}}   (one per frame, live)
-//   <- {"id":N,"ok":B,"cached":B,"frames":F,"elapsedMs":M,"exitCode":E,
-//       "stderr":"..."}
+//   <- {"event":"display","id":N,"frame":{...}}   (one per CHANGED frame, live)
+//   <- {"id":N,"ok":B,"cached":B,"frames":F,"unchanged":U,"elapsedMs":M,
+//       "exitCode":E,"stderr":"..."}
 //
 // `cached:true` means the executable was reused -- the steady state, and the
 // whole reason the lane exists. An older compiler answers `unknown cmd
 // 'render'`, which is how a client probes for it.
+//
+// Only frames whose BYTES MOVED since this session's last render are sent;
+// `unchanged` counts the rest. A camera change can only alter the plots that
+// read the camera, but the program emits every plot it has, so re-sending all
+// of them replays the whole notebook into the panel -- a fixed tour under a
+// stable id animates its entire descent again on every zoom.
 //
 // ...and the LANGUAGE SURFACE, the one command that reads no program at all:
 //
@@ -414,6 +420,18 @@ let cameraErasedSource (source: string) (names: string list) (csvPath: string)
         out <- out.Substring(0, firstIdx) + preamble + out.Substring firstIdx
         Ok ("import csv as __blade_cam_csv\n\n" + out)
 
+/// Which frames of a render to actually send, as indices into this run's
+/// `digests`, given the digests of what the session's LAST render showed.
+///
+/// A camera change can only alter the plots that read the camera, but the
+/// program emits every plot it has -- so sending all of them replays the whole
+/// notebook into the panel. The failure mode to guard is the other direction:
+/// holding back a frame that DID move leaves a stale picture on screen, so
+/// anything past the end of `previous` counts as changed.
+let changedFrameIndices (previous: string[]) (digests: string[]) : int[] =
+    [| for i in 0 .. digests.Length - 1 do
+         if i >= previous.Length || previous.[i] <> digests.[i] then yield i |]
+
 /// SHA256 of the erased source, hex -- the render cache key. Same bytes means
 /// the executable already on disk still computes this program.
 let private sourceDigest (s: string) : string =
@@ -557,6 +575,10 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
     // even re-typechecked -- the front end is most of what is left once the
     // executable cache has turned g++ into a file copy.
     let renderCache = Collections.Generic.Dictionary<string, string * string * string>()
+    // What the last render of this session PUT ON SCREEN: one digest per frame,
+    // in program order. The same executable emits the same sequence every run,
+    // so position identifies a plot across renders without parsing one.
+    let renderFrames = Collections.Generic.Dictionary<string, string[]>()
 
     /// One camera change, rendered from an already-built executable.
     let runRender (id: int) (key: string) (names: string list) (values: float list)
@@ -620,6 +642,11 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
                                     | Error e -> Error e
                                     | Ok exe ->
                                         renderCache.[key] <- (digest, exe, csvPath)
+                                        // A different program may emit a
+                                        // different sequence, so position no
+                                        // longer identifies anything: start the
+                                        // comparison over.
+                                        renderFrames.Remove key |> ignore
                                         Ok (exe, false)
                             match built with
                             | Error e -> Error e
@@ -636,15 +663,36 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
             // for a stable-id plot, and NOT also in a `display` array: one
             // frame, one delivery (docs/display-frames.md section 3).
             let sentinel = Blade.Display.Frame.Sentinel
-            let mutable frames = 0
-            for line in out.Replace("\r\n", "\n").Split('\n') do
-                if line.StartsWith sentinel then
-                    frames <- frames + 1
-                    respond (sprintf "{\"event\":\"display\",\"id\":%d,\"frame\":%s}"
-                                id (line.Substring sentinel.Length))
+            let produced =
+                out.Replace("\r\n", "\n").Split('\n')
+                |> Array.filter (fun l -> l.StartsWith sentinel)
+                |> Array.map (fun l -> l.Substring sentinel.Length)
+            // A gesture moves the camera, and only the plots that READ the
+            // camera can have changed by it -- but the program emits every plot
+            // it has. Re-sending all of them replays the whole notebook into the
+            // panel: a fixed tour under a stable id animates its entire descent
+            // again on every zoom, and lands back where it started. So send the
+            // frames whose bytes actually moved.
+            //
+            // Suppression is safe because the panel keeps history: an unchanged
+            // frame would merge onto an entry already holding exactly those
+            // bytes. The first render after a build sends everything -- there is
+            // nothing to compare against, and that is the run whose output the
+            // panel has not seen from this executable.
+            let previous =
+                match renderFrames.TryGetValue key with
+                | true, ds -> ds
+                | _ -> Array.empty
+            let digests = produced |> Array.map sourceDigest
+            let send = changedFrameIndices previous digests
+            for i in send do
+                respond (sprintf "{\"event\":\"display\",\"id\":%d,\"frame\":%s}" id produced.[i])
+            let frames = send.Length
+            renderFrames.[key] <- digests
             respond (sprintf
-                        "{\"id\":%d,\"ok\":%b,\"cached\":%b,\"frames\":%d,\"elapsedMs\":%d,\"exitCode\":%d,\"stderr\":\"%s\"}"
-                        id (code = 0) wasCached frames (int watch.ElapsedMilliseconds)
+                        "{\"id\":%d,\"ok\":%b,\"cached\":%b,\"frames\":%d,\"unchanged\":%d,\"elapsedMs\":%d,\"exitCode\":%d,\"stderr\":\"%s\"}"
+                        id (code = 0) wasCached frames (produced.Length - frames)
+                        (int watch.ElapsedMilliseconds)
                         code (Blade.Ide.jsonEscape err))
     /// Handle one line; false means "stop the loop".
     let handle (line: string) : bool =

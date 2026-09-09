@@ -58,9 +58,51 @@ function in_body(cr: Float64, ci: Float64) -> Bool = {
     q * (q + xq) <= 0.25 * ci * ci || bulb <= 0.0625
 }
 
-/// Escape count with the interior short-circuit.
+/// Escape count with the interior short-circuit, reporting STABLE as 0.
+///
+/// The convention is the one every renderer draws with and the one
+/// `mandel_smooth` below already used: a point that never escapes reports 0,
+/// so it lands on the colorscale's floor and paints black, while an escaping
+/// point reports how long it survived. Reporting the CAP instead -- which is
+/// the other natural reading of "never escaped" -- puts the whole interior at
+/// the top of the scale, and the set comes out as a solid slab of the
+/// brightest color in the ramp.
+///
+/// Both ways in matter: `in_body` proves membership without iterating, and an
+/// orbit that simply rides out the cap is just as stable.
 function mandel_count(cr: Float64, ci: Float64, kmax: Int64) -> Int64 =
-    if in_body(cr, ci) then kmax else esc(complex(0.0, 0.0), complex(cr, ci), 0, kmax)
+    if in_body(cr, ci) then 0 else {
+        let k = esc(complex(0.0, 0.0), complex(cr, ci), 0, kmax)
+        if k >= kmax then 0 else k
+    }
+
+/// Integer min/max, for folding a count grid.
+function imin(a: Int64, b: Int64) -> Int64 = if a < b then a else b
+function imax(a: Int64, b: Int64) -> Int64 = if a > b then a else b
+
+/// The ESCAPED band of a count grid, as the [zmin, zmax] the heatmap should
+/// span. Computed FROM THE GRID, so the colorbar describes the window on
+/// screen and re-spans itself every time the window moves -- without it the
+/// scale is whatever plotly infers, and a zoom that lands somewhere with a
+/// different range of escape times is drawn against the wrong ruler.
+///
+/// Stable pixels report 0 and must not drag the floor to zero: 0 is the one
+/// value the Depth scale reserves black for. They are masked to the cap
+/// before the min, and the floor then sits a hair BELOW the fastest escape,
+/// so stable pixels (clipped to zmin) keep exact black while every escaping
+/// pixel lands above the scale's discontinuity. A window with nothing
+/// escaping at all hands back the (0.0, -1.0) sentinel, which `plot.heatmap`
+/// reads as "no explicit range".
+///
+/// The Float64 twin of this is `field_range` in the zoom-lens section below;
+/// the two differ only in the element type they fold.
+function count_range(g: Array<Int64 like Idx<nr>, Idx<nc>>, kmax: Int64) -> (Float64, Float64) = {
+    let masked = (method_for(g) <@> lambda(v) -> if v == 0 then kmax else v) |> compute
+    let lo = Float64(reduce(reduce(masked, imin, kmax), imin, kmax))
+    let hi = Float64(reduce(reduce(g, imax, 0), imax, 0))
+    let pad = (hi - lo) * 0.002 + 1.0e-12
+    if hi > 0.0 then (lo - pad, hi) else (0.0, -1.0)
+}
 
 // c = 1 escapes at the third step (0, 1, 2, 5); c = -1 is the period-2 orbit
 // 0, -1, 0, -1, ... and rides out any cap we set -- and sits in the bulb,
@@ -70,26 +112,6 @@ let probe_in = esc(complex(0.0, 0.0), complex(-1.0, 0.0), 0, 64)
 let probes = [probe_out, probe_in]
 probes
 // EXPECT: probes = [3, 64]
-
-// %% [markdown]
-// ## The loop that isn't there
-//
-// The reflex is to write the orbit as a `for` with two mutable accumulators.
-// Blade removed the imperative loop from the language — not "discourages",
-// removed — and the next cell shows the diagnostic doing its job. A failing
-// cell never joins the session, so nothing downstream is disturbed.
-//
-// The recursion above is not a workaround; it is the recurrence itself,
-// $z_{k+1} = z_k^2 + c$, with the escape test as its base case. The compiler
-// emits it as a self-calling closure — no loop syntax required, and nothing
-// about it is slower.
-//
-// %%
-function esc_loop(c: Complex128, kmax: Int64) -> Int64 = {
-    let mut k = 0
-    for i in 0..kmax { k += 1 }   // BL1003: the imperative loop was removed
-    k
-}
 
 // %% [markdown]
 // ## The window is data
@@ -103,12 +125,30 @@ function esc_loop(c: Complex128, kmax: Int64) -> Int64 = {
 // 450 and 300 are both under `plot.heatmap`'s decimation cap (512), so every
 // sample we compute reaches the panel unresampled.
 //
+// A center and a half-width are just three bindings, so they go in this cell
+// beside the grid they position — and the plot below declares them as its
+// *camera*. That makes this first picture already a lens: scroll on it and the
+// editor rewrites `wide_cx` / `wide_cy` / `wide_r` and recomputes the grid at
+// the new window, so a zoom shows detail that was never in the old pixels.
+// Nothing further down the notebook has to be running for that to work.
+//
 // %%
-let wide_x0 = -2.25
-let wide_y0 = -1.0
-let wide_dx = 3.0 / 450.0
-let wide_dy = 2.0 / 300.0
-let wide_kmax = 96
+// The camera for THIS picture, named in the same cell as the picture: one
+// cell to run, and a zoom on the plot below rewrites these three numbers and
+// recomputes the grid around them. At r = 1 they are the classical window,
+// -2.25..0.75 by -1..1, which is what the pins below are pinned at.
+let wide_cx = -0.75
+let wide_cy = 0.0
+let wide_r = 1.0
+
+let wide_x0 = wide_cx - 1.5 * wide_r
+let wide_y0 = wide_cy - wide_r
+let wide_dx = 3.0 * wide_r / 450.0
+let wide_dy = 2.0 * wide_r / 300.0
+// Depth has to buy iterations, or a zoomed window posterizes into flat bands.
+// The term is zero at r = 1, so the fold below is the same 96-cap number it
+// has always been.
+let wide_kmax = 96 + Int64(floor(48.0 * log10(1.0 / wide_r)))
 
 let wide_xs = (method_for(range<Wx>) <@> lambda(j) -> wide_x0 + wide_dx * Float64(j)) |> compute
 let wide_ys = (method_for(range<Wy>) <@> lambda(i) -> wide_y0 + wide_dy * Float64(i)) |> compute
@@ -117,18 +157,23 @@ let wide_counts = (method_for(range<Wy, Wx>) <@> lambda(i, j) where omp(i: 1) ->
     mandel_count(wide_x0 + wide_dx * Float64(j), wide_y0 + wide_dy * Float64(i), wide_kmax)) |> compute
 
 // One full fold and two spot reads pin the whole 135,000-pixel computation:
-// the fold, a cardioid-interior pixel (rides the cap), an exterior pixel.
+// the fold, a cardioid-interior pixel (stable, so it reports 0), and an
+// exterior pixel that escapes immediately.
 let wide_total = reduce(wide_counts, (+), axes = 2)
 let spot_cardioid = wide_counts((150 : Wy), (262 : Wx))
 let spot_exterior = wide_counts((20 : Wy), (20 : Wx))
+// The colorbar's span, recomputed with the grid: every zoom re-ranges it.
+let (wide_lo, wide_hi) = count_range(wide_counts, wide_kmax)
+
 let wide_pins = [wide_total, spot_cardioid, spot_exterior]
 wide_pins
-// EXPECT: wide_pins = [3941495, 96, 1]
+// EXPECT: wide_pins = [588983, 0, 1]
 
 // %%
-let p_wide = plot.heatmap(wide_xs, wide_ys, wide_counts, 5: cmap, 1: smoothing,
-    "The Mandelbrot set (zoom to aim the lens)": title, "Re(c)": xlabel, "Im(c)": ylabel,
-    "cam_cx,cam_cy,cam_r": camera)
+let p_wide = plot.heatmap(wide_xs, wide_ys, wide_counts, 5: cmap,
+    wide_lo: zmin, wide_hi: zmax,
+    "The Mandelbrot set (scroll to zoom)": title, "Re(c)": xlabel, "Im(c)": ylabel,
+    "wide_cx,wide_cy,wide_r": camera)
 p_wide
 // EXPECT: p_wide = true
 
@@ -238,11 +283,11 @@ function field_range(g: Array<Float64 like Idx<nr>, Idx<nc>>, kmax: Float64) -> 
     let masked = (method_for(g) <@> lambda(v) -> if v == 0.0 then kmax else v) |> compute
     let lo = reduce(reduce(masked, fmin, 1.0e300), fmin, 1.0e300)
     let hi = reduce(reduce(g, fmax, 0.0), fmax, 0.0)
-    // The floor sits a HAIR below the escaped band: the Heat scale reserves
-    // exact position 0 for black with a jump to dark blue just above, so
-    // in-set pixels (0.0, clipped to zmin) render black while the slowest
-    // ESCAPED pixel lands above the jump and renders dark blue -- no black
-    // patches where the orbit merely escaped slowly.
+    // The floor sits a HAIR below the escaped band: the Depth scale reserves
+    // exact position 0 for black with a jump to near-black navy just above,
+    // so stable pixels (0.0, clipped to zmin) render black while the slowest
+    // ESCAPED pixel lands above the jump and renders navy -- no black patches
+    // where the orbit merely escaped slowly.
     let pad = (hi - lo) * 0.002 + 1.0e-12
     if hi > 0.0 then (lo - pad, hi) else (0.0, -1.0)
 }
@@ -271,7 +316,7 @@ function __render192(cx: Float64, cy: Float64, r: Float64, kmax: Float64) -> Flo
     let xs = (method_for(range<V192>) <@> lambda(j) -> x0 + h * Float64(j)) |> compute
     let ys = (method_for(range<V192>) <@> lambda(i) -> y0 + h * Float64(i)) |> compute
     let (lo, hi) = field_range(g, kmax)
-    let shown = plot.heatmap(xs, ys, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+    let shown = plot.heatmap(xs, ys, g, 5: cmap, lo: zmin, hi: zmax,
         "Seahorse valley (scroll to dive)": title, "Re(c)": xlabel, "Im(c)": ylabel,
         "mandelbrot-view": plotid, "cam_cx,cam_cy,cam_r": camera)
     reduce(g, (+), axes = 2)
@@ -286,7 +331,7 @@ function __render256(cx: Float64, cy: Float64, r: Float64, kmax: Float64) -> Flo
     let xs = (method_for(range<V256>) <@> lambda(j) -> x0 + h * Float64(j)) |> compute
     let ys = (method_for(range<V256>) <@> lambda(i) -> y0 + h * Float64(i)) |> compute
     let (lo, hi) = field_range(g, kmax)
-    let shown = plot.heatmap(xs, ys, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+    let shown = plot.heatmap(xs, ys, g, 5: cmap, lo: zmin, hi: zmax,
         "Seahorse valley (scroll to dive)": title, "Re(c)": xlabel, "Im(c)": ylabel,
         "mandelbrot-view": plotid, "cam_cx,cam_cy,cam_r": camera)
     reduce(g, (+), axes = 2)
@@ -301,7 +346,7 @@ function __render320(cx: Float64, cy: Float64, r: Float64, kmax: Float64) -> Flo
     let xs = (method_for(range<V320>) <@> lambda(j) -> x0 + h * Float64(j)) |> compute
     let ys = (method_for(range<V320>) <@> lambda(i) -> y0 + h * Float64(i)) |> compute
     let (lo, hi) = field_range(g, kmax)
-    let shown = plot.heatmap(xs, ys, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+    let shown = plot.heatmap(xs, ys, g, 5: cmap, lo: zmin, hi: zmax,
         "Seahorse valley (scroll to dive)": title, "Re(c)": xlabel, "Im(c)": ylabel,
         "mandelbrot-view": plotid, "cam_cx,cam_cy,cam_r": camera)
     reduce(g, (+), axes = 2)
@@ -351,8 +396,8 @@ function __dive_frame(cx: Float64, cy: Float64, r: Float64) -> Bool = {
     let xs = (method_for(range<Dx>) <@> lambda(j) -> x0 + h * Float64(j)) |> compute
     let ys = (method_for(range<Dy>) <@> lambda(i) -> y0 + h * Float64(i)) |> compute
     let (lo, hi) = field_range(g, kmax)
-    plot.heatmap(xs, ys, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
-        "The dive (plays live)": title, "mandelbrot-dive": plotid, "cam_cx,cam_cy,cam_r": camera)
+    plot.heatmap(xs, ys, g, 5: cmap, lo: zmin, hi: zmax,
+        "The dive (plays live)": title, "mandelbrot-dive": plotid)
 }
 
 /// Descend: each frame 32% deeper. Returns the number of frames flown.
@@ -367,6 +412,16 @@ function dive(cx: Float64, cy: Float64, r: Float64, k: Int64, n: Int64) -> Int64
 /// would make every zoom gesture re-fly all 18 frames to show the same
 /// pictures, since a changed camera cell invalidates everything downstream of
 /// it. Decoupling costs no pixel and saves that flight on every gesture.
+///
+/// The CONTRACT goes with the coupling. These frames carry a stable `plotid`,
+/// so the 18 of them merge into one panel entry and animate -- but no `camera`
+/// slot, because they are not a function of one. A viewer that saw the camera
+/// contract here would offer zoom-to-recompute on a picture that cannot
+/// answer: the gesture would rewrite the camera, the tour would recompute
+/// from `tour_cx` to exactly what it already showed, and the whole descent
+/// would replay to arrive back at the default. Advertise a lens only where
+/// there is one -- the wide view and `mandelbrot-view` above, each carrying
+/// its OWN camera, and the double-double lens below.
 let tour_cx = -0.743643887037151
 let tour_cy = 0.131825904205330
 
@@ -386,9 +441,8 @@ dove
 let deep = zoom_view(tour_cx, tour_cy, 1.0e-4, 350.0)
 let (deep_lo, deep_hi) = field_range(deep, 350.0)
 let p_deep = plot.heatmap(zoom_xs(tour_cx, 1.0e-4), zoom_ys(tour_cy, 1.0e-4), deep,
-    5: cmap, 1: smoothing, deep_lo: zmin, deep_hi: zmax,
-    "Seahorse valley, r = 0.0001 (12,000x)": title, "Re(c)": xlabel, "Im(c)": ylabel,
-    "cam_cx,cam_cy,cam_r": camera)
+    5: cmap, deep_lo: zmin, deep_hi: zmax,
+    "Seahorse valley, r = 0.0001 (12,000x)": title, "Re(c)": xlabel, "Im(c)": ylabel)
 // EXPECT: p_deep = true
 let deep_sum = reduce(deep, (+), axes = 2)
 deep_sum
@@ -439,7 +493,7 @@ deep_sum
 // and 5.8s -- which is why the tour names its own coordinates (`tour_cx`)
 // instead of reading the camera: a cell that reads the camera cannot sit
 // above it.
-
+//
 // %%
 let cam_cx = -0.743643887037151
 let cam_cy = 0.131825904205330
@@ -780,7 +834,7 @@ misi30_pins
 
 let (misi_zlo, misi_zhi) = field_range(misi20, misi_kmax)
 let misi_axis = (method_for(range<Idx<32>>) <@> lambda(j) -> -1.0 + (2.0 / 32.0) * Float64(j)) |> compute
-let p_misi = plot.heatmap(misi_axis, misi_axis, misi20, 5: cmap, 1: smoothing, misi_zlo: zmin, misi_zhi: zmax,
+let p_misi = plot.heatmap(misi_axis, misi_axis, misi20, 5: cmap, misi_zlo: zmin, misi_zhi: zmax,
     "c = i, r = 1e-20: the window Float64 cannot address": title,
     "Re(c - i) / r": xlabel, "Im(c - i) / r": ylabel)
 // EXPECT: p_misi = true
@@ -821,7 +875,7 @@ function __deep96(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax:
         esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
     let ax = (method_for(range<Idx<96>>) <@> lambda(j) -> -1.0 + (2.0 / 96.0) * Float64(j)) |> compute
     let (lo, hi) = field_range(g, kmax)
-    let shown = plot.heatmap(ax, ax, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
         "The deep lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
         "mandelbrot-deep": plotid, "lens_cx_hi,lens_cx_lo,lens_cy_hi,lens_cy_lo,lens_r": camera)
     reduce(reduce(g, (+)), (+))
@@ -832,7 +886,7 @@ function __deep192(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax
         esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
     let ax = (method_for(range<Idx<192>>) <@> lambda(j) -> -1.0 + (2.0 / 192.0) * Float64(j)) |> compute
     let (lo, hi) = field_range(g, kmax)
-    let shown = plot.heatmap(ax, ax, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
         "The deep lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
         "mandelbrot-deep": plotid, "lens_cx_hi,lens_cx_lo,lens_cy_hi,lens_cy_lo,lens_r": camera)
     reduce(reduce(g, (+)), (+))
@@ -843,7 +897,7 @@ function __deep256(ref: Array<Float64 like Idx<32768>, Idx<4>>, r: Float64, kmax
         esc_pert(0.0, 0, 0.0, 0.0, 0.0 - r + h * Float64(j), 0.0 - r + h * Float64(i), ref, kmax)) |> compute
     let ax = (method_for(range<Idx<256>>) <@> lambda(j) -> -1.0 + (2.0 / 256.0) * Float64(j)) |> compute
     let (lo, hi) = field_range(g, kmax)
-    let shown = plot.heatmap(ax, ax, g, 5: cmap, 1: smoothing, lo: zmin, hi: zmax,
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
         "The deep lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
         "mandelbrot-deep": plotid, "lens_cx_hi,lens_cx_lo,lens_cy_hi,lens_cy_lo,lens_r": camera)
     reduce(reduce(g, (+)), (+))

@@ -785,6 +785,38 @@ let private runIdeServeTests () : TH.BlockResult =
         if camBack = camVals then record name TH.Pass ""
         else record name TH.Fail (sprintf "%A" camBack)
 
+        // A render re-runs the WHOLE program, so it re-emits every plot the
+        // notebook has -- but a camera change can only alter the plots that read
+        // the camera. Sending the rest replays the notebook into the panel: a
+        // fixed tour under a stable id animates its entire descent again on
+        // every zoom and lands back where it started, which is exactly how this
+        // was reported.
+        let name = "an unchanged frame is not re-sent"
+        let same = [| "a"; "b"; "c" |]
+        match Blade.IdeServe.changedFrameIndices same same with
+        | [||] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        // ...and the direction that must never be wrong. Holding back a frame
+        // that DID move leaves a stale picture on screen, so a differing digest
+        // and anything past the end of the previous run both count as changed.
+        let name = "a moved frame is sent, and only that one"
+        match Blade.IdeServe.changedFrameIndices [| "a"; "b"; "c" |] [| "a"; "B"; "c" |] with
+        | [| 1 |] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        let name = "frames past the previous run's end are always sent"
+        match Blade.IdeServe.changedFrameIndices [| "a" |] [| "a"; "b"; "c" |] with
+        | [| 1; 2 |] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        // The first render of a session has nothing to compare against, and the
+        // panel has not seen this executable's output: send all of it.
+        let name = "the first render sends every frame"
+        match Blade.IdeServe.changedFrameIndices [||] [| "a"; "b" |] with
+        | [| 0; 1 |] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
         // Protocol refusals, and that the loop SURVIVES them: a bad render
         // request must not take the notebook's language server down with it.
         let (code, responses, _) =
