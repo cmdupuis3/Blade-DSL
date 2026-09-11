@@ -1,0 +1,19 @@
+// TEST: Comm licensed on a kernel that is both invariant and self-conjugate
+// `x * y + conj(x) * conj(y)` is z + conj(z) for z = x*y: 2 Re(xy). Each
+// addend is invariant under the swap on its own (the mirror rule's
+// commutative cross-match), so the body is PInv -- AND, being real-valued,
+// it also equals its own conjugate, so the conjugate-mirror test matches
+// too. Both laws hold; the sign law is the one storage reads, and comm's
+// identity mirror is exactly right here. Guards the order of the BinOp
+// parity rule: when the conjugate mirror was consulted BEFORE the
+// children's combined parity, this body deduced PConj and a sound comm was
+// refused (BL4013) -- found as the nightly MPI block's `sym_complex` case,
+// which only `blade test --mpi` reaches.
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let s = method_for(A, A) <@> lambda(x, y) where comm(x, y) -> x * y + conj(x) * conj(y) |> compute
+let s00 = s(0, 0)
+let s01 = s(0, 1)
+let s10 = s(1, 0)
+// EXPECT: s00 = (-6,0)
+// EXPECT: s01 = (-10,0)
+// EXPECT: s10 = (-10,0)

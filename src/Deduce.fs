@@ -710,13 +710,24 @@ let rec private parityOf (resolver: IRId -> SignParity list option)
     | TExprVar (_, id, _) -> if id = pi || id = pj then PBottom else PInv
     | TExprBinOp (_, op, l, r) ->
         if mirrorEq pi pj l r then opSwapClass op
-        // The PConj birth site: swap(l) = conj(r) makes swap(l op r) =
-        // conj(r) op conj(l) = conj(r op l), which is conj(l op r) exactly
-        // when the op commutes AND conj distributes over it -- OpAdd/OpMul
-        // only (OpSub/OpDiv fail commutation; booleans absorb conj's law).
-        elif (match op with OpAdd | OpMul -> true | _ -> false)
-             && conjMirrorEq pi pj l r then PConj
-        else combineBinOp op (par l) (par r)
+        else
+            // A SIGN law proved from the children outranks the conjugate
+            // mirror below. The two can hold at once -- `x*y + conj(x)*conj(y)`
+            // is z + conj z with each side invariant, so e[swap] = e AND
+            // e[swap] = conj e, which only says the value is real -- and when
+            // they do, the sign law is the one storage reads: comm (identity
+            // mirror) is then exactly right, and PConj's refutation would be a
+            // false positive. PNeg with PConj likewise means purely imaginary,
+            // where anticomm is right. PConj only speaks when no sign law does.
+            let combined = combineBinOp op (par l) (par r)
+            if combined <> PBottom then combined
+            // The PConj birth site: swap(l) = conj(r) makes swap(l op r) =
+            // conj(r) op conj(l) = conj(r op l), which is conj(l op r) exactly
+            // when the op commutes AND conj distributes over it -- OpAdd/OpMul
+            // only (OpSub/OpDiv fail commutation; booleans absorb conj's law).
+            elif (match op with OpAdd | OpMul -> true | _ -> false)
+                 && conjMirrorEq pi pj l r then PConj
+            else PBottom
     | TExprUnaryOp (op, inner) ->
         (match op, par inner with
          | _, PInv -> PInv
