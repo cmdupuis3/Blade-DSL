@@ -1207,18 +1207,73 @@ let private clangStamp (clang: string) : string =
         else $"{clang}:missing"
     with _ -> $"{clang}:?"
 
+/// What `-march=native` ACTUALLY SELECTED for one clang on this machine,
+/// hashed -- the LLVM lane's twin of `nativeTargetIdentity`, and missing from
+/// its key until the same failure found it. `llvmOptFlags` passes `-march=native`
+/// as TEXT, identical on every runner, while the vector ISA behind it is not:
+/// a binary built on an AVX-512 Xeon runner, cached, and restored onto one
+/// without AVX-512 dies at STATUS_ILLEGAL_INSTRUCTION (-1073741795) -- and
+/// only the programs whose hot loops vectorized with EVEX-only instructions
+/// do, so a few tests per night went red on a lane that "compiles and links"
+/// every time, because a cache hit is a file copy, not a compile.
+///
+/// Asks CLANG, not g++ (this lane runs with no g++ in the loop, and the two
+/// may not resolve `native` alike): `-###` prints the cc1 line without
+/// compiling, and only its `-target-cpu` / `-target-feature` tokens are kept,
+/// so the working directory and the input name the line also carries cannot
+/// perturb the key. One subprocess per clang path per run; empty on failure,
+/// the same choice `nativeTargetIdentity` makes.
+let private clangNativeTargetIdentities =
+    System.Collections.Concurrent.ConcurrentDictionary<string, string>()
+
+let private clangNativeTargetIdentity (clang: string) : string =
+    clangNativeTargetIdentities.GetOrAdd(clang, fun clang ->
+        try
+            let devNull = if Platforms.os = Platforms.Windows then "NUL" else "/dev/null"
+            let psi = ProcessStartInfo(clang, $"-### -march=native -x c -c - -o {devNull}")
+            psi.RedirectStandardInput <- true
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            psi.UseShellExecute <- false
+            psi.CreateNoWindow <- true
+            use proc = Process.Start(psi)
+            proc.StandardInput.Close()
+            Blade.Runtime.readToEndOffPool proc.StandardOutput |> ignore
+            let err = Blade.Runtime.readToEndOffPool proc.StandardError
+            proc.WaitForExit(10000) |> ignore
+            let tokens =
+                err.Result.Split([| ' '; '\t'; '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.map _.Trim('"')
+            let selected =
+                tokens
+                |> Array.pairwise
+                |> Array.choose (fun (flag, value) ->
+                    if flag = "-target-cpu" || flag = "-target-feature" then Some $"{flag} {value}" else None)
+            if selected.Length = 0 then ""
+            else
+                use sha = System.Security.Cryptography.SHA256.Create()
+                sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(String.concat "\n" selected))
+                |> Array.map _.ToString("x2")
+                |> String.concat ""
+        with _ -> "")
+
 /// The LLVM lane's twin of `exeCacheKey` (Stage 4.1). Differences, each
 /// deliberate: the compiler identity is the clang STAMP, not `gppIdentity`;
 /// the runtime input is the shim SOURCE text (the `.o` is a link input whose
-/// content the argument string cannot see); and the version tag is its own,
-/// so the two lanes can never collide on a key.
+/// content the argument string cannot see); the native-target identity is
+/// clang's own resolution of `native`; and the version tag is its own, so the
+/// two lanes can never collide on a key. v2: v1 keys carried no CPU identity,
+/// so no v1 entry can say which CPU it was built for and none is trusted.
 let private llvmExeCacheKey (clang: string) (args: string) (llText: string) (shimText: string) (exeFullPath: string) (llFullPath: string) : string =
     let normalizedArgs = args.Replace(exeFullPath, "<EXE>").Replace(llFullPath, "<LL>")
     let material =
         String.concat " "
-            [ "blade-llvm-exe-cache-v1"
+            [ "blade-llvm-exe-cache-v2"
               clangStamp clang
               normalizedArgs
+              // Only when the flag is `native`, as in `exeCacheKey`: an
+              // explicit `-march=` is portable text `normalizedArgs` carries.
+              (if (marchFlag ()).Contains "native" then clangNativeTargetIdentity clang else "")
               shimText
               llText ]
     use sha = System.Security.Cryptography.SHA256.Create()
