@@ -2215,7 +2215,10 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                     $"{ind}    {name}[__g] = {name}__pool + __off;" ]
                 @ rowRead
                 @ [ $"{ind}}}" ]
-            registerShapedAlloc name "deallocate_ragged_storage"
+            // The same layout as the per-tile branch above: a row table whose
+            // rows are slices of ONE pool, so the table and the pool are freed
+            // together (and no row individually).
+            registerShapedAlloc name "deallocate_ragged_storage" ($"{name}.data, {name}__pool")
             let ctx' = addVarName binding.Id name ctx
             let ctx' = { ctx' with GroupedArrays = Map.add name gkName ctx'.GroupedArrays }
             (code, ctx')

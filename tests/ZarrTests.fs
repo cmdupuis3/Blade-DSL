@@ -887,6 +887,61 @@ let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
                      (refusals |> List.exists (fun r -> (string r).Contains "needs a structural grouping") || cppCode.Contains "needs a structural grouping") cppCode
               with ex -> check "per-segment stream: a key grouping over a streamed variable refuses with a steer" (ex.Message.Contains "needs a structural grouping") ex.Message)
          | Error e -> check "per-segment stream: key grouping program lowers" false e)
+        // The same streamed group_by inside a FUNCTION BODY -- where an
+        // allocation scope exists, so the result must be freed at its exit.
+        // The row table and the one pool its rows slice are freed together
+        // (deallocate_ragged_storage). This branch once registered that free
+        // with its argument missing -- a discarded partial application, the
+        // build's FS0193 -- so nothing was freed and every call leaked both.
+        // The top-level program above cannot see it: main frees nothing.
+        let inFn = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+function run_sums(k: Int64) -> Float = {
+    let g = group_by(A, seg)
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+}
+let total = run_sums(0)
+"""
+                            segStore
+        try
+            match lower inFn with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_fn"
+                let marker = cppCode.IndexOf "per-segment STREAMED rows"
+                check "per-segment stream in a function body: rows are read per run (marker present)" (marker >= 0) ""
+                // The table's name is a generated `__vN`, so read it off the
+                // streamed block's own declaration rather than pinning a number.
+                let table =
+                    if marker < 0 then ""
+                    else
+                        System.Text.RegularExpressions.Regex.Match(
+                            cppCode.Substring marker, @"Array<double\*, 1> (\w+) = \{ new double\*\[").Groups.[1].Value
+                check "per-segment stream in a function body: the row table and its pool are freed at scope exit"
+                    (table <> ""
+                     && cppCode.Contains $"nested_array_utilities::deallocate_ragged_storage({table}.data, {table}__pool);")
+                    (if table = "" then "no streamed row-table declaration found"
+                     else $"no deallocate_ragged_storage({table}.data, {table}__pool) in the emitted C++")
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_streamed_fn.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          check "per-segment stream in a function body: total of the per-run sums"
+                              (runOut.Contains "total = 55") runOut
+                      | Ok (code, out) -> check "per-segment stream in a function body: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "per-segment stream in a function body: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP per-segment stream in a function body (compile skipped): %s" e
+                     else check "per-segment stream in a function body: compiles" false e)
+            | Error e -> check "per-segment stream in a function body: lowers" false e
+        with ex -> check "per-segment stream in a function body" false ex.Message
     streamedSegmentsE2E ()
 
     // ---------------------------------------------------------------
