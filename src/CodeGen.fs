@@ -1332,16 +1332,58 @@ let genFuncDef (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFuncDef) :
     // lengths through the forwarded `__gk<id>__*` params exactly as they
     // resolve them in the frame that built the group (grouped-capture
     // forwarding, requirement 3).
+    //
+    // The stem is ALWAYS `__gk<id>` here, because that is what
+    // `gkSidecarParams` names the params this signature declares. It used to
+    // be `gkSidecarStem ctx.VarNames gkId`, which only lands on `__gk<id>`
+    // when the gk is absent from the name map -- true for a gk local to an
+    // enclosing function, false for a MODULE-level one, which the map spells
+    // `seg`. Then the body read `seg__ngroups`, a main() local this free
+    // function cannot see, while the forwarded `__gk<id>__ngroups` sat unused.
     let bodyCtx =
         funcDef.Captures
         |> List.fold (fun c cap ->
             match groupedCaptureGkOf cap with
             | Some gkId ->
-                { c with GroupedArrays = Map.add cap.Name (gkSidecarStem ctx.VarNames gkId) c.GroupedArrays }
+                { c with GroupedArrays = Map.add cap.Name $"__gk{gkId}" c.GroupedArrays }
             | None -> c)
             // The body's parameters, for the co-iteration extent guard
             // (CodeGenContext.ParamIds).
             { ctx with ParamIds = funcDef.Params |> List.map (fun p -> p.VarId) |> Set.ofList }
+    // A captured GROUPING (`group_keys` / `segments` / `tiles` ...) is refused
+    // rather than emitted into g++'s "was not declared in this scope". The
+    // binding is an opaque `void*` sentinel whose state lives in locals named
+    // after it (`<gk>__ngroups`, `__offsets`, `__perm`, `__at`, grid bounds)
+    // in the scope that bound it, and a body can only use a grouping through
+    // that state (`group_by(x, gk)`, the gk accessors) -- so a free function
+    // capturing one has never compiled, called or not, and refusing it takes
+    // nothing that worked. A captured group_by RESULT is different and fine:
+    // its row table is a real value and its gk's ngroups/offsets are
+    // forwarded (grouped-capture forwarding, seeded above).
+    //
+    // A named function using a grouping works, because it is emitted as a
+    // `[&]` closure in main() (genFuncDefAsLambda) that resolves the state by
+    // name. A lifted kernel cannot simply take that route: its call sites
+    // forward the captures as arguments and its closure would be emitted after
+    // the binding that applies it. Both steers in the message compile and run.
+    //
+    // NOT refused here: a captured STREAMED variable. A lifted function that
+    // merely receives it as `Array<T, N>& A` compiles, and is dead code
+    // whenever the consumer inlines the kernel (the streamed halo stencil) --
+    // what breaks is a CALLER that names the never-materialized `A`, which is
+    // a different site.
+    let unforwardableCaptureRefusal =
+        funcDef.Captures |> List.tryPick (fun cap ->
+            match cap.Type with
+            | IRTGroupKeys _ ->
+                let outer = captureForwardName ctx.VarNames cap
+                Some ($"a kernel body captures the grouping '{outer}', but the body is compiled as a separate "
+                      + "C++ function and a grouping's state lives in locals named after its binding "
+                      + $"(`{outer}__ngroups`, `{outer}__offsets`, ...) that the function cannot see. Group "
+                      + $"outside the kernel (`let g = group_by(x, {outer})`) and use `g` inside it -- a "
+                      + "group_by result IS forwarded, and grouping once beats regrouping on every "
+                      + "iteration -- or move the body into a named function")
+            | _ -> None)
     // `where repro`: the body emits inside the routing veto scope (no
     // BLAS/LAPACK/cuBLAS classification while depth > 0), and the definition
     // carries BLADE_REPRO_FN (noinline + fp-contract off on GCC). try/finally
@@ -1351,6 +1393,9 @@ let genFuncDef (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFuncDef) :
     Blade.Types.PoolReuseTable.setCurrentReturnDonor (Blade.Types.PoolReuseTable.tryReturnDonor funcDef.Id)
     let bodyStmts =
         try
+            match unforwardableCaptureRefusal with
+            | Some msg -> codegenError ctx bodyInd msg
+            | None ->
             if funcDef.IsRepro then
                 Blade.LinAlgPatterns.reproScopeDepth.Value <-
                     Blade.LinAlgPatterns.reproScopeDepth.Value + 1

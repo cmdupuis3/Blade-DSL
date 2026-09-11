@@ -1,0 +1,31 @@
+// TEST: Kernel Body Captures A group_by Result Of A Top-Level Grouping
+// A kernel body may use a group_by RESULT bound outside it: the row table is
+// a real value, and its grouping's ngroups/offsets are forwarded into the
+// kernel's function as hidden `__gk<id>__*` parameters (grouped-capture
+// forwarding). The body used to look those up by the grouping's MODULE name
+// (`seg__ngroups`), a main() local the free function cannot see, so this
+// shape reached g++ with undeclared names whenever the grouping was bound at
+// top level. Both grouping kinds: structural runs and data keys.
+//
+// Grouping once, outside, is also the fast spelling: the grouping inside the
+// kernel is refused (017), and would regroup on every iteration.
+type X = Chunked<Idx<10>, 4>
+type K = Idx<3>
+let A: Array<Float like X> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+let seg = segments(X)
+let g = group_by(A, seg)
+let totals = method_for(range<K>) <@> lambda(k) -> {
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+} |> compute
+// EXPECT: totals = [55, 56, 57]
+
+let B = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+let keys = [0, 0, 1, 1, 2, 2, 0, 1, 2, 0]
+let gk = group_keys(keys)
+let h = group_by(B, gk)
+let counted = method_for(range<K>) <@> lambda(k) -> {
+    let n = method_for(h) <@> lambda(r) -> Float64(extents(r)) |> compute
+    reduce(n, (+)) * Float64(k + 1)
+} |> compute
+// EXPECT: counted = [10, 20, 30]

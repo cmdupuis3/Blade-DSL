@@ -942,6 +942,80 @@ let total = run_sums(0)
                      else check "per-segment stream in a function body: compiles" false e)
             | Error e -> check "per-segment stream in a function body: lowers" false e
         with ex -> check "per-segment stream in a function body" false ex.Message
+        // The same group_by inside a KERNEL body is different: the kernel is
+        // compiled as a separate C++ function that sees only its parameters,
+        // and a grouping cannot be one -- it is an opaque sentinel whose state
+        // (`seg__ngroups`, `seg__offsets`) is main() locals. It used to reach
+        // g++ as "'seg__ngroups' / 'A_fillv' / 'A' was not declared in this
+        // scope"; codegen now refuses the captured grouping (BL7004) with a
+        // steer, and the #error guard stops the compile before g++ runs.
+        let inKernel = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+type K = Idx<3>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+let totals = method_for(range<K>) <@> lambda(k) -> {
+    let g = group_by(A, seg)
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+} |> compute
+"""
+                            segStore
+        (match lower inKernel with
+         | Ok ir ->
+             (try
+                 let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_kernel"
+                 let refusals = CodeGen.takeCodegenRefusalDiagnostics cppCode |> List.map string
+                 let steer = "captures the grouping 'seg'"
+                 check "per-segment stream in a kernel body: refused before g++ (BL7004), with a steer"
+                     (cppCode.Contains "#error" && refusals |> List.exists (fun r -> r.Contains steer))
+                     (String.concat " | " refusals)
+              with ex -> check "per-segment stream in a kernel body: refused before g++ (BL7004), with a steer" false ex.Message)
+         | Error e -> check "per-segment stream in a kernel body: lowers" false e)
+        // ...and the steer it gives compiles: group ONCE, outside the kernel,
+        // and use the result inside. A group_by result is forwarded into the
+        // kernel's function (its row table plus the grouping's ngroups and
+        // offsets as hidden params) -- and it reads the store once, not once
+        // per iteration.
+        let steered = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+type K = Idx<3>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+let g = group_by(A, seg)
+let totals = method_for(range<K>) <@> lambda(k) -> {
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+} |> compute
+"""
+                            segStore
+        try
+            match lower steered with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_steered"
+                check "per-segment stream, grouped outside a kernel: rows are read per run (marker present)"
+                    (cppCode.Contains "per-segment STREAMED rows") ""
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_streamed_steered.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          check "per-segment stream, grouped outside a kernel: per-iteration totals"
+                              (runOut.Contains "totals = [55, 56, 57]") runOut
+                      | Ok (code, out) -> check "per-segment stream, grouped outside a kernel: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "per-segment stream, grouped outside a kernel: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP per-segment stream grouped outside a kernel (compile skipped): %s" e
+                     else check "per-segment stream, grouped outside a kernel: compiles" false e)
+            | Error e -> check "per-segment stream, grouped outside a kernel: lowers" false e
+        with ex -> check "per-segment stream, grouped outside a kernel" false ex.Message
     streamedSegmentsE2E ()
 
     // ---------------------------------------------------------------
