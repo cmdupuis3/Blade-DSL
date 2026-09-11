@@ -1227,6 +1227,121 @@ let takeCodegenRefusalDiagnostics (cppCode: string) : Blade.Diagnostics.Diagnost
             Blade.Diagnostics.Codes.backendRefusal (IR.declSpanOf declName)
                 ($"{msg}{where}"))
 
+// STREAMED VALUES NEVER REACH C++.
+//
+// A variable bound with `.stream` is never materialized: its binding emits a
+// reader over the store (`A_zm`, `A_fillv`, ...) and NOTHING named `A`. The
+// stream-eligible consumers -- the top-level fold (structural/07 D6), a
+// group_by over a structural grouping, fiber-kernel method_for and the
+// segment-run elementwise/stencil nests -- find it by name in
+// ctx.StreamedArrays and read the store themselves. Every OTHER use needs the
+// values as an array, and used to render the bare name, so g++ said "'A' was
+// not declared in this scope" (a fold inside a kernel body inlined into
+// main(), the same fold inside a named function's closure, a capture argument
+// at a call site). ProviderReadSpec.Streamed has always promised a loud
+// codegen error there instead; this is it.
+//
+// The renderers see only a name map, not the context, and `A` IS legitimately
+// declared in two scopes: a lifted free function receives a capture as a
+// parameter named `A`, and a segment run declares a window alias named `A`.
+// So the check is by the BINDING's id and emitted name, and those two scopes
+// mask the name while they emit (`maskStreamedNames`, restored on Dispose --
+// bind it with `use`).
+//
+// The refusal is DEFERRED: a render returns a sentinel identifier and queues
+// the message, and `settleStreamedValueLeaks` turns it into a BL7004 refusal
+// (plus the `#error` the corpus harness reads) only if that sentinel reached
+// the translation unit. Renders that are made and then discarded -- a
+// consumer that renders an operand before deciding it takes the streamed
+// route -- therefore cost nothing, which is the lazy-rendering trap
+// `exprError` cannot avoid.
+let internal streamedBindingsStorage = System.Threading.AsyncLocal<Map<IRId, string> ref>()
+let internal streamedMaskStorage = System.Threading.AsyncLocal<Set<string> ref>()
+let internal streamedLeaksStorage = System.Threading.AsyncLocal<(string * string * string) list ref>()
+
+let private asyncCell (storage: System.Threading.AsyncLocal<'T ref>) (empty: 'T) : 'T ref =
+    let v = storage.Value
+    if isNull (box v) then
+        let fresh = ref empty
+        storage.Value <- fresh
+        fresh
+    else v
+
+let private streamedBindingsCell () = asyncCell streamedBindingsStorage Map.empty
+let private streamedMaskCell () = asyncCell streamedMaskStorage Set.empty
+let private streamedLeaksCell () = asyncCell streamedLeaksStorage []
+
+/// Per-program reset, beside the other codegen channels.
+let resetStreamedValueState () : unit =
+    (streamedBindingsCell ()).Value <- Map.empty
+    (streamedMaskCell ()).Value <- Set.empty
+    (streamedLeaksCell ()).Value <- []
+
+/// A `.stream` binding was emitted under C++ name `name`: from here on, a
+/// render of that binding as a value is a leak unless a scope masks it.
+let noteStreamedBinding (id: IRId) (name: string) : unit =
+    let cell = streamedBindingsCell ()
+    cell.Value <- Map.add id name cell.Value
+
+/// The emitted name of a streamed binding, if `id` is one.
+let streamedBindingName (id: IRId) : string option =
+    Map.tryFind id (streamedBindingsCell ()).Value
+
+/// Treat `names` as materialized until the returned handle is disposed: the
+/// scope declares an array under that name (a lifted function's capture
+/// parameter, a segment run's window alias).
+let maskStreamedNames (names: string list) : System.IDisposable =
+    let cell = streamedMaskCell ()
+    let saved = cell.Value
+    cell.Value <- Set.union saved (Set.ofList names)
+    { new System.IDisposable with member _.Dispose () = cell.Value <- saved }
+
+/// The sentinel to render instead of `resolved` when `id` is a streamed
+/// binding that is not materialized in the current scope; None otherwise.
+/// `resolved` must equal the binding's emitted name: a name map that sends
+/// the id elsewhere (an alias) is already a materialized array.
+let streamedValueSentinel (id: IRId) (resolved: string) : string option =
+    match streamedBindingName id with
+    | Some emitted when emitted = resolved && not (Set.contains emitted (streamedMaskCell ()).Value) ->
+        let token =
+            "BLADE_CODEGEN_ERROR_STREAMED_VALUE_"
+            + System.String(emitted |> Seq.map (fun c -> if System.Char.IsLetterOrDigit c || c = '_' then c else '_') |> Array.ofSeq)
+        let msg =
+            $"'{emitted}' is bound with `.stream`, so it is never materialized -- no array named "
+            + $"'{emitted}' exists, only a reader over its store -- and this use needs its values as an "
+            + "array (a fold or read inside a kernel or function body, an index, an argument). A "
+            + "streamed variable is read only by top-level consumers: fold it (`let t = reduce(x, (+))`), "
+            + "group it by a structural grouping (`let g = group_by(x, segments(...))`), or map or "
+            + "stencil it at top level, and use that result -- or bind it with `.read` to load it"
+        let entry = (token, msg, (currentDeclCell ()).Value)
+        let cell = streamedLeaksCell ()
+        if not (List.contains entry cell.Value) then cell.Value <- cell.Value @ [entry]
+        Some token
+    | _ -> None
+
+/// Settle the deferred leaks against the finished translation unit: each whose
+/// sentinel actually appears becomes a BL7004 refusal (spanned at the
+/// declaration that rendered it) and an `#error` appended to the unit.
+/// Discarded renders are dropped. The queue is drained either way.
+let settleStreamedValueLeaks (code: string) : string =
+    let cell = streamedLeaksCell ()
+    let pending = cell.Value
+    cell.Value <- []
+    let hits =
+        pending |> List.filter (fun (token, _, _) ->
+            System.Text.RegularExpressions.Regex.IsMatch(code, $@"\b{token}\b"))
+    if hits.IsEmpty then code
+    else
+        let refusals = codegenRefusalsCell ()
+        for (_, msg, decl) in hits do
+            if not (List.contains (msg, decl) refusals.Value) then
+                refusals.Value <- refusals.Value @ [(msg, decl)]
+        let directives =
+            hits
+            |> List.map (fun (_, msg, _) -> "#error \"Blade codegen: " + msg.Replace("\"", "'") + "\"")
+            |> List.distinct
+        code + "\n" + (directives |> String.concat "\n") + "\n"
+
 /// Record an expression-level warning and return a C++ expression that causes a compile error.
 /// The identifier is the in-place marker; the companion `#error` directive is
 /// appended to the translation unit by `genSelfContainedProgramFromIR` (an

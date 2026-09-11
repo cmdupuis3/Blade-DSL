@@ -1384,6 +1384,18 @@ let genFuncDef (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFuncDef) :
                       + "group_by result IS forwarded, and grouping once beats regrouping on every "
                       + "iteration -- or move the body into a named function")
             | _ -> None)
+    // A captured `.stream` variable IS an array in this body -- the signature
+    // receives it as a parameter -- so it reads by name here, and no
+    // stream-eligible consumer in the body may take the store-reading route
+    // (whose state is main() locals). What cannot work is FORWARDING it from
+    // a scope that never materialized it; captureForwardArgs refuses that at
+    // the call site. A lifted kernel whose consumer inlines it instead (the
+    // streamed halo stencil) is dead code and costs nothing.
+    let streamedCaptureNames = funcDef.Captures |> List.choose (fun c -> streamedBindingName c.Id)
+    use _captureMask = maskStreamedNames streamedCaptureNames
+    let bodyCtx =
+        { bodyCtx with
+            StreamedArrays = streamedCaptureNames |> List.fold (fun m n -> Map.remove n m) bodyCtx.StreamedArrays }
     // `where repro`: the body emits inside the routing veto scope (no
     // BLAS/LAPACK/cuBLAS classification while depth > 0), and the definition
     // carries BLADE_REPRO_FN (noinline + fp-contract off on GCC). try/finally
@@ -3272,6 +3284,7 @@ let genSelfContainedProgramFromIR (program: IRProgram) (testName: string) : stri
     (unhandledNodesCell ()).Value <- []
     (codegenRefusalsCell ()).Value <- []
     (currentDeclCell ()).Value <- ""
+    resetStreamedValueState ()
     // Deterministic deallocation: see genMainProgram.
     (freshReturnFactsCell ()).Value <- Map.empty
     (copyInPlaceMutsCell ()).Value <- Map.empty
@@ -3311,6 +3324,9 @@ let genSelfContainedProgramFromIR (program: IRProgram) (testName: string) : stri
     // g++'s "not declared in this scope" -- is what the user and the corpus
     // runner's REJECT-AT: codegen verdict see. A program with no expression
     // refusal appends nothing, so no currently-compiling program is affected.
+    // A `.stream` binding rendered as a value: refused only if its sentinel
+    // reached the unit (CodeGenState, "STREAMED VALUES NEVER REACH C++").
+    let code = settleStreamedValueLeaks code
     let sentinels = (exprSentinelsCell ()).Value
     let code =
         if List.isEmpty sentinels then code

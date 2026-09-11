@@ -1391,6 +1391,9 @@ and genProviderReadBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: 
             let code = gen spec.FilePath spec.VarName name spec.VarType
             let ctx' = addVarName binding.Id name ctx
             let ctx' = { ctx' with StreamedArrays = Map.add name spec ctx'.StreamedArrays }
+            // Nothing named `name` exists: a render of this binding as a
+            // value from here on is refused, not handed to g++.
+            noteStreamedBinding binding.Id name
             (code |> List.map (fun s -> ind + s), ctx')
     else
     // A wreath group passes the `Symmetry <> SymNone && Rank >= 2` packed test
@@ -2981,8 +2984,15 @@ and genReduceBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuil
     // sequence as the flat fold over a materialized copy, so the two agree
     // bitwise; nothing is reassociated and no reorder licence is asked
     // (`omp` on the kernel is noted and ignored: the store is read serially).
+    // Keyed by the binding's NAME, not by `arrName`: a streamed operand
+    // RENDERS as the refusal sentinel (it is not materialized), which is
+    // exactly right for every non-streamed path below and never matches here.
+    let streamedKey =
+        match arrExpr with
+        | IRVar (vid, _) -> Map.tryFind vid ctx.VarNames |> Option.defaultValue arrName
+        | _ -> arrName
     let streamedFold =
-        match Map.tryFind arrName ctx.StreamedArrays with
+        match Map.tryFind streamedKey ctx.StreamedArrays with
         | Some spec when spec.VarType.IndexTypes.Length = 1 ->
             let pspec = (Blade.ProviderRegistry.tryFind spec.Provider).Value
             match pspec.GenStreamRows, pspec.StreamRowsBlock with
@@ -3016,7 +3026,7 @@ and genReduceBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuil
                     | Some c when c.IsOmpParallel -> [ $"{ind}// [omp] requested but emitted serial: the operand is streamed from the store in storage order" ]
                     | _ -> []
                 let rowRead =
-                    genRows spec.FilePath spec.VarName arrName blk "__lo" "__hi" spec.VarType
+                    genRows spec.FilePath spec.VarName streamedKey blk "__lo" "__hi" spec.VarType
                     |> List.map (fun s -> ind + "    " + s)
                 Some (
                     elemErrCode @ ompNote @ wrapperLines

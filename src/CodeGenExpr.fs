@@ -53,7 +53,14 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
             $$"""[&]({{paramSig}}) { return {{safeName}}({{allArgs}}); }"""
         | _ ->
             match Map.tryFind id names with
-            | Some name -> name
+            | Some name ->
+                // A `.stream` binding read as a VALUE outside a scope that
+                // materializes it: render the deferred refusal sentinel, not
+                // a name no C++ declaration carries (CodeGenState, "STREAMED
+                // VALUES NEVER REACH C++").
+                (match streamedValueSentinel id name with
+                 | Some sentinel -> sentinel
+                 | None -> name)
             | None -> $"__v{id}"
     | IRParam (name, _, _) -> name
     | IRHaloUnhash (w, off) ->

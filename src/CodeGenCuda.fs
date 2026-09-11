@@ -1958,7 +1958,13 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
     let peelSourceStreamed =
         lazy (not (Map.isEmpty ctx.StreamedArrays)
               && info.Arrays |> List.exists (fun a ->
-                    Map.containsKey (exprToCppCtx ctx a) ctx.StreamedArrays))
+                    // By the binding's NAME: a streamed operand RENDERS as the
+                    // refusal sentinel, which is never a StreamedArrays key.
+                    Map.containsKey
+                        (match a with
+                         | IRVar (vid, _) -> Map.tryFind vid ctx.VarNames |> Option.defaultValue ""
+                         | _ -> exprToCppCtx ctx a)
+                        ctx.StreamedArrays))
     let peelStreamBlocker () : string option =
         if peelSourceStreamed.Force () then
             Some "the peeled source is a streamed provider read (shared per-source handles and per-argument buffers are not thread-safe)"
@@ -3058,6 +3064,15 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
             | Some (_, _, _, _, _, _, sources, _) ->
                 sources |> List.fold (fun c (vn, _) -> { c with StreamedArrays = Map.remove vn c.StreamedArrays }) ctx
             | None -> ctx
+        // ...so its reads render by name for the rest of this emission, the
+        // same fact as the StreamedArrays removal above, for the renderers that
+        // see only a name map (CodeGenState, "STREAMED VALUES NEVER REACH
+        // C++"). Disposed when this block ends.
+        use _runAliasMask =
+            maskStreamedNames
+                (match segmentRun with
+                 | Some (_, _, _, _, _, _, sources, _) -> sources |> List.map fst
+                 | None -> [])
         // STREAMED provider inputs (`alias.stream`): no materialized arrays
         // exist -- the nest inlines per-fiber reads at the S/T boundary.
         // Pre-allocate one destination buffer per streamed fiber binding (a

@@ -1399,7 +1399,9 @@ type ProviderReadSpec = {
     /// `alias.stream(var)`: not materialized at the binding -- consuming loop
     /// nests inline per-fiber reads at the S/T boundary. Only fiber-kernel
     /// method_for consumers are stream-eligible; other consumption is a
-    /// loud codegen error steering to `.read`.
+    /// loud codegen error steering to `.read` -- BL7004, raised wherever the
+    /// binding would render as a value (CodeGenState, "STREAMED VALUES NEVER
+    /// REACH C++"), never an undeclared name handed to g++.
     Streamed: bool
 }
 

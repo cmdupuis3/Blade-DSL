@@ -578,7 +578,14 @@ let gkSidecarParams (caps: CaptureInfo list) : string list =
 /// through the active name map, then the gk side-state pairs in the same
 /// order the signature declares them.
 let captureForwardArgs (names: Map<IRId, string>) (caps: CaptureInfo list) : string list =
-    (caps |> List.map (captureForwardName names))
+    // A `.stream` capture forwarded from a scope that does not materialize it
+    // names an array no C++ declaration carries: forward the deferred refusal
+    // sentinel instead (CodeGenState, "STREAMED VALUES NEVER REACH C++").
+    (caps |> List.map (fun c ->
+        let n = captureForwardName names c
+        match streamedValueSentinel c.Id n with
+        | Some sentinel -> sentinel
+        | None -> n))
     @ (groupedCaptureGks caps
        |> List.collect (fun gkId ->
            let stem = gkSidecarStem names gkId

@@ -1016,6 +1016,67 @@ let totals = method_for(range<K>) <@> lambda(k) -> {
                      else check "per-segment stream, grouped outside a kernel: compiles" false e)
             | Error e -> check "per-segment stream, grouped outside a kernel: lowers" false e
         with ex -> check "per-segment stream, grouped outside a kernel" false ex.Message
+        // A streamed variable used as a plain ARRAY anywhere else. `A` is
+        // never materialized -- its binding emits a reader, and nothing named
+        // `A` -- so these used to reach g++ as "'A' was not declared in this
+        // scope". Each is now a BL7004 refusal before g++ runs, whatever
+        // construct the use sits in: a fold inlined from a kernel body into
+        // main(), the same fold inside a named function's closure, an
+        // argument to a function, a scalar index.
+        let streamedLeaks =
+            [ ("a fold inside a kernel body",
+               "let totals = method_for(range<K>) <@> lambda(k) -> reduce(A, (+)) + Float64(k) |> compute")
+              ("a fold inside a named function",
+               "function total_plus(k: Int64) -> Float = reduce(A, (+)) + Float64(k)\nlet totals = method_for(range<K>) <@> lambda(k) -> total_plus(k) |> compute")
+              ("an argument to a function",
+               "function total(v: Array<Float like CX>) -> Float = reduce(v, (+))\nlet t = total(A)")
+              ("a scalar index",
+               "let x = A((3 : CX)) + 1.0") ]
+        for (what, body) in streamedLeaks do
+            let src = sprintf "import zarr as z\nlet sample = z.load(\"%s\")\ntype CX = Chunked<sample.index.x, store>\ntype K = Idx<3>\nlet A: Array<Float like CX> = sample.vars.A |> z.stream\n%s\n" segStore body
+            let label = $"streamed variable used as an array ({what}): refused before g++ (BL7004), with a steer"
+            match lower src with
+            | Ok ir ->
+                (try
+                    let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_streamed_leak"
+                    let refusals = CodeGen.takeCodegenRefusalDiagnostics cppCode |> List.map string
+                    check label
+                        (cppCode.Contains "#error"
+                         && refusals |> List.exists (fun r -> r.Contains "'A' is bound with `.stream`, so it is never materialized"))
+                        (String.concat " | " refusals)
+                 with ex -> check label false ex.Message)
+            | Error e -> check $"streamed variable used as an array ({what}): lowers" false e
+        // ...and the steer compiles: fold at top level (the streamed fold,
+        // structural/07 D6) and use the scalar inside the kernel.
+        let foldedOutside = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type K = Idx<3>
+let A = sample.vars.A |> z.stream
+let t = reduce(A, (+))
+let totals = method_for(range<K>) <@> lambda(k) -> t + Float64(k) |> compute
+"""
+                                segStore
+        try
+            match lower foldedOutside with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_streamed_fold_outside"
+                let cppFile = Path.Combine(e2eDir, "zarr_streamed_fold_outside.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          check "streamed fold at top level, used in a kernel: totals"
+                              (runOut.Contains "totals = [55, 56, 57]") runOut
+                      | Ok (code, out) -> check "streamed fold at top level, used in a kernel: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "streamed fold at top level, used in a kernel: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP streamed fold at top level (compile skipped): %s" e
+                     else check "streamed fold at top level, used in a kernel: compiles" false e)
+            | Error e -> check "streamed fold at top level, used in a kernel: lowers" false e
+        with ex -> check "streamed fold at top level, used in a kernel" false ex.Message
     streamedSegmentsE2E ()
 
     // ---------------------------------------------------------------
