@@ -1,0 +1,95 @@
+// TEST: C2-Reverse -- Zip Co-Iteration Reached Through Named Bindings
+// The same lowering, with both indirections the surface allows: the loop
+// object behind a `let` (`MapApplyWith` resolves it by name, as the tangent
+// rule already did) and -- reverse mode only -- the KERNEL behind one too.
+//
+// Once every application has become a construction loop those bindings are
+// DEAD, and a dead `let L = method_for(...)` still trips the combinator
+// refusal the rewrite exists to avoid, so `dropDeadLoopBindings` removes it.
+// A binding still mentioned afterwards is KEPT, which is what makes a shape
+// the lowering declined keep refusing exactly as before.
+//
+// `zip` is CO-iteration, not the outer product: one shared axis, one kernel
+// parameter per zipped array. Getting that backwards silently changes the
+// output RANK, which is why `m(2)` is read as a rank-1 cell.
+//
+// NO `ad.jvp` LEG, and the reason is the interesting part: forward mode's
+// Tier-2 map rule classifies operands as "a named array PARAMETER with a
+// declared index type" or a `halo`/`range` traversal, and a `zip` is neither
+// -- `ad.jvp` refuses this body outright. Nor can it map over a LOCAL. So on
+// this shape the lowering makes reverse mode STRICTLY WIDER than forward,
+// and the jvp-vs-grad residual is unavailable. The gate here is the
+// plan-ad-combinators.md 6 combinator-vs-lane differential instead: the same
+// construction, reached through `expandRecArray`'s independent lowering of a
+// prefix-free `let rec`, must agree to the digit -- value AND gradients.
+//
+// x = [1, 2, 3, 4], y = [2, 1, 4, 0.5]
+//   m(k)  = x(k) * y(k) + y(k)     m = [4, 3, 16, 2.5]
+//   loss  = m(0) + 2 m(2) - m(3) = 4 + 32 - 2.5 = 33.5
+//   dm    = [1, 0, 2, -1]
+//   dx(k) = dm(k) * y(k)       = [2, 0, 8, -0.5]
+//   dy(k) = dm(k) * (x(k) + 1) = [2, 0, 8, -5]
+import ad as ad
+
+type S = Idx<4>
+
+function loss(x: Array<Float like S>, y: Array<Float like S>) -> Float = {
+    let L = method_for(zip(x, y))
+    let m = L <@> lambda(a: Float, b: Float) -> a * b + b |> compute
+    m(0) + 2.0 * m(2) - m(3)
+}
+
+// The kernel behind a name too. Forward mode has no arm for a let-bound
+// kernel lambda either (it resolves let-bound LOOP OBJECTS only, via
+// `noteLoopBinding`), so this is a second reverse-only spelling.
+function loss_k(x: Array<Float like S>, y: Array<Float like S>) -> Float = {
+    let L = method_for(zip(x, y))
+    let k = lambda(a: Float, b: Float) -> a * b + b
+    let m = L <@> k |> compute
+    m(0) + 2.0 * m(2) - m(3)
+}
+
+// The lane twin: the SAME construction loop, produced by a completely
+// different pre-pass (`expandRecArray`'s prefix-free arm), so agreement here
+// is a differential check on the new lowering rather than a restatement.
+function loss_rec(x: Array<Float like S>, y: Array<Float like S>) -> Float = {
+    let rec m: Array<Float like Idx<4>> =
+        match m with
+        | zero -> zero
+        | prefix :: n -> prefix :: x(n) * y(n) + y(n)
+    m(0) + 2.0 * m(2) - m(3)
+}
+
+// WARN: BL4003
+let x0 = [1.0, 2.0, 3.0, 4.0]
+let y0 = [2.0, 1.0, 4.0, 0.5]
+let mut dx = [0.0, 0.0, 0.0, 0.0]
+let mut dy = [0.0, 0.0, 0.0, 0.0]
+let lv = ad.grad(loss)(x0, y0, dx, dy)
+// EXPECT: lv = 33.5
+// EXPECT: dx = [2, 0, 8, -0.5]
+// EXPECT: dy = [2, 0, 8, -5]
+
+let mut kx = [0.0, 0.0, 0.0, 0.0]
+let mut ky = [0.0, 0.0, 0.0, 0.0]
+let kv = ad.grad(loss_k)(x0, y0, kx, ky)
+let kvresid = kv - lv
+let kgresid = reduce(abs(kx - dx), (+)) + reduce(abs(ky - dy), (+))
+// EXPECT: kvresid = 0
+// EXPECT: kgresid = 0
+
+let mut rx = [0.0, 0.0, 0.0, 0.0]
+let mut ry = [0.0, 0.0, 0.0, 0.0]
+let rv = ad.grad(loss_rec)(x0, y0, rx, ry)
+let rvresid = rv - lv
+let rgresid = reduce(abs(rx - dx), (+)) + reduce(abs(ry - dy), (+))
+// EXPECT: rvresid = 0
+// EXPECT: rgresid = 0
+
+let h = 0.000001
+let fdx2 = (loss([1.0, 2.0, 3.0 + h, 4.0], y0) - loss([1.0, 2.0, 3.0 - h, 4.0], y0)) / (2.0 * h)
+let fdy3 = (loss(x0, [2.0, 1.0, 4.0, 0.5 + h]) - loss(x0, [2.0, 1.0, 4.0, 0.5 - h])) / (2.0 * h)
+let fd_okx = abs(fdx2 - dx(2)) < 0.000001 * (abs(dx(2)) + 1.0)
+let fd_oky = abs(fdy3 - dy(3)) < 0.000001 * (abs(dy(3)) + 1.0)
+// EXPECT: fd_okx = true
+// EXPECT: fd_oky = true

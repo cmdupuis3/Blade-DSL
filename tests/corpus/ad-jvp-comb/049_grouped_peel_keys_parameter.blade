@@ -23,7 +23,6 @@ let v0 = [10.0, 20.0, 30.0, 40.0, 50.0]
 let c0 = [2.0, 5.0]
 
 let ka: Array<Int64 like R> = [0, 1, 0, 0, 1]
-// WARN: BL4003
 let mut dva = [0.0, 0.0, 0.0, 0.0, 0.0]
 let mut dca = [0.0, 0.0]
 let ga = ad.grad(loss)(v0, ka, c0, dva, dca)

@@ -1,7 +1,8 @@
 // TEST: JVP General Recurrence (non-additive, forward only)
-// A geometric recurrence grad cannot touch (its rec-array lowering is
-// additive-only, a reverse-sweep artifact). Forward differentiates any
-// smooth immediate-predecessor recurrence in place, O(n).
+// A geometric recurrence. Forward differentiates any smooth
+// immediate-predecessor recurrence in place, O(n); since structural/01
+// milestone B reverse mode takes the same loop backwards (ad/034 pins the
+// gradient of this very function against this tangent).
 // s0 = x; s(n) = 0.5*s(n-1) + x -> s = [x, 1.5x, 1.75x, 1.875x];
 // reduce = 6.125x. At x = 2: primal 12.25, d = 6.125 (exact binary).
 import ad as ad

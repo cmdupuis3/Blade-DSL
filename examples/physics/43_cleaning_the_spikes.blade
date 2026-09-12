@@ -61,10 +61,13 @@ let GT_h = csvd.load("data/43_GT.csv")
 let GT: Array<Float64 like Idx<4>, Idx<160>> = GT_h.vars.data |> csvd.read
 // ---- the chain's normal modes, in-language (DST: exactly orthogonal) ----
 function eqInd(a: Int64, b: Int64) -> Float64 = if a + 1 > b then (if a < b + 1 then 1.0 else 0.0) else 0.0
-let U1 = method_for(range<Idx<40>>) <@> lambda(i) -> 0.223606797749979 * sin(3.14159265358979 * 1.0 * (i + 0.5) / 40.0) |> compute
-let U2 = method_for(range<Idx<40>>) <@> lambda(i) -> 0.223606797749979 * sin(3.14159265358979 * 2.0 * (i + 0.5) / 40.0) |> compute
-let U3 = method_for(range<Idx<40>>) <@> lambda(i) -> 0.223606797749979 * sin(3.14159265358979 * 3.0 * (i + 0.5) / 40.0) |> compute
-let U4 = method_for(range<Idx<40>>) <@> lambda(i) -> 0.223606797749979 * sin(3.14159265358979 * 4.0 * (i + 0.5) / 40.0) |> compute
+// The mode shapes are arithmetic in the site ordinal: lift over one shared
+// half-offset axis instead of four identical range loops.
+let uax = Float64(0..40) + 0.5
+let U1 = 0.223606797749979 * sin(3.14159265358979 * 1.0 * uax / 40.0)
+let U2 = 0.223606797749979 * sin(3.14159265358979 * 2.0 * uax / 40.0)
+let U3 = 0.223606797749979 * sin(3.14159265358979 * 3.0 * uax / 40.0)
+let U4 = 0.223606797749979 * sin(3.14159265358979 * 4.0 * uax / 40.0)
 
 // ---- data: X = white fuzz + sqrt(l_k - 1) u_k g_k ; estimate E = X X^T / N ----
 let X = method_for(range<Idx<40>>) <*> method_for(range<Idx<160>>) <@> lambda(i: Int64, t: Int64) -> ZT(i, t) + 3.0 * U1(i) * GT(0, t) + 2.0 * U2(i) * GT(1, t) + 1.22474487139159 * U3(i) * GT(2, t) + 0.547722557505166 * U4(i) * GT(3, t) |> compute

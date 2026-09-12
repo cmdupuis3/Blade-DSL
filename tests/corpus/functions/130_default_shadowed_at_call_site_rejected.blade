@@ -1,0 +1,14 @@
+// TEST: Default Shadowed At Call Site (rejects)
+// ERROR: BL3012
+// ERROR-CONTAINS: different binding
+// ============================================================================
+// A default is spliced into the call site as surface syntax and re-inferred
+// there, so a free name it reads resolves in the CALLER's scope. `f`'s
+// default reads the module-level `k`; inside `g`, `k` is a parameter, and
+// the splice used to read that instead (`g(99)` gave 99 where the
+// declaration says 10). The splice compares binding identities against the
+// ones recorded at the declaration and refuses.
+let k = 10
+function f(x: Int64 = k) = x
+function g(k: Int64) = f()
+let result = g(99)

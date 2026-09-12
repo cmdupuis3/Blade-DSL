@@ -1,0 +1,19 @@
+// TEST: T^0 binary function broadcasts a scalar LITERAL
+// ============================================================================
+// The scalar position BROADCASTS, exactly as it does for the binary
+// intrinsics (`atan2(A, 2.0)`) and for the operators (`A * 2.0`). The call is
+// re-synthesized as `(method_for(A) <@> lambda(v) -> add0(v, 2.5)) |> compute`
+// and re-inferred, so `T` becomes the ELEMENT type and the output rank is
+// deduced from the array.
+//
+// What this used to do: `T` took the FIRST argument's type (the array) and
+// monomorphization silently discarded the second teaching, emitting
+// `Array<double,1> add0_HM_10000_arr_double__r1s0e3(Array<double,1>,
+// Array<double,1>)` against a call site handing it a bare `2.5`. That program
+// passed `blade check` and died in g++ with no BL code at all.
+// ============================================================================
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let r = add0(A, 2.5)
+// EXPECT: r = [3.5, 4.5, 5.5]

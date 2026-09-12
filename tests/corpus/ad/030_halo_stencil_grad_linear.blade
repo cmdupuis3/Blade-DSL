@@ -1,0 +1,25 @@
+// TEST: AD Reverse Halo Stencil, Linear Central Difference
+import ad as ad
+// ============================================================================
+// Reverse mode through a `halo` stencil map (docs/plans/structural/02,
+// section 3.3). The transposed stencil is a GATHER: each input cell collects
+// the cotangents of the windows that read it, one loop per (array, offset)
+// the kernel reads, and the interior's edges are ZeroOutside -- a window
+// that does not exist contributes nothing, so no zero-Pad spelling is
+// needed. The forward-mode twin is ad-jvp-comb/014: same value, and the
+// gradient's inner product with its seed is that test's tangent.
+// d = (a2-a0)+(a3-a1)+(a4-a2) = 6; d/da = [-1, -1, 0, 1, 1].
+// ============================================================================
+type H = Idx<5>
+function f(a: Array<Float like H>) -> Float = {
+    let d = method_for(halo<H, [-1, 0, 1]>) <@> lambda(w) -> a(w(1)) - a(w(-1)) |> compute
+    reduce(d, (+))
+}
+let a0: Array<Float like H> = [0.0, 1.0, 2.0, 3.0, 4.0]
+let mut da: Array<Float like H> = [0.0, 0.0, 0.0, 0.0, 0.0]
+let fv = ad.grad(f)(a0, da)
+// EXPECT: fv = 6
+// EXPECT: da = [-1, -1, 0, 1, 1]
+let (jv, jt) = ad.jvp(f)(a0, [1.0, 0.0, 0.0, 0.0, 1.0])
+// EXPECT: jv = 6
+// EXPECT: jt = 0

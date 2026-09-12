@@ -53,7 +53,14 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
             $$"""[&]({{paramSig}}) { return {{safeName}}({{allArgs}}); }"""
         | _ ->
             match Map.tryFind id names with
-            | Some name -> name
+            | Some name ->
+                // A `.stream` binding read as a VALUE outside a scope that
+                // materializes it: render the deferred refusal sentinel, not
+                // a name no C++ declaration carries (CodeGenState, "STREAMED
+                // VALUES NEVER REACH C++").
+                (match streamedValueSentinel id name with
+                 | Some sentinel -> sentinel
+                 | None -> name)
             | None -> $"__v{id}"
     | IRParam (name, _, _) -> name
     | IRHaloUnhash (w, off) ->
@@ -88,6 +95,12 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
         $"({(exprToCppCore subst names cond)} ? {(exprToCppCore subst names thenBr)} : {(exprToCppCore subst names elseBr)})"
     | IRTuple exprs ->
         $"""std::make_tuple({(exprs |> List.map (exprToCppCore subst names) |> String.concat ", ")})"""
+    | IRFma (a, b, c) ->
+        // std::fma is correctly rounded on every libm Blade links (and a
+        // single vfmadd on any -march with FMA), so it is bit-identical to
+        // the interpreter's Math.FusedMultiplyAdd under any -ffp-contract --
+        // contraction only ever fuses SEPARATE nodes, never unfuses this one.
+        $"std::fma({(exprToCppCore subst names a)}, {(exprToCppCore subst names b)}, {(exprToCppCore subst names c)})"
     | IRComplex (re, im) ->
         // Determine width from the component type. checkExpr enforces
         // that Complex128 components are Float64 and Complex64 are
@@ -306,7 +319,7 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
                 @ laneStmts
                 @ [ $"return {resultLane};" ]
             $$"""[&]() { {{(String.concat " " body)}} }()"""
-    | IRDisplayEmit (head, quoted, dataExpr, metaTail) ->
+    | IRDisplayEmit (head, quoted, dataExpr, metaTail, None) ->
         // One display-frame line on stdout (docs/display-frames.md), answering
         // bool. The head / quoting flag / meta tail are elaboration-time
         // constants; only the payload is computed here. The helper is
@@ -318,10 +331,23 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
             (exprToCppCore subst names dataExpr)
             (escapeStringLit metaTail)
             (escapeStringLit Blade.Display.Frame.SessionTag)
+    | IRDisplayEmit (head, quoted, dataExpr, metaTail, Some idExpr) ->
+        // display.emit_id: same line, with the runtime id where the
+        // `<tag><ordinal>` goes. No session tag argument -- the id IS the
+        // identity -- and the helper leaves the ordinal counter alone, exactly
+        // as Frame.emitId does. There is no sink in this lane and none is
+        // needed: a compiled program's frames already reach stdout as it runs.
+        sprintf "blade_display::emit_id(%s, %s, %s, %s, %s)"
+            (escapeStringLit head)
+            (if quoted then "true" else "false")
+            (exprToCppCore subst names dataExpr)
+            (escapeStringLit metaTail)
+            (exprToCppCore subst names idExpr)
     | IRDisplayJson (rank, dataExpr) ->
-        // JSON text of a rank-1/rank-2 numeric array. The helper streams with
-        // setprecision(15) -- the print block's own rule -- so the
-        // interpreter's CppFormat.formatFloat15 mirror gives byte parity.
+        // JSON text of a rank-1/rank-2 numeric array. The helper renders each
+        // float at its shortest round-trip digits (blade_display::jsonfloat),
+        // and the interpreter's CppFormat.formatFloatShortest mirror gives
+        // byte parity.
         $"blade_display::json{rank}({(exprToCppCore subst names dataExpr)})"
     | IRDisplayNum dataExpr ->
         $"blade_display::jsonnum({(exprToCppCore subst names dataExpr)})"
@@ -422,10 +448,14 @@ let rec exprToCppCore (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr
         exprError "array_product in expression position"
     | IRFunctorMap (f, c) ->
         exprError "functor_map in expression position"
-    | IRConstraintCheck (cond, message, span) ->
+    | IRConstraintCheck (cond, blCode, message, span) ->
         // Expression-position fallback: a portable IIFE so the guard still
         // fires if it lands somewhere other than a statement slot.
-        $"([&](){{ if (!({(exprToCppCore subst names cond)})) {{ blade_rt::panic(\"BL8001\", \"{message}\", {(panicSpanArgs span)}); }} return 0; }})()"
+        $"([&](){{ if (!({(exprToCppCore subst names cond)})) {{ blade_rt::panic(\"{blCode}\", \"{message}\", {(panicSpanArgs span)}); }} return 0; }})()"
+    | IRBreakIf _ ->
+        // A C++ `break` cannot live inside an expression (the IIFE fallback
+        // would bind it to no loop) -- statement position only, by refusal.
+        exprError "break_if (a rec-array while guard) in expression position"
     | IRAssign (target, value) ->
         let targetStr =
             match target with
@@ -787,166 +817,196 @@ and renderIndexExpr (subst: SubstMap) (names: Map<IRId, string>) arr indices : s
 
 
 and renderMatchExpr (subst: SubstMap) (names: Map<IRId, string>) scrutinee cases : string =
-    // Generate nested ternary for match expressions
+    // A match compiles to a chain of ternaries, one arm each --
+    // `(test ? bound : rest)` -- bottoming out in the non-exhaustive abort.
+    // What each arm contributes comes from ONE recursive pattern compiler
+    // (`patCompile`) rather than a per-constructor emitter, which is exactly
+    // what makes NESTED patterns work: the emitter this replaced only ever
+    // looked one level down, so `((a, b), c)` bound nothing and rendered its
+    // body against dangling names, `head :: tail` fell into a catch-all that
+    // did the same, and a struct pattern read a real C++ struct with
+    // `std::get<i>`. All three typechecked cleanly and died at g++ -- and the
+    // interpreter handled all three correctly, so each was also a live twin
+    // divergence.
     let scrut = exprToCppCore subst names scrutinee
-    let rec genCase (cases: IRMatchCase list) : string =
-        match cases with
-        | [] -> "([&]() -> double { blade_rt::panic(\"BL8002\", \"Blade: non-exhaustive match\", nullptr, 0); return 0; }())"
-        | [case] ->
-            // Last case - assume it matches (wildcard or variable)
-            // But if there's a guard, we must still check it.
-            let abortExpr = "([&]() -> double { blade_rt::panic(\"BL8002\", \"Blade: non-exhaustive match\", nullptr, 0); return 0; }())"
-            let wrapGuard (bodyStr: string) (names': Map<IRId, string>) : string =
-                match case.Guard with
-                | Some guard ->
-                    let guardStr = exprToCppCore subst names' guard
-                    $"({guardStr} ? {bodyStr} : {abortExpr})"
-                | None -> bodyStr
-            match case.Pattern with
-            | IRPatVar varId ->
-                // Bind variable and evaluate body (only if variable is used)
-                let varUsed =
-                    (collectVarRefsIR case.Body).Contains varId ||
-                    (case.Guard |> Option.map (fun g -> (collectVarRefsIR g).Contains varId) |> Option.defaultValue false)
-                if varUsed then
-                    let varName = $"__match_{varId}"
-                    let names' = Map.add varId varName names
-                    let bodyStr = exprToCppCore subst names' case.Body
-                    let guardedBody = wrapGuard bodyStr names'
-                    $$"""[&]() { auto {{varName}} = {{scrut}}; return {{guardedBody}}; }()"""
-                else
-                    wrapGuard (exprToCppCore subst names case.Body) names
-            | IRPatWild ->
-                wrapGuard (exprToCppCore subst names case.Body) names
-            | IRPatLit lit ->
-                let litStr = litToCpp lit
-                let bodyStr = wrapGuard (exprToCppCore subst names case.Body) names
-                $"({scrut} == {litStr} ? {bodyStr} : {abortExpr})"
-            | IRPatVariant (ctorName, tag, innerOpt, isEnum) ->
-                // Last variant case -- extract payload and evaluate body
-                match innerOpt with
-                | Some (IRPatVar varId) ->
-                    let varName = $"__match_{varId}"
-                    let names' = Map.add varId varName names
-                    let extractExpr = $"std::get<{ctorName}_T>({scrut}).value"
-                    let bodyStr = exprToCppCore subst names' case.Body
-                    let guardedBody = wrapGuard bodyStr names'
-                    $$"""[&]() { auto {{varName}} = {{extractExpr}}; return {{guardedBody}}; }()"""
-                | _ ->
-                    wrapGuard (exprToCppCore subst names case.Body) names
-            | IRPatTuple innerPats ->
-                // Last tuple case -- bind each element
-                let bindings =
-                    innerPats |> List.mapi (fun idx pat ->
-                        match pat with
-                        | IRPatVar varId -> Some (varId, $"__match_{varId}", idx)
-                        | _ -> None)
-                    |> List.choose id
-                let bindingDecls = bindings |> List.map (fun (_, name, idx) ->
-                    $"auto {name} = std::get<{idx}>({scrut})") |> String.concat "; "
-                let names' = bindings |> List.fold (fun acc (id, name, _) -> Map.add id name acc) names
-                let bodyStr = exprToCppCore subst names' case.Body
-                let guardedBody = wrapGuard bodyStr names'
-                $$"""[&]() { {{bindingDecls}}; return {{guardedBody}}; }()"""
+    let scrutTy = inferExprType scrutinee
+    // The non-exhaustive panic IIFE, typed as the MATCH RESULT rather than a
+    // hardcoded double: as a ternary operand it participates in the chain's
+    // common type, so a double-typed abort on an Int64-valued match poisoned
+    // the whole chain to double and died as a g++ -Werror=float-conversion --
+    // making BL8002 unreachable for every non-double element type. `return
+    // {};` value-initializes whatever the type is (the panic never returns;
+    // C++ just needs the statement).
+    let abortExpr =
+        let retTyStr =
+            match cases |> List.tryHead with
+            | Some c ->
+                (match inferExprType c.Body with
+                 | ArrayElem arr -> cppArrayTypeStr arr
+                 | IRTInfer _ -> "double"
+                 | t -> irTypeToCpp t)
+            | None -> "double"
+        $$"""([&]() -> {{retTyStr}} { blade_rt::panic("BL8002", "Blade: non-exhaustive match", nullptr, 0); return {}; }())"""
+
+    let mergeParts (parts: (string list * (IRId * string * string) list) list) =
+        (parts |> List.collect fst, parts |> List.collect snd)
+
+    /// The `n` slot accesses of one access, each with its own type where one
+    /// is recoverable. A struct is read by declared field NAME -- `std::get<i>`
+    /// on a real C++ struct is not valid C++, which is how a struct pattern
+    /// used to reach g++.
+    let slotsOf (access: string) (ty: IRType option) (n: int) : (string * IRType option) list =
+        match ty |> Option.bind IR.tryLookupStructFields with
+        | Some flds when flds.Length = n ->
+            flds |> List.map (fun (fn, t) -> ($"{access}.{fn}", Some t))
+        | _ ->
+            match ty with
+            | Some (IRTTuple ts) when ts.Length = n ->
+                ts |> List.mapi (fun i t -> ($"std::get<{i}>({access})", Some t))
+            | _ -> [ for i in 0 .. n - 1 -> ($"std::get<{i}>({access})", None) ]
+
+    /// Compile ONE pattern against a C++ access expression whose IR type is
+    /// `ty` (`None` where the type is not recoverable at that depth) into
+    ///
+    ///   - `tests` -- boolean conjuncts, all of which must hold, in
+    ///     short-circuit order: a variant's tag test is emitted BEFORE any
+    ///     conjunct that reads its payload, so `&&` keeps the payload read on
+    ///     the alternative that actually holds it;
+    ///   - `binds` -- `(id, name, initializer)` declarations, in order, run
+    ///     only once every test has passed.
+    ///
+    /// Composition over sub-patterns is the whole point; the three shapes
+    /// this file used to get wrong are just its three recursive cases. Only
+    /// three decisions consult `ty` at all -- tuple-vs-struct slot access, a
+    /// cons tail's arity, and the type handed to the next level down -- and a
+    /// struct PATTERN carries its own type name, so it needs none of them.
+    let rec patCompile (access: string) (ty: IRType option) (pat: IRPattern)
+            : string list * (IRId * string * string) list =
+        match pat with
+        | IRPatWild -> ([], [])
+        | IRPatVar id -> ([], [ (id, $"__match_{id}", access) ])
+        | IRPatLit lit -> ([ $"{access} == {(litToCpp lit)}" ], [])
+        | IRPatStruct (typeName, fieldPats) ->
+            // BY NAME. The declared field list is consulted only to TYPE the
+            // sub-pattern; the access itself is `.field`, so a pattern that
+            // lists fields out of declaration order still reads the right
+            // ones -- positional lowering used to bind every one of them to
+            // the wrong slot.
+            let declared = IR.tryLookupStructFieldsByName typeName
+            fieldPats
+            |> List.map (fun (fname, fpat) ->
+                let fty =
+                    declared
+                    |> Option.bind (List.tryFind (fun (n, _) -> n = fname))
+                    |> Option.map snd
+                patCompile $"{access}.{fname}" fty fpat)
+            |> mergeParts
+        | IRPatTuple pats -> patCompileSlots (slotsOf access ty pats.Length) pat
+        | IRPatCons _ ->
+            // TUPLES ONLY, deliberately -- the interpreter's cons arm matches
+            // `VTuple` and nothing else, so a struct scrutinee here must fall
+            // through to the next arm rather than get decomposed by declared
+            // field order. `slotsOf` would happily hand back those fields.
+            match ty with
+            | Some (IRTTuple ts) when ts.Length >= 2 ->
+                patCompileSlots (slotsOf access ty ts.Length) pat
             | _ ->
-                wrapGuard (exprToCppCore subst names case.Body) names
-        | case :: rest ->
-            let restStr = genCase rest
-            match case.Pattern with
-            | IRPatLit lit ->
-                let litStr = litToCpp lit
-                let bodyStr = 
-                    match case.Guard with
-                    | Some guard -> 
-                        let guardStr = exprToCppCore subst names guard
-                        $"({guardStr} ? {(exprToCppCore subst names case.Body)} : {restStr})"
-                    | None -> exprToCppCore subst names case.Body
-                $"({scrut} == {litStr} ? {bodyStr} : {restStr})"
-            | IRPatVar varId ->
-                let varUsed =
-                    (collectVarRefsIR case.Body).Contains varId ||
-                    (case.Guard |> Option.map (fun g -> (collectVarRefsIR g).Contains varId) |> Option.defaultValue false)
-                if varUsed then
-                    let varName = $"__match_{varId}"
-                    match case.Guard with
-                    | Some guard ->
-                        // Variable pattern with guard, variable used
-                        let guardStr = exprToCppWithVarCore subst names varId varName guard
-                        let bodyStr = exprToCppWithVarCore subst names varId varName case.Body
-                        $$"""[&]() { auto {{varName}} = {{scrut}}; return {{guardStr}} ? {{bodyStr}} : {{restStr}}; }()"""
-                    | None ->
-                        // Variable pattern without guard - always matches, variable used
-                        let bodyStr = exprToCppWithVarCore subst names varId varName case.Body
-                        $$"""[&]() { auto {{varName}} = {{scrut}}; return {{bodyStr}}; }()"""
-                else
-                    match case.Guard with
-                    | Some guard ->
-                        // Variable unused, but has guard
-                        let guardStr = exprToCppCore subst names guard
-                        let bodyStr = exprToCppCore subst names case.Body
-                        $"({guardStr} ? {bodyStr} : {restStr})"
-                    | None ->
-                        // Variable unused, no guard - always matches (like wildcard)
-                        exprToCppCore subst names case.Body
-            | IRPatWild ->
-                match case.Guard with
-                | Some guard ->
-                    let guardStr = exprToCppCore subst names guard
-                    let bodyStr = exprToCppCore subst names case.Body
-                    $"({guardStr} ? {bodyStr} : {restStr})"
-                | None ->
-                    // Wildcard without guard - always matches
-                    exprToCppCore subst names case.Body
-            | IRPatTuple innerPats ->
-                // Tuple pattern - bind each element
-                let rec collectVarBindings (pats: IRPattern list) (idx: int) : (IRId * string) list =
-                    match pats with
-                    | [] -> []
-                    | IRPatVar varId :: rest ->
-                        let varName = $"__match_{varId}"
-                        (varId, varName) :: collectVarBindings rest (idx + 1)
-                    | _ :: rest -> collectVarBindings rest (idx + 1)
-                
-                let bindings = collectVarBindings innerPats 0
-                let bindingDecls = bindings |> List.mapi (fun idx (_, name) ->
-                    $"auto {name} = std::get<{idx}>({scrut})") |> String.concat "; "
-                
-                // Extend names map with bindings
-                let names' = bindings |> List.fold (fun acc (id, name) -> Map.add id name acc) names
-                
-                match case.Guard with
-                | Some guard ->
-                    let guardStr = exprToCppCore subst names' guard
-                    let bodyStr = exprToCppCore subst names' case.Body
-                    $$"""[&]() { {{bindingDecls}}; return {{guardStr}} ? {{bodyStr}} : {{restStr}}; }()"""
-                | None ->
-                    let bodyStr = exprToCppCore subst names' case.Body
-                    $$"""[&]() { {{bindingDecls}}; return {{bodyStr}}; }()"""
-            | IRPatVariant (ctorName, tag, innerOpt, isEnum) ->
-                // Variant pattern - check variant type and optionally bind inner value
-                let checkExpr =
-                    if isEnum then $"{scrut} == {ctorName}"
-                    else $"std::holds_alternative<{ctorName}_T>({scrut})"
-                
-                match innerOpt with
-                | Some (IRPatVar varId) ->
-                    // Variant with inner value binding
-                    let varName = $"__match_{varId}"
-                    let names' = Map.add varId varName names
-                    let extractExpr = $"std::get<{ctorName}_T>({scrut}).value"
-                    let bodyStr = exprToCppCore subst names' case.Body
-                    $$"""({{checkExpr}} ? [&]() { auto {{varName}} = {{extractExpr}}; return {{bodyStr}}; }() : {{restStr}})"""
-                | Some _ ->
-                    // Other inner patterns - fallback
-                    let bodyStr = exprToCppCore subst names case.Body
-                    $"({checkExpr} ? {bodyStr} : {restStr})"
-                | None ->
-                    // Variant without inner value
-                    let bodyStr = exprToCppCore subst names case.Body
-                    $"({checkExpr} ? {bodyStr} : {restStr})"
+                // A parameter pack still spelled as one at codegen was never
+                // specialized (`let head :: tail = A` is the shape the
+                // monomorphizer knows), and a one-slot or non-tuple scrutinee
+                // has no remainder to bind. Refuse by name rather than emit a
+                // body over dangling identifiers, which is what the
+                // pre-rewrite catch-all did.
+                ([ exprError "cons pattern (head :: tail) in a match needs a tuple scrutinee with at least two slots; destructure a parameter pack with a let binding instead" ], [])
+        | IRPatVariant (ctorName, _, innerOpt, isEnum) ->
+            let test =
+                if isEnum then $"{access} == {ctorName}"
+                else $"std::holds_alternative<{ctorName}_T>({access})"
+            match innerOpt with
+            | None -> ([ test ], [])
+            | Some inner ->
+                // The tag test leads, so the payload read below it is
+                // short-circuited away on every other alternative.
+                let (ts, bs) = patCompile $"std::get<{ctorName}_T>({access}).value" None inner
+                (test :: ts, bs)
+
+    /// Compile a pattern against a RUN of slots rather than a single access.
+    /// Both the tuple arm and a cons TAIL land here, which is what keeps
+    /// `h :: (a, b)` reading `std::get<1>` and `std::get<2>` of the original
+    /// instead of rebuilding an intermediate tuple and immediately taking it
+    /// apart again (once per leaf, nested -- an exponential in cons depth).
+    and patCompileSlots (slots: (string * IRType option) list) (pat: IRPattern)
+            : string list * (IRId * string * string) list =
+        match pat with
+        | IRPatWild -> ([], [])
+        | IRPatTuple pats when pats.Length = slots.Length ->
+            List.zip slots pats
+            |> List.map (fun ((a, t), p) -> patCompile a t p)
+            |> mergeParts
+        | IRPatCons (headPat, tailPat) when slots.Length >= 2 ->
+            let (headAcc, headTy) = slots.Head
+            mergeParts [ patCompile headAcc headTy headPat
+                         patCompileSlots slots.Tail tailPat ]
+        | _ ->
+            // The pattern wants the run as ONE value (a binder, a literal, a
+            // variant). Blade has no 1-tuple -- `(x)` IS `x` -- so a
+            // single-slot run is its bare element; that is the same rule
+            // `let head :: tail` applies (Lowering's `subBindingValue`) and
+            // the one TypeCheck types the leaf by.
+            match slots with
+            | [ (a, t) ] -> patCompile a t pat
             | _ ->
-                // Unsupported pattern - fallback
-                $"(true ? {(exprToCppCore subst names case.Body)} : {restStr})"
+                let acc =
+                    $"""std::make_tuple({(slots |> List.map fst |> String.concat ", ")})"""
+                let ty =
+                    if slots |> List.forall (fun (_, t) -> Option.isSome t)
+                    then Some (IRTTuple (slots |> List.map (snd >> Option.get)))
+                    else None
+                patCompile acc ty pat
+
+    /// One arm, given the code for everything after it. `rest` appears twice
+    /// when an arm has BOTH a refutable pattern and a guard (either failure
+    /// falls through to the same place); the emitter this replaced had the
+    /// same shape, and match chains are short.
+    let renderArm (case: IRMatchCase) (restStr: string) : string =
+        let (tests, allBinds) = patCompile scrut (Some scrutTy) case.Pattern
+        let binds =
+            match case.Pattern with
+            | IRPatVar id ->
+                // Economy preserved byte-for-byte from the emitter this
+                // replaced: a TOP-LEVEL binder nobody reads emits neither a
+                // declaration nor the IIFE that would carry it, so `| x -> 1`
+                // stays the bare body it has always been.
+                let used =
+                    (collectVarRefsIR case.Body).Contains id
+                    || (case.Guard
+                        |> Option.map (fun g -> (collectVarRefsIR g).Contains id)
+                        |> Option.defaultValue false)
+                if used then allBinds else []
+            | _ -> allBinds
+        let names' = binds |> List.fold (fun acc (id, name, _) -> Map.add id name acc) names
+        let bodyStr = exprToCppCore subst names' case.Body
+        // The guard runs AFTER the binders (it may read them) and falls
+        // through to the next arm when false -- on the last arm that is the
+        // abort. A guard on a variant arm used to be dropped on the floor
+        // here, taking the arm unconditionally.
+        let guarded =
+            match case.Guard with
+            | Some g -> $"({(exprToCppCore subst names' g)} ? {bodyStr} : {restStr})"
+            | None -> bodyStr
+        let bound =
+            if List.isEmpty binds then guarded
+            else
+                let decls =
+                    binds |> List.map (fun (_, n, init) -> $"auto {n} = {init}") |> String.concat "; "
+                $$"""[&]() { {{decls}}; return {{guarded}}; }()"""
+        if List.isEmpty tests then bound
+        else $"""({(String.concat " && " tests)} ? {bound} : {restStr})"""
+
+    let rec genCase (cs: IRMatchCase list) : string =
+        match cs with
+        | [] -> abortExpr
+        | case :: rest -> renderArm case (genCase rest)
     genCase cases
 
 
@@ -978,6 +1038,32 @@ and renderReduceExpr (subst: SubstMap) (names: Map<IRId, string>) arrExpr kernel
     // `reduce(A, <omp-licensed kernel>, init)` written without `axes = rank`
     // arrives here, and the marker is what tells its author that the clause
     // bought nothing and `axes = rank` is the spelling that would.
+    // A BARE range operand (`reduce(0..n, (+))` in expression position --
+    // kernel bodies / function-body returns, where the lift pass's operand
+    // hoist does not reach): materialize the iota into an IIFE-local, then
+    // re-render the fold over a synthetic named operand carrying the range's
+    // array type (IRParam renders as its bare name and typeOf answers the
+    // carried type, so every bound/elem decision below just works). Binding
+    // and module-scope reduces take the lift road to genRangeBinding instead.
+    // Non-plain ranges (compound/sparse/halo/multi-slot) answer None from the
+    // materializer and fall through to the ordinary refusal.
+    let rangeInline =
+        match arrExpr with
+        | IRRange ([ ix ], _) ->
+            let rname = $"__rng{ix.Id}"
+            materializeInlineForm subst names rname (lazy "int64_t") arrExpr
+            |> Option.map (fun (stmts, _) -> (rname, ix, stmts))
+        | _ -> None
+    match rangeInline with
+    | Some (rname, ix, stmts) ->
+        let arrTy = mkArrayLike { ElemType = IRTScalar ETInt64; IndexTypes = [ix]; IsVirtual = false; Identity = None }
+        let inner = renderReduceExpr subst names (IRParam (rname, 0, arrTy)) kernelExpr initExpr
+        // Expression position: the materialization is spliced into an IIFE,
+        // so there is no statement scope whose exit could carry a free -- the
+        // descriptors are dropped (same unchanged pre-existing leak as
+        // renderLetExpr's inline-form site).
+        $$"""([&]() { {{(stmts |> String.concat " ")}} return {{inner}}; }())"""
+    | None ->
     let arrStr = exprToCppCore subst names arrExpr
     let elemType =
         match inferExprType arrExpr with
@@ -1197,8 +1283,14 @@ and renderUnitStmts (subst: SubstMap) (names: Map<IRId, string>) (expr: IRExpr) 
     | IRLit IRLitUnit -> ""
     | IRAssign _ ->
         $"{(exprToCppCore subst names expr)};"
-    | IRConstraintCheck (cond, message, span) ->
-        $"if (!({(exprToCppCore subst names cond)})) {{ blade_rt::panic(\"BL8001\", \"{message}\", {(panicSpanArgs span)}); }}"
+    | IRConstraintCheck (cond, blCode, message, span) ->
+        $"if (!({(exprToCppCore subst names cond)})) {{ blade_rt::panic(\"{blCode}\", \"{message}\", {(panicSpanArgs span)}); }}"
+    | IRBreakIf cond ->
+        // Inside an expression-context loop render the break still binds to
+        // the innermost emitted `for` (renderUnitStmts' own IRForRange arm),
+        // which is the rec-array recursion loop that synthesized it. No
+        // alloc-scope frees here: this flat-text path never pushes one.
+        $"if ({(exprToCppCore subst names cond)}) {{ break; }}"
     | IRForRange (vid, lo, hi, body) ->
         // Same loop-var naming (__k<id>) and int64_t convention as
         // genForRangeBinding / EmitCpp.forLoopFrom, so inlined kernel
@@ -1389,6 +1481,8 @@ and materializeInlineForm (subst: SubstMap) (names: Map<IRId, string>) (varName:
         materializeNegateConjugateForm subst names varName elemTypeStr.Value form arrExpr
     | IRGram (lExpr, rExpr, sameArray) ->
         materializeGramForm subst names varName elemTypeStr.Value lExpr rExpr sameArray
+    | IRGramApply (lExpr, rExpr, xExpr) ->
+        materializeGramApplyForm subst names varName elemTypeStr.Value lExpr rExpr xExpr
     | IRMatmul (lExpr, rExpr) ->
         materializeMatmulForm subst names varName elemTypeStr.Value lExpr rExpr
     // `elemTypeStr` is deliberately NOT forwarded: eigh produces TWO pools whose
@@ -1401,6 +1495,55 @@ and materializeInlineForm (subst: SubstMap) (names: Map<IRId, string>) (varName:
         materializeEighForm subst names varName operand
     | IRSolve (mExpr, rExpr) ->
         materializeSolveForm subst names varName elemTypeStr.Value mExpr rExpr
+    // `elemTypeStr` not forwarded for lu: a TUPLE value (Float64 factor,
+    // Int64 pivots), both derived from the operand, as for eigh.
+    | IRLu mExpr ->
+        materializeLuForm subst names varName mExpr
+    | IRLuSolve (lExpr, pExpr, rExpr, transposed) ->
+        materializeLuSolveForm subst names varName elemTypeStr.Value lExpr pExpr rExpr transposed
+    // `elemTypeStr` not forwarded: a range's element is always Int64, and the
+    // caller-side inference has no arm for a bare range (same Lazy discipline
+    // as IREigh above -- this arm must not force it).
+    | IRRange (ixs, offset) ->
+        materializeRangeForm subst names varName ixs offset
+    | _ -> None
+
+
+and materializeRangeForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (ixs: IRIndexType list) (offset: IRExpr option) : (string list * MaterializedAlloc list) option =
+    // A BARE range in value position (`let xs = 0..n` / `let r = range<I>`,
+    // `reduce(0..n, (+))` via the lift pass, either behind `|> compute`):
+    // materialize the iota it denotes, x[i] = offset + i. Inside a combinator
+    // a range never becomes a value -- the nest peels it as induction values,
+    // which is the whole point of a virtual array; this arm is only for the
+    // positions that consume a materialized array by name.
+    //
+    // Only the single-slot plain dense form has a standalone value meaning:
+    // compound/sparse/halo slots enumerate coordinate SETS (their "element"
+    // is not a storable position), and a multi-slot range only means anything
+    // to a loop nest -- those answer None and keep their refusal.
+    match ixs with
+    | [ ix ] when ix.IxKind = IxKPlain && ix.Rank = 1
+                  && (match ix.Tag with
+                      | Some t -> not (t.StartsWith haloWinTagPrefix)
+                      | None -> true) ->
+        let boundDim =
+            match tryEvalIntIR ix.Extent with
+            | Some n -> (string n, true)
+            | None -> ($"(size_t)({exprToCppCore subst names ix.Extent})", false)
+        let (extentsDecl, ownedExtents) =
+            emitExtentsTable "" ($"{varName}_extents") 1 [boundDim]
+        let bound = fst boundDim
+        let offStr =
+            match offset with
+            | Some o -> exprToCppCore subst names o
+            | None -> "0"
+        Some (
+            extentsDecl @ [
+                $$"""Array<int64_t, 1> {{varName}} = { new int64_t[{{bound}}], {{varName}}_extents };"""
+                $"for (size_t __ri = 0; __ri < {bound}; __ri++) {varName}[__ri] = (int64_t)__ri + (int64_t)({offStr});"
+            ],
+            [MatRawData (varName, ownedExtents)]
+        )
     | _ -> None
 
 
@@ -2323,6 +2466,11 @@ and materializeGramForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
         // complex is detected on the stripped type
         let isComplexElem (t: IRType) =
             match stripUnits t with IRTScalar (ETComplex64 | ETComplex128) -> true | _ -> false
+        // inferGram REFUSES operands whose element types differ (they must be
+        // converted explicitly at the call site), so the two agree here and
+        // this reads the agreed type off the left one. The complex arms
+        // remain because a unit-annotated or otherwise wrapped pair can still
+        // present differently-spelled but unified types.
         let outElem =
             if isComplexElem la.ElemType then la.ElemType
             elif isComplexElem ra.ElemType then ra.ElemType
@@ -2481,6 +2629,25 @@ and materializeGramForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
             // dense m x p
             let (extentDecl, ownedExtents) =
                 emitExtentsTable "" extentsName 2 [mDim; pDim]
+            // CONTRACTED-DIM RUNTIME GUARD (BL8011). The checker refuses a
+            // literal disagreement between A's and B's trailing extents
+            // (inferGram); inside a function over `T^2` parameters the
+            // extents are the caller's and the k-loop runs to A's `n`, so a
+            // shorter B was read past its row end (`[[3]]` for a 1x3 against
+            // a 1x2, where the interpreter threw). Emitted only when the two
+            // are not the same literal, ahead of both the shim and the
+            // native loops; the same-array arm has nothing to compare.
+            // BLOCK-free lines: this list may be space-joined into an IIFE.
+            let contractGuard =
+                match literalExtentOfArray la 1, literalExtentOfArray ra 1 with
+                | Some a, Some b when a = b -> []
+                | _ ->
+                    let rInner = literalOrRuntimeExtentOfArray ra rName 1
+                    [ $$"""if ((int64_t)({{nExtent}}) != (int64_t)({{rInner}})) {"""
+                      $"    std::cerr << \"Blade runtime: gram(A, B) contracts over A's trailing axis (\" << {nExtent} << \") and B's trailing axis (\" << {rInner} << \"), which must be equal\" << std::endl;"
+                      "    blade_rt::panic(\"BL8011\", \"co-iteration extent mismatch\", nullptr, 0);"
+                      "}" ]
+            let extentDecl = extentDecl @ contractGuard
             let allocDecl =
                 $"Array<{outElemStr}, 2> {varName} = {{ allocate<typename promote<{outElemStr}, 2>::type, nullptr>({extentsName}), {extentsName} }};"
             let loop =
@@ -2641,6 +2808,106 @@ and materializeGramForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
                   [MatPool (varName, outElemStr, 2, "nullptr", None, ownedExtents)])
      | _ -> None)
 
+
+and materializeGramApplyForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (lExpr: IRExpr) (rExpr: IRExpr) (xExpr: IRExpr) : (string list * MaterializedAlloc list) option =
+    // gram_apply(A, B, x) = A * (B^H * x):  y[i] = sum_k A[i][k] * t[k], with
+    // t[k] = sum_j conj(B[j][k]) * x[j]. A : m x n, B : p x n, x : p. TWO
+    // rank-1 pools (t: n cells, y: m cells) and no m x p matrix -- the action
+    // of gram(A, B) declared as such (docs/plans/structural/05, 3.2). Both
+    // halves fold ASCENDING from the element zero, one accumulator per output
+    // cell, so the per-cell operation sequence is fixed and the interpreter
+    // twin (gramApplyArray) reproduces it bit for bit; no reassociation, no
+    // licence. The first half walks B's rows in order (unit-stride reads, the
+    // n accumulators live in the t pool); the second half's rows are
+    // independent and thread without a licence, exactly as gram's nest does.
+    // Dispatch (BLAS on) is two L2 calls resolved by LinAlgPatterns like
+    // every node route: the transposed gemv adapter for t, the plain one for
+    // y; no route emits the loops below. Block comments only: this list may
+    // be space-joined into a single-line IIFE at an expression position.
+    let lName = exprToCppCore subst names lExpr
+    let rName = exprToCppCore subst names rExpr
+    let xName = exprToCppCore subst names xExpr
+    let lTy = inferExprType lExpr
+    let rTy = inferExprType rExpr
+    let xTy = inferExprType xExpr
+    (match lTy, rTy, xTy with
+     | ArrayElem la, ArrayElem ra, ArrayElem xa ->
+        let isComplexElem (t: IRType) =
+            match stripUnits t with IRTScalar (ETComplex64 | ETComplex128) -> true | _ -> false
+        let outElem =
+            if isComplexElem la.ElemType then la.ElemType
+            elif isComplexElem ra.ElemType then ra.ElemType
+            elif isComplexElem xa.ElemType then xa.ElemType
+            else la.ElemType
+        let outElemStr = irTypeToCpp outElem
+        let mExtent = literalOrRuntimeExtentOfArray la lName 0
+        let nExtent = literalOrRuntimeExtentOfArray la lName 1
+        let pExtent = literalOrRuntimeExtentOfArray ra rName 0
+        let mDim = extentDimOfArray la lName 0
+        let nDim = extentDimOfArray la lName 1
+        let tName = $"{varName}__t"
+        let tExtentsName = $"{tName}_extents"
+        let extentsName = $"{varName}_extents"
+        // Runtime twins of the checker's static agreement (BL8011): B's
+        // trailing axis against A's, x's extent against B's leading axis.
+        // Emitted only when the two are not the same literal.
+        let guardIf (litA: int64 option) (litB: int64 option) (lhs: string) (rhs: string) (what: string) =
+            match litA, litB with
+            | Some a, Some b when a = b -> []
+            | _ ->
+                [ $$"""if ((int64_t)({{lhs}}) != (int64_t)({{rhs}})) {"""
+                  $"    std::cerr << \"Blade runtime: gram_apply(A, B, x): {what} (\" << {lhs} << \" vs \" << {rhs} << \")\" << std::endl;"
+                  "    blade_rt::panic(\"BL8011\", \"co-iteration extent mismatch\", nullptr, 0);"
+                  "}" ]
+        let guards =
+            guardIf (literalExtentOfArray la 1) (literalExtentOfArray ra 1) nExtent (literalOrRuntimeExtentOfArray ra rName 1) "A's and B's trailing axes must be equal"
+            @ guardIf (literalExtentOfArray ra 0) (literalExtentOfArray xa 0) pExtent (literalOrRuntimeExtentOfArray xa xName 0) "x must have B's leading extent"
+        let (tExtentDecl, tOwned) = emitExtentsTable "" tExtentsName 1 [nDim]
+        let (yExtentDecl, yOwned) = emitExtentsTable "" extentsName 1 [mDim]
+        let tAlloc = $"Array<{outElemStr}, 1> {tName} = {{ allocate<typename promote<{outElemStr}, 1>::type, nullptr>({tExtentsName}), {tExtentsName} }};"
+        let yAlloc = $"Array<{outElemStr}, 1> {varName} = {{ allocate<typename promote<{outElemStr}, 1>::type, nullptr>({extentsName}), {extentsName} }};"
+        let halves = Blade.LinAlgPatterns.classifyGramApply lExpr rExpr xExpr
+        let resolvedT = halves |> Option.bind (fun (t, _) -> Blade.LinAlgPatterns.resolveNodeRoute t)
+        let resolvedY = halves |> Option.bind (fun (_, y) -> Blade.LinAlgPatterns.resolveNodeRoute y)
+        let lCells = denseCellCountExpr lTy lName
+        let rCells = denseCellCountExpr rTy rName
+        for resolved in [ resolvedT; resolvedY ] do
+            match resolved with
+            | Some (Blade.LinAlgPatterns.CudaBlas, _) -> (cudaLinalgUsedCell ()).Value <- true
+            | Some (Blade.LinAlgPatterns.HostBlas, _) -> (linalgUsedCell ()).Value <- true
+            | None -> ()
+        let tLoop =
+            match resolvedT with
+            | Some (_, entry) ->
+                [ $"/* {(dispatchMarkerTag resolvedT)} dispatch: gram_apply(A, B, x), t = B^H x */ {entry}({pExtent}, {nExtent}, {rName}.data, {rCells}, {xName}.data, {tName}.data);" ]
+            | None ->
+                [ $$"""for (size_t __gk = 0; __gk < {{nExtent}}; __gk++) { {{tName}}[__gk] = {{outElemStr}}(); }"""
+                  $$"""for (size_t __gj = 0; __gj < {{pExtent}}; __gj++) {"""
+                  $"    const {(irTypeToCpp ra.ElemType)}* BLADE_RESTRICT __growj = &{rName}[__gj][0];"
+                  $"    const {(irTypeToCpp xa.ElemType)} __gx = {xName}[__gj];"
+                  $$"""    for (size_t __gk = 0; __gk < {{nExtent}}; __gk++) {"""
+                  $"        {tName}[__gk] += nested_array_utilities::conj_scalar(__growj[__gk]) * __gx;"
+                  "    }"
+                  "}" ]
+        let yLoop =
+            match resolvedY with
+            | Some (_, entry) ->
+                [ $"/* {(dispatchMarkerTag resolvedY)} dispatch: gram_apply(A, B, x), y = A t */ {entry}({mExtent}, {nExtent}, {lName}.data, {lCells}, {tName}.data, {varName}.data);" ]
+            | None ->
+                [ (if ompThreadEmissionEnabled () then "BLADE_OMP_PARALLEL_FOR"
+                   else ompThreadsSuppressedBlockMarker ())
+                  $$"""for (size_t __gi = 0; __gi < {{mExtent}}; __gi++) {"""
+                  $"    const {(irTypeToCpp la.ElemType)}* BLADE_RESTRICT __growi = &{lName}[__gi][0];"
+                  $"    {outElemStr} __gacc = {outElemStr}();"
+                  $$"""    for (size_t __gk = 0; __gk < {{nExtent}}; __gk++) {"""
+                  $"        __gacc += __growi[__gk] * {tName}[__gk];"
+                  "    }"
+                  $"    {varName}[__gi] = __gacc;"
+                  "}" ]
+        Some (guards @ tExtentDecl @ [ tAlloc ] @ tLoop @ yExtentDecl @ [ yAlloc ] @ yLoop,
+              [ MatPool (tName, outElemStr, 1, "nullptr", None, tOwned)
+                MatPool (varName, outElemStr, 1, "nullptr", None, yOwned) ])
+     | _ -> None)
 
 and materializeMatmulForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (lExpr: IRExpr) (rExpr: IRExpr) : (string list * MaterializedAlloc list) option =
     // matmul(A, B) = A * B:  result[i][j] = sum_t A[i][t] * B[t][j].
@@ -2935,6 +3202,151 @@ and materializeEighForm (subst: SubstMap) (names: Map<IRId, string>) (varName: s
             Some ([ refusalErrorLine "" "Blade codegen: eigh reached emission with no LAPACK route (availability gate changed after elaboration?); the synthesized Jacobi path is chosen at elaboration time and cannot be recovered here" ], [])
      | _ -> None)
 
+
+and materializeLuForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (mExpr: IRExpr) : (string list * MaterializedAlloc list) option =
+    // lu(A) -> (LU, piv): the partial-pivoted LU `materializeSolveForm`
+    // computes, KEPT. LU is a fresh n x n dense pool holding L (unit lower,
+    // multipliers below the diagonal) and U (on and above); piv is a fresh
+    // n-cell Int64 pool, piv[k] = the row swapped with row k at step k
+    // (0-based, LAPACK's ipiv less one). The elimination is the solve form's
+    // statement for statement -- same working-copy order, same STRICT `>`
+    // pivot rule, same exact-zero singularity test (BL8007) -- so
+    // `lu_solve(lu(A), b)` reproduces `solve(A, b)` to the bit, and the
+    // interpreter twin `luArrays` reproduces this. Routed arm: `?getrf`
+    // through `blade_lapack::blade_lu_d`, which bridges the column-major
+    // scratch both ways and converts the pivots; that arm agrees to ~1e-14
+    // like every LAPACK route, so the differential harnesses run gate-off.
+    let aName = exprToCppCore subst names mExpr
+    (match inferExprType mExpr with
+     | ArrayElem aa ->
+        let elemStr = irTypeToCpp aa.ElemType
+        let nExtent = $"{aName}.extents[0]"
+        let nName = $"{varName}__n"
+        let luName = $"{varName}__lu"
+        let pivName = $"{varName}__piv"
+        let infoName = $"{varName}__info"
+        let luExtents = $"{luName}_extents"
+        let pivExtents = $"{pivName}_extents"
+        let call = Blade.LinAlgPatterns.classifyLu aa
+        let shimEntry = call |> Option.bind (Blade.LinAlgPatterns.shimEntryPoint Blade.LinAlgPatterns.HostBlas)
+        match shimEntry with
+        | Some _ -> (lapackUsedCell ()).Value <- true
+        | None -> ()
+        let (luExtentsDecl, luOwned) = emitExtentsTable "" luExtents 2 [(nExtent, false); (nExtent, false)]
+        let (pivExtentsDecl, pivOwned) = emitExtentsTable "" pivExtents 1 [(nExtent, false)]
+        let decls =
+            luExtentsDecl
+            @ [ arrayAlloc { Ind = ""; Elem = elemStr; Rank = 2; Name = luName; Symm = "nullptr"; Strict = None; Extents = luExtents } ]
+            @ pivExtentsDecl
+            @ [ arrayAlloc { Ind = ""; Elem = "int64_t"; Rank = 1; Name = pivName; Symm = "nullptr"; Strict = None; Extents = pivExtents } ]
+        let panicLine = "blade_rt::panic(\"BL8007\", \"lu(A): the matrix is SINGULAR -- LU factorization found an exactly-zero pivot\", nullptr, 0);"
+        let body =
+            match shimEntry with
+            | Some entry ->
+                [ $"const size_t {nName} = {nExtent};"
+                  $"/* lapack dispatch: lu(A) -> (LU, piv), dense square operand */ int {infoName} = {entry}({nName}, {aName}.data, {luName}.data, {pivName}.data);"
+                  $$"""if ({{infoName}} != 0) { {{panicLine}} }""" ]
+            | None ->
+                [ "/* lu factor: partial-pivoted, multipliers stored below the diagonal, pivot rows in piv */"
+                  $"const size_t {nName} = {nExtent};"
+                  $$"""for (size_t __si = 0; __si < {{nName}}; __si++) { for (size_t __sj = 0; __sj < {{nName}}; __sj++) { {{luName}}[__si][__sj] = {{aName}}[__si][__sj]; } }"""
+                  $$"""for (size_t __sk = 0; __sk < {{nName}}; __sk++) {"""
+                  "    size_t __sp = __sk;"
+                  $"    {elemStr} __sbig = std::fabs({luName}[__sk][__sk]);"
+                  $$"""    for (size_t __si = __sk + 1; __si < {{nName}}; __si++) {"""
+                  $"        {elemStr} __sm = std::fabs({luName}[__si][__sk]);"
+                  "        if (__sm > __sbig) { __sbig = __sm; __sp = __si; }"
+                  "    }"
+                  $$"""    if ({{luName}}[__sp][__sk] == {{elemStr}}(0)) { {{panicLine}} }"""
+                  $"    {pivName}[__sk] = (int64_t)__sp;"
+                  "    if (__sp != __sk) {"
+                  $$"""        for (size_t __sj = 0; __sj < {{nName}}; __sj++) { {{elemStr}} __st = {{luName}}[__sk][__sj]; {{luName}}[__sk][__sj] = {{luName}}[__sp][__sj]; {{luName}}[__sp][__sj] = __st; }"""
+                  "    }"
+                  $$"""    for (size_t __si = __sk + 1; __si < {{nName}}; __si++) {"""
+                  $"        {elemStr} __sf = {luName}[__si][__sk] / {luName}[__sk][__sk];"
+                  $"        {luName}[__si][__sk] = __sf;"
+                  $$"""        for (size_t __sj = __sk + 1; __sj < {{nName}}; __sj++) { {{luName}}[__si][__sj] = {{luName}}[__si][__sj] - __sf * {{luName}}[__sk][__sj]; }"""
+                  "    }"
+                  "}" ]
+        let tupleLine =
+            $"std::tuple<Array<{elemStr}, 2>, Array<int64_t, 1>> {varName} = std::make_tuple({luName}, {pivName});"
+        Some (decls @ ["{"] @ body @ ["}"; tupleLine],
+              [ MatPool (luName, elemStr, 2, "nullptr", None, luOwned)
+                MatPool (pivName, "int64_t", 1, "nullptr", None, pivOwned) ])
+     | _ -> None)
+
+and materializeLuSolveForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (lExpr: IRExpr) (pExpr: IRExpr) (rExpr: IRExpr) (transposed: bool) : (string list * MaterializedAlloc list) option =
+    // lu_solve(LU, piv, b) -> x with A x = b from the stored factors: x = b,
+    // the pivot swaps applied in step order, the multipliers applied in the
+    // solve form's fused order (k outer, i inner), then the same back
+    // substitution -- bitwise `solve(A, b)`. lu_solve_t solves A^T x = b: with
+    // P A = L U, A^T = U^T L^T P, so U^T y = b (forward, divide by the
+    // diagonal), L^T w = y (backward, unit diagonal), x = P^T w (the swaps
+    // undone in REVERSE step order). Interpreter twin: `luSolveArray`.
+    // Routed arm: `?getrs` with 'N' / 'T' through `blade_lapack::blade_lu_solve_d`.
+    let lName = exprToCppCore subst names lExpr
+    let pName = exprToCppCore subst names pExpr
+    let bName = exprToCppCore subst names rExpr
+    (match inferExprType lExpr, inferExprType rExpr with
+     | ArrayElem la, ArrayElem _ ->
+        let outElemStr = irTypeToCpp la.ElemType
+        let nExtent = $"{lName}.extents[0]"
+        let extentsName = $"{varName}_extents"
+        let nName = $"{varName}__n"
+        let infoName = $"{varName}__info"
+        let call = Blade.LinAlgPatterns.classifyLuSolve la
+        let shimEntry = call |> Option.bind (Blade.LinAlgPatterns.shimEntryPoint Blade.LinAlgPatterns.HostBlas)
+        match shimEntry with
+        | Some _ -> (lapackUsedCell ()).Value <- true
+        | None -> ()
+        let (extentDecl, ownedExtents) = emitExtentsTable "" extentsName 1 [(nExtent, false)]
+        let allocDecl =
+            $"Array<{outElemStr}, 1> {varName} = {{ allocate<typename promote<{outElemStr}, 1>::type, nullptr>({extentsName}), {extentsName} }};"
+        let modeWord = if transposed then "transposed" else "plain"
+        let transArg = if transposed then 1 else 0
+        let body =
+            match shimEntry with
+            | Some entry ->
+                [ $"const size_t {nName} = {nExtent};"
+                  $"/* lapack dispatch: lu_solve(LU, piv, b) -> x, {modeWord} */ int {infoName} = {entry}({nName}, {lName}.data, {pName}.data, {bName}.data, {varName}.data, {transArg});"
+                  $$"""if ({{infoName}} != 0) { blade_rt::panic("BL8007", "lu_solve: the stored factorization is invalid", nullptr, 0); }""" ]
+            | None when not transposed ->
+                [ "/* lu solve: pivots, then L (unit lower), then U */"
+                  $"const size_t {nName} = {nExtent};"
+                  $$"""for (size_t __si = 0; __si < {{nName}}; __si++) { {{varName}}[__si] = {{bName}}[__si]; }"""
+                  $$"""for (size_t __sk = 0; __sk < {{nName}}; __sk++) {"""
+                  $"    size_t __sp = (size_t){pName}[__sk];"
+                  $$"""    if (__sp != __sk) { {{outElemStr}} __sxt = {{varName}}[__sk]; {{varName}}[__sk] = {{varName}}[__sp]; {{varName}}[__sp] = __sxt; }"""
+                  $$"""    for (size_t __si = __sk + 1; __si < {{nName}}; __si++) { {{varName}}[__si] = {{varName}}[__si] - {{lName}}[__si][__sk] * {{varName}}[__sk]; }"""
+                  "}"
+                  $$"""for (size_t __skk = {{nName}}; __skk > 0; __skk--) {"""
+                  "    size_t __sk = __skk - 1;"
+                  $"    {outElemStr} __ss = {varName}[__sk];"
+                  $$"""    for (size_t __sj = __sk + 1; __sj < {{nName}}; __sj++) { __ss = __ss - {{lName}}[__sk][__sj] * {{varName}}[__sj]; }"""
+                  $"    {varName}[__sk] = __ss / {lName}[__sk][__sk];"
+                  "}" ]
+            | None ->
+                [ "/* lu solve transposed: U^T (forward), L^T (backward), then the pivots undone */"
+                  $"const size_t {nName} = {nExtent};"
+                  $$"""for (size_t __sk = 0; __sk < {{nName}}; __sk++) {"""
+                  $"    {outElemStr} __ss = {bName}[__sk];"
+                  $$"""    for (size_t __sj = 0; __sj < __sk; __sj++) { __ss = __ss - {{lName}}[__sj][__sk] * {{varName}}[__sj]; }"""
+                  $"    {varName}[__sk] = __ss / {lName}[__sk][__sk];"
+                  "}"
+                  $$"""for (size_t __skk = {{nName}}; __skk > 0; __skk--) {"""
+                  "    size_t __sk = __skk - 1;"
+                  $"    {outElemStr} __ss = {varName}[__sk];"
+                  $$"""    for (size_t __sj = __sk + 1; __sj < {{nName}}; __sj++) { __ss = __ss - {{lName}}[__sj][__sk] * {{varName}}[__sj]; }"""
+                  $"    {varName}[__sk] = __ss;"
+                  "}"
+                  $$"""for (size_t __skk = {{nName}}; __skk > 0; __skk--) {"""
+                  "    size_t __sk = __skk - 1;"
+                  $"    size_t __sp = (size_t){pName}[__sk];"
+                  $$"""    if (__sp != __sk) { {{outElemStr}} __sxt = {{varName}}[__sk]; {{varName}}[__sk] = {{varName}}[__sp]; {{varName}}[__sp] = __sxt; }"""
+                  "}" ]
+        Some (extentDecl @ [allocDecl; "{"] @ body @ ["}"],
+              [MatPool (varName, outElemStr, 1, "nullptr", None, ownedExtents)])
+     | _ -> None)
 
 and materializeSolveForm (subst: SubstMap) (names: Map<IRId, string>) (varName: string) (elemTypeStr: string) (mExpr: IRExpr) (rExpr: IRExpr) : (string list * MaterializedAlloc list) option =
     // solve(A, b) -> x with A.x = b, by partial-pivoted LU. A : n x n dense,

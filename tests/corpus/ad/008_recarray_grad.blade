@@ -5,12 +5,12 @@ import ad as ad
 //   s(0) = 0;  s(n) = s(n-1) + w(n-1) * xs(n-1)   (a prefix sum)
 // read at the final element hv = s(2) = w0*xs0 + w1*xs1.
 //
-// A same-direction adjoint loop is wrong for a genuine scan, so grad's
-// pre-pass unrolls the additive prefix recurrence into an equivalent
-// triangular scatter-add (each s(k) an independent accumulation of its
-// increments) — semantically identical, and exactly differentiable by the
-// existing loop machinery. dh(i) = xs(i) for the read prefix, 0 past it.
-// Verified against a central finite-difference check: [4, 5, 0].
+// The recurrence lowers to the direct loop `s(n) = s(n-1) + w(n-1)*xs(n-1)`
+// in both AD modes; reverse mode recognizes the additive carry
+// (GradNormalize.CarryLoop) and runs the SAME loop backwards for its
+// adjoint -- O(n), where the triangular scatter-add it used to unroll into
+// was O(n^2) (docs/plans/structural/01). dh(i) = xs(i) for the read prefix,
+// 0 past it. Verified against a central finite-difference check: [4, 5, 0].
 // ============================================================================
 let xs = [4.0, 5.0, 6.0]
 function h(w: Array<Float like Idx<3>>) -> Float = {

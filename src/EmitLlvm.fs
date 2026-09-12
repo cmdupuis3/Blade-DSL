@@ -1933,6 +1933,19 @@ and private emitRaw (c: Ctx) (e: IRExpr) : Val =
 
     | IRUnaryOp (op, x) -> emitUnary c op x
 
+    // fma(a, b, c) -> llvm.fma.f64: the fused op is the semantics, so it is
+    // emitted as the intrinsic (not fmul+fadd with `contract`), and it
+    // carries NO fast-math flags -- correctly rounded on every lane.
+    | IRFma (a, b, cc) ->
+        need c "declare double @llvm.fma.f64(double, double, double)"
+        let va = coerce c ScF64 (emitExpr c a)
+        let vb = coerce c ScF64 (emitExpr c b)
+        let vc = coerce c ScF64 (emitExpr c cc)
+        let dest = freshReg c
+        ln c (renderCall { Dest = Some dest; RetTy = ScF64; Callee = "@llvm.fma.f64"
+                           Args = [ ScF64, va.Reg; ScF64, vb.Reg; ScF64, vc.Reg ] })
+        { Reg = dest; Ty = ScF64 }
+
     | IRIf (cond, tb, fb) ->
         let resTy = requireScalar "an if-expression" (typeOf e)
         let cv = coerce c ScBool (emitExpr c cond)
@@ -2018,6 +2031,14 @@ and private emitRaw (c: Ctx) (e: IRExpr) : Val =
     // already turned into hoisted lag bindings and clamped, implicitly-zero
     // guarded reads -- and the rank-k dense fold `reduce(A, op, axes = k)`.
     | IRForRange (vid, lo, hi, body) -> emitForRange c vid lo hi body
+
+    // The rec-array `while` guard's early exit (and the budget abort that
+    // rides with it as IRConstraintCheck) would need a conditional-branch
+    // loop shape this emitter's single-block for-range does not have yet.
+    // Refuse LOUDLY: a silently dropped break would run the full budget and
+    // overwrite the frozen slices.
+    | IRBreakIf _ ->
+        refuse "a `while`-guarded recursive array (early exit / IRBreakIf) -- not supported by the llvm lane yet"
 
     // ---- array-derived scalars -------------------------------------------
     // A read CONSUMES its base where it can: one cell of a producer costs one
@@ -2726,6 +2747,17 @@ and private classifyValue (c: Ctx) (e: IRExpr) : ValKind =
     | IRParallel _ | IRFusion _ -> VTuple (emitTupleParts c e)
     | IRCompute (IRParallel _ | IRFusion _ | IRTuple _) -> VTuple (emitTupleParts c e)
     | IRTuple _ -> VTuple (emitTupleParts c e)
+    // A BARE range in value position (`let xs = 0..n`, its `|> compute`
+    // form, the lift pass's hoisted reduce operand): an ARRAY value, though
+    // `typeOf` answers the IntValued tier's Int64 scalar (the element under
+    // nest peeling), so the type fall-through below would misroute it to the
+    // scalar lane's refusal. emitArr already carries the descriptor;
+    // materialize it (rather than leave it AVirt) to mirror the C++ lane's
+    // genRangeBinding -- every Blade binding except `static` is assignable,
+    // and a write needs a pool. Non-plain/multi-slot ranges still refuse
+    // inside emitArr/staticExtentOf, keeping the lane's clean-skip contract.
+    | IRRange _ -> VArray (materialize c (emitArr c e))
+    | IRCompute (IRRange _ as inner) -> VArray (materialize c (emitArr c inner))
     | _ ->
         match Blade.IR.stripUnits (typeOf e) with
         | ArrayElem _ -> VArray (emitArr c e)

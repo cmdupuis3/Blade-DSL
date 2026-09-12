@@ -1,0 +1,18 @@
+// TEST: Enumerable Domain: A Closed-Form Band Is Not Box-Capped
+// The counting layer refuses `idx_card` over a box above 100,000 cells (the
+// cap is on the BOX, index-types/153); a closed-form domain has no box to
+// scan, so `range<Band509>` over a 509 x 509 box (259,081 cells) iterates
+// its 3,551 solutions directly: n(2w+1) - w(w+1) = 509*7 - 12. The two
+// inequality spelling and the `abs` spelling are the same difference
+// constraints. Non-power-of-two extent on purpose.
+static struct Band509 {
+    i: Int<min=0, max=508>,
+    j: Int<min=0, max=508>
+} where i - j <= 3, j - i <= 3
+
+let R = method_for(range<Band509>) <@> lambda(i, j) -> i + j |> compute
+let total = reduce(R, (+))
+// EXPECT: total = 1803908
+let ones = method_for(range<Band509>) <@> lambda(i, j) -> 1 |> compute
+let cells = reduce(ones, (+))
+// EXPECT: cells = 3551

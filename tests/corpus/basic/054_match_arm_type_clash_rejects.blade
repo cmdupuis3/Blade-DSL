@@ -1,0 +1,13 @@
+// TEST: Match Arm Type Clash (rejects)
+// ============================================================================
+// Arm result types must unify. The old inferMatch discarded the unify
+// result ("lenient cross-unify"), so an array arm and a scalar arm coexisted
+// through `check` and died as a raw g++ ternary error.
+
+type A = Idx<2>
+let arr: Array<Float like A> = [1.0, 2.0]
+let x = 5
+let r = match x with
+    | n if n > 100 -> arr
+    | _ -> 0
+// ERROR: BL3001

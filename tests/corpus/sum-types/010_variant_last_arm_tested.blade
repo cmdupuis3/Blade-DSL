@@ -1,0 +1,16 @@
+// TEST: Variant Last Arm Is Tested (aborts)
+// ============================================================================
+// The emitter used to assume the LAST arm always matches and dropped its tag
+// test, so a match whose only arm names the wrong constructor extracted the
+// wrong alternative -- `std::get<Some_T>` on a `None` value, i.e. a C++
+// `std::bad_variant_access` rather than Blade's own diagnostic. The
+// interpreter tested the tag and panicked BL8002; the twins disagreed on
+// what "no arm matched" means. Every arm carries its test now.
+
+type Option = Some : Int64 | None
+
+let x = None
+let r = match x with
+    | Some(v) -> v
+r
+// ABORT: error[BL8002]

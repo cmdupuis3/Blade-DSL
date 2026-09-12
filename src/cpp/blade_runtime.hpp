@@ -47,8 +47,14 @@ namespace blade_rt {
   // panic call added to another runtime header would silently cost those
   // kernels their trace frame -- add one only with a matching
   // resolveShadowFrames rule (tripwire in tests/Test_Diagnostics.fs).
+  // The failure that ended the run, for the run record (blade_run_record.hpp
+  // reads these at exit): empty code = the program exited normally.
+  inline const char* exit_code = "";
+  inline const char* exit_message = "";
   [[noreturn]] inline void panic(const char* code, const char* msg,
                                  const char* file, int line) {
+    exit_code = code;
+    exit_message = msg;
     std::cerr << "error[" << code << "]: " << msg << "\n";
     if (file && line > 0) std::cerr << "  --> " << file << ":" << line << "\n";
     int d = depth < 64 ? depth : 64;

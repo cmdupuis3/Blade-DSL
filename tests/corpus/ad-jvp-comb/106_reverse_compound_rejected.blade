@@ -1,0 +1,30 @@
+// TEST: C1 Reverse Refuses compound By Name (rejects)
+// `compound` and `<|:>` are the two C1 linear-closure members that forward
+// mode differentiates (they are `LinearForm`s) and reverse mode does not:
+// `adjointOfInit` has a flow for every OTHER member -- alias, `transpose`,
+// `stack`, `sequence`, `replicate`, `join`, `guard`, `pure`, `compute`,
+// `sort`, `gram` -- and none for these.
+//
+// Both used to land on ONE message, "must be initialized by an array literal
+// (aliases are not differentiable)", which is true of an alias and actively
+// misleading here: `compound` is not an alias and its shape is not the
+// problem. The problem is that its adjoint is the scatter `cot <|:> zeros`
+// (plan-ad-combinators.md 2.12 -- the surface DOES have the transpose), a
+// whole-array statement the reverse lane has no rule for, over a compacted
+// extent that is a RUNTIME value the static shape env cannot hold.
+// ERROR: BL5500
+// ERROR-CONTAINS: a GATHER through a mask
+import ad as ad
+
+type I = Idx<4>
+
+let keep = [true, false, true, true]
+
+function f(a: Array<Float like I>) -> Float = {
+    let c = compound(a, keep)
+    c(0) + c(1)
+}
+
+let mut da = [0.0, 0.0, 0.0, 0.0]
+let v = ad.grad(f)([1.0, 2.0, 3.0, 4.0], da)
+v

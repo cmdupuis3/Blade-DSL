@@ -50,7 +50,7 @@ let private forIn (var: string) (lo: Expr) (hi: Expr) (body: Stmt list) =
 let private meanE arr n = divE (syn (ExprReduce (arr, syn (ExprSection OpAdd), None, None))) (fLit n)
 let private prodsumE args = syn (ExprApp (v "prodsum", args))
 let private commWhere (names: string list) =
-    Some { Commutativity = [names]; Antisymmetry = []; Parallel = []; TDims = []; Custom = [] }
+    Some { Commutativity = [names]; Antisymmetry = []; Parallel = []; Repro = false; TDims = []; Custom = [] }
 // Full-span construction wrappers (stamp the ambient synthSpan); structural combinators only, scalar helpers above already wrap.
 let private appE f args = syn (ExprApp (f, args))
 let private arrLitE (cells: Expr list) = syn (ExprArrayLit cells)
@@ -314,6 +314,7 @@ let rec private anyExpr (p: Expr -> bool) (e: Expr) : bool =
     | ExprKind.ExprMask (a, pr) | ExprKind.ExprCompound (a, pr) | ExprKind.ExprSparse (a, pr) | ExprKind.ExprGroupBy (a, pr)
     | ExprKind.ExprIntersect (a, pr) | ExprKind.ExprUnion (a, pr) | ExprKind.ExprContains (a, pr)
     | ExprKind.ExprSort (a, pr) | ExprKind.ExprGram (a, pr) -> any a || any pr
+    | ExprKind.ExprGramApply (a, b, x) -> any a || any b || any x
     | ExprKind.ExprReduce (a, k, i, _) -> any a || any k || (i |> Option.map any |> Option.defaultValue false)
     | ExprKind.ExprAssign (l, r) -> any l || any r
     | _ -> false
@@ -1047,7 +1048,7 @@ let private elabMixedCumulants (ctx: Ctx) (span: Span) (outName: string) (bindin
                     let commGroups = [ xParams; yParams ] |> List.filter (fun g -> g.Length >= 2)
                     let whereC =
                         if commGroups.IsEmpty then None
-                        else Some { Commutativity = commGroups; Antisymmetry = []; Parallel = []; TDims = []; Custom = [] }
+                        else Some { Commutativity = commGroups; Antisymmetry = []; Parallel = []; Repro = false; TDims = []; Custom = [] }
                     let mkDecl name value = { Value = DeclLet { Pattern = pvar name; Type = None; Value = value; Mutability = BindLet }; Span = span }
                     Ok [ mkDecl lName (methodForE ((List.replicate p (v xName)) @ (List.replicate q (v yName))))
                          mkDecl kName (lambdaE ps whereC (cumulantKernelBody r (float nX)))
@@ -3081,7 +3082,8 @@ let private elabMh (ctx: Ctx) (span: Span) (chainName: string) (binding: Binding
                                     SeedArm = Some ("__s", v x0N)
                                     PrefixVar = "__p"
                                     StepVar = tN
-                                    SliceExpr = appE (v stepN) [appE (v "__p") [subE (v tN) (iLit 1)]; v tN] }) }
+                                    SliceExpr = appE (v stepN) [appE (v "__p") [subE (v tN) (iLit 1)]; v tN]
+                                    Guard = None }) }
                 [ bind x0N x0E
                   bind scN scaleE
                   bind keyN keyE
@@ -3162,7 +3164,8 @@ let private elabHmc (ctx: Ctx) (span: Span) (chainName: string) (binding: Bindin
                                 SeedArm = Some ("__s", v x0N)
                                 PrefixVar = "__p"
                                 StepVar = tN
-                                SliceExpr = appE (v stepN) [appE (v "__p") [subE (v tN) (iLit 1)]; v tN] }) }
+                                SliceExpr = appE (v stepN) [appE (v "__p") [subE (v tN) (iLit 1)]; v tN]
+                                Guard = None }) }
             Ok ([ bind x0N x0E
                   bind epsN epsE
                   bind eps2N (divE (v epsN) (fLit 2.0))
@@ -3983,7 +3986,8 @@ let rec private stripQualified (aliases: Set<string>) (e: Expr) : Expr =
     | ExprKind.ExprRecArray def ->
         inheritSpan e (ExprRecArray { def with
                                         SeedArm = def.SeedArm |> Option.map (fun (sv, se) -> (sv, r se))
-                                        SliceExpr = r def.SliceExpr })
+                                        SliceExpr = r def.SliceExpr
+                                        Guard = def.Guard |> Option.map r })
     // The rest of the expression algebra. The wildcard is deliberately gone so FS0025 flags AST growth here rather than leaving
     // a qualified name to fail downstream as an unbound variable.
     | ExprKind.ExprCompute a -> inheritSpan e (ExprCompute (r a))
@@ -3999,7 +4003,6 @@ let rec private stripQualified (aliases: Set<string>) (e: Expr) : Expr =
     | ExprKind.ExprPartialApp (op, a, isLeft) -> inheritSpan e (ExprPartialApp (op, r a, isLeft))
     | ExprKind.ExprTranspose (a, d1, d2) -> inheritSpan e (ExprTranspose (r a, d1, d2))
     | ExprKind.ExprDecompact (a, d) -> inheritSpan e (ExprDecompact (r a, d))
-    | ExprKind.ExprBlocked (t, a) -> inheritSpan e (ExprBlocked (t, r a))
     | ExprKind.ExprHalo (t, offs) -> inheritSpan e (ExprHalo (t, r offs))
     | ExprKind.ExprMethodFor es -> inheritSpan e (ExprMethodFor (List.map r es))
     | ExprKind.ExprZip es -> inheritSpan e (ExprZip (List.map r es))
@@ -4021,6 +4024,7 @@ let rec private stripQualified (aliases: Set<string>) (e: Expr) : Expr =
     | ExprKind.ExprGroupBy (v, g) -> inheritSpan e (ExprGroupBy (r v, r g))
     | ExprKind.ExprSort (a, k) -> inheritSpan e (ExprSort (r a, r k))
     | ExprKind.ExprGram (l, rr) -> inheritSpan e (ExprGram (r l, r rr))
+    | ExprKind.ExprGramApply (l, rr, x) -> inheritSpan e (ExprGramApply (r l, r rr, r x))
     | ExprKind.ExprReduce (a, k, init, ax) -> inheritSpan e (ExprReduce (r a, r k, Option.map r init, ax))
     | ExprKind.ExprStruct (nm, fields, spread) ->
         inheritSpan e (ExprStruct (nm, fields |> List.map (fun (fn, fe) -> (fn, r fe)), Option.map r spread))

@@ -117,6 +117,26 @@
       "examples": [],
       "docs": []
     },
+    "BL2008": {
+      "title": "provider cannot resolve the store",
+      "explanation": "A provider REFUSED the store named at a load or checkout site (`let repo = ic.load(path)`, `repo.checkout(ref)` -- the checkout desugars into a load of a canonical key). The store, not the library, is the problem: a missing or non-repo directory, a ref that names no branch/tag/snapshot, a bare ref that names BOTH a branch and a tag, a deleted-tag tombstone, an unsupported spec version byte, a repo whose status is Offline, or a snapshot carrying something the reader refuses by name (a virtual chunk ref, a nested group). The checker refuses at the binding site because nothing the store binds can be typed without its metadata: every `store.dims.x` and `store.vars.y` would otherwise fall back to an opaque type and die far downstream as a baffling element-type mismatch. Providers opt in to this code by raising a store-resolution error; one that does not keeps its historical behaviour, where the store's own diagnostic arrives at lowering instead. The message's detail is the provider's own refusal text, which names the condition and, where a ref is involved, lists the refs that DO exist.",
+      "fix": "Read the detail -- it names the condition precisely. A misspelled ref is answered by one of the names it lists; an ambiguous bare ref is answered by a marker (`repo.checkout(\"release\", ic.tag)` or `ic.branch`); a missing repo is a path relative to the compiler's working directory, which for a notebook cell is the notebook's own directory; an Offline repo must be brought online in the tool that manages it; a spec version other than 2 needs a different reader, by design.",
+      "examples": [],
+      "docs": [
+        "docs/plans/plan-icechunk-provider.md"
+      ]
+    },
+    "BL2009": {
+      "title": "duplicate function declaration",
+      "explanation": "A second top-level `function` declaration reuses a name the same module scope already declares; the refusal names both sites. Before this code existed the later declaration silently SHADOWED the earlier one: the name rebound to the last declaration, and a call matching the FIRST signature died with a rank or type mismatch (BL3001) blaming the call site instead of the real cause. Same-scope only: a nested `function` desugars to a block-scoped binding and may still shadow an outer function of the same name, and an imported name (`from X import f`) is not a declaration, so neither trips this. Dispatching one name across several signatures -- function clauses, where same-name declarations at compatible-but-distinct signatures form a clause set selected at specialization -- is a planned feature (docs/plans/plan-match-statements.md, refinement R1); until it lands, every same-scope duplicate is refused.",
+      "fix": "Rename one of the two declarations, or delete the one that was meant to be replaced. If the two bodies were meant to be rank-dispatched alternatives of one function (a scalar base case and an array case), that is the planned function-clause feature -- today, write one function whose body dispatches, or give the variants distinct names.",
+      "examples": [
+        "tests/corpus/functions/126_duplicate_function_rejects.blade"
+      ],
+      "docs": [
+        "docs/plans/plan-match-statements.md"
+      ]
+    },
     "BL3001": {
       "title": "type mismatch",
       "explanation": "Unification failed: a value's type cannot be reconciled with the type its position requires. Covers plain mismatches as well as an argument whose RANK or element type disagrees with the parameter, with the expected and actual types printed.",
@@ -345,6 +365,18 @@
         "tests/corpus/casts/014_implicit_warning.blade"
       ],
       "docs": []
+    },
+    "BL3021": {
+      "title": "undecidable specialization-index match arm",
+      "explanation": "A `match` whose scrutinee is a specialization index -- `arity(p)` over a Poly pack parameter, or `rank(p)` over an abstract (caret) parameter -- selects its arm when the specialization is CLONED, not at runtime: the constant-match fold picks exactly one arm per arity/rank clone. A guarded arm reads runtime values, so it cannot be chosen there; the fold is order-sound and correctly bails on it, and for a recursive pack the arity specializer then cannot select the base arm, specialization shrinks past arity 0, and the program used to die as a raw g++ error naming the missing clone. The same holds for a non-integer pattern, or a second catch-all (which can never be selected). Only fires when the scrutinee IS the intrinsic syntactically; ordinary integer matches -- including `rank(a)` over a concrete array, which folds to a plain static int -- keep accepting guards.",
+      "fix": "Keep the arms statically decidable -- unguarded integer literals plus at most one catch-all (`_` or a name) -- and move the runtime condition INSIDE the chosen arm's body: `| 1 -> if threshold > 0.0 then ... else ...` instead of `| 1 if threshold > 0.0 -> ...`.",
+      "examples": [
+        "tests/corpus/arity/052_arity_match_guarded_arm_rejected.blade",
+        "tests/corpus/arity/053_rank_match_guarded_arm_rejected.blade"
+      ],
+      "docs": [
+        "docs/plans/plan-match-statements.md"
+      ]
     },
     "BL3999": {
       "title": "type error",
@@ -586,6 +618,16 @@
         "docs/formalism.md"
       ]
     },
+    "BL4019": {
+      "title": "halo offset outside the declared set",
+      "explanation": "A stencil kernel over `halo<I, [o1, o2, ...]>` reads its window at a LITERAL offset outside the declared REACH -- the span from the smallest to the largest declared offset, including 0 -- such as `a(w(2))` under `halo<I, [-1, 0, 1]>`. The loop's interior is shrunk for that reach only, so at the boundary the read lands one or more cells past the array's allocation: the compiled program reads garbage silently and the interpreter panics, a divergence no test would show you. An unlisted offset INSIDE the reach is safe and stays legal. Only literal offsets are judged; an offset computed from a sibling range slot is left to the runtime guards.",
+      "fix": "Add the offset to the halo's list (`halo<I, [-1, 0, 1, 2]>`), which widens the interior shrink to match, or read within the declared set.",
+      "examples": [
+        "tests/corpus/loops/202_halo_offset_outside_set_rejects.blade",
+        "tests/corpus/loops/203_halo_compound_offset_outside_window_rejects.blade"
+      ],
+      "docs": []
+    },
     "BL4021": {
       "title": "invalid tree shape",
       "explanation": "A `TreeIdx<shape>` whose shape argument is not a well-formed preorder degree sequence. The shape is the child count of each node in depth-first order -- `[[leaf, leaf], [leaf, leaf, leaf]]` is `[2, 2, 0, 0, 3, 0, 0, 0]` -- and it must be a compile-time value: a `let static` binding or an inline literal. Two different mistakes share this code and are told apart by the message. First, the shape does not statically evaluate, or evaluates to something that is not a list of non-negative integers. A tree carries its whole shape in its type, so cardinality, every subtree size and every node arity are compile-time constants; a shape computed at run time can be neither honoured nor compared, which is the same refusal a runtime RaggedIdx lens gets. Second, the shape evaluates to integers that do not describe a tree: the prefix walk closes before the sequence ends (a trailing tail belonging to no tree), or the sequence ends before the walk closes (child slots nothing fills). Note that cardinality is the LEAF count, not the node count -- the value domain of a tree index is complete root-to-leaf paths.",
@@ -813,6 +855,35 @@
       "examples": [],
       "docs": []
     },
+    "BL8010": {
+      "title": "recursion budget exhausted",
+      "explanation": "A recursive array's `while` guard was still true when the recursion reached the end of its declared leading extent (the budget). The recurrence did not converge, and freezing the last slice would silently pretend it did, so the runtime aborts naming the array and the budget.",
+      "fix": "Raise the budget (the leading `Idx<N>` extent), loosen the convergence tolerance in the guard, or fix the recurrence so it actually contracts. If running the full budget is the intended behavior, drop the `while` guard -- an unguarded `let rec` runs every step unconditionally.",
+      "examples": [
+        "tests/corpus/recursive-arrays/013_while_guard_budget_aborts.blade"
+      ],
+      "docs": [
+        "docs/formalism.md"
+      ]
+    },
+    "BL8011": {
+      "title": "co-iteration extent mismatch",
+      "explanation": "Two operands walked together in one loop nest -- `a + b`, `zip(a, b)`, `method_for(zip(...))`, or gram's contracted axis -- disagree on the runtime extent of a shared axis. The nest is bounded by its first operand, so the shorter one would be read past its end. The compile-time twin is BL3016, which compares literal extents at the call site; inside a function over `T^k` parameters the extents belong to the caller, and a curried or let-bound partial application never reaches the call-site check, so this guard runs once before the nest on both the compiled and interpreted lanes.",
+      "fix": "Pass operands of equal extent on every shared axis, or declare the parameters with named index types (`Array<Float like I>`) so the disagreement is refused at the call site instead of at runtime.",
+      "examples": [
+        "tests/corpus/functions/128_curried_extent_mismatch_aborts.blade"
+      ],
+      "docs": []
+    },
+    "BL8012": {
+      "title": "provider shape mismatch",
+      "explanation": "A data file read at run time no longer has the shape the program was compiled against. `NetCDF.load(...)` bakes each variable's rank and dimension lengths into the program's types when it is compiled, and the dense readers size their buffers from those extents; libnetcdf then writes the variable's whole CURRENT extent into that buffer. A file whose dimensions grew since compilation would overrun the buffer, and one that shrank or reordered its axes would read garbage into the cells the program indexes -- both silently. The guard queries the opened variable's rank and every dimension length before the first read and aborts on any disagreement, on both the compiled and interpreted lanes.",
+      "fix": "Recompile the program against the file it will read, or read a file with the schema the program was compiled against. Equal dimension lengths are the contract this guard enforces; a different grid with the same lengths is not detected here.",
+      "examples": [
+        "tests/NetcdfTests.fs"
+      ],
+      "docs": []
+    },
     "BL9001": {
       "title": "internal compiler error",
       "explanation": "An invariant inside the compiler broke, or an unexpected exception escaped to the CLI boundary. This is a bug in Blade, not in the program being compiled.",
@@ -841,6 +912,17 @@
       "examples": [],
       "docs": [
         "docs/features/equivariant-nn.md"
+      ]
+    },
+    "BL4020": {
+      "title": "constrained domain not enumerable",
+      "explanation": "`range<R>` (or `Array<T like R>`) names a `static struct` whose solution set is the iteration space (docs/plans/structural/06). When the struct's `where` conjuncts are linear inequalities on the fields (`i - j <= w`, `abs(i - j) <= w`, `l3 <= l1 + l2`, `m1 + m2 == m_out`) the solutions are enumerated in CLOSED FORM -- nested loops whose bounds are affine in the earlier fields -- and the box size does not matter. When a conjunct is not linear (a product of fields, `%`, `||`, `!=`, a function call) the only route is to enumerate the whole box once at compile time and bake the solutions as a key table, which is capped at 100,000 box cells (with a BL4010 advisory when it is taken). This error is the case where neither route exists: a non-linear conjunct over a box above the cap.",
+      "fix": "Write the constraint as linear inequalities on the fields so it enumerates in closed form, or narrow the field bounds until the box is under the table cap.",
+      "examples": [
+        "tests/corpus/index-types/265_domain_nonlinear_over_cap_rejects.blade"
+      ],
+      "docs": [
+        "docs/plans/structural/06-enumerable-domains.md"
       ]
     }
   }

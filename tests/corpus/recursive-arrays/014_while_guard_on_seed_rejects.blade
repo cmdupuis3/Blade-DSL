@@ -1,0 +1,15 @@
+// TEST: While Guard On Seed Arm Rejects (rejects)
+// ============================================================================
+// The `while` guard belongs to the INDUCTIVE arm only: the seed slice is
+// unconditional by construction (a guarded seed would leave the family
+// undefined at extent 1 with nothing to freeze). Parsed as a hard error,
+// not silently ignored.
+// ============================================================================
+type It = Idx<4>
+let rec s: Array<Float like It> =
+    match s with
+    | zero -> zero
+    | zero :: n while n < 2 -> zero :: 1.0
+    | prefix :: n -> prefix :: prefix(n - 1)
+s
+// ERROR: BL1003

@@ -430,8 +430,8 @@ let runZarrTests () =
     Blade.ProviderStatics.install ()
     check "registry: zarr registered"
         (match Blade.ProviderRegistry.tryFind "zarr" with Some s -> s.Name = "zarr" | None -> false) ""
-    check "registry: csv + netcdf registered too"
-        ((Blade.ProviderRegistry.names ()) |> List.sort = ["csv"; "netcdf"; "zarr"]) (sprintf "%A" (Blade.ProviderRegistry.names ()))
+    check "registry: csv + icechunk + netcdf registered too"
+        ((Blade.ProviderRegistry.names ()) |> List.sort = ["csv"; "icechunk"; "netcdf"; "zarr"]) (sprintf "%A" (Blade.ProviderRegistry.names ()))
     check "registry: zarr rejects load_compound (no compound reader)"
         (match Blade.ProviderRegistry.tryFind "zarr" with Some s -> s.GenReadCompoundVar.IsNone | None -> false) ""
     check "registry: zarr needs no link flags"
@@ -641,6 +641,686 @@ let out = method_for(A) <@> lambda(x) -> x + x |> compute
                      else check ($"e2e v{version}: compiles") false e)
             | Error e -> check ($"e2e v{version}: lowers") false e
         with ex -> check ($"e2e v{version}") false ex.Message
+
+    // ---------------------------------------------------------------
+    // 10c. Provider-inherited segmentation (docs/plans/structural/07 §3.1):
+    // `type CX = Chunked<sample.index.x, store>` takes the store's own chunk
+    // edge on x (recorded at the load site by ProviderRegistry.DimChunks),
+    // and the structural grouping / ungroup pipeline runs over it. A store
+    // whose variables chunk x differently refuses at the declaration.
+    // ---------------------------------------------------------------
+    printfn "
+--- inherited segmentation: Chunked<sample.index.x, store> ---"
+    let inheritedSegmentationE2E () =
+        let segStore = fixStore "zarr_segments"
+        let segInDir = Path.Combine(e2eDir, segStore)
+        let segVars : ZarrWrite.WriteVar list = [
+            { Name = "A"; DimNames = Some ["x"]; Shape = [10L]; Chunks = [4L]
+              FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in 1 .. 10 -> float i |]; OmitChunks = []; Blade = None } ]
+        (try Directory.Delete(segStore, true) with _ -> ())
+        (try Directory.Delete(segInDir, true) with _ -> ())
+        ZarrWrite.writeStoreV3 segStore segVars
+        ZarrWrite.writeStoreV3 segInDir segVars
+        let segSource = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A = sample.vars.A |> z.read
+let seg = segments(CX)
+let sizes = extents(seg)
+let g = group_by(A, seg)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+let back = ungroup(g)
+"""
+                            segStore
+        try
+            match lower segSource with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_inherited"
+                check "inherited segmentation: emits the structural grouping (no __perm)"
+                    (cppCode.Contains "structural" && not (cppCode.Contains "seg__perm")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_inherited.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "inherited segmentation: sizes = [4, 4, 2]" (has "sizes = [4, 4, 2]") runOut
+                          check "inherited segmentation: per-segment sums" (has "sums = [10, 26, 19]") runOut
+                          check "inherited segmentation: ungroup restores the axis" (has "back = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]") runOut
+                      | Ok (code, out) -> check "inherited segmentation: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "inherited segmentation: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP inherited segmentation (compile skipped): %s" e
+                     else check "inherited segmentation: compiles" false e)
+            | Error e -> check "inherited segmentation: lowers" false e
+        with ex -> check "inherited segmentation" false ex.Message
+        // the refusal: two variables chunk x differently
+        let mixStore = fixStore "zarr_segments_mixed"
+        (try Directory.Delete(mixStore, true) with _ -> ())
+        ZarrWrite.writeStoreV3 mixStore [
+            { Name = "A"; DimNames = Some ["x"]; Shape = [10L]; Chunks = [4L]
+              FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in 1 .. 10 -> float i |]; OmitChunks = []; Blade = None }
+            { Name = "B"; DimNames = Some ["x"]; Shape = [10L]; Chunks = [5L]
+              FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in 1 .. 10 -> float i |]; OmitChunks = []; Blade = None } ]
+        let mixSource = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+"""
+                            mixStore
+        (match lower mixSource with
+         | Error e -> check "inherited segmentation: non-uniform chunking refuses with a steer" (e.Contains "does not chunk 'x' uniformly") e
+         | Ok _ -> check "inherited segmentation: non-uniform chunking refuses with a steer" false "lowered")
+
+    inheritedSegmentationE2E ()
+
+    // ---------------------------------------------------------------
+    // 10d. The FILE level (docs/plans/structural/07 §2.7, decisions D1/D3/D5):
+    // `type T = Chunked<s1.index.x, [[s1, store], [s2, store]]>` tiles x over
+    // two stores in order, each keeping its own chunk grid (a dependent chunk
+    // level: 3-cell chunks in the first file, 2-cell in the second). `files(T)`
+    // is the file grouping (labelled by the store names), `segments(T)` the
+    // innermost chunk grouping, and `ungroup([a1, a2], T)` names a variable
+    // that lives in both stores over the tiled axis. Provider-agnostic: only
+    // the stores' extents and edges are consulted, never a coordinate value.
+    // ---------------------------------------------------------------
+    printfn "
+--- file level: Chunked<s1.index.x, [[s1, store], [s2, store]]> ---"
+    let fileLevelE2E () =
+        let st1 = fixStore "zarr_tile_a"
+        let st2 = fixStore "zarr_tile_b"
+        let mk (name: string) (n: int) (lo: int) (edge: int64) : ZarrWrite.WriteVar list =
+            [ { Name = "A"; DimNames = Some ["x"]; Shape = [int64 n]; Chunks = [edge]
+                FillValue = FillFloat 0.0; Data = ZarrWrite.WF64 [| for i in lo .. lo + n - 1 -> float i |]; OmitChunks = []; Blade = None } ]
+        for (store, vars) in [ (st1, mk "A" 6 1 3L); (st2, mk "A" 4 7 2L) ] do
+            let inDir = Path.Combine(e2eDir, store)
+            (try Directory.Delete(store, true) with _ -> ())
+            (try Directory.Delete(inDir, true) with _ -> ())
+            ZarrWrite.writeStoreV3 store vars
+            ZarrWrite.writeStoreV3 inDir vars
+        let src = sprintf """
+import zarr as z
+
+let s1 = z.load("%s")
+let s2 = z.load("%s")
+type T = Chunked<s1.index.x, [[s1, store], [s2, store]]>
+let a1 = s1.vars.A |> z.read
+let a2 = s2.vars.A |> z.read
+let a = ungroup([a1, a2], T)
+let fs = files(T)
+let fsizes = extents(fs)
+let seg = segments(T)
+let ssizes = extents(seg)
+let gf = group_by(a, fs)
+let fsums = method_for(gf) <@> lambda(r) -> reduce(r, (+)) |> compute
+let gs = group_by(a, seg)
+let ssums = method_for(gs) <@> lambda(r) -> reduce(r, (+)) |> compute
+let back = ungroup(gs)
+"""
+                            st1 st2
+        try
+            match lower src with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_files"
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_files.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "file level: the tiled variable" (has "a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]") runOut
+                          check "file level: files(T) sizes = [6, 4]" (has "fsizes = [6, 4]") runOut
+                          check "file level: segments(T) sizes = [3, 3, 2, 2] (per-file chunk grids)" (has "ssizes = [3, 3, 2, 2]") runOut
+                          check "file level: per-file sums" (has "fsums = [21, 34]") runOut
+                          check "file level: per-chunk sums" (has "ssums = [6, 15, 15, 19]") runOut
+                          check "file level: ungroup of the chunk grouping restores the axis" (has "back = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]") runOut
+                      | Ok (code, out) -> check "file level: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "file level: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP file level (compile skipped): %s" e
+                     else check "file level: compiles" false e)
+            | Error e -> check "file level: lowers" false e
+        with ex -> check "file level" false ex.Message
+        // refusals: a wrong row count, and a store without the dimension
+        let bad1 = sprintf """
+import zarr as z
+
+let s1 = z.load("%s")
+let s2 = z.load("%s")
+type T = Chunked<s1.index.x, [[s1, store], [s2, store]]>
+let a1 = s1.vars.A |> z.read
+let a = ungroup([a1], T)
+"""
+                             st1 st2
+        (match lower bad1 with
+         | Error e -> check "file level: wrong row count refuses" (e.Contains "tiles 2 store(s) but 1 row(s)") e
+         | Ok _ -> check "file level: wrong row count refuses" false "lowered")
+        let bad2 = sprintf """
+import zarr as z
+
+let s1 = z.load("%s")
+let s2 = z.load("%s")
+type T = Chunked<s1.index.x, [[s1, store], [s2, 3]]>
+let a1 = s1.vars.A |> z.read
+let a2 = s2.vars.A |> z.read
+let a = ungroup([a2, a1], T)
+"""
+                             st1 st2
+        (match lower bad2 with
+         | Error e -> check "file level: a row of the wrong extent refuses" (e.Contains "has extent 4 but store 0") e
+         | Ok _ -> check "file level: a row of the wrong extent refuses" false "lowered")
+    fileLevelE2E ()
+
+    // ---------------------------------------------------------------
+    // 10e. PER-SEGMENT streamed reads (docs/plans/structural/07 §3.4): a rank-1
+    // variable bound with `.stream` and grouped by a structural grouping is
+    // read one run at a time, straight into each group's row -- the emitted
+    // C++ has no whole-array buffer for it. A KEY grouping over a streamed
+    // variable keeps refusing with a steer to `.read`.
+    // ---------------------------------------------------------------
+    printfn "
+--- per-segment stream: group_by(s.vars.A |> z.stream, segments(CX)) ---"
+    let streamedSegmentsE2E () =
+        let segStore = fixStore "zarr_segments"    // written by 10c (10 cells, chunked at 4)
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+let g = group_by(A, seg)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+let counts = method_for(g) <@> lambda(r) -> extents(r) |> compute
+"""
+                            segStore
+        try
+            match lower src with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed"
+                check "per-segment stream: rows are read per run (marker present)"
+                    (cppCode.Contains "per-segment STREAMED rows") ""
+                check "per-segment stream: no whole-array buffer for A"
+                    (not (cppCode.Contains "A_flat = new") && not (cppCode.Contains "Array<double, 1> A = ")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_streamed.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "per-segment stream: per-run sums" (has "sums = [10, 26, 19]") runOut
+                          check "per-segment stream: per-run counts" (has "counts = [4, 4, 2]") runOut
+                      | Ok (code, out) -> check "per-segment stream: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "per-segment stream: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP per-segment stream (compile skipped): %s" e
+                     else check "per-segment stream: compiles" false e)
+            | Error e -> check "per-segment stream: lowers" false e
+        with ex -> check "per-segment stream" false ex.Message
+        // a key grouping over a streamed variable still refuses
+        let bad = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+let A = sample.vars.A |> z.stream
+let keys = [0, 0, 1, 1, 2, 2, 0, 1, 2, 0]
+let gk = group_keys(keys)
+let g = group_by(A, gk)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+"""
+                            segStore
+        (match lower bad with
+         | Ok ir ->
+             (try
+                 let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_bad"
+                 let refusals = CodeGen.takeCodegenRefusalDiagnostics cppCode
+                 check "per-segment stream: a key grouping over a streamed variable refuses with a steer"
+                     (refusals |> List.exists (fun r -> (string r).Contains "needs a structural grouping") || cppCode.Contains "needs a structural grouping") cppCode
+              with ex -> check "per-segment stream: a key grouping over a streamed variable refuses with a steer" (ex.Message.Contains "needs a structural grouping") ex.Message)
+         | Error e -> check "per-segment stream: key grouping program lowers" false e)
+        // The same streamed group_by inside a FUNCTION BODY -- where an
+        // allocation scope exists, so the result must be freed at its exit.
+        // The row table and the one pool its rows slice are freed together
+        // (deallocate_ragged_storage). This branch once registered that free
+        // with its argument missing -- a discarded partial application, the
+        // build's FS0193 -- so nothing was freed and every call leaked both.
+        // The top-level program above cannot see it: main frees nothing.
+        let inFn = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+function run_sums(k: Int64) -> Float = {
+    let g = group_by(A, seg)
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+}
+let total = run_sums(0)
+"""
+                            segStore
+        try
+            match lower inFn with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_fn"
+                let marker = cppCode.IndexOf "per-segment STREAMED rows"
+                check "per-segment stream in a function body: rows are read per run (marker present)" (marker >= 0) ""
+                // The table's name is a generated `__vN`, so read it off the
+                // streamed block's own declaration rather than pinning a number.
+                let table =
+                    if marker < 0 then ""
+                    else
+                        System.Text.RegularExpressions.Regex.Match(
+                            cppCode.Substring marker, @"Array<double\*, 1> (\w+) = \{ new double\*\[").Groups.[1].Value
+                check "per-segment stream in a function body: the row table and its pool are freed at scope exit"
+                    (table <> ""
+                     && cppCode.Contains $"nested_array_utilities::deallocate_ragged_storage({table}.data, {table}__pool);")
+                    (if table = "" then "no streamed row-table declaration found"
+                     else $"no deallocate_ragged_storage({table}.data, {table}__pool) in the emitted C++")
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_streamed_fn.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          check "per-segment stream in a function body: total of the per-run sums"
+                              (runOut.Contains "total = 55") runOut
+                      | Ok (code, out) -> check "per-segment stream in a function body: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "per-segment stream in a function body: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP per-segment stream in a function body (compile skipped): %s" e
+                     else check "per-segment stream in a function body: compiles" false e)
+            | Error e -> check "per-segment stream in a function body: lowers" false e
+        with ex -> check "per-segment stream in a function body" false ex.Message
+        // The same group_by inside a KERNEL body is different: the kernel is
+        // compiled as a separate C++ function that sees only its parameters,
+        // and a grouping cannot be one -- it is an opaque sentinel whose state
+        // (`seg__ngroups`, `seg__offsets`) is main() locals. It used to reach
+        // g++ as "'seg__ngroups' / 'A_fillv' / 'A' was not declared in this
+        // scope"; codegen now refuses the captured grouping (BL7004) with a
+        // steer, and the #error guard stops the compile before g++ runs.
+        let inKernel = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+type K = Idx<3>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+let totals = method_for(range<K>) <@> lambda(k) -> {
+    let g = group_by(A, seg)
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+} |> compute
+"""
+                            segStore
+        (match lower inKernel with
+         | Ok ir ->
+             (try
+                 let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_kernel"
+                 let refusals = CodeGen.takeCodegenRefusalDiagnostics cppCode |> List.map string
+                 let steer = "captures the grouping 'seg'"
+                 check "per-segment stream in a kernel body: refused before g++ (BL7004), with a steer"
+                     (cppCode.Contains "#error" && refusals |> List.exists (fun r -> r.Contains steer))
+                     (String.concat " | " refusals)
+              with ex -> check "per-segment stream in a kernel body: refused before g++ (BL7004), with a steer" false ex.Message)
+         | Error e -> check "per-segment stream in a kernel body: lowers" false e)
+        // ...and the steer it gives compiles: group ONCE, outside the kernel,
+        // and use the result inside. A group_by result is forwarded into the
+        // kernel's function (its row table plus the grouping's ngroups and
+        // offsets as hidden params) -- and it reads the store once, not once
+        // per iteration.
+        let steered = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+type K = Idx<3>
+let A = sample.vars.A |> z.stream
+let seg = segments(CX)
+let g = group_by(A, seg)
+let totals = method_for(range<K>) <@> lambda(k) -> {
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+} |> compute
+"""
+                            segStore
+        try
+            match lower steered with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_streamed_steered"
+                check "per-segment stream, grouped outside a kernel: rows are read per run (marker present)"
+                    (cppCode.Contains "per-segment STREAMED rows") ""
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_streamed_steered.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          check "per-segment stream, grouped outside a kernel: per-iteration totals"
+                              (runOut.Contains "totals = [55, 56, 57]") runOut
+                      | Ok (code, out) -> check "per-segment stream, grouped outside a kernel: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "per-segment stream, grouped outside a kernel: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP per-segment stream grouped outside a kernel (compile skipped): %s" e
+                     else check "per-segment stream, grouped outside a kernel: compiles" false e)
+            | Error e -> check "per-segment stream, grouped outside a kernel: lowers" false e
+        with ex -> check "per-segment stream, grouped outside a kernel" false ex.Message
+        // A streamed variable used as a plain ARRAY anywhere else. `A` is
+        // never materialized -- its binding emits a reader, and nothing named
+        // `A` -- so these used to reach g++ as "'A' was not declared in this
+        // scope". Each is now a BL7004 refusal before g++ runs, whatever
+        // construct the use sits in: a fold inlined from a kernel body into
+        // main(), the same fold inside a named function's closure, an
+        // argument to a function, a scalar index.
+        let streamedLeaks =
+            [ ("a fold inside a kernel body",
+               "let totals = method_for(range<K>) <@> lambda(k) -> reduce(A, (+)) + Float64(k) |> compute")
+              ("a fold inside a named function",
+               "function total_plus(k: Int64) -> Float = reduce(A, (+)) + Float64(k)\nlet totals = method_for(range<K>) <@> lambda(k) -> total_plus(k) |> compute")
+              ("an argument to a function",
+               "function total(v: Array<Float like CX>) -> Float = reduce(v, (+))\nlet t = total(A)")
+              ("a scalar index",
+               "let x = A((3 : CX)) + 1.0") ]
+        for (what, body) in streamedLeaks do
+            let src = sprintf "import zarr as z\nlet sample = z.load(\"%s\")\ntype CX = Chunked<sample.index.x, store>\ntype K = Idx<3>\nlet A: Array<Float like CX> = sample.vars.A |> z.stream\n%s\n" segStore body
+            let label = $"streamed variable used as an array ({what}): refused before g++ (BL7004), with a steer"
+            match lower src with
+            | Ok ir ->
+                (try
+                    let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_streamed_leak"
+                    let refusals = CodeGen.takeCodegenRefusalDiagnostics cppCode |> List.map string
+                    check label
+                        (cppCode.Contains "#error"
+                         && refusals |> List.exists (fun r -> r.Contains "'A' is bound with `.stream`, so it is never materialized"))
+                        (String.concat " | " refusals)
+                 with ex -> check label false ex.Message)
+            | Error e -> check $"streamed variable used as an array ({what}): lowers" false e
+        // ...and the steer compiles: fold at top level (the streamed fold,
+        // structural/07 D6) and use the scalar inside the kernel.
+        let foldedOutside = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type K = Idx<3>
+let A = sample.vars.A |> z.stream
+let t = reduce(A, (+))
+let totals = method_for(range<K>) <@> lambda(k) -> t + Float64(k) |> compute
+"""
+                                segStore
+        try
+            match lower foldedOutside with
+            | Ok ir ->
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_streamed_fold_outside"
+                let cppFile = Path.Combine(e2eDir, "zarr_streamed_fold_outside.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          check "streamed fold at top level, used in a kernel: totals"
+                              (runOut.Contains "totals = [55, 56, 57]") runOut
+                      | Ok (code, out) -> check "streamed fold at top level, used in a kernel: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "streamed fold at top level, used in a kernel: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP streamed fold at top level (compile skipped): %s" e
+                     else check "streamed fold at top level, used in a kernel: compiles" false e)
+            | Error e -> check "streamed fold at top level, used in a kernel: lowers" false e
+        with ex -> check "streamed fold at top level, used in a kernel" false ex.Message
+    streamedSegmentsE2E ()
+
+    // ---------------------------------------------------------------
+    // 10f. STREAMED FOLD (decision D6 of docs/plans/structural/07): `reduce`
+    // over a rank-1 `.stream` variable is the plain flat fold at the API and
+    // walks the store one block at a time in storage order -- the same
+    // operation sequence as the flat fold over a materialized copy, so the
+    // answer is bitwise identical and no reorder licence is involved. Both
+    // a builtin operator and a lambda kernel; and `segments(A)` off the
+    // annotation's `Chunked` slot. The decision is recorded for `blade plan`.
+    // ---------------------------------------------------------------
+    printfn "
+--- streamed fold: reduce(s.vars.A |> z.stream, (+)) ---"
+    let streamedFoldE2E () =
+        let segStore = fixStore "zarr_segments"    // 10 cells 1..10, chunked at 4
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A: Array<Float like CX> = sample.vars.A |> z.stream
+let total = reduce(A, (+))
+let biggest = reduce(A, lambda(x, y) -> if x > y then x else y)
+let shifted = reduce(A, (+), 100.0)
+let seg = segments(A)
+let sizes = extents(seg)
+"""
+                            segStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "streamed fold: `blade plan` records segment-streaming for the folds"
+                    (decisions |> List.filter (fun d -> d.Rule = "segment-streaming" && d.Outcome = Blade.Effects.Applied) |> List.length >= 3)
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Rule + ":" + d.Subject)))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_fold"
+                check "streamed fold: block-wise emission, no whole-array buffer"
+                    (cppCode.Contains "STREAMED fold" && not (cppCode.Contains "A_flat = new") && not (cppCode.Contains "Array<double, 1> A = ")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_fold.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "streamed fold: builtin (+) = 55" (has "total = 55") runOut
+                          check "streamed fold: lambda max = 10" (has "biggest = 10") runOut
+                          check "streamed fold: seeded (+) = 155" (has "shifted = 155") runOut
+                          check "streamed fold: segments(A) off the annotation" (has "sizes = [4, 4, 2]") runOut
+                      | Ok (code, out) -> check "streamed fold: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "streamed fold: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP streamed fold (compile skipped): %s" e
+                     else check "streamed fold: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "streamed fold: lowers" false e
+        with ex -> check "streamed fold" false ex.Message
+    streamedFoldE2E ()
+
+    // ---------------------------------------------------------------
+    // 10g. STENCIL OVER SEGMENTS (docs/plans/structural/07 §2.3): a halo map
+    // over a streamed rank-1 variable on a `Chunked` axis runs one segment at
+    // a time, reading each run plus the ghost cells its reach demands. The
+    // values are the flat stencil's; the emission has no whole-array buffer.
+    // ---------------------------------------------------------------
+    printfn "\n--- stencil over segments: halo<CX, ..> over s.vars.A |> z.stream ---"
+    let stencilSegmentsE2E () =
+        let segStore = fixStore "zarr_segments"    // 10 cells 1..10, chunked at 4
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A: Array<Float like CX> = sample.vars.A |> z.stream
+let d = method_for(halo<CX, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1)) |> compute
+let d2 = method_for(halo<CX, [-2, 0, 2]>) <@> lambda(w) -> A(w(2)) * A(w(-2)) - A(w(0)) * A(w(0)) |> compute
+"""
+                            segStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "stencil over segments: `blade plan` records the decision"
+                    (decisions |> List.exists (fun d -> d.Rule = "segment-streaming" && d.Outcome = Blade.Effects.Applied && d.Evidence |> List.exists (fun e -> e.Contains "stencil")))
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Rule + ":" + d.Subject)))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_stencil"
+                check "stencil over segments: per-run emission, no whole-array buffer"
+                    (cppCode.Contains "stencil over segments" && not (cppCode.Contains "A_flat = new")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_stencil.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "stencil over segments: central difference" (has "d = [2, 2, 2, 2, 2, 2, 2, 2]") runOut
+                          check "stencil over segments: reach-2 kernel" (has "d2 = [-4, -4, -4, -4, -4, -4]") runOut
+                      | Ok (code, out) -> check "stencil over segments: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "stencil over segments: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP stencil over segments (compile skipped): %s" e
+                     else check "stencil over segments: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "stencil over segments: lowers" false e
+        with ex -> check "stencil over segments" false ex.Message
+    stencilSegmentsE2E ()
+
+    // ---------------------------------------------------------------
+    // 10h. ELEMENTWISE consumers of a streamed source. StreamingIONotes v1
+    // refused these outright ("elementwise consumption is not stream-
+    // eligible") because its only in-nest read was a whole trailing fiber
+    // at a site; the segment run loop (10g) with zero reach is the missing
+    // mechanism: a map, a scalar-broadcast binop and a zip with a
+    // materialized array each run one block of the store's chunk edge at a
+    // time, the source never materialized.
+    // ---------------------------------------------------------------
+    printfn "
+--- elementwise over a streamed source: map, A + 1.0, zip(A, M) ---"
+    let elementwiseStreamE2E () =
+        let segStore = fixStore "zarr_segments"    // 10 cells 1..10, chunked at 4
+        let src = sprintf """
+import zarr as z
+
+let sample = z.load("%s")
+type CX = Chunked<sample.index.x, store>
+let A: Array<Float like CX> = sample.vars.A |> z.stream
+let doubled = method_for(A) <@> lambda(x) -> x * 2.0 |> compute
+let shifted = A + 1.0
+let m: Array<Float like CX> = [0.5, 0.5, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 2.0]
+let scaled = method_for(zip(A, m)) <@> lambda(x, w) -> x * w |> compute
+"""
+                            segStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "elementwise stream: `blade plan` records three elementwise decisions"
+                    ((decisions |> List.filter (fun d -> d.Rule = "segment-streaming" && d.Evidence |> List.exists (fun e -> e.Contains "elementwise")) |> List.length) = 3)
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Subject + ":" + (String.concat "|" d.Evidence).Substring(0, 30))))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_elementwise"
+                check "elementwise stream: per-block emission, no whole-array buffer"
+                    (cppCode.Contains "elementwise over segments" && not (cppCode.Contains "A_flat = new")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_elementwise.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "elementwise stream: map" (has "doubled = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]") runOut
+                          check "elementwise stream: scalar broadcast" (has "shifted = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]") runOut
+                          check "elementwise stream: zip with a materialized array" (has "scaled = [0.5, 1, 1.5, 2, 2.5, 12, 14, 16, 18, 20]") runOut
+                      | Ok (code, out) -> check "elementwise stream: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "elementwise stream: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP elementwise stream (compile skipped): %s" e
+                     else check "elementwise stream: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "elementwise stream: lowers" false e
+        with ex -> check "elementwise stream" false ex.Message
+    elementwiseStreamE2E ()
+
+    // ---------------------------------------------------------------
+    // 10i. RANK-2 streaming: one store standing in for four files decomposed
+    // along lat and lon (a 6 x 8 variable chunked 3 x 4 = four chunk files).
+    // `segments(T)` off the annotation's two `Chunked` slots is the tile
+    // grouping; `group_by` over the streamed variable reads each tile as one
+    // window (here, exactly one chunk file) into its row; an elementwise
+    // consumer runs one band of rows (the leading chunk edge) at a time with
+    // a row-pointer alias; `ungroup` puts the tiles back. The traversal order
+    // is the store's own. No whole-array buffer for T anywhere.
+    // ---------------------------------------------------------------
+    printfn "
+--- rank-2 streaming: tiles, row bands, ungroup ---"
+    let rank2StreamE2E () =
+        let tileStore = fixStore "zarr_tiles_2d"
+        let tileInDir = Path.Combine(e2eDir, tileStore)
+        let vars : ZarrWrite.WriteVar list = [
+            { Name = "T"; DimNames = Some ["lat"; "lon"]; Shape = [6L; 8L]; Chunks = [3L; 4L]
+              FillValue = FillFloat 0.0
+              Data = ZarrWrite.WF64 [| for i in 0 .. 5 do for j in 0 .. 7 -> float (10 * i + j) |]
+              OmitChunks = []; Blade = None } ]
+        (try Directory.Delete(tileStore, true) with _ -> ())
+        (try Directory.Delete(tileInDir, true) with _ -> ())
+        ZarrWrite.writeStoreV3 tileStore vars
+        ZarrWrite.writeStoreV3 tileInDir vars
+        let src = sprintf """
+import zarr as z
+
+let s = z.load("%s")
+type CLat = Chunked<s.index.lat, store>
+type CLon = Chunked<s.index.lon, store>
+let T: Array<Float like CLat, CLon> = s.vars.T |> z.stream
+let tiles = segments(T)
+let tsizes = extents(tiles)
+let g = group_by(T, tiles)
+let tsums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+let doubled = T * 2.0
+let back = ungroup(g)
+let dev = reduce(back - T, (+), axes = 2)
+"""
+                            tileStore
+        try
+            Blade.Effects.Decisions.start ()
+            match lower src with
+            | Ok ir ->
+                let decisions = Blade.Effects.Decisions.drain ()
+                check "rank-2 stream: plan records the tile group_by and the elementwise consumers"
+                    ((decisions |> List.filter (fun d -> d.Rule = "segment-streaming" && d.Outcome = Blade.Effects.Applied) |> List.length) >= 3)
+                    (sprintf "%A" (decisions |> List.map (fun d -> d.Subject)))
+                let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "zarr_segments_rank2"
+                check "rank-2 stream: tile windows and row bands, no whole-array buffer"
+                    (cppCode.Contains "per-tile STREAMED windows" && cppCode.Contains "elementwise over segments" && not (cppCode.Contains "T_flat = new")) ""
+                CodeGen.deployRuntimeHeaders e2eDir
+                let cppFile = Path.Combine(e2eDir, "zarr_segments_rank2.cpp")
+                File.WriteAllText(cppFile, cppCode)
+                (match compileCpp cppFile e2eDir with
+                 | Ok exePath ->
+                     (match runExecutable exePath with
+                      | Ok (0, runOut) ->
+                          let has (line: string) = runOut.Contains line
+                          check "rank-2 stream: tile sizes" (has "tsizes = [12, 12, 12, 12]") runOut
+                          check "rank-2 stream: per-tile sums" (has "tsums = [138, 186, 498, 546]") runOut
+                          check "rank-2 stream: elementwise by row bands" (has "doubled = [[0, 2, 4, 6, 8, 10, 12, 14], [20, 22, 24, 26, 28, 30, 32, 34]") runOut
+                          check "rank-2 stream: ungroup of the tiles restores the variable (zip with the stream)" (has "dev = 0") runOut
+                      | Ok (code, out) -> check "rank-2 stream: runs" false ($"exit {code}: {out}")
+                      | Error e -> check "rank-2 stream: runs" false e)
+                 | Error e ->
+                     if isSkipError e then printfn "  SKIP rank-2 stream (compile skipped): %s" e
+                     else check "rank-2 stream: compiles" false e)
+            | Error e ->
+                Blade.Effects.Decisions.drain () |> ignore
+                check "rank-2 stream: lowers" false e
+        with ex -> check "rank-2 stream" false ex.Message
+    rank2StreamE2E ()
 
     // ---------------------------------------------------------------
     // 10b. Dimension names that collide with C-library globals.
@@ -1987,6 +2667,14 @@ let w = z.write("%s", W)
     check "window: out-of-range bounds rejected at typecheck"
         ((typeErrOf "import zarr as z\nlet s = z.load(\"tests/fixtures/zarr_stores/zarr_win_blocks\")\nlet W = z.read_window(s.vars.C, 2, 7)\n").Contains "bounds")
         (typeErrOf "import zarr as z\nlet s = z.load(\"tests/fixtures/zarr_stores/zarr_win_blocks\")\nlet W = z.read_window(s.vars.C, 2, 7)\n")
+    // The IDE payload agrees: a window read is a provider-read binding, so
+    // the fast tier's `providerRead` names the store member (the 3-arg
+    // read_window arm of Ide.readOperandProvenance).
+    (let ideSrc = "import zarr as z\nlet s = z.load(\"tests/fixtures/zarr_stores/zarr_win_blocks\")\nlet W = z.read_window(s.vars.C, 2, 6)\n"
+     let (ideJson, ideCode) = Blade.Ide.ideCheckSource "zarr_win_ide.blade" ideSrc
+     check "window: ide payload providerRead = {store s, member vars.C}"
+         (ideCode = 0 && ideJson.Contains "\"providerRead\":{\"store\":\"s\",\"member\":\"vars.C\"}")
+         (if ideJson.Length > 400 then ideJson.Substring(0, 400) else ideJson))
     // The dims/vars split is Zarr's too (isCoordinateArr), so the same
     // wrong-section mistake is available here -- and BL3018 answers it with
     // the sibling accessor, in both directions. The seam is shared with
@@ -2325,7 +3013,10 @@ let (m2a, m2b) = (method_for(A, A) <@> lambda(x: Array<Float64 like TimeIdx>, y:
                let (ok, why) = sameCompute out refOut
                check "stream fused <&>: stdout identical to .read" ok why))
 
-     // (f) elementwise consumption of a streamed source: loud reject.
+     // (f) elementwise consumption of a streamed source: ONCE a loud reject
+     // (v1's only in-nest read was a whole fiber at a site); now the segment
+     // run loop reads one band of rows at a time (docs/plans/structural/07
+     // §3.4, zarr lane 10h/10i), so it compiles and says so.
      (let src = """
 import zarr as z
 
@@ -2336,11 +3027,11 @@ let out = method_for(A) <@> lambda(x) -> x + x |> compute
       match lower src with
       | Ok ir ->
           (try
-              CodeGen.genSelfContainedProgramFromIR ir "strm_elem_reject" |> ignore
-              check "stream: elementwise consumption rejected loudly" false "codegen succeeded?"
+              let (cpp, _) = CodeGen.genSelfContainedProgramFromIR ir "strm_elem_bands"
+              check "stream: elementwise consumption runs by row bands (was a loud reject)"
+                  (cpp.Contains "elementwise over segments" && not (cpp.Contains "not stream-eligible")) ""
            with ex ->
-              check "stream: elementwise consumption rejected loudly"
-                  (ex.Message.Contains "not stream-eligible") ex.Message)
+              check "stream: elementwise consumption runs by row bands (was a loud reject)" false ex.Message)
       | Error e -> check "stream: elementwise reject case lowers" false e)
      // (e) netcdf streaming differential (needs sample.nc + libnetcdf).
      if File.Exists "tests/fixtures/sample.nc" then

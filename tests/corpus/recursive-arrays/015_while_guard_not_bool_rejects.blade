@@ -1,0 +1,13 @@
+// TEST: While Guard Not Bool Rejects (rejects)
+// ============================================================================
+// The guard is a PREDICATE: it unifies with Bool, mirroring the match-arm
+// guard rule. A bare Float read (C truthiness) is refused with a steer.
+// ============================================================================
+type It = Idx<4>
+let rec b: Array<Float like It> =
+    match b with
+    | zero -> zero
+    | zero :: s -> zero :: 1.0
+    | prefix :: n while prefix(n - 1) -> prefix :: prefix(n - 1) * 0.5
+b
+// ERROR-CONTAINS: a `while` guard must be Bool

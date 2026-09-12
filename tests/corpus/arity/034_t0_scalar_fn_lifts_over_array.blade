@@ -1,0 +1,14 @@
+// TEST: T^0 scalar function lifts over an array argument
+// ============================================================================
+// The BASELINE of the arity-lift family: one rank-0 abstract parameter, one
+// array argument. `T^0` is a SCALAR type variable, so a rank-1 argument is a
+// call site one rank above the declaration -- and arity polymorphism's promise
+// is that such a call deduces its output rank from the argument rather than
+// refusing. This is the shape that already worked; it is pinned here so the
+// mixed-rank cases below (036-038) cannot be "fixed" by regressing it.
+// ============================================================================
+function sq0(x: T^0) -> T^0 = x * x
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let r = sq0(A)
+// EXPECT: r = [1.0, 4.0, 9.0]

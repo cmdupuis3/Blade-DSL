@@ -1,0 +1,32 @@
+// TEST: C2-Reverse Refuses A Rank-Carrying (Fiber) Kernel Parameter (rejects)
+// This IS `ppl.comoments(A, 2)`'s other elaboration -- the branch
+// `PplElaborate.fs:460-464` takes when the leading extent does not resolve
+// statically: `method_for(A, A) <@> lambda(__x1: fiber, __x2: fiber)
+// where comm(__x1, __x2) -> <central pair body> |> compute`.
+//
+// A parameter annotated with an array type is bound to a rank-k FIBER, not to
+// a cell, so the loop peels ROWS and the reverse rule for it is a contraction
+// over the axes the parameter absorbed -- a partial fold, which grad refuses
+// outright (`hoistReduces`: "reduce with an explicit `axes = n`"). The
+// construction-loop lowering has nothing to say about it and says so, rather
+// than emitting a buffer of the wrong rank.
+//
+// Forward mode DOES differentiate this shape (C8-ii, pinned by 068-071), so
+// the message names `ad.jvp` as the route that exists today. 101 pins the
+// former's OTHER elaboration -- the pool path -- which reverse mode now does
+// differentiate end to end.
+// ERROR: BL5500
+// ERROR-CONTAINS: rank-carrying
+import ad as ad
+
+type V = Idx<2>
+type S = Idx<4>
+
+function loss(a: Array<Float like V, S>) -> Float = {
+    let c = method_for(a, a) <@> lambda(x1: Array<Float like S>, x2: Array<Float like S>) -> reduce(x1 * x2, (+)) / 4.0 |> compute
+    c(0, 1)
+}
+
+let mut da = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]
+let lv = ad.grad(loss)([[1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 1.0]], da)
+lv

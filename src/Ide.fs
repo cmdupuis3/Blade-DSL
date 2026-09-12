@@ -126,9 +126,14 @@ type private BindingInfo = {
     /// Stage-3 DEDUCED symmetry as canonical pin-clause strings ("comm(a,
     /// b)"), declared or not -- always emitted for functions ([] = "None").
     DeducedComm: string list
-    /// Provenance for a top-level provider read (`let x = store.vars.v |>
+    /// Provenance for a top-level provider READ (`let x = store.vars.v |>
     /// alias.read`): (store binding name, "vars.v" / "dims.v"). None otherwise.
     ProviderRead: (string * string) option
+    /// Provenance for a top-level provider WRITE (`let saved = alias.write(
+    /// "out.csv", obs)`): the store member the array it persists came from,
+    /// chased through `obs`. Its own channel, not `ProviderRead` -- a write
+    /// binding reads nothing from the store.
+    ProviderWrite: (string * string) option
     /// Full-tier upgrade: the type MONOMORPHIZATION resolved, when it is
     /// strictly more concrete than `TypeStr`. None on the fast tier and on
     /// bindings lowering left unchanged.
@@ -344,6 +349,13 @@ let private renderJson (env: Envelope) (diags: Diag list) (bindings: BindingInfo
                 ",\"providerRead\":{{\"store\":\"{0}\",\"member\":\"{1}\"}}",
                 jsonEscape store, jsonEscape memberPath) |> ignore
         | None -> ()
+        // Same shape, opposite direction, and never both on one binding.
+        match b.ProviderWrite with
+        | Some (store, memberPath) ->
+            sb.AppendFormat(
+                ",\"providerWrite\":{{\"store\":\"{0}\",\"member\":\"{1}\"}}",
+                jsonEscape store, jsonEscape memberPath) |> ignore
+        | None -> ()
         match b.Ret with
         | Some ret ->
             sb.Append ",\"params\":[" |> ignore
@@ -507,7 +519,15 @@ let rec private indexNamesOf (t: IRType) : (IRId * string) list =
             |> List.choose (fun idx ->
                 match idx.Tag with
                 | Some tag when not (tag.StartsWith "__") -> Some (idx.Id, tag)
-                | _ -> None)
+                // A provider AXIS tag is `__`-prefixed so the type system reads it
+                // as synthetic (IcechunkProvider.axisTag says why), but the dim name
+                // inside it is exactly the user-facing name this map wants -- without
+                // it a checkout array prints as `Idx<24>, Idx<10>, Idx<12>` while the
+                // store calls those axes time, lat and lon.
+                | Some tag ->
+                    Blade.IcechunkProvider.tryAxisTagName tag
+                    |> Option.map (fun name -> (idx.Id, name))
+                | None -> None)
         fromIndices @ indexNamesOf arr.ElemType
     | IRTTuple ts -> ts |> List.collect indexNamesOf
     | _ -> []
@@ -710,7 +730,7 @@ let builtinCallNames : string list =
       "guard"; "reynolds"; "zero"; "rank"; "arity"; "extents"; "reduce"; "mask"
       "compound"; "sparse"; "zip"; "stack"; "sort"; "unique"; "intersect"; "union"
       "contains"; "display.emit"; "group_by"; "group_keys"; "transpose"; "decompact"
-      "gram"; "matmul"; "eigh"; "solve"; "sequence"; "replicate"; "complex"
+      "gram"; "gram_apply"; "matmul"; "eigh"; "solve"; "lu"; "lu_solve"; "lu_solve_t"; "sequence"; "replicate"; "complex"
       "prodsum"; "fill_random" ]
 
 /// The builtin a typed node is an application of, with its argument nodes
@@ -747,19 +767,29 @@ let private builtinCallOf (te: TypedExpr) : (string * TypedExpr list) option =
     | TExprIntersect (a, b) -> Some ("intersect", [a; b])
     | TExprUnion (a, b) -> Some ("union", [a; b])
     | TExprContains (a, v) -> Some ("contains", [a; v])
-    | TExprDisplayEmit (_, _, d, _) -> Some ("display.emit", [d])
+    // Both spellings report under the ONE name `display.emit`: `builtinCallNames`
+    // above is the checked-in enumeration of everything this function can
+    // return (protocol/surface.json is generated from it and a self-test pins
+    // the two together), and `emit_id` is the same builtin with one more
+    // operand, not a second builtin. The id operand IS reported, so the call
+    // record carries both argument types.
+    | TExprDisplayEmit (_, _, d, _, idOpt) -> Some ("display.emit", d :: Option.toList idOpt)
     | TExprGroupBy (v, g) -> Some ("group_by", [v; g])
     | TExprGroupKeys ks -> Some ("group_keys", ks)
     | TExprGroupBucket gk -> Some ("group_bucket", [gk])
     | TExprTranspose (a, _, _) -> Some ("transpose", [a])
     | TExprDecompact (a, _) -> Some ("decompact", [a])
     | TExprGram (l, r, _) -> Some ("gram", [l; r])
+    | TExprGramApply (l, r, x) -> Some ("gram_apply", [l; r; x])
     | TExprMatmul (l, r) -> Some ("matmul", [l; r])
     | TExprEigh a -> Some ("eigh", [a])
+    | TExprLu a -> Some ("lu", [a])
+    | TExprLuSolve (l, p, b, t) -> Some ((if t then "lu_solve_t" else "lu_solve"), [l; p; b])
     | TExprSolve (a, b) -> Some ("solve", [a; b])
     | TExprSequence es -> Some ("sequence", es)
     | TExprReplicate (c, b) -> Some ("replicate", [c; b])
     | TExprComplexLit (re, im) -> Some ("complex", [re; im])
+    | TExprFma (a, b, c) -> Some ("fma", [a; b; c])
     | TExprProdSum args -> Some ("prodsum", args)
     | TExprFillRandom m -> Some ("fill_random", [m])
     | TExprUnaryOp (OpMath name, a) -> Some (name, [a])
@@ -1153,7 +1183,10 @@ let private parityClauses (names: string list) (parities: Blade.Deduce.Parity li
             match parArr.[i] with
             | Blade.Deduce.PInv -> Some "comm"
             | Blade.Deduce.PNeg -> Some "anticomm"
-            | Blade.Deduce.PBottom -> None
+            // PConj (Hermitian, f(y,x) = conj(f(x,y))) has no writable
+            // clause yet -- it exists to refute comm/anticomm, so it
+            // renders like PBottom rather than proposing a pin.
+            | Blade.Deduce.PConj | Blade.Deduce.PBottom -> None
         match kw with
         | None -> i <- i + 1
         | Some kw ->
@@ -1343,36 +1376,87 @@ let private providerAliases (prog: Ast.Program) : Map<string, string> =
             | _ -> ()
     acc |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq
 
-/// The `store.vars.v` / `store.dims.v` receiver of a `|> alias.read` (the
-/// pipe desugars to `alias.read(store.vars.v)`), recovered from the
-/// untyped RHS so a top-level provider-read binding names its source.
-let private readOperandProvenance (aliases: Map<string, string>) (v: Expr) : (string * string) option =
-    match v.Kind with
-    | ExprKind.ExprApp ({ Kind = ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, meth) }, [operand])
-        when (meth = "read" || meth = "stream") && aliases.ContainsKey alias ->
+/// Which direction a provider-verb binding faces. A `write` binding does not
+/// read the store member it names -- it PERSISTS an array that came from there
+/// -- so the two travel in separate payload fields and must not be conflated.
+type private ProvDirection =
+    | ProvRead
+    | ProvWrite
+
+/// The `store.vars.v` / `store.dims.v` receiver of a provider-verb call (the
+/// pipe desugars to `alias.read(store.vars.v)`), recovered from the untyped
+/// RHS so a top-level provider-read binding names its source. `read`/`stream`
+/// take the view alone; `read_window` adds window bounds and `load_compound`
+/// a mask, view first in both. `write` takes a prior named binding, never a
+/// view, so its provenance is that binding's own, when one was recorded
+/// (`priorOf` -- the caller accumulates in declaration order) -- and comes back
+/// tagged `ProvWrite`, because what it names is where the array CAME FROM, not
+/// something this binding reads.
+let private readOperandProvenance (aliases: Map<string, string>) (priorOf: string -> (string * string) option)
+                                  (v: Expr) : (ProvDirection * (string * string)) option =
+    let storeMember (operand: Expr) =
         match operand.Kind with
         | ExprKind.ExprField ({ Kind = ExprKind.ExprField ({ Kind = ExprKind.ExprVar store }, section) }, field)
             when section = "vars" || section = "dims" ->
             Some (store, $"{section}.{field}")
         | _ -> None
+    match v.Kind with
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, meth) }, args)
+        when aliases.ContainsKey alias ->
+        (match meth, args with
+         | ("read" | "stream"), [operand]                    // alias.read(v) / alias.stream(v)
+         | "read_window", [operand; _; _]                    // alias.read_window(v, lo, hi)
+         | "load_compound", [operand; _] ->                  // alias.load_compound(v, mask)
+             storeMember operand |> Option.map (fun pr -> ProvRead, pr)
+         | "write", [_; { Kind = ExprKind.ExprVar src }] ->  // alias.write("path", v)
+             priorOf src |> Option.map (fun pr -> ProvWrite, pr)
+         | _ -> None)
     | _ -> None
 
-/// bindingName -> (store, "vars.v") for module-level provider reads.
-let private readProvenance (prog: Ast.Program) (aliases: Map<string, string>) : Map<string, string * string> =
-    let acc = Dictionary<string, string * string>()
+/// bindingName -> (store, "vars.v"), as two maps: READS (`alias.read` and its
+/// siblings) and WRITES (`alias.write`, chased to the source binding it
+/// persists).
+///
+/// The write chase is scoped to ONE MODULE: `alias.write("p", obs)` resolves
+/// `obs` against its own module's bindings, so `priorOf`'s accumulator is
+/// effectively keyed by (module, name) -- a program-wide name-keyed
+/// accumulator would let a `let obs` in module A hand its provenance to an
+/// unrelated same-named write in module B.
+///
+/// The RETURNED maps stay name-keyed: `joinBindings` pairs them against typed
+/// binding entries, which carry a scope but no module identity, so
+/// cross-module duplicates of a top-level name still collide there (last
+/// module wins) -- only the CHASE above is module-scoped.
+let private readProvenance (prog: Ast.Program) (aliases: Map<string, string>)
+    : Map<string, string * string> * Map<string, string * string> =
+    let reads = Dictionary<string, string * string>()
+    let writes = Dictionary<string, string * string>()
     if not aliases.IsEmpty then
         for m in prog.Modules do
+            let prior = Dictionary<string, string * string>()
+            let priorOf name =
+                match prior.TryGetValue name with
+                | true, pr -> Some pr
+                | _ -> None
             for ld in m.Decls do
                 match ld.Value with
                 | DeclLet b | DeclStatic b ->
                     match b.Pattern.Kind with
                     | PatternKind.PatVar name ->
-                        match readOperandProvenance aliases b.Value with
-                        | Some pr -> acc.[name] <- pr
+                        match readOperandProvenance aliases priorOf b.Value with
+                        | Some (dir, pr) ->
+                            // Both directions feed the chase (a write of a
+                            // write still names the array's origin); only the
+                            // OUTPUT channel splits.
+                            prior.[name] <- pr
+                            (match dir with
+                             | ProvRead -> reads.[name] <- pr
+                             | ProvWrite -> writes.[name] <- pr)
                         | None -> ()
                     | _ -> ()
                 | _ -> ()
-    acc |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq
+    (reads |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq,
+     writes |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq)
 
 /// Provided structure for every `let store = alias.load("path")`, rendered
 /// from the module TypeCheck already stashed in IdeStores -- so this NEVER
@@ -1458,8 +1542,9 @@ let private joinBindings (prog: Ast.Program) (tp: TypedProgram) (sourceLines: st
             docCache.[line] <- d
             d
     // Provenance for top-level provider reads (`let x = store.vars.v |>
-    // alias.read`), attached to the matching module-level binding.
-    let provRead = readProvenance prog (providerAliases prog)
+    // alias.read`) and writes (`let saved = alias.write("out", x)`), attached
+    // to the matching module-level binding in their own fields.
+    let (provRead, provWrite) = readProvenance prog (providerAliases prog)
     [ for e in collectTypedBindings srcFuncs tp do
         let key = e.Scope + " " + e.EName
         match spans.TryGetValue key with
@@ -1488,11 +1573,13 @@ let private joinBindings (prog: Ast.Program) (tp: TypedProgram) (sourceLines: st
                 |> List.map (fun (n, t, mr, dflt) ->
                     { PName = n; PType = t; PDoc = paramDocIn block n; PMinRank = mr; PDefault = dflt })
             let providerRead = if e.Scope = "" then Map.tryFind e.EName provRead else None
+            let providerWrite = if e.Scope = "" then Map.tryFind e.EName provWrite else None
             yield { Name = e.EName; Kind = kind; Line = line; Col = col
                     EndLine = endLine; EndCol = endCol
                     TypeStr = e.ETypeStr; Doc = doc; Params = ps; Ret = e.ERet
                     Where = e.EWhere; DeducedComm = e.EDeducedComm
                     ProviderRead = providerRead
+                    ProviderWrite = providerWrite
                     ConcreteType = None
                     // Params and function-body locals carry their function's
                     // scope; functions themselves carry a return type. What
@@ -1807,6 +1894,14 @@ let ideCheckSourceWith (env: Envelope) (upgrade: FullTierUpgrade option)
                     Message = e.Message; Code = e.Code }
         exitCode <- 1
     | Ok program ->
+        // Provider checkout desugar, on the same terms as the compile lane:
+        // `repo.checkout(ref)` becomes the load shape every payload collector
+        // below already recognizes (collectProviderStores, readProvenance), so
+        // a checkout binding gets its store hover instead of nothing.
+        // `typeCheck` re-runs the pass internally (it is idempotent); a
+        // wrong-shaped checkout is left alone here and surfaces as the
+        // checker's diagnostic, which is where the editor wants it anyway.
+        let program = Blade.ProviderDesugar.desugarOrIdentity program
         // File-based imports (`import units.SI`) are resolved here for the
         // same reason `blade check` resolves them: without it the editor
         // squiggles every `Float<newton>` in a file that compiles fine.
@@ -1859,8 +1954,11 @@ let ideCheckSourceWith (env: Envelope) (upgrade: FullTierUpgrade option)
                  | [] -> tp
                  | ms -> { tp with Modules = [ List.last ms ] }
         // Fresh provider-module registry (the load site records into it
-        // during typeCheck; collectProviderStores reads it).
+        // during typeCheck; collectProviderStores reads it), and with it the
+        // icechunk axis mint table -- both are per-compilation AsyncLocal
+        // side-channels a previous check must not leak into this one.
         Blade.ProviderRegistry.IdeStores.reset ()
+        Blade.IcechunkProvider.resetAxisMint ()
         // Suggestions and warnings are NOT error-exclusive: a file with
         // a type error earned every nudge before hitting it. All three
         // channels are AsyncLocal, so Error reads them like Ok does.
@@ -2102,6 +2200,8 @@ let renderSurfaceWith (id: int option) (compilerVersion: string) : string =
     appendNameArray sb "unary" Blade.Grad.mathIntrinsics
     sb.Append ',' |> ignore
     appendNameArray sb "binary" Blade.Grad.binaryMathIntrinsics
+    sb.Append ',' |> ignore
+    appendNameArray sb "ternary" Blade.Grad.ternaryMathIntrinsics
     sb.Append ',' |> ignore
     appendNameArray sb "complex" Blade.Grad.complexMathIntrinsics
     sb.Append "}," |> ignore

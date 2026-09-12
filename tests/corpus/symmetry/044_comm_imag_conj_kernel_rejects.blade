@@ -1,0 +1,10 @@
+// TEST: Comm contradicts imag of conjugating kernel (rejects)
+// ERROR: BL4013
+// The lattice composes PConj through imag(): imag(conj w) = -imag(w), so
+// `imag(x * conj(y))` deduces PNeg -- provably ANTIcommutative -- and the
+// declared `comm` rejects through the ORIGINAL PNeg arm of the check, not
+// the conjugate one. Pins that the Hermitian element feeds the existing
+// contradiction machinery rather than bypassing it: without PConj this
+// body deduced PBottom and the clause was silently trusted.
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let bad = method_for(A, A) <@> lambda(x, y) where comm(x, y) -> imag(x * conj(y)) |> compute

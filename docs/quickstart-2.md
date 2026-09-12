@@ -70,6 +70,21 @@ source index type as a unit (`i : Nat<LatIdx>`), a kernel can only index a
 captured array with indices from the *right* index space — using a `LatIdx`
 value on a `LonIdx` array is a compile error, even at equal extents.
 
+When no named index type is in play, the **anonymous range** `m..n`
+(half-open) is the lightweight spelling, and a plain dense range is an
+ordinary rank-1 array value: it lifts elementwise, folds, and materializes
+when bound. Index generation that is just arithmetic needs no loop at all:
+
+```F#
+let axis = -2.5 + 0.01 * Float64(0..450)   // a 450-point coordinate axis
+let total = reduce(0..100, (+))             // 4950
+let ids = 0..8                              // materialized iota, [0..7]
+```
+
+Reach for `method_for(range<...>) <@> lambda` when the kernel is a real
+block, gathers, or composes with other combinators — not for a body that is
+merely affine in the index.
+
 ## For Loops
 
 `method_for` and `object_for` can be unwieldy, so there's shorthand:

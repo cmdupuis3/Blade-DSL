@@ -1,0 +1,9 @@
+// TEST: T^0 lift deduces a rank-2 output from a rank-2 argument
+// The output rank comes from the ARRAY arguments, not from the declaration,
+// so the same call at rank 2 yields a rank-2 result. Pins that the lift is
+// rank-general rather than a rank-1 special case.
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let M: Array<Float like Idx<2>, Idx<3>> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let r = add0(M, 100.0)
+// EXPECT: r = [[101.0, 102.0, 103.0], [104.0, 105.0, 106.0]]

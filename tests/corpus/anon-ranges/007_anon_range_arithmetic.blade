@@ -1,0 +1,10 @@
+// TEST: Anon Range Arithmetic
+// Implicit lifting treats a range as the rank-1 array it is.
+let shifted = (0..5) + 10
+let squares = (0..4) * (0..4)
+let neg = -(0..4)
+let s0 = shifted(0)
+// EXPECT: shifted = [10, 11, 12, 13, 14]
+// EXPECT: squares = [0, 1, 4, 9]
+// EXPECT: neg = [0, -1, -2, -3]
+// EXPECT: s0 = 10

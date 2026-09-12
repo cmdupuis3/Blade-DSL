@@ -1,0 +1,64 @@
+// TEST: C2-Reverse -- Eager Map Over range<I> Lowered To A Construction Loop
+// The crown jewel of plan-equivariant-nn-notebooks.md 5.2, and a deliberate
+// amendment to plan-ad-combinators.md 4 C6's "do not build a general
+// reverse-through-combinators pass". No general pass is built and no new
+// adjoint theory is introduced: the eager map is REWRITTEN, before the
+// sweeps run, into the element-write construction loop grad's v1 subset
+// already differentiates --
+//
+//     let m = method_for(range<I>) <@> lambda(i) -> BODY |> compute
+//  becomes
+//     let mut m = [0.0, ...];  for __mi in 0..n { m(__mi) = BODY[i := __mi] }
+//
+// -- so the adjoint is the EXISTING loop replay (`adjointOfStmt`'s NFor arm:
+// save the cotangent cell, zero it, flow into the rhs). Exactly the move
+// `expandRecArray` makes for `let rec` and `fuseProgram` makes for pipelines.
+//
+// Reverse mode only: forward mode keeps its Tier-2 rule (`tangentOfMap`),
+// which preserves the loop object, its `range<SymIdx>` symmetric fast path
+// and its parallelism licences. The `ad.jvp` leg below therefore travels a
+// COMPLETELY DIFFERENT route to the same number, which is what makes the
+// residual pin a differential gate rather than a tautology.
+//
+// HAND DERIVATION (x = [1, 2, 3, 4], all dyadic so the pins are exact):
+//   m(i)  = x(i)^2 + 3 x(i)      m = [4, 10, 18, 28]
+//   loss  = m(0) + 2 m(1) + m(2) - m(3) = 4 + 20 + 18 - 28 = 14
+//   dm    = [1, 2, 1, -1]
+//   dx(i) = dm(i) * (2 x(i) + 3) = [5, 14, 9, -11]
+//   with seed s = [0.5, -1, 0.25, 2]:
+//   <dx, s> = 2.5 - 14 + 2.25 - 22 = -31.25
+import ad as ad
+
+type I = Idx<4>
+
+function loss(x: Array<Float like I>) -> Float = {
+    let m = method_for(range<I>) <@> lambda(i: I) -> x(i) * x(i) + 3.0 * x(i) |> compute
+    m(0) + 2.0 * m(1) + m(2) - m(3)
+}
+
+// WARN: BL4003
+let x0 = [1.0, 2.0, 3.0, 4.0]
+let mut dx = [0.0, 0.0, 0.0, 0.0]
+let lv = ad.grad(loss)(x0, dx)
+// EXPECT: lv = 14
+// EXPECT: dx = [5, 14, 9, -11]
+
+// The differential gate: the forward tangent along a seed equals the reverse
+// gradient contracted with it, EXACTLY -- and the two legs share no code
+// (jvp keeps the map, grad lowers it).
+let seed = [0.5, -1.0, 0.25, 2.0]
+let (jp, jt) = ad.jvp(loss)(x0, seed)
+let resid = jt - reduce(dx * seed, (+))
+// EXPECT: jp = 14
+// EXPECT: resid = 0
+
+// The independent route: central differences on the primal, no AD on that
+// side. Pinned as a thresholded boolean -- an FD residual is a
+// catastrophic-cancellation quantity and must never be an EXPECT value.
+let h = 0.000001
+let fd1 = (loss([1.0, 2.0 + h, 3.0, 4.0]) - loss([1.0, 2.0 - h, 3.0, 4.0])) / (2.0 * h)
+let fd3 = (loss([1.0, 2.0, 3.0, 4.0 + h]) - loss([1.0, 2.0, 3.0, 4.0 - h])) / (2.0 * h)
+let fd_ok1 = abs(fd1 - dx(1)) < 0.000001 * (abs(dx(1)) + 1.0)
+let fd_ok3 = abs(fd3 - dx(3)) < 0.000001 * (abs(dx(3)) + 1.0)
+// EXPECT: fd_ok1 = true
+// EXPECT: fd_ok3 = true

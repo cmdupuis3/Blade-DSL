@@ -1,0 +1,16 @@
+// TEST: Anticomm licensed on imag of conjugating kernel
+// The accepted half of symmetry/044: `imag(x * conj(y))` deduces PNeg
+// (PConj composed through imag()), which AGREES with the declared
+// anticomm -- strict-triangular storage with the sign mirror is exactly
+// right. h(1, 0) reads the stored h(0, 1) negated (2 becomes -2, the
+// truth), and the never-stored diagonal reads zero, which imag(x *
+// conj(x)) genuinely is. This is the steering the symmetry/040
+// diagnostic offers, pinned so it stays true.
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let h = method_for(A, A) <@> lambda(x, y) where anticomm(x, y) -> imag(x * conj(y)) |> compute
+let h00 = h(0, 0)
+let h01 = h(0, 1)
+let h10 = h(1, 0)
+// EXPECT: h00 = 0
+// EXPECT: h01 = 2
+// EXPECT: h10 = -2

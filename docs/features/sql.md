@@ -366,6 +366,101 @@ Tests: `sql-group-by` cases "Group Extents", "Group Gather Elision", "Group
 Extents Inline Argument"; the emission shape (which a value check cannot see) is
 pinned by the "Group Gather Elision" block in `tests/Test_Sqlish.fs`.
 
+## 7c. `segments(A)`, `files(A)`, `ungroup` — structural groupings of a segmented axis
+
+A chunked dimension is a grouping of its axis whose keys are given by STRUCTURE
+rather than by values (docs/plans/structural/07). The surface is one type and
+three name-keyed forms:
+
+```blade
+type I  = Idx<10>
+type CI = Chunked<I, 4>                       // I segmented into runs of four: [0,4) [4,8) [8,10)
+type CX = Chunked<s.index.x, store>           // a store axis, chunked as the store chunks it
+type T  = Chunked<s1.index.x, [[s1, store], [s2, 2]]>   // x TILED over two stores, each with its own grid
+
+let seg = segments(CI)                        // GroupKeys<I>: the run partition, no key array, no permutation
+let g   = group_by(a, seg)                    // groups x members, as for any grouping
+let back = ungroup(g)                         // Array<Float like I>: the runs reassembled over I
+let fs  = files(T)                            // the FILE level of a tiled axis: one run per store, labelled
+let v   = ungroup([v1, v2], T)                // a variable living in both stores, named over T
+let tiles = segments(C0, C1)                  // a rank-2 array's TILE grouping: one group per (g0, g1), slot order
+let t2  = segments(a)                         // the same, read off a's own annotation `Array<T like C0, C1>`
+let A: Array<Float like CX> = s.vars.A |> z.stream   // NOT materialized; consumers below stream it
+let total = reduce(A, (+))                    // block-by-block in storage order: bitwise the flat fold
+let g = group_by(A, segments(A))              // one run read per group (rank 2: one TILE window per group)
+let d = method_for(halo<CX, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1)) |> compute   // run + ghost cells per segment
+let e = A * 2.0                               // elementwise: one block (rank 2: one band of rows) at a time
+let T: Array<Float like CLat, CLon> = s.vars.T |> z.stream    // a 2-D variable chunked in both dims
+let tiles = group_by(T, segments(T))          // each tile one window read; with inherited edges, one chunk file
+```
+
+- `Chunked<I, spec>` **is** `I`: the alias adopts I's record, so arrays over `CI` and
+  over `I` are one type. The segmentation lives beside the alias and is read only
+  by `segments`/`files`. A file-tiled axis is a NEW axis of the summed extent,
+  named by the alias; its inner only names the dimension the stores tile, and each
+  store keeps its own chunk grid (a `store` entry inherits it, a literal sets it,
+  none leaves the file unchunked). Only extents and chunk edges are consulted --
+  never a coordinate value: the declaration order *is* the axis order.
+- `segments(A)` and `files(A)` are groupings on exactly the terms of `group_keys`
+  (section 7): name-keyed (BL3017), sharing one binding co-iterates,
+  `group_bucket`/`extents` read them. They emit no permutation: the position
+  accessor every grouping now carries (`<gk>__at`) is the identity here and
+  `__perm` for a CSR grouping, so downstream consumers do not know which regime
+  built the table. `segments` of a tiled axis is its innermost (per-file chunk)
+  level; `files` its outermost. In a static position `segments(A)` is the tuple
+  of run sizes, so `let static n = length(segments(A))` is a compile-time segment
+  count.
+- `segments(C0, C1)` over a rank-2 array whose slots are exactly those axes, in
+  slot order (decisions D8/D10 -- the reversed order is refused, not transposed),
+  is the PRODUCT grouping: one group per tile, row-major over the tile grid, the
+  member the tile's cells row-major; `extents` gives tile sizes and `ungroup`
+  puts the tiles back over both axes. `group_bucket` is refused for it (its
+  source is two-dimensional). The cross-slot condition of the design's §4.0 holds
+  by construction here, since both slots are single-slot segmentations; a
+  two-dimensional mosaic of stores has no declaration form yet.
+- `segments(a)` over a VALUE reads the tiling its annotation declared: an array
+  whose slots name `Chunked` aliases already says its tiling, so one slot gives the
+  rank-1 grouping and two the tile grouping. An unannotated value is refused with
+  both spellings that work.
+- A rank-1 variable bound with `.stream` on a `Chunked` axis is never
+  materialized; its consumers stream it, and each choice is recorded for
+  `blade plan` under the rule `segment-streaming`:
+  `reduce(A, k)` walks the store one block at a time (the store's chunk edge) and
+  folds the cells in storage order -- the same operation sequence as the flat
+  fold, so bitwise the same answer, no reorder licence (an `omp` on the kernel is
+  noted and ignored); `group_by(A, segments(..))` reads one run per group into
+  its row (a rank-2 variable's tile grouping reads one rectangular window per
+  tile, which is exactly one chunk file when the edges are the store's); an
+  ELEMENTWISE consumer -- a map, a scalar-broadcast binop, a zip with a
+  materialized array -- runs one block of the leading chunk edge at a time (a
+  band of rows above rank 1), each streamed operand its own window; a halo map
+  over `A`'s axis runs one segment at a time, reading each run plus the ghost
+  cells its reach demands (docs/plans/structural/07 §2.3). The traversal order is
+  the store's own. A fiber kernel over a streamed rank-2 variable keeps the older
+  fiber path; a key grouping over a streamed variable keeps its refusal. Zarr
+  today; the hooks exist for the other providers.
+- `ungroup(G)` restores the axis from a `group_by(_, segments(A))` result;
+  `ungroup(G, A)` names the axis when G derives from one (a map over it keeps
+  neither the outer id nor the grouping registration). `ungroup([r1, .., rF], A)`
+  assembles one array per store over a tiled axis; rows are bare names whose
+  extents must match the stores'. `join` is untouched: it concatenates into a
+  fresh axis, `ungroup` reassembles an existing one.
+
+Folds (decision D6): a flat `reduce` over an array on a `Chunked` axis is the plain
+flat fold -- the alias IS the axis, nothing is reassociated, no license is asked.
+A per-segment fold is what `group_by(a, segments(A))` and an explicit combine
+spell; nothing implicit exists to refuse.
+
+Not yet: an elementwise map over a grouped array (the ragged-map emitter's
+standing refusal; stream the source instead, or `ungroup` then map); streaming
+of rank >= 3 variables, of a rank-2 stencil, and of netcdf/icechunk stores (zarr
+today); a stencil streaming MORE than one source; a two-dimensional mosaic of
+stores; string-label indexing of the `files` outer axis; static `segments` for
+provider axes; chunk edges for netcdf and icechunk (zarr only). Tests:
+`tests/corpus/segments/`, and `blade test zarr` sections 10c (inherited edge),
+10d (two stores), 10e (streamed runs), 10f (streamed fold), 10g (stencil over
+segments), 10h (elementwise consumers), 10i (rank 2: tiles and row bands).
+
 ## 8. `group_by(values, gk)` — ragged grouped view
 
 ```blade
@@ -516,6 +611,15 @@ serial` marker at the fold, naming `axes = rank` as the spelling that threads.
 A multi-axis partial fold (1 < n < rank) additionally
 needs the folded slice to be dense, statically sized, untagged and unitless;
 outside that envelope, write the row-wise form with the slice type spelled out.
+One partial fold never builds its operand: an ANONYMOUS deferred outer product
+under the default `axes = 1` -- `reduce(method_for(A, B) <@> lambda(a, b) ->
+f(a, b), op[, init])` with two named rank-1 plain sources, no `where` clause on
+the map kernel, and a `(+)`/`(*)` section or a seeded fold -- is rewritten into
+an outer apply over `A` whose row kernel is the fused fold over `B`, so the
+|A| x |B| product is never materialized (docs/plans/structural/03, piece D;
+`tests/corpus/loops/206` pins it bit-for-bit against the forced spelling). A
+named operand, a `where comm` map kernel, or three or more sources keep the
+materialized route.
 
 A fused `<&!>` tree terminal (`reduce((L₁ <@> k₁) <&!> (L₂ <@> k₂), (+))`) has
 no partial form and stays the full fold it has always been: its leaves may have

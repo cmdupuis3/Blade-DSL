@@ -27,7 +27,6 @@ function loss(v: Array<Float64 like R>, k: Array<Int64 like R>) -> Float = {
 
 let v0: Array<Float64 like R> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
 let kk: Array<Int64 like R> = [0, 1, 0, 2, 1, 0]
-// WARN: BL4003
 let mut dv = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 let gv = ad.grad(loss)(v0, kk, dv)
 // EXPECT: gv = 210

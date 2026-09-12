@@ -1,0 +1,16 @@
+// TEST: Halo compound-inner offset outside the declared window rejected (rejects)
+// The compound twin of loops/202. Over a `CompoundIdx` inner the window
+// ordinal walks the PRESENT cells and `w(o)` yields the coordinate of the
+// (center + o)-th of them, looked up in the rank table; the interior is
+// shrunk by the declared REACH, exactly as in the dense case. An offset
+// outside that reach therefore runs off the table's end -- and unlike the
+// dense read it was not even extent-checked, because the array being indexed
+// (`dense`, over the BASE axis) has nothing to do with the compound
+// cardinality. Judged now by the same reach rule.
+// ERROR: BL4019
+// ERROR-CONTAINS: offset 3
+type T = Idx<8>
+let dense: Array<Float64 like T> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let m: Array<Bool like T> = [true, false, true, true, false, true, true, false]
+let d = method_for(halo<CompoundIdx<m>, [0, 1]>) <@> lambda(w) -> dense(w(3)) - dense(w(0)) |> compute
+d

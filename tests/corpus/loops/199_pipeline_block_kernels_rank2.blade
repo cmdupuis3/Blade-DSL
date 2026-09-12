@@ -1,0 +1,12 @@
+// TEST: Pipeline Block Kernels Rank 2
+// ============================================================================
+// The staged path emitted ONE loop whatever the input's rank, handing row
+// pointers to scalar kernels (g++: cannot convert double*). The sweep now
+// covers every axis.
+let A = [[1.0, 2.0], [3.0, 4.0]]
+function inc(x: Float64) -> Float64 = { x + 1.0 }
+function dbl(x: Float64) -> Float64 = { x * 2.0 }
+let piped = (object_for(inc) >>@ object_for(dbl)) <@> A |> compute
+let direct = A * 2.0 + 2.0
+// EXPECT: piped = [[4, 6], [8, 10]]
+// EXPECT: direct = [[4, 6], [8, 10]]

@@ -1,0 +1,10 @@
+// TEST: Match Guard Must Be Bool (rejects)
+// ============================================================================
+// A guard is a predicate. The old path inferred the guard and discarded its
+// type, so an Int64 (or even an array) guard sailed through to C truthiness.
+
+let x = 5
+let r = match x with
+    | n if n + 1 -> 1
+    | _ -> 0
+// ERROR-CONTAINS: a match-arm guard must be Bool

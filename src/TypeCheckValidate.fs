@@ -268,6 +268,27 @@ let rec internal collectAppRankErrors (subst: Subst) (expr: TypedExpr) : Compile
                         Span = arg.Span
                         Context = []
                         Code = None } ]
+                | None ->
+                // The ABSTRACT-PARAMETER twin, and the reason this sweep has
+                // to carry it: a `T^k` parameter is STILL an open variable
+                // after zonking -- polymorphic ids are deliberately preserved
+                // for IR-phase monomorphization -- so the rank clash above
+                // cannot see these, and neither could the eager seam when the
+                // arguments were not yet determined there. What IS determined
+                // by now is every ARGUMENT type, which is all this predicate
+                // reads. See firstAbstractVarConflict.
+                match firstAbstractVarConflict subst paramTys (tArgs |> List.map (_.Type)) with
+                | Some (firstPos, conflictPos, firstTy, conflictTy) ->
+                    let arg = List.item conflictPos tArgs
+                    let calleeDesc =
+                        match tFunc.Kind with
+                        | TExprVar (name, _, _) -> $"'{name}'"
+                        | _ -> "this function"
+                    [ { Error = Other (abstractVarConflictMessage subst calleeDesc
+                                                                  firstPos conflictPos firstTy conflictTy)
+                        Span = arg.Span
+                        Context = []
+                        Code = None } ]
                 | None -> []
             | _ -> []
         | _ -> []
@@ -437,7 +458,9 @@ let internal declWriteRoots (decl: TypedDecl) : (bool * TypedExpr) list =
 /// is an alias, and the alias is exactly the bug.
 let internal groupKeysLetRhs (b: TypedBinding) : string option * TypedExpr =
     match b.Value.Kind with
-    | TExprGroupKeys _ when List.isEmpty b.SubBindings -> (None, b.Value)
+    // `segments(A)` is a grouping on the same name-keyed terms as group_keys
+    // (docs/plans/structural/07 §3.2): its locals are suffixed off the binding.
+    | TExprGroupKeys _ | TExprSegments _ | TExprSegmentsGrid _ when List.isEmpty b.SubBindings -> (None, b.Value)
     | _ -> (Some "as another binding's value", b.Value)
 
 let rec internal collectGroupKeysEscapes (subst: Subst) (pos: string option) (expr: TypedExpr) : CompileError list =
@@ -445,6 +468,8 @@ let rec internal collectGroupKeysEscapes (subst: Subst) (pos: string option) (ex
     let describe (e: TypedExpr) =
         match e.Kind with
         | TExprGroupKeys _ -> "a `group_keys(...)` call"
+        | TExprSegments (_, _, Some _) -> "a `files(...)` call"
+        | TExprSegments _ | TExprSegmentsGrid _ -> "a `segments(...)` call"
         | TExprVar (n, _, _) -> $"the group_keys binding '{n}'"
         | _ -> "a group_keys result"
     // A block is TRANSPARENT here: its type is its final expression's, and its

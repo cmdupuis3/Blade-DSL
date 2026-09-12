@@ -1,0 +1,18 @@
+// TEST: T^0 call whose later argument would NARROW (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: would have to NARROW into it
+// ============================================================================
+// Compatibility at this seam is judged by what the emitted MONOMORPH accepts,
+// not by type equality: the specialization is built from the FIRST teaching,
+// so a later argument is fine exactly when it flows into that signature
+// without conversion.
+//
+// Here argument 1 makes `T` Int64, so the monomorph is
+// `int64 add0(int64, int64)` -- and feeding it 2.5 is the narrowing g++
+// refuses under -Werror=float-conversion. The reverse order (`add0(2.5, 3)`)
+// builds `double add0(double, double)` and WIDENS the int64, which C++ does
+// silently and which is therefore accepted; 044 pins that direction.
+// ============================================================================
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let r = add0(3, 2.5)

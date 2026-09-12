@@ -1,0 +1,12 @@
+// TEST: T^0 binary function broadcasts a scalar BINDING
+// The binding spelling of 036. Worth its own test because the two used to
+// FAIL DIFFERENTLY -- a literal and a `let` scalar reach the seam as different
+// node kinds -- and because the scalar's SURFACE expression is what the lift
+// embeds in the synthesized kernel body, so a captured local is exactly the
+// case where capture analysis has to see it.
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let s = 100.0
+let r = add0(A, s)
+// EXPECT: r = [101.0, 102.0, 103.0]

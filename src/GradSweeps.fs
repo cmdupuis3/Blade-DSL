@@ -43,6 +43,9 @@ type internal RevCtx = {
     /// beside it. Both sweeps read the SAME entry, which is what keeps the
     /// primal, the tangent gather, and the adjoint gather on one permutation.
     SortPlans: Map<string, SortPlan>
+    /// LU factors kept as values (`let f = m.lu(A)`): factor name -> matrix
+    /// name, read by the lu_solve arms of both sweeps (GradCommon.luFactorsOf).
+    LuOf: Map<string, string>
     /// The chain of same-module functions currently being substituted INTO a
     /// kernel body, innermost first (see `kernelCallBody`). Statement-level
     /// calls are inlined before either sweep runs and are capped by
@@ -178,6 +181,14 @@ let rec internal adjointOf (rc: RevCtx) (e: Expr) (cot: Expr) : Result<NStmt lis
         let (dA, dB) = binaryDerivRule name a b
         adjointOf rc a (mul c dA) |> Result.bind (fun sa ->
         adjointOf rc b (mul c dB) |> Result.map (fun sb -> pre @ sa @ sb))
+    // fma(a, b, c) = a*b + c: partials b, a, 1. The adjoint arithmetic is
+    // unfused on purpose (see GradCommon.ternaryMathIntrinsics).
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar name }, [a; b; cc]) when isTernaryMathIntrinsic name
+                                       && not (Map.containsKey name rc.Ctx.Decls) ->
+        let pre, c = bindCot rc cot
+        adjointOf rc a (mul c b) |> Result.bind (fun sa ->
+        adjointOf rc b (mul c a) |> Result.bind (fun sb ->
+        adjointOf rc cc c |> Result.map (fun sc -> pre @ sa @ sb @ sc)))
     // A same-module user call the statement-level inliner did not reach.
     // `hoistCalls` walks only the arithmetic fragment, so a call wrapped in
     // `pure`/`compute`/`guard` (all of which the adjoint DOES walk through)
@@ -288,6 +299,76 @@ let rec internal adjointOf (rc: RevCtx) (e: Expr) (cot: Expr) : Result<NStmt lis
 /// from the shape of `value`: only the identity reader may reach the gram arm.
 let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: string) (value: Expr) : Result<NStmt list, string> option =
     let ctx = rc.Ctx
+    // ROUTE G (docs/plans/structural/02, 3.3): the reverse rule of a
+    // sole-halo stencil map is a GATHER. The kernel body is differentiated
+    // ONCE against a symbolic interior ordinal i and a cotangent cell c;
+    // every accumulation it produces targets either a windowed cell
+    // `__g_x(i + K)` (K static, by the admissibility test) or a captured
+    // scalar. Per (x, K), one loop over the INPUT ordinal j collects the
+    // cotangent of output ordinal i = j - K WHEN that window exists: the
+    // boundary is ZeroOutside -- outside [0, M) there is no window and the
+    // cell is left as it is (the `else` re-assigns the same value; a `+ 0.0`
+    // would not be the same, it flips a signed zero). The loops run in
+    // DESCENDING K, the order the scatter would have written each cell in,
+    // so the two routes accumulate in the same order and agree bitwise.
+    // Scalar accumulators collect in one loop over the output ordinals.
+    let haloGather (h: Blade.Types.HaloAccess) (n: int) (wname: string) (kbody: Expr) : Result<NStmt list, string> =
+        let m = n - int h.Shrink
+        let i = fresh ctx "__hi"
+        let j = fresh ctx "__hj"
+        let c = fresh ctx "__hc"
+        substWindowReads rc.Fname wname h (v i) kbody |> Result.bind (fun body' ->
+        adjointOf rc body' (v c) |> Result.bind (fun adj ->
+        let temps = adj |> List.choose (function NLet (nm, mt, e) -> Some (nm, mt, e) | _ -> None)
+        let assigns = adj |> List.choose (function NAssign (t, rhs) -> Some (t, rhs) | _ -> None)
+        let windowTarget (t: Expr) =
+            match t.Kind with
+            | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar g },
+                                [ { Kind = ExprKind.ExprBinOp (_, OpAdd, { Kind = ExprKind.ExprVar i' }, { Kind = ExprKind.ExprLit (LitInt k) }) } ])
+                    when i' = i -> Some (g, int k)
+            | _ -> None
+        let addend (rhs: Expr) =
+            match rhs.Kind with
+            | ExprKind.ExprBinOp (_, OpAdd, _, t) -> Some t
+            | _ -> None
+        let isScalarTarget (t: Expr) = match t.Kind with ExprKind.ExprVar _ -> true | _ -> false
+        let malformed =
+            adj |> List.exists (function NFor _ -> true | _ -> false)
+            || assigns |> List.exists (fun (t, rhs) ->
+                   match windowTarget t with
+                   | Some _ -> (addend rhs).IsNone
+                   | None -> not (isScalarTarget t))
+        if malformed then
+            err rc.Fname "internal: the halo gather rule met an adjoint shape its admissibility test should have declined -- please report it"
+        else
+        let cotRead = syn (ExprApp (v (dName xname), [ v i ]))
+        let inRange =
+            syn (ExprBinOp (Elementwise, OpAnd,
+                            syn (ExprBinOp (Elementwise, OpLe, iLit 0L, v i)),
+                            syn (ExprBinOp (Elementwise, OpLt, v i, iLit (int64 m)))))
+        let letOf (nm: string) (e: Expr) =
+            StmtLet { Mutability = BindLet; Pattern = synPat (PatVar nm); Type = None; Value = e }
+        let tempLets = temps |> List.map (fun (nm, _, e) -> letOf nm e)
+        let gathers =
+            assigns
+            |> List.choose (fun (t, rhs) ->
+                windowTarget t |> Option.bind (fun (g, k) -> addend rhs |> Option.map (fun a -> (g, k, a))))
+            |> List.sortByDescending (fun (_, k, _) -> k)
+            |> List.map (fun (g, k, a) ->
+                let cell = syn (ExprApp (v g, [ v j ]))
+                let collected = syn (ExprBlock (letOf c cotRead :: tempLets, Some (add cell a)))
+                NFor (j, iLit 0L, iLit (int64 n),
+                      [ NLet (i, false, sub (v j) (iLit (int64 k)))
+                        NAssign (cell, syn (ExprIf (inRange, collected, cell))) ]))
+        let scalars = assigns |> List.filter (fun (t, _) -> isScalarTarget t)
+        let scalarLoop =
+            if scalars.IsEmpty then []
+            else
+                [ NFor (i, iLit 0L, iLit (int64 m),
+                        NLet (c, false, cotRead)
+                        :: (temps |> List.map (fun (nm, mt, e) -> NLet (nm, mt, e)))
+                        @ (scalars |> List.map NAssign)) ]
+        Ok (gathers @ scalarLoop)))
     let accumInto (aname: string) (mkIdx: Expr list -> Expr list) (dims: int list) (cotAt: Expr list -> Expr) =
         if Set.contains aname rc.Diff then
             accumLoop ctx dims (fun idx -> syn (ExprApp (v (dName aname), mkIdx idx))) cotAt
@@ -344,6 +425,43 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
                      (Ok (0, []))
                  |> Result.map snd
              | [] -> err rc.Fname "internal: join initializer with no dims")
+        // LU derivative action, reverse (plan-fortran-killer-2 section 6.3):
+        // for x = A^{-1} b with cotangent xbar,
+        //   bbar += A^{-T} xbar            -- the TRANSPOSED solve, same factors
+        //   Abar(i, j) += -(A^{-T} xbar)(i) * x(j)
+        // and for x = A^{-T} b the roles swap: bbar += A^{-1} xbar,
+        // Abar(i, j) += -x(i) * (A^{-1} xbar)(j). The cotangent is read whole
+        // by name (as gram's), so only the identity reader may reach here.
+        | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, _) when isLuSolveName op && not cotIdent ->
+            err rc.Fname "the adjoint of lu_solve nested under transpose/guard/stack/join is not supported (v1); bind it to its own let first (`let x = m.lu_solve(f, b)` then wrap `x`), which gives it an identity cotangent and differentiates today"
+        | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, [ luE; pivE; bE ]) when isLuSolveName op ->
+            (match luFactorMatrix rc.LuOf luE, bE.Kind with
+             | None, _ -> err rc.Fname luFactorMsg
+             | Some aName, ExprKind.ExprVar bName ->
+                 let dimsA =
+                     if Set.contains aName rc.Diff then
+                         match Map.tryFind aName denv with
+                         | Some ds -> Ok (Some ds)
+                         | None -> err rc.Fname "differentiating lu_solve with respect to the matrix needs its statically-known dims (v1)"
+                     else Ok None
+                 dimsA |> Result.map (fun dimsA ->
+                     let lb = fresh ctx "__lb"
+                     let flows = ResizeArray<NStmt>()
+                     flows.Add (NLet (lb, false, syn (ExprApp (v (luTransposedOf op), [ luE; pivE; v (dName xname) ]))))
+                     if Set.contains bName rc.Diff then
+                         for st in accumLoop ctx dims (fun idx -> syn (ExprApp (v (dName bName), idx))) (fun idx -> syn (ExprApp (v lb, idx))) do flows.Add st
+                     (match dimsA with
+                      | Some dimsA ->
+                          for st in accumLoop ctx dimsA
+                                        (fun idx -> syn (ExprApp (v (dName aName), idx)))
+                                        (fun idx ->
+                                            match idx with
+                                            | [ i; j ] when op = "__math_lu_solve" -> neg (mul (syn (ExprApp (v lb, [ i ]))) (syn (ExprApp (v xname, [ j ]))))
+                                            | [ i; j ] -> neg (mul (syn (ExprApp (v xname, [ i ]))) (syn (ExprApp (v lb, [ j ]))))
+                                            | _ -> fLit 0.0) do flows.Add st
+                      | None -> ())
+                     List.ofSeq flows)
+             | Some _, _ -> err rc.Fname "differentiating lu_solve needs a NAMED right-hand side (v1); bind it first")
         | ExprKind.ExprGram _ when not cotIdent ->
             // The arm below reads `__g_<xname>` whole. Reaching it through a
             // wrapper would drop that wrapper's reindexing on the floor --
@@ -369,6 +487,55 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
                       Ok (List.ofSeq flows)
                   | _ -> err rc.Fname "gram operands need statically-known dims to differentiate (v1)")
              | _ -> err rc.Fname "differentiating gram needs named array operands (v1); bind the operands first")
+        | ExprKind.ExprGramApply _ when not cotIdent ->
+            err rc.Fname "the adjoint of gram_apply nested under transpose/guard/stack/join is not supported (v1); bind it to its own let first (`let y = gram_apply(a, b, x)` then wrap `y`), which gives it an identity cotangent and differentiates today"
+        | ExprKind.ExprGramApply (ga, gb, gx) ->
+            // y = a (b^T x) over REAL named operands (v1, as gram's arm). With
+            // the cotangent ybar read whole by name and t = b^T x (n cells):
+            //   xbar += b (a^T ybar) = gram_apply(b, a, ybar)  -- the adjoint
+            //                          ACTION, itself a gram_apply: no m x p
+            //   abar(i, k) += ybar(i) * t(k)
+            //   bbar(j, k) += x(j) * s(k),   s = a^T ybar (n cells)
+            // The two n-cell vectors are per-column prodsums over the
+            // factor's transpose (docs/plans/structural/05, 3.2); the
+            // m x p Gram matrix is never formed, in the primal or here.
+            (match ga.Kind, gb.Kind, gx.Kind with
+             | ExprKind.ExprVar a, ExprKind.ExprVar b, ExprKind.ExprVar x ->
+                 (match Map.tryFind a denv, Map.tryFind b denv, Map.tryFind x denv with
+                  | Some dimsA, Some dimsB, Some dimsX ->
+                      // t(k) = sum_j mat(j, k) * vec(j): a row map over mat's transpose.
+                      let colDots (mat: string) (vec: string) =
+                          let rname = fresh ctx "__gr"
+                          syn (ExprCompute (syn (ExprBinOp (Elementwise, OpApply,
+                                                             syn (ExprMethodFor [ syn (ExprTranspose (v mat, 0, 1)) ]),
+                                                             syn (ExprLambda ([ { Name = rname; Type = None; Default = None; NameSpan = noSpan } ], None,
+                                                                              syn (ExprApp (v "prodsum", [ v rname; v vec ]))))))))
+                      let flows = ResizeArray<NStmt>()
+                      if Set.contains x rc.Diff then
+                          let tX = fresh ctx "__gx"
+                          flows.Add (NLet (tX, false, syn (ExprGramApply (v b, v a, v (dName xname)))))
+                          for st in accumLoop ctx dimsX (fun idx -> syn (ExprApp (v (dName x), idx))) (fun idx -> syn (ExprApp (v tX, idx))) do flows.Add st
+                      if Set.contains a rc.Diff then
+                          let tT = fresh ctx "__gt"
+                          flows.Add (NLet (tT, false, colDots b x))
+                          for st in accumLoop ctx dimsA
+                                        (fun idx -> syn (ExprApp (v (dName a), idx)))
+                                        (fun idx ->
+                                            match idx with
+                                            | [ i; k ] -> mul (syn (ExprApp (v (dName xname), [ i ]))) (syn (ExprApp (v tT, [ k ])))
+                                            | _ -> fLit 0.0) do flows.Add st
+                      if Set.contains b rc.Diff then
+                          let tS = fresh ctx "__gs"
+                          flows.Add (NLet (tS, false, colDots a (dName xname)))
+                          for st in accumLoop ctx dimsB
+                                        (fun idx -> syn (ExprApp (v (dName b), idx)))
+                                        (fun idx ->
+                                            match idx with
+                                            | [ j; k ] -> mul (syn (ExprApp (v x, [ j ]))) (syn (ExprApp (v tS, [ k ])))
+                                            | _ -> fLit 0.0) do flows.Add st
+                      Ok (List.ofSeq flows)
+                  | _ -> err rc.Fname "gram_apply operands need statically-known dims to differentiate (v1)")
+             | _ -> err rc.Fname "differentiating gram_apply needs named array operands (v1); bind the operands first")
         // C7: the adjoint of a sort is the cotangent GATHERED through the
         // INVERSE permutation -- dA(j) += ds(invperm(j)). No scatter
         // primitive is needed: the inverse is a second sort the pre-pass
@@ -388,6 +555,10 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
     // dispatch: only takes over for the combinator forms; literals and
     // scalar expressions keep their existing arms
     match value.Kind with
+    | _ when haloGatherEnabled () && (haloGatherPlan ctx (fun n -> Map.tryFind n rc.LoopBindings) value).IsSome ->
+        (match haloGatherPlan ctx (fun n -> Map.tryFind n rc.LoopBindings) value, Map.tryFind xname denv with
+         | Some (h, n, w, kbody), Some [ _ ] -> Some (haloGather h n w kbody)
+         | _ -> Some (err rc.Fname "internal: a halo stencil local reached the reverse sweep without its rank-1 shape -- please report it"))
     | ExprKind.ExprVar _ when Set.contains xname rc.Arrays ->
         // array ALIAS: cotangent flows whole-buffer (grad refused this
         // before C6 because no adjoint existed; now one does)
@@ -395,11 +566,16 @@ let internal adjointOfInit (rc: RevCtx) (denv: Map<string, int list>) (xname: st
          | Some dims -> Some (flow true (fun idx -> syn (ExprApp (v (dName xname), idx))) dims value)
          | None -> None)
     | ExprKind.ExprTranspose _ | ExprKind.ExprStack _ | ExprKind.ExprJoin _
-    | ExprKind.ExprGram _ | ExprKind.ExprSort _
+    | ExprKind.ExprGram _ | ExprKind.ExprGramApply _ | ExprKind.ExprSort _
     | ExprKind.ExprSequence _ | ExprKind.ExprReplicate _ ->
         (match Map.tryFind xname denv with
          | Some dims -> Some (flow true (fun idx -> syn (ExprApp (v (dName xname), idx))) dims value)
          | None -> Some (err rc.Fname "this combinator initializer needs statically-known dims to differentiate (v1)"))
+    // a solve against LU factors (its flow arm is above, with gram's)
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, _) when isLuSolveName op ->
+        (match Map.tryFind xname denv with
+         | Some dims -> Some (flow true (fun idx -> syn (ExprApp (v (dName xname), idx))) dims value)
+         | None -> Some (err rc.Fname "lu_solve needs a right-hand side with statically-known dims to differentiate (v1)"))
     // pure/compute/guard over an ARRAY use the reindexing flow; the scalar
     // case falls through to adjointOf, which has pass-through arms
     | ExprKind.ExprGuard _ | ExprKind.ExprPure _ | ExprKind.ExprCompute _
@@ -478,6 +654,43 @@ let rec internal adjointOfStmt (rc: RevCtx) (s: NStmt) : Result<NStmt list, stri
                  let c = fresh rc.Ctx "__c"
                  adjointOf rc rhs (inheritSpan lhs (ExprVar c)) |> Result.map (fun flow ->
                      [NLet (c, false, t); NAssign (t, fLit 0.0)] @ flow))
+    | CarryLoop (_, t, lo, hi, _, _) & NFor (_, _, _, body) ->
+        // The additive carry `s(t) = s(t-1) + INC` (GradNormalize.CarryLoop):
+        // a scan, whose adjoint is the SAME loop run backwards. Every
+        // per-step adjoint is the generic one -- general-overwrite saves and
+        // zeros `__g_s(t)`, the array-read rule scatters the saved value into
+        // `__g_s(t-1)`, INC's adjoint follows -- and descending order is what
+        // makes `__g_s(t)` complete when step t reads it: the loss's direct
+        // cotangent (deposited by later statements' adjoints, which run
+        // first) plus the carry from step t+1 (deposited one iteration
+        // earlier in this sweep). O(n), where the triangular unroll this
+        // replaces was O(n^2) (docs/plans/structural/01, section 2.1).
+        //
+        // The body is replayed exactly as the generic arm replays it, and
+        // the replay is a no-op here: at descending step t, `s(t-1)` is
+        // final (written at forward step t-1, not yet touched by this sweep)
+        // and INC reads only non-mutated inputs, so `s(t)` is rewritten with
+        // its own value.
+        let j = fresh rc.Ctx "__rj"
+        let tLet = NLet (t, false, sub (sub hi (iLit 1L)) (v j))
+        let localLets = body |> List.choose (fun s ->
+            match s with
+            | NLet (n, _, _) when Set.contains n rc.Diff -> Some n
+            | _ -> None)
+        let localCots =
+            localLets |> List.map (fun n ->
+                match body |> List.tryPick (fun s ->
+                        match s with
+                        | NLet (m, _, init) when m = n -> zerosLikeLiteral init
+                        | _ -> None) with
+                | Some z -> NLet (dName n, true, z)
+                | None -> NLet (dName n, true, fLit 0.0))
+        let folded =
+            List.rev body
+            |> traverseR (adjointOfStmt rc)
+            |> Result.map List.concat
+        folded |> Result.map (fun bodyAdjoints ->
+            [NFor (j, iLit 0L, sub hi lo, tLet :: body @ localCots @ bodyAdjoints)])
     | NFor (var, lo, hi, body) ->
         // Same-direction adjoint loop: REPLAY THE WHOLE BODY (fresh
         // per-iteration values, including loop-local arrays filled by
@@ -573,6 +786,12 @@ let rec internal tangentOfExpr (rc: RevCtx) (e: Expr) : Result<Expr, string> =
         let (dA, dB) = binaryDerivRule name a b
         tangentOfExpr rc a |> Result.bind (fun ta ->
         tangentOfExpr rc b |> Result.map (fun tb -> addZ (mulZ dA ta) (mulZ dB tb)))
+    | { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar name }, [a; b; cc]) } when isTernaryMathIntrinsic name
+                                       && not (Map.containsKey name rc.Ctx.Decls) ->
+        // fma: tangent = b*ta + a*tb + tc (unfused, see GradCommon).
+        tangentOfExpr rc a |> Result.bind (fun ta ->
+        tangentOfExpr rc b |> Result.bind (fun tb ->
+        tangentOfExpr rc cc |> Result.map (fun tc -> addZ (addZ (mulZ b ta) (mulZ a tb)) tc)))
     // A same-module user call the statement-level inliner did not reach --
     // the shape a KERNEL BODY produces, since `hoistCalls` stops at a lambda.
     // See `kernelCallBody`: substitute, then differentiate the result.
@@ -676,6 +895,17 @@ let rec internal tangentOfExpr (rc: RevCtx) (e: Expr) : Result<Expr, string> =
             let t1 = if isZeroLit ta then fLit 0.0 else syn (ExprGram (ta, gb))
             let t2 = if isZeroLit tb then fLit 0.0 else syn (ExprGram (ga, tb))
             addZ t1 t2))
+    // gram_apply is trilinear: d[a (b^H x)] = gram_apply(da, b, x) +
+    // gram_apply(a, db, x) + gram_apply(a, b, dx), inactive terms folded
+    // away (a scalar-zero placeholder must not reach the node).
+    | { Kind = ExprKind.ExprGramApply (ga, gb, gx) } ->
+        tangentOfExpr rc ga |> Result.bind (fun ta ->
+        tangentOfExpr rc gb |> Result.bind (fun tb ->
+        tangentOfExpr rc gx |> Result.map (fun tx ->
+            let t1 = if isZeroLit ta then fLit 0.0 else syn (ExprGramApply (ta, gb, gx))
+            let t2 = if isZeroLit tb then fLit 0.0 else syn (ExprGramApply (ga, tb, gx))
+            let t3 = if isZeroLit tx then fLit 0.0 else syn (ExprGramApply (ga, gb, tx))
+            addZ (addZ t1 t2) t3)))
     | { Kind = ExprKind.ExprIf (c, t, f) } ->
         // Branch of tangents under the same condition (see walkExpr's arm).
         tangentOfExpr rc t |> Result.bind (fun tt ->
@@ -1035,6 +1265,44 @@ and internal tangentOfStmt (rc: RevCtx) (s: NStmt) : Result<NStmt list, string> 
             (match value with
              | { Kind = ExprKind.ExprArrayLit _ } ->
                  tangentOfLit rc value |> Result.map (fun t -> [s; NLet (tName x, isMut, t)])
+             // LU derivative action, forward: x = A^{-1} b (or A^{-T} b)
+             // gives  A dx = db - dA x  -- one more solve against the SAME
+             // factors, the matrix never re-factored (plan-fortran-killer-2
+             // section 6.3). The factor binding itself carries no tangent;
+             // `-(dA x)` is a row map over dA (dA^T for the transposed solve),
+             // each row's negated dot with the primal solution, bound to a
+             // temp so the solve reads a NAME (as gram's tangent terms are).
+             | { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, [ luE; pivE; bE ]) } when isLuSolveName op ->
+                 (match luFactorMatrix rc.LuOf luE with
+                  | None -> err rc.Fname luFactorMsg
+                  | Some aName ->
+                 tangentOfExpr rc bE |> Result.map (fun tb ->
+                     let ta = if Set.contains aName rc.Diff then v (tName aName) else fLit 0.0
+                     let negMatVec () =
+                         let rname = fresh rc.Ctx "__lr"
+                         let rows = if op = "__math_lu_solve" then ta else syn (ExprTranspose (ta, 0, 1))
+                         syn (ExprCompute (syn (ExprBinOp (Elementwise, OpApply,
+                                                            syn (ExprMethodFor [ rows ]),
+                                                            syn (ExprLambda ([ { Name = rname; Type = None; Default = None; NameSpan = noSpan } ], None,
+                                                                             sub (fLit 0.0) (syn (ExprApp (v "prodsum", [ v rname; v x ])))))))))
+                     let solveOf (rhs: Expr) = syn (ExprApp (v op, [ luE; pivE; rhs ]))
+                     let named (e: Expr) : NStmt list * Expr =
+                         match e.Kind with
+                         | ExprKind.ExprVar _ -> [], e
+                         | _ -> let t = fresh rc.Ctx "__lq" in [ NLet (t, false, e) ], v t
+                     match isZeroLit tb, isZeroLit ta with
+                     | true, true -> [ s ]
+                     | false, true ->
+                         let pre, tbN = named tb
+                         [ s ] @ pre @ [ NLet (tName x, isMut, solveOf tbN) ]
+                     | true, false ->
+                         let m = fresh rc.Ctx "__lm"
+                         [ s; NLet (m, false, negMatVec ()); NLet (tName x, isMut, solveOf (v m)) ]
+                     | false, false ->
+                         let m = fresh rc.Ctx "__lm"
+                         let pre, tbN = named tb
+                         let r = fresh rc.Ctx "__lq"
+                         [ s ] @ pre @ [ NLet (m, false, negMatVec ()); NLet (r, false, add tbN (v m)); NLet (tName x, isMut, solveOf (v r)) ]))
              // gram: bind each bilinear term to its own temp -- an
              // array-add whose operands are gram NODES (not vars) hits the
              // flat-elementwise emitter's unnamed-operand hazard
@@ -1054,6 +1322,24 @@ and internal tangentOfStmt (rc: RevCtx) (s: NStmt) : Result<NStmt list, string> 
                            NLet (t1, false, syn (ExprGram (ta, gb)))
                            NLet (t2, false, syn (ExprGram (ga, tb)))
                            NLet (tName x, isMut, add (v t1) (v t2)) ]))
+             // gram_apply: the same per-term temps, three terms.
+             | { Kind = ExprKind.ExprGramApply (ga, gb, gx) } ->
+                 tangentOfExpr rc ga |> Result.bind (fun ta ->
+                 tangentOfExpr rc gb |> Result.bind (fun tb ->
+                 tangentOfExpr rc gx |> Result.map (fun tx ->
+                     let terms =
+                         [ (ta, (fun () -> syn (ExprGramApply (ta, gb, gx))))
+                           (tb, (fun () -> syn (ExprGramApply (ga, tb, gx))))
+                           (tx, (fun () -> syn (ExprGramApply (ga, gb, tx)))) ]
+                         |> List.filter (fun (t, _) -> not (isZeroLit t))
+                         |> List.map (fun (_, mk) -> mk ())
+                     match terms with
+                     | [] -> [s]
+                     | [ one ] -> [s; NLet (tName x, isMut, one)]
+                     | many ->
+                         let temps = many |> List.map (fun e -> (fresh rc.Ctx "__gt", e))
+                         let total = temps |> List.map (fun (nm, _) -> v nm) |> List.reduce add
+                         [s] @ (temps |> List.map (fun (nm, e) -> NLet (nm, false, e))) @ [ NLet (tName x, isMut, total) ])))
              | ConstFill (cnt, _) -> Ok [s; NLet (tName x, isMut, zeroFill cnt)]
              | _ -> tangentOfExpr rc value |> Result.map (fun t -> [s; NLet (tName x, isMut, t)]))
     | NAssign (lhs, rhs) ->

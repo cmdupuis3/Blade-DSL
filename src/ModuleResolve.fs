@@ -71,7 +71,7 @@ let private elaboratorModules =
 /// Provider module names. The registry is the source of truth, but it is only
 /// populated by `ProviderStatics.install ()` (which typeCheck runs), so the
 /// literal set is the floor -- resolution happens BEFORE typecheck.
-let private providerModulesFallback = set [ "csv"; "netcdf"; "zarr" ]
+let private providerModulesFallback = set [ "csv"; "icechunk"; "netcdf"; "zarr" ]
 
 /// Does this dotted import name belong to a builtin pseudo-module (and so
 /// must NOT be looked for on disk)?

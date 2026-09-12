@@ -1,0 +1,8 @@
+// TEST: Where Repro On Lambda (rejects)
+// ============================================================================
+// `repro` rides the emitted function boundary; a lambda kernel is textually
+// inlined into its call sites, where the attribute cannot travel. Named
+// functions only.
+
+let bad = method_for(range<Idx<4>>) <@> lambda(x) where repro -> x * 2 |> compute
+// ERROR-CONTAINS: `where repro` is carried by named function declarations only

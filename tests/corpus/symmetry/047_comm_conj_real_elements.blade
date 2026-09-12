@@ -1,0 +1,13 @@
+// TEST: Comm licensed on conj kernel over real elements
+// The type gate on symmetry/039's refusal: the SAME `x * conj(y)` body
+// over REAL elements is genuinely commutative -- conj is the identity on
+// reals, so the deduced PConj is vacuous and the declared comm stands.
+// The contradiction is judged on the operand arrays' element types (the
+// kernel's own param types are still inference vars at the apply seam),
+// so a generic conj-written kernel keeps working over floats.
+let A = [1.0, 2.0, 3.0]
+let p = method_for(A, A) <@> lambda(x, y) where comm(x, y) -> x * conj(y) |> compute
+let p01 = p(0, 1)
+let p10 = p(1, 0)
+// EXPECT: p01 = 2
+// EXPECT: p10 = 2

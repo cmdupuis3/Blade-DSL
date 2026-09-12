@@ -1,0 +1,14 @@
+// TEST: Nested Function Shadows Outer Function Name
+// A nested `function` desugars to a block-scoped let and legitimately
+// shadows an OUTER function of the same name -- BL2009 refuses only
+// SAME-scope duplicates (two top-level decls in one module). g's body
+// sees its own f; the top level keeps the outer one.
+function f(x: Float64) -> Float64 = x + 1.0
+function g(y: Float64) -> Float64 = {
+    function f(z: Float64) -> Float64 = z * 2.0
+    f(y)
+}
+let a = f(3.0)
+let b = g(3.0)
+// EXPECT: a = 4
+// EXPECT: b = 6

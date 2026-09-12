@@ -55,8 +55,8 @@ let private runBlade (exePath: string) (srcFile: string) : Result<string, string
         psi.UseShellExecute <- false
         psi.CreateNoWindow <- true
         use proc = Process.Start(psi)
-        let outT = proc.StandardOutput.ReadToEndAsync()
-        let errT = proc.StandardError.ReadToEndAsync()
+        let outT = Blade.Runtime.readToEndOffPool proc.StandardOutput
+        let errT = Blade.Runtime.readToEndOffPool proc.StandardError
         if not (proc.WaitForExit(180000)) then
             (try proc.Kill() with _ -> ())
             Error "timed out (>180s)"

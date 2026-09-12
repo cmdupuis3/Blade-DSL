@@ -1,0 +1,11 @@
+// TEST: Inner Axis Extent Mismatch Aborts (aborts)
+// ============================================================================
+// The call-site check compares LEADING extents only: a 2x3 beside a 2x2
+// agreed on the leading axis and was accepted, and the elementwise sweep
+// over `a`'s cells read `b` past its end (`[[2, 4, 6], [8, 5, 6]]`). The
+// runtime guard (BL8011) covers every co-iterated axis of a parameter.
+function f(a: T^2, b: T^2) = a + b
+let a = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let b = [[1.0, 2.0], [3.0, 4.0]]
+let out = f(a, b)
+// ABORT: BL8011

@@ -43,6 +43,20 @@ type ProcessStartInfo = System.Diagnostics.ProcessStartInfo
 // of the differential gates, not of user builds.
 //   unset  -> `fast` (default: FMA on)
 //   other  -> `-ffp-contract=<value>` verbatim (`fast` | `on` | `off`)
+// The `fma(a, b, c)` intrinsic is the explicit, lane-identical form: it is its
+// own IR node rendered std::fma / Math.FusedMultiplyAdd / llvm.fma.f64, so it
+// fuses under `off` and cannot be unfused under `fast` -- write it where the
+// single rounding IS the algorithm (error-free transformations, double-double).
+//
+// `-fno-math-errno` is unconditional and is a VECTORIZATION flag, not a
+// fast-math one. Without it GCC must treat `sqrt` (and fabs/floor/ceil/trunc/
+// round) as a call that may write the global `errno`, which is a side effect no
+// vector form can reproduce -- so a `sqrt(a)` map over an array does not
+// vectorize at all under `-O3 -march=native`. With it the same loop reports
+// "loop vectorized using 32 byte vectors". The dropped side effect is
+// unobservable here: `src/cpp/` never reads `errno`, and the VALUES are
+// untouched (IEEE-754 sqrt is correctly rounded either way), so this is
+// bit-exact and safe for the byte-identity differential gates.
 //
 // These are FUNCTIONS, not module-level values, so a harness may set the
 // env var mid-process and have it honored by the next compile -- a
@@ -65,9 +79,10 @@ let private fpContractFlag () =
     | v -> $" -ffp-contract={v.Trim()}"
 
 /// Host-compiler optimization flags shared by every g++ invocation.
-/// Currently `-O3 -march=native -ffp-contract=fast` by default (see the two
-/// env vars above). Re-evaluated per call so harness env pins take effect.
-let optFlags () = "-O3" + marchFlag () + fpContractFlag ()
+/// Currently `-O3 -march=native -ffp-contract=fast -fno-math-errno` by default
+/// (see the env vars above; the errno flag is unconditional).
+/// Re-evaluated per call so harness env pins take effect.
+let optFlags () = "-O3" + marchFlag () + fpContractFlag () + " -fno-math-errno"
 
 // ---------------------------------------------------------------------------
 // The BLADE_LLVM lane's gates (docs/plans/plan-llvm-backend.md section 5).
@@ -90,7 +105,16 @@ let llvmEnabled () : bool =
 /// like with like. No `-ffp-contract`: LLVM IR contracts only where the
 /// `contract` fast-math flag is present, and EmitLlvm emits none -- the
 /// default emission is already byte-identity-shaped.
-let llvmOptFlags () = "-O3" + marchFlag ()
+///
+/// `-fno-math-errno` is carried for flag PARITY with `optFlags`, but measure
+/// before crediting it: on this lane clang's input is a `.ll`, and the flag
+/// only changes what the C FRONT END emits. It cannot retroactively annotate
+/// declarations that are already in the IR, and `EmitLlvm.libmUnary` declares
+/// `@sqrt` with `nofree nounwind willreturn` -- no `memory(none)` -- so LLVM
+/// must still assume the call writes errno. A/B measured on a 1023-cell
+/// `sqrt` map: the loop vectorizes with the flag NEITHER on nor off. Closing
+/// the gap means emitting the attribute in EmitLlvm, not adding a flag here.
+let llvmOptFlags () = "-O3" + marchFlag () + " -fno-math-errno"
 
 type HostPlatform = PWindows | PLinux | PMacOS
 
@@ -280,8 +304,8 @@ let runProc (exe: string) (args: string) (timeoutMs: int) : Result<unit, string>
         psi.UseShellExecute <- false
         psi.CreateNoWindow <- true
         use proc = Process.Start(psi)
-        let outT = proc.StandardOutput.ReadToEndAsync()
-        let errT = proc.StandardError.ReadToEndAsync()
+        let outT = Blade.Runtime.readToEndOffPool proc.StandardOutput
+        let errT = Blade.Runtime.readToEndOffPool proc.StandardError
         if not (proc.WaitForExit(timeoutMs)) then
             (try proc.Kill() with _ -> ())
             Error $"{exe} timed out"
@@ -562,8 +586,8 @@ let private gppIdentity : Lazy<string> =
                 psi.UseShellExecute <- false
                 psi.CreateNoWindow <- true
                 use proc = Process.Start(psi)
-                let out = proc.StandardOutput.ReadToEndAsync()
-                proc.StandardError.ReadToEndAsync() |> ignore
+                let out = Blade.Runtime.readToEndOffPool proc.StandardOutput
+                Blade.Runtime.readToEndOffPool proc.StandardError |> ignore
                 proc.WaitForExit(10000) |> ignore
                 let text = out.Result
                 match text.Split('\n') |> Array.tryHead with
@@ -598,8 +622,8 @@ let private nativeTargetIdentity : Lazy<string> =
             psi.UseShellExecute <- false
             psi.CreateNoWindow <- true
             use proc = Process.Start(psi)
-            let out = proc.StandardOutput.ReadToEndAsync()
-            proc.StandardError.ReadToEndAsync() |> ignore
+            let out = Blade.Runtime.readToEndOffPool proc.StandardOutput
+            Blade.Runtime.readToEndOffPool proc.StandardError |> ignore
             proc.WaitForExit(10000) |> ignore
             use sha = System.Security.Cryptography.SHA256.Create()
             sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes out.Result)
@@ -700,6 +724,73 @@ let private evictExeCache (dir: string) : unit =
                         count <- count - 1
                         bytes <- bytes - len
     with _ -> ()
+
+// ---------------------------------------------------------------------------
+// The tile store of revision reuse (docs/plans/structural/04, 3.1): a local
+// on-disk store beside the exe cache, gated by BLADE_TILE_CACHE with the exe
+// cache's grammar EXCEPT that unset means OFF (the mechanism is opt-in). The
+// generated program locates it at run time (blade_tilecache.hpp's `dir()`);
+// the compiler reads the same variable to decide whether to emit tile
+// phases at all (CodeGenTiles.tileCacheEnabled) and to evict here.
+// ---------------------------------------------------------------------------
+
+let tileCacheDir () : string option =
+    let defaultDir () =
+        let root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)
+        if String.IsNullOrEmpty root then None
+        else Some (Path.Combine(root, "Blade", "tile-cache"))
+    match Environment.GetEnvironmentVariable "BLADE_TILE_CACHE" with
+    | null | "" -> None
+    | v ->
+        match v.Trim() with
+        | "" -> None
+        | t when t = "1" || t.ToLowerInvariant() = "on" || t.ToLowerInvariant() = "true" -> defaultDir ()
+        | t when t = "0" || t.ToLowerInvariant() = "off" || t.ToLowerInvariant() = "false" -> None
+        | t when Path.IsPathRooted t -> Some t
+        | _ -> None
+
+/// The exe cache's caps, applied to tile files: oldest-mtime first, down to
+/// 3/4 of whichever cap tripped. BOTH caps matter and for the exe cache's
+/// reason -- a tile holds one chunk's worth of OUTPUT CELLS, so a coarse
+/// grid makes them large (8 tiles of a 4000 x 4000 float64 field are 128 MB,
+/// measured) and a count cap alone would let the store reach hundreds of
+/// gigabytes before it evicted anything.
+let private evictTileCache (dir: string) : unit =
+    try
+        if Directory.Exists dir then
+            let entries = DirectoryInfo(dir).GetFiles("*.tile", SearchOption.AllDirectories)
+            let total = entries |> Array.sumBy _.Length
+            if entries.Length > exeCacheMaxEntries || total > exeCacheMaxBytes then
+                let targetCount = (exeCacheMaxEntries * 3) / 4
+                let targetBytes = (exeCacheMaxBytes / 4L) * 3L
+                let mutable count = entries.Length
+                let mutable bytes = total
+                for f in entries |> Array.sortBy _.LastWriteTimeUtc do
+                    if count > targetCount || bytes > targetBytes then
+                        let len = f.Length
+                        (try f.Delete() with _ -> ())
+                        count <- count - 1
+                        bytes <- bytes - len
+    with _ -> ()
+
+/// The toolchain identity a tile-enabled program carries
+/// (`-DBLADE_TOOLCHAIN_ID=...`): the exe cache's key terms other than the
+/// program text and the DLL stamp -- compiler, flags, what `-march=native`
+/// selected, the runtime headers -- so bits compiled by a different
+/// toolchain never share a tile file, without hashing at run time.
+let private toolchainIdentity (flags: string) : string =
+    let material =
+        String.concat " "
+            [ "blade-toolchain-v1"
+              gppIdentity.Value
+              flags
+              (if (marchFlag ()).Contains "native" then nativeTargetIdentity.Value else "")
+              runtimeHeaderDigest.Value ]
+    use sha = System.Security.Cryptography.SHA256.Create()
+    sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes material)
+    |> Array.map _.ToString("x2")
+    |> String.concat ""
+    |> fun h -> h.Substring(0, 16)
 
 /// Cache lookup. On a hit the entry is copied to `exeFullPath` (the exact file
 /// a real compile would have written) and its mtime is bumped so eviction sees
@@ -860,7 +951,28 @@ let compileCppWithExtraSource (srcText: string option) (extraLinkInputs: string 
         | Ok deviceInputs ->
 
         let extraFlags = (extraLinkInputs @ deviceInputs) |> List.map (fun p -> $" \"{Path.GetFullPath p}\"") |> String.concat ""
-        let args = $"-std=c++17 {optFlags ()} {ompFlag} {safetyFlags}{blasCompileFlags} -o \"{exeFullPath}\" \"{cppFullPath}\"{extraFlags}{netcdfFlags}{mpiFlags}{blasLinkFlags}"
+        // The run record's build policy and library routes (blade_run_record.hpp
+        // stringizes these). On the COMMAND LINE, not in the emitted text, so
+        // the .cpp stays environment-free; the executable cache keys on args.
+        let rrDefines =
+            let tok (frag: string) =
+                match frag.IndexOf '=' with
+                | -1 -> "off"
+                | i -> frag.Substring(i + 1).Trim()
+            let march = (let f = marchFlag () in if f = "" then "off" else tok f)
+            let fpc = tok (fpContractFlag ())
+            let flag (b: bool) = if b then "1" else "0"
+            $" -DBLADE_RR_MARCH={march} -DBLADE_RR_FPC={fpc} -DBLADE_RR_REASSOC={flag (Blade.CodeGenState.fpReassocEnabled ())} -DBLADE_RR_BLAS={flag wantsBlas} -DBLADE_RR_LAPACK={flag wantsLapack} -DBLADE_RR_CUBLAS={flag (not (List.isEmpty deviceInputs))}"
+        // Revision reuse: a program with a tiled binding (the include line is
+        // written by codegen exactly then) carries the toolchain identity its
+        // tile files are keyed under; the store is evicted here, never in C++.
+        let tileDefines =
+            if cppText.Contains "#include \"blade_tilecache.hpp\"" then
+                (match tileCacheDir () with Some d -> evictTileCache d | None -> ())
+                let tid = toolchainIdentity (optFlags () + " " + ompFlag)
+                $" -DBLADE_TOOLCHAIN_ID={tid}"
+            else ""
+        let args = $"-std=c++17 {optFlags ()}{rrDefines}{tileDefines} {ompFlag} {safetyFlags}{blasCompileFlags} -o \"{exeFullPath}\" \"{cppFullPath}\"{extraFlags}{netcdfFlags}{mpiFlags}{blasLinkFlags}"
         
         // The executable cache (Stage 4.1, above). v1 scope, deliberately
         // narrow -- every excluded lane is one whose inputs are not fully
@@ -890,9 +1002,9 @@ let compileCppWithExtraSource (srcText: string option) (extraLinkInputs: string 
         psi.CreateNoWindow <- true
 
         use proc = Process.Start(psi)
-        // Read both streams asynchronously to prevent pipe deadlocks
-        let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-        let stderrTask = proc.StandardError.ReadToEndAsync()
+        // Drain both streams on dedicated threads -- never the thread pool (Runtime.readToEndOffPool)
+        let stdoutTask = Blade.Runtime.readToEndOffPool proc.StandardOutput
+        let stderrTask = Blade.Runtime.readToEndOffPool proc.StandardError
         
         // 300s: spectra-scale generated programs (rank-2 transforms, capped
         // at 65536 cells) can legitimately push g++ this long under -O3.
@@ -969,8 +1081,8 @@ let compileCuda (cuFile: string) (outputDir: string) : Result<string, string> =
         psi.CreateNoWindow <- true
 
         use proc = Process.Start(psi)
-        let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-        let stderrTask = proc.StandardError.ReadToEndAsync()
+        let stdoutTask = Blade.Runtime.readToEndOffPool proc.StandardOutput
+        let stderrTask = Blade.Runtime.readToEndOffPool proc.StandardError
 
         if not (proc.WaitForExit(120000)) then
             try proc.Kill() with _ -> ()
@@ -1095,18 +1207,73 @@ let private clangStamp (clang: string) : string =
         else $"{clang}:missing"
     with _ -> $"{clang}:?"
 
+/// What `-march=native` ACTUALLY SELECTED for one clang on this machine,
+/// hashed -- the LLVM lane's twin of `nativeTargetIdentity`, and missing from
+/// its key until the same failure found it. `llvmOptFlags` passes `-march=native`
+/// as TEXT, identical on every runner, while the vector ISA behind it is not:
+/// a binary built on an AVX-512 Xeon runner, cached, and restored onto one
+/// without AVX-512 dies at STATUS_ILLEGAL_INSTRUCTION (-1073741795) -- and
+/// only the programs whose hot loops vectorized with EVEX-only instructions
+/// do, so a few tests per night went red on a lane that "compiles and links"
+/// every time, because a cache hit is a file copy, not a compile.
+///
+/// Asks CLANG, not g++ (this lane runs with no g++ in the loop, and the two
+/// may not resolve `native` alike): `-###` prints the cc1 line without
+/// compiling, and only its `-target-cpu` / `-target-feature` tokens are kept,
+/// so the working directory and the input name the line also carries cannot
+/// perturb the key. One subprocess per clang path per run; empty on failure,
+/// the same choice `nativeTargetIdentity` makes.
+let private clangNativeTargetIdentities =
+    System.Collections.Concurrent.ConcurrentDictionary<string, string>()
+
+let private clangNativeTargetIdentity (clang: string) : string =
+    clangNativeTargetIdentities.GetOrAdd(clang, fun clang ->
+        try
+            let devNull = if Platforms.os = Platforms.Windows then "NUL" else "/dev/null"
+            let psi = ProcessStartInfo(clang, $"-### -march=native -x c -c - -o {devNull}")
+            psi.RedirectStandardInput <- true
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            psi.UseShellExecute <- false
+            psi.CreateNoWindow <- true
+            use proc = Process.Start(psi)
+            proc.StandardInput.Close()
+            Blade.Runtime.readToEndOffPool proc.StandardOutput |> ignore
+            let err = Blade.Runtime.readToEndOffPool proc.StandardError
+            proc.WaitForExit(10000) |> ignore
+            let tokens =
+                err.Result.Split([| ' '; '\t'; '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.map _.Trim('"')
+            let selected =
+                tokens
+                |> Array.pairwise
+                |> Array.choose (fun (flag, value) ->
+                    if flag = "-target-cpu" || flag = "-target-feature" then Some $"{flag} {value}" else None)
+            if selected.Length = 0 then ""
+            else
+                use sha = System.Security.Cryptography.SHA256.Create()
+                sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(String.concat "\n" selected))
+                |> Array.map _.ToString("x2")
+                |> String.concat ""
+        with _ -> "")
+
 /// The LLVM lane's twin of `exeCacheKey` (Stage 4.1). Differences, each
 /// deliberate: the compiler identity is the clang STAMP, not `gppIdentity`;
 /// the runtime input is the shim SOURCE text (the `.o` is a link input whose
-/// content the argument string cannot see); and the version tag is its own,
-/// so the two lanes can never collide on a key.
+/// content the argument string cannot see); the native-target identity is
+/// clang's own resolution of `native`; and the version tag is its own, so the
+/// two lanes can never collide on a key. v2: v1 keys carried no CPU identity,
+/// so no v1 entry can say which CPU it was built for and none is trusted.
 let private llvmExeCacheKey (clang: string) (args: string) (llText: string) (shimText: string) (exeFullPath: string) (llFullPath: string) : string =
     let normalizedArgs = args.Replace(exeFullPath, "<EXE>").Replace(llFullPath, "<LL>")
     let material =
         String.concat " "
-            [ "blade-llvm-exe-cache-v1"
+            [ "blade-llvm-exe-cache-v2"
               clangStamp clang
               normalizedArgs
+              // Only when the flag is `native`, as in `exeCacheKey`: an
+              // explicit `-march=` is portable text `normalizedArgs` carries.
+              (if (marchFlag ()).Contains "native" then clangNativeTargetIdentity clang else "")
               shimText
               llText ]
     use sha = System.Security.Cryptography.SHA256.Create()
@@ -1222,9 +1389,9 @@ let runExecutable (exeFile: string) : Result<int * string, string> =
         prependNetcdfBin psi
         
         use proc = Process.Start(psi)
-        // Read both streams asynchronously to avoid deadlocks
-        let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-        let stderrTask = proc.StandardError.ReadToEndAsync()
+        // Drain both streams on dedicated threads -- never the thread pool (Runtime.readToEndOffPool)
+        let stdoutTask = Blade.Runtime.readToEndOffPool proc.StandardOutput
+        let stderrTask = Blade.Runtime.readToEndOffPool proc.StandardError
         
         // 120s: simulation-scale examples (thousands of spectral steps) can
         // legitimately run long; corpus tests still finish well under a second.
@@ -1339,8 +1506,8 @@ let runExecutableMpi (ranks: int) (exeFile: string) : Result<int * string, strin
             psi.WorkingDirectory <- Path.GetDirectoryName(exeFullPath)
             prependNetcdfBin psi
             use proc = Process.Start(psi)
-            let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-            let stderrTask = proc.StandardError.ReadToEndAsync()
+            let stdoutTask = Blade.Runtime.readToEndOffPool proc.StandardOutput
+            let stderrTask = Blade.Runtime.readToEndOffPool proc.StandardError
             if proc.WaitForExit(60000) then
                 let stdout = stdoutTask.Result
                 let stderr = stderrTask.Result

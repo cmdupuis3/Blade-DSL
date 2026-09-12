@@ -1,0 +1,28 @@
+// TEST: Anon Range Flat Elementwise
+// The anonymous range reaches the FLAT ELEMENTWISE path (docs/plan-cpp-perf-
+// exploitation.md phase 3), exactly as the named `range<I>` spelling does.
+//
+// It did not always. The range carries the reserved tag `__anon`, and both
+// halves of the flat gate (CodeGenLoopNest's `flatShapeSignature` and its
+// element-level twin) refused any `__`-prefixed tag outright. Every OTHER
+// reserved tag also carries a non-plain IxKind and was already refused on that
+// ground, so `__anon` -- a plain contiguous skeleton -- was the only thing the
+// blanket prefix test actually excluded. The cost was invisible in values and
+// real in code: `x0 + dx * Float64(0..n)`, the idiom CLAUDE.md names the top
+// rung of the ladder, emitted a nest with no BLADE_RESTRICT pool pointers and
+// no BLADE_IVDEP, while the identical `Float64(range<I>)` got both. The gate
+// now names `__halowin` (whose reads are OFFSET from the loop index, so its
+// flat index really is not the operand's pool offset) and nothing else.
+//
+// `t * t` puts one array in both operand positions, which is also the flat
+// emitter's pool-dedup case: two ArrayPositions, one pointer declaration.
+// `sqrt` over perfect squares keeps the pins exact -- and is the same loop
+// shape `-fno-math-errno` (src/Build.fs) exists to let g++ vectorize.
+// Extent 7 is non-power-of-two, per the repo's stride discipline.
+let axis = 1.5 + 0.25 * Float64(0..7)
+let t = Float64(0..7)
+let squares = t * t
+let roots = sqrt(squares)
+// EXPECT: axis = [1.5, 1.75, 2, 2.25, 2.5, 2.75, 3]
+// EXPECT: squares = [0, 1, 4, 9, 16, 25, 36]
+// EXPECT: roots = [0, 1, 2, 3, 4, 5, 6]

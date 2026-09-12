@@ -256,10 +256,10 @@ let private genFuncBodyScoped
                 [$"{indent}std::copy_n(pool_base({rhsStr}.data), {n}, pool_base({targetStr}.data));"]
             | None ->
                 [$"{indent}{targetStr} = {(exprToCpp currentNames v)};"]
-        | IRConstraintCheck (cond, message, span) ->
+        | IRConstraintCheck (cond, blCode, message, span) ->
             currentNames <- Map.add id varName currentNames
             [ $$"""{{indent}}if (!({{(exprToCpp currentNames cond)}})) {"""
-              $"{indent}    blade_rt::panic(\"BL8001\", \"{message}\", {(panicSpanArgs span)});"
+              $"{indent}    blade_rt::panic(\"{blCode}\", \"{message}\", {(panicSpanArgs span)});"
               $"{indent}}}" ]
         | IRLit IRLitUnit ->
             // Skip unit literals (side effects already emitted)
@@ -427,6 +427,22 @@ body-level let RHS of that shape in IRCompute; emitting nothing here would regis
             currentTupleChildren <- ctxAfter.TupleChildren
             currentNames <- Map.add id varName currentNames
             code
+        | IRRange _ | IRCompute (IRRange _) ->
+            // A BARE range as a function-body let -- written (`let xs = 0..n`,
+            // with or without `|> compute`) or minted by the lift pass's
+            // reduce-operand hoist. Statement-shaped (extents table + allocate
+            // + fill), so route through genBinding's IRRange arm exactly as at
+            // module level; the default arm's exprToCpp has no inline
+            // rendering for a standalone range.
+            let bodyCtx = { ctx with VarNames = currentNames; Indent = bodyIndent; GroupedArrays = currentGrouped; TupleChildren = currentTupleChildren }
+            let tempBinding = {
+                Id = id; Name = varName; Type = inferExprType value
+                Value = value; IsConst = false; IsMutable = true
+            }
+            let (code, ctxAfter) = genBinding bodyCtx tempBinding builder
+            currentTupleChildren <- ctxAfter.TupleChildren
+            currentNames <- Map.add id varName currentNames
+            code
         | IRVar _ when Set.contains id ctx.MutableArrayLets ->
             // Function-body `let mut a = Z` over an array: route through
             // genBinding so genVarAliasBinding's mut-copy path runs (fresh
@@ -580,7 +596,7 @@ body-level let RHS of that shape in IRCompute; emitting nothing here would regis
             currentTupleChildren <- ctxAfter.TupleChildren
             currentNames <- Map.add id varName currentNames
             code
-        | IRMask _ | IRIntersect _ | IRUnion _ | IRSort _ | IRUnique _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _ | IRGram _ | IRMatmul _ | IREigh _ | IRSolve _
+        | IRMask _ | IRIntersect _ | IRUnion _ | IRSort _ | IRUnique _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _ | IRGram _ | IRGramApply _ | IRMatmul _ | IREigh _ | IRSolve _ | IRLu _ | IRLuSolve _
         | IRStack _ | IRJoin _ ->
             // The lift pass can place an inline form as a let value at
             // function-body level. The same materialization helper used by
@@ -671,6 +687,24 @@ body-level let RHS of that shape in IRCompute; emitting nothing here would regis
             let valStr = exprToCpp currentNames value
             currentNames <- Map.add id varName currentNames
             [$"{indent}auto {varName} = {valStr};"])
+    // Scratch reuse: a let the plan gave a donor takes the donor's pool -- its
+    // `allocate<>` declaration is rewritten into an alias of the donor's data
+    // (its own extents table stays), and its scope free is spared; the donor's
+    // registration frees the storage once, at scope exit (or never, when the
+    // reuser escapes: computeScopeEscapes carries an escaping reuser over to
+    // its donor). Only a rewrite that MATCHED spares the free.
+    let stmts =
+        lets |> List.fold (fun (acc: string list) (id, _) ->
+            match Blade.Types.PoolReuseTable.tryDonor id with
+            | Some d ->
+                (match Map.tryFind d currentNames with
+                 | Some dn ->
+                     let name = $"__v{id}"
+                     let (acc', matched) = rewritePoolAlias acc name dn
+                     if matched then suppressAllocName name
+                     acc'
+                 | None -> acc)
+            | None -> acc) stmts
     // Return-arm emissions carry NO owner: a __retN temporary must not be matched
     // against some let's escape status by accident. It is exempted by NAME below.
     setAllocOwner None
@@ -701,6 +735,17 @@ body-level let RHS of that shape in IRCompute; emitting nothing here would regis
             let retVarName = $"__ret{builder.FreshId()}"
             let bodyCtx = { ctx with VarNames = currentNames; Indent = ctx.Indent + 1; GroupedArrays = currentGrouped; TupleChildren = currentTupleChildren }
             let combCode = genApplyCombinator bodyCtx retVarName info builder
+            // Scratch reuse at the RETURN position: the returned value takes
+            // its donor's pool, which leaves with it, so the donor's scope
+            // free is spared exactly like the `__retN` name below -- but only
+            // when the declaration actually rewrote.
+            let combCode =
+                match Blade.Types.PoolReuseTable.currentReturnDonor () |> Option.bind (fun d -> Map.tryFind d currentNames) with
+                | Some dn ->
+                    let (rewritten, matched) = rewritePoolAlias combCode retVarName dn
+                    if matched then suppressAllocName dn
+                    rewritten
+                | None -> combCode
             // The returned pool leaves with the value; free everything else.
             suppressAllocName retVarName
             stmts @ combCode @ popAllocScopeFrees indent @ [$"{indent}return {retVarName};"]
@@ -1082,10 +1127,20 @@ let private panicFreeNamespaces =
 /// Call-shaped tokens in emitted C++: an optionally-qualified `ns::name(`,
 /// plus the three spellings that name no identifier before the paren --
 /// `f<T>(x)` (template call), `(*fp)(x)` / `g()(x)` (functor call through a
-/// value), and `[&](...)` (lambda).
+/// value). A LAMBDA HEADER `[&](` is deliberately NOT call-shaped: it
+/// defines, it does not call. Its body text is inline in this same scanned
+/// body, so a panic inside it is caught by the direct substring check and
+/// its calls are collected as this body's callees by this same scan; the
+/// escaping-lambda case is covered on the RECEIVING side, where a
+/// function-typed parameter forces the frame (shadowFrameOpen). Before the
+/// lookbehind, every let-block's IIFE marked its function Unknown, keeping
+/// a shadow frame on every block-bodied function -- and the frame's RAII
+/// destructor takes a recursive call out of tail position: measured 3.2x on
+/// a self-recursive escape-time kernel g++ otherwise turns into a register
+/// loop. `table[i](x)` (call through an indexed slot) stays call-shaped.
 let private callShapedRe =
     System.Text.RegularExpressions.Regex(
-        @"(?<qual>(?:[A-Za-z_][A-Za-z0-9_]*::)+)?(?<id>[A-Za-z_][A-Za-z0-9_]*)\s*\(|(?<ind>[>)\]]\s*\()",
+        @"(?<qual>(?:[A-Za-z_][A-Za-z0-9_]*::)+)?(?<id>[A-Za-z_][A-Za-z0-9_]*)\s*\(|(?<ind>(?:[>)]|(?<!\[&)\])\s*\()",
         System.Text.RegularExpressions.RegexOptions.Compiled)
 
 /// What one emitted body does that bears on whether its frame is observable.
@@ -1277,14 +1332,91 @@ let genFuncDef (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFuncDef) :
     // lengths through the forwarded `__gk<id>__*` params exactly as they
     // resolve them in the frame that built the group (grouped-capture
     // forwarding, requirement 3).
+    //
+    // The stem is ALWAYS `__gk<id>` here, because that is what
+    // `gkSidecarParams` names the params this signature declares. It used to
+    // be `gkSidecarStem ctx.VarNames gkId`, which only lands on `__gk<id>`
+    // when the gk is absent from the name map -- true for a gk local to an
+    // enclosing function, false for a MODULE-level one, which the map spells
+    // `seg`. Then the body read `seg__ngroups`, a main() local this free
+    // function cannot see, while the forwarded `__gk<id>__ngroups` sat unused.
     let bodyCtx =
         funcDef.Captures
         |> List.fold (fun c cap ->
             match groupedCaptureGkOf cap with
             | Some gkId ->
-                { c with GroupedArrays = Map.add cap.Name (gkSidecarStem ctx.VarNames gkId) c.GroupedArrays }
-            | None -> c) ctx
-    let bodyStmts = genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+                { c with GroupedArrays = Map.add cap.Name $"__gk{gkId}" c.GroupedArrays }
+            | None -> c)
+            // The body's parameters, for the co-iteration extent guard
+            // (CodeGenContext.ParamIds).
+            { ctx with ParamIds = funcDef.Params |> List.map (fun p -> p.VarId) |> Set.ofList }
+    // A captured GROUPING (`group_keys` / `segments` / `tiles` ...) is refused
+    // rather than emitted into g++'s "was not declared in this scope". The
+    // binding is an opaque `void*` sentinel whose state lives in locals named
+    // after it (`<gk>__ngroups`, `__offsets`, `__perm`, `__at`, grid bounds)
+    // in the scope that bound it, and a body can only use a grouping through
+    // that state (`group_by(x, gk)`, the gk accessors) -- so a free function
+    // capturing one has never compiled, called or not, and refusing it takes
+    // nothing that worked. A captured group_by RESULT is different and fine:
+    // its row table is a real value and its gk's ngroups/offsets are
+    // forwarded (grouped-capture forwarding, seeded above).
+    //
+    // A named function using a grouping works, because it is emitted as a
+    // `[&]` closure in main() (genFuncDefAsLambda) that resolves the state by
+    // name. A lifted kernel cannot simply take that route: its call sites
+    // forward the captures as arguments and its closure would be emitted after
+    // the binding that applies it. Both steers in the message compile and run.
+    //
+    // NOT refused here: a captured STREAMED variable. A lifted function that
+    // merely receives it as `Array<T, N>& A` compiles, and is dead code
+    // whenever the consumer inlines the kernel (the streamed halo stencil) --
+    // what breaks is a CALLER that names the never-materialized `A`, which is
+    // a different site.
+    let unforwardableCaptureRefusal =
+        funcDef.Captures |> List.tryPick (fun cap ->
+            match cap.Type with
+            | IRTGroupKeys _ ->
+                let outer = captureForwardName ctx.VarNames cap
+                Some ($"a kernel body captures the grouping '{outer}', but the body is compiled as a separate "
+                      + "C++ function and a grouping's state lives in locals named after its binding "
+                      + $"(`{outer}__ngroups`, `{outer}__offsets`, ...) that the function cannot see. Group "
+                      + $"outside the kernel (`let g = group_by(x, {outer})`) and use `g` inside it -- a "
+                      + "group_by result IS forwarded, and grouping once beats regrouping on every "
+                      + "iteration -- or move the body into a named function")
+            | _ -> None)
+    // A captured `.stream` variable IS an array in this body -- the signature
+    // receives it as a parameter -- so it reads by name here, and no
+    // stream-eligible consumer in the body may take the store-reading route
+    // (whose state is main() locals). What cannot work is FORWARDING it from
+    // a scope that never materialized it; captureForwardArgs refuses that at
+    // the call site. A lifted kernel whose consumer inlines it instead (the
+    // streamed halo stencil) is dead code and costs nothing.
+    let streamedCaptureNames = funcDef.Captures |> List.choose (fun c -> streamedBindingName c.Id)
+    use _captureMask = maskStreamedNames streamedCaptureNames
+    let bodyCtx =
+        { bodyCtx with
+            StreamedArrays = streamedCaptureNames |> List.fold (fun m n -> Map.remove n m) bodyCtx.StreamedArrays }
+    // `where repro`: the body emits inside the routing veto scope (no
+    // BLAS/LAPACK/cuBLAS classification while depth > 0), and the definition
+    // carries BLADE_REPRO_FN (noinline + fp-contract off on GCC). try/finally
+    // so a codegen exception cannot leave the scope stuck on.
+    // Scratch reuse: the plan's donor for THIS body's return position, read
+    // by genFuncBody's return arm; cleared after so no other body sees it.
+    Blade.Types.PoolReuseTable.setCurrentReturnDonor (Blade.Types.PoolReuseTable.tryReturnDonor funcDef.Id)
+    let bodyStmts =
+        try
+            match unforwardableCaptureRefusal with
+            | Some msg -> codegenError ctx bodyInd msg
+            | None ->
+            if funcDef.IsRepro then
+                Blade.LinAlgPatterns.reproScopeDepth.Value <-
+                    Blade.LinAlgPatterns.reproScopeDepth.Value + 1
+                try genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+                finally
+                    Blade.LinAlgPatterns.reproScopeDepth.Value <-
+                        Blade.LinAlgPatterns.reproScopeDepth.Value - 1
+            else genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+        finally Blade.Types.PoolReuseTable.setCurrentReturnDonor None
     // Shadow-stack frame: named as the Blade function so a runtime
     // panic prints a Blade call stack. file/line are nullptr/0 because
     // IRCallable carries no span (adding one touches TypeCheck.fs's IRCallable
@@ -1292,8 +1424,14 @@ let genFuncDef (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFuncDef) :
     // BLADE_FRAME macro's CUDA guard.
     // Emitted as a MARKER, not the statement: whether this body can reach a
     // panic depends on what its callees do. resolveShadowFrames settles it.
+    let reproAttr = if funcDef.IsRepro then "BLADE_REPRO_FN " else ""
+    let reproNote =
+        if funcDef.IsRepro
+        then [$"{bodyInd}// [repro] contraction off, noinline; library routing and reorder licences vetoed in this body"]
+        else []
     let code =
-        [$$"""{{ind}}{{retType}} {{safeName}}({{paramList}}) {"""]
+        [$$"""{{ind}}{{reproAttr}}{{retType}} {{safeName}}({{paramList}}) {"""]
+        @ reproNote
         @ shadowFrameOpen funcDef bodyInd
         @ bodyStmts
         @ shadowFrameClose bodyInd
@@ -1355,12 +1493,35 @@ let genFuncDefAsLambda (ctx: CodeGenContext) (builder: IRBuilder) (funcDef: IRFu
             | Some gkId ->
                 { c with GroupedArrays = Map.add cap.Name (gkSidecarStem ctx.VarNames gkId) c.GroupedArrays }
             | None -> c) bodyCtx
-    let bodyStmts = genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+    // `where repro` on a MAIN-LOCAL function: the routing veto scope still
+    // applies (no library dispatch in this body), but a std::function lambda
+    // cannot carry the GCC `optimize` attribute, so the contraction half of
+    // the demand is NOT dischargeable here. Say so in the emitted text --
+    // never silently -- rather than refuse the whole program.
+    // Scratch reuse: the plan's donor for THIS body's return position, read
+    // by genFuncBody's return arm; cleared after so no other body sees it.
+    Blade.Types.PoolReuseTable.setCurrentReturnDonor (Blade.Types.PoolReuseTable.tryReturnDonor funcDef.Id)
+    let bodyStmts =
+        try
+            if funcDef.IsRepro then
+                Blade.LinAlgPatterns.reproScopeDepth.Value <-
+                    Blade.LinAlgPatterns.reproScopeDepth.Value + 1
+                try genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+                finally
+                    Blade.LinAlgPatterns.reproScopeDepth.Value <-
+                        Blade.LinAlgPatterns.reproScopeDepth.Value - 1
+            else genFuncBody bodyCtx builder bodyNames bodyInd funcDef.Body
+        finally Blade.Types.PoolReuseTable.setCurrentReturnDonor None
+    let reproNote =
+        if funcDef.IsRepro
+        then [$"{bodyInd}// [repro] main-local emission: routing vetoed, but the contraction attribute cannot attach to a lambda -- bind this function's inputs at module level to restore the full guarantee"]
+        else []
     // Shadow-stack frame; see genFuncDef. Name-only (nullptr/0),
     // and marker-form so resolveShadowFrames can drop it if no panic is
     // reachable from this body.
     let code =
         [$$"""{{ind}}{{funcType}} {{safeName}} = [&]({{paramList}}) -> {{retType}} {"""]
+        @ reproNote
         @ shadowFrameOpen funcDef bodyInd
         @ bodyStmts
         @ shadowFrameClose bodyInd
@@ -1401,7 +1562,10 @@ let private genForwardDecls (fileScopeFuncs: IRFuncDef list) : string list =
                 | ArrayElem arr -> cppArrayTypeStr arr
                 | t -> irTypeToCpp t
             let safeName = sanitizeCppName funcDef.Name
-            $"{retType} {safeName}({allParams});")
+            // Attribute on the declaration too: GCC wants function
+            // attributes visible at the first declaration.
+            let reproAttr = if funcDef.IsRepro then "BLADE_REPRO_FN " else ""
+            $"{reproAttr}{retType} {safeName}({allParams});")
     if decls.IsEmpty then [] else decls @ [""]
 
 /// Classify a binding as a "computation" (forced combinator / compute) vs
@@ -1710,6 +1874,9 @@ let genModule (modul: IRModule) (builder: IRBuilder) : string list * string list
 
     let ctx0 = emptyContext ()
     let ctx0 = { ctx0 with ProviderReads = modul.ProviderReads; ProviderWrites = modul.ProviderWrites; RandomInits = modul.RandomInits; CompoundInits = modul.CompoundInits; SparseInits = modul.SparseInits; MutableArrayLets = modul.MutableArrayLets }
+    // Revision reuse (docs/plans/structural/04): empty unless BLADE_TILE_CACHE is set.
+    let (tilePlans, tileReads) = Blade.CodeGenTiles.planTiles modul
+    let ctx0 = { ctx0 with TilePlans = tilePlans; TileReads = tileReads }
 
     // First pass: register ALL names (both bindings and functions) in context
     let ctx0 =
@@ -1832,6 +1999,9 @@ let genModuleSplit (modul: IRModule) (builder: IRBuilder) : string list * string
     resetAllocScopeStack ()
     let ctx0 = emptyContext ()
     let ctx0 = { ctx0 with ProviderReads = modul.ProviderReads; ProviderWrites = modul.ProviderWrites; RandomInits = modul.RandomInits; CompoundInits = modul.CompoundInits; SparseInits = modul.SparseInits; MutableArrayLets = modul.MutableArrayLets }
+    // Revision reuse (docs/plans/structural/04): empty unless BLADE_TILE_CACHE is set.
+    let (tilePlans, tileReads) = Blade.CodeGenTiles.planTiles modul
+    let ctx0 = { ctx0 with TilePlans = tilePlans; TileReads = tileReads }
     let ctx0 =
         modul.Bindings |> List.fold (fun c b -> addVarName b.Id b.Name c) ctx0
     let ctx0 =
@@ -2230,6 +2400,30 @@ let computeDeferredIds (bindings: IRBinding list) : Set<int> =
 
 let genPrintStatements (modul: IRModule) : string list =
     let deferredIds = computeDeferredIds modul.Bindings
+    // `--print <names>` (BLADE_PRINT, CodeGenState.printSelection): print only
+    // the named bindings. A name that is not a top-level binding AT ALL is a
+    // typo, and a typo that silently printed nothing would look exactly like a
+    // program that computed nothing -- so it refuses, by name, listing what is
+    // there. (A name that IS a binding but never prints -- a deferred loop
+    // value, a streamed read -- prints nothing, as it does unselected.)
+    let selection = printSelection ()
+    // The refusal is SPLICED (refusalErrorLine), not merely recorded: the
+    // channel delivers BL7004 only for a translation unit that carries a
+    // marker, and a recorded-but-unspliced message would leave the typo
+    // printing nothing and exiting 0 -- the very failure this guards.
+    let selectionRefusal =
+        match selection with
+        | Some names ->
+            let sep = ", "
+            let declared = modul.Bindings |> List.map (fun b -> b.Name) |> Set.ofList
+            let unknown = Set.difference names declared |> Set.toList
+            if unknown.IsEmpty then []
+            else
+                let known = declared |> Set.toList |> List.filter (fun n -> not (n.StartsWith "__")) |> String.concat sep
+                let missing = String.concat sep unknown
+                let verb = if unknown.Length = 1 then "is not a top-level binding of this program" else "are not top-level bindings of this program"
+                [ refusalErrorLine "    " $"--print: {missing} {verb} -- it has: {known}" ]
+        | None -> []
     // A deferred binding that a consumer FORCED (forceDeferredArrayInput
     // materialized it under its own name at main's top level) is a real
     // array by program end and prints like any eager binding; one that
@@ -2237,7 +2431,8 @@ let genPrintStatements (modul: IRModule) : string list =
     // populated during genModule, so callers must assemble print code AFTER
     // body generation.
     let forcedIds = (forcedDeferredIdsCell ()).Value
-    modul.Bindings |> List.collect (fun b ->
+    selectionRefusal @
+    (modul.Bindings |> List.collect (fun b ->
         // |> compute of a DEFERRED combinator is a forced materialization and
         // always prints; |> compute of anything ELSE prints exactly when the
         // wrapped value itself would (an eager reduce/scalar is unchanged by
@@ -2264,8 +2459,15 @@ let genPrintStatements (modul: IRModule) : string list =
                 arr.IndexTypes |> List.exists (fun idx ->
                     idx.Symmetry = SymSymmetric || idx.Symmetry = SymAntisymmetric || idx.Symmetry = SymHermitian)
             | _ -> false
-        
-        if isPrintable then
+
+        // The `--print` selection, applied exactly where the interpreter's
+        // twin applies it (Interp/Print.printBindingsOnly's `wanted`).
+        let wanted =
+            match selection with
+            | Some names -> Set.contains b.Name names
+            | None -> true
+
+        if isPrintable && wanted then
             match IR.stripUnits b.Type with
             | IRTScalar (ETFloat64 | ETFloat32 | ETInt64 | ETInt32 | ETBool | ETComplex64 | ETComplex128 | ETString) ->
                 genPrintScalar b.Name
@@ -2474,7 +2676,7 @@ let genPrintStatements (modul: IRModule) : string list =
             | IRTNamed _ -> []
             | IRTUnit -> []
             | _ -> []
-        else []
+        else [])
     )
 
 /// Assemble the main() function wrapper around binding code and print statements.
@@ -2529,6 +2731,20 @@ let private netcdfFinalizeLines : string list =
 /// crash. The helper is idempotent, so this and the explicit call coexist.
 let private netcdfRegisterLines : string list =
     [ "    std::atexit(__blade_nc_finalize);" ]
+
+/// The run record's file-scope lines (Blade.RunRecord.cppLines): the input
+/// manifest of this module -- its provider reads plus the folds this
+/// compilation logged -- and the static writer. `emitted` is the program
+/// text assembled so far, sniffed for the `rand` runtime so the record can
+/// name the generator. Every program carries the record (a getenv at exit
+/// when BLADE_RUN_RECORD is unset), so byte-identity across builds of the
+/// same program is unaffected and no environment reaches the emitted text.
+let private runRecordLines (modul: IRModule) (testName: string) (mpiOn: bool) (emitted: string list) : string list =
+    let folds = Blade.ProviderStatics.drainFoldLog ()
+    let entries = Blade.RunRecord.manifestOf [ modul ] folds
+    let usesRng = emitted |> List.exists (fun (l: string) -> l.Contains "blade_rand::")
+    let rankExpr = if mpiOn then "&__blade_mpi_rank" else "nullptr"
+    Blade.RunRecord.cppLines testName Blade.RunRecord.bladeVersion usesRng rankExpr entries @ [ "" ]
 
 let genMainWrapper (mpi: bool, mpiThreaded: bool, netcdf: bool) (testName: string) (bodyIndented: string list) (printCode: string list) : string list =
     let header =
@@ -2685,6 +2901,7 @@ let genMainProgram (modul: IRModule) (testName: string) : string =
     (streamBufDeclsCell ()).Value <- Set.empty
     (forcedDeferredIdsCell ()).Value <- Set.empty
     (linalgUsedCell ()).Value <- false
+    (tilesUsedCell ()).Value <- false
     (cudaLinalgUsedCell ()).Value <- false
     (lapackUsedCell ()).Value <- false
     (ompApiUsedCell ()).Value <- false
@@ -2717,6 +2934,10 @@ let genMainProgram (modul: IRModule) (testName: string) : string =
     // line). Appended post-body like the CUDA prototypes below. A program
     // using neither gram nor matmul never names the header at all.
     let includes = if (linalgUsedCell ()).Value then includes @ ["#include \"blade_linalg.hpp\""] else includes
+    // blade_tilecache.hpp only when a tiled binding was emitted (revision
+    // reuse, docs/plans/structural/04); Build.fs keys -DBLADE_TOOLCHAIN_ID
+    // off this include line.
+    let includes = if (tilesUsedCell ()).Value then includes @ ["#include \"blade_tilecache.hpp\""] else includes
     // blade_linalg_cuda.hpp: the DEVICE half of the same collect-then-append
     // shape, its OWN cell and its own build consequence -- Build.fs
     // sniffs THIS line to write the companion `.cu`, build it with nvcc and
@@ -2757,8 +2978,9 @@ let genMainProgram (modul: IRModule) (testName: string) : string =
 
     let bodyIndented = bindCode |> List.map (fun s -> "    " + s)
     let mainFunc = genMainWrapper (mpiOn, mpiOn && moduleHybridMpiOmp modul, moduleUsesNetcdf modul) testName bodyIndented []
+    let rrLines = runRecordLines modul testName mpiOn (funcDefs @ mainFunc)
 
-    (includes @ [""] @ mpiDecls @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainFunc) |> String.concat "\n"
+    (includes @ [""] @ mpiDecls @ rrLines @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainFunc) |> String.concat "\n"
 
 /// The .cu file content for the most recently assembled program, or None if no
 /// CUDA kernel was emitted. Call AFTER genMainProgram/genProgramFromIR (the
@@ -2782,12 +3004,40 @@ let getCudaFileContent () : string option =
             @ [ "" ]
         Some ((header @ defs) |> String.concat "\n")
 
+/// MODULE IDENTITY SURVIVES THE MERGE. Two file modules may each declare an
+/// `f`; the checker keeps them apart (a qualified import binds `a.f` and
+/// `b.f` to distinct VarIds) but the C++ TU is one namespace, and both used
+/// to emit as `int64_t f(int64_t)` -- a g++ redefinition. A function whose
+/// name another module also declares is emitted as `<module>__<name>`
+/// unless it belongs to the LAST module (the program's main module keeps
+/// its spelling). Call sites resolve through the Id-keyed VarNames map, so
+/// the rename is total by construction; nothing emits a function by its
+/// string name. Shared by both multi-module assembly sites.
+let private disambiguateModuleFunctions (modules: IRModule list) : IRModule list =
+    let nameCounts =
+        modules
+        |> List.collect (fun m -> m.Functions |> List.map (fun f -> f.Name))
+        |> List.countBy id
+        |> Map.ofList
+    let lastIdx = modules.Length - 1
+    modules |> List.mapi (fun i m ->
+        if i = lastIdx then m
+        else
+            let prefix = (if m.Name = "" then $"m{i}" else m.Name).Replace('.', '_')
+            { m with
+                Functions =
+                    m.Functions |> List.map (fun f ->
+                        match Map.tryFind f.Name nameCounts with
+                        | Some n when n > 1 -> { f with Name = $"{prefix}__{f.Name}" }
+                        | _ -> f) })
+
 /// Generate a complete C++ program from an IR program (all modules)
 let genProgramFromIR (program: IRProgram) (testName: string) : string =
     match program.Modules with
     | [] -> "// Empty program\nint main() { return 0; }\n"
     | [modul] -> genMainProgram modul testName
     | modules ->
+        let modules = disambiguateModuleFunctions modules
         let merged = {
             Name = "merged"
             Types = modules |> List.collect (_.Types)
@@ -2850,6 +3100,7 @@ let genSelfContainedProgram (modul: IRModule) (testName: string) : string =
     // reads it to auto-print deferred bindings that ended up materialized.
     (forcedDeferredIdsCell ()).Value <- Set.empty
     (linalgUsedCell ()).Value <- false
+    (tilesUsedCell ()).Value <- false
     (cudaLinalgUsedCell ()).Value <- false
     (lapackUsedCell ()).Value <- false
     (ompApiUsedCell ()).Value <- false
@@ -2905,6 +3156,10 @@ let genSelfContainedProgram (modul: IRModule) (testName: string) : string =
     // Build.fs keys -DBLADE_HAS_BLAS + the -I/link flags off this include
     // line). Appended post-body like the CUDA prototypes below.
     let includes = if (linalgUsedCell ()).Value then includes @ ["#include \"blade_linalg.hpp\""] else includes
+    // blade_tilecache.hpp only when a tiled binding was emitted (revision
+    // reuse, docs/plans/structural/04); Build.fs keys -DBLADE_TOOLCHAIN_ID
+    // off this include line.
+    let includes = if (tilesUsedCell ()).Value then includes @ ["#include \"blade_tilecache.hpp\""] else includes
     // blade_linalg_cuda.hpp: the DEVICE half of the same collect-then-append
     // shape, its OWN cell and its own build consequence -- Build.fs
     // sniffs THIS line to write the companion `.cu`, build it with nvcc and
@@ -2941,7 +3196,8 @@ let genSelfContainedProgram (modul: IRModule) (testName: string) : string =
     // S0: module-level bindings promoted to namespace scope (declaration only).
     let moduleGlobalDecls = (moduleGlobalDeclsCell ()).Value
 
-    (includes @ typeDefs @ [""] @ mpiDecls @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainBody) |> String.concat "\n"
+    let rrLines = runRecordLines modul testName mpiOn (funcDefs @ mainBody)
+    (includes @ typeDefs @ [""] @ mpiDecls @ rrLines @ symmDecls @ moduleGlobalDecls @ [""] @ cudaProtos @ [""] @ funcDefs @ mainBody) |> String.concat "\n"
 
 /// Generate a C++ program with external runtime header
 /// Returns (mainFileContent, headerFileContent)
@@ -2968,6 +3224,7 @@ let genProgramWithExternalRuntime (modul: IRModule) (testName: string) : string 
     // Reset the S0 module-global promotion collector (see moduleGlobalDeclsCell).
     (moduleGlobalDeclsCell ()).Value <- []
     (linalgUsedCell ()).Value <- false
+    (tilesUsedCell ()).Value <- false
     (cudaLinalgUsedCell ()).Value <- false
     (lapackUsedCell ()).Value <- false
     (ompApiUsedCell ()).Value <- false
@@ -2981,6 +3238,10 @@ let genProgramWithExternalRuntime (modul: IRModule) (testName: string) : string 
     // Build.fs keys -DBLADE_HAS_BLAS + the -I/link flags off this include
     // line).
     let includes = if (linalgUsedCell ()).Value then includes @ ["#include \"blade_linalg.hpp\""] else includes
+    // blade_tilecache.hpp only when a tiled binding was emitted (revision
+    // reuse, docs/plans/structural/04); Build.fs keys -DBLADE_TOOLCHAIN_ID
+    // off this include line.
+    let includes = if (tilesUsedCell ()).Value then includes @ ["#include \"blade_tilecache.hpp\""] else includes
     // blade_linalg_cuda.hpp: the DEVICE half of the same collect-then-append
     // shape, its OWN cell and its own build consequence -- Build.fs
     // sniffs THIS line to write the companion `.cu`, build it with nvcc and
@@ -3006,7 +3267,8 @@ let genProgramWithExternalRuntime (modul: IRModule) (testName: string) : string 
 
     // S0: module-level bindings promoted to namespace scope (declaration only).
     let moduleGlobalDecls = (moduleGlobalDeclsCell ()).Value
-    let mainFile = (includes @ typeDefs @ [""] @ mpiDecls @ moduleGlobalDecls @ funcDefs @ mainFunc) |> String.concat "\n"
+    let rrLines = runRecordLines modul testName mpiOn (funcDefs @ mainFunc)
+    let mainFile = (includes @ typeDefs @ [""] @ mpiDecls @ rrLines @ moduleGlobalDecls @ funcDefs @ mainFunc) |> String.concat "\n"
     let headerFile = genRuntimeHeader ()
     (mainFile, headerFile)
 
@@ -3022,6 +3284,7 @@ let genSelfContainedProgramFromIR (program: IRProgram) (testName: string) : stri
     (unhandledNodesCell ()).Value <- []
     (codegenRefusalsCell ()).Value <- []
     (currentDeclCell ()).Value <- ""
+    resetStreamedValueState ()
     // Deterministic deallocation: see genMainProgram.
     (freshReturnFactsCell ()).Value <- Map.empty
     (copyInPlaceMutsCell ()).Value <- Map.empty
@@ -3033,6 +3296,7 @@ let genSelfContainedProgramFromIR (program: IRProgram) (testName: string) : stri
         | modules ->
             // Multi-module: merge all modules into one for code generation
             // Functions and bindings from earlier modules come first
+            let modules = disambiguateModuleFunctions modules
             let merged = {
                 Name = "merged"
                 Types = modules |> List.collect (_.Types)
@@ -3060,6 +3324,9 @@ let genSelfContainedProgramFromIR (program: IRProgram) (testName: string) : stri
     // g++'s "not declared in this scope" -- is what the user and the corpus
     // runner's REJECT-AT: codegen verdict see. A program with no expression
     // refusal appends nothing, so no currently-compiling program is affected.
+    // A `.stream` binding rendered as a value: refused only if its sentinel
+    // reached the unit (CodeGenState, "STREAMED VALUES NEVER REACH C++").
+    let code = settleStreamedValueLeaks code
     let sentinels = (exprSentinelsCell ()).Value
     let code =
         if List.isEmpty sentinels then code

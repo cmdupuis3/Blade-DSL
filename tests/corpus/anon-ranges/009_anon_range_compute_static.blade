@@ -1,0 +1,12 @@
+// TEST: Anon Range Compute And Static Bound
+// `|> compute` on a bare range is the same materialization; a `let static`
+// bound folds into the extent.
+let xs = 0..5 |> compute
+let x4 = xs(4)
+let static n = 7
+let ys = 0..n
+let y6 = ys(6)
+// EXPECT: xs = [0, 1, 2, 3, 4]
+// EXPECT: x4 = 4
+// EXPECT: ys = [0, 1, 2, 3, 4, 5, 6]
+// EXPECT: y6 = 6

@@ -104,6 +104,76 @@ type MutualGroupInfo = {
 }
 
 /// Exported bindings from a type-checked module, for cross-module imports
+/// One level of a segmentation of one axis (docs/plans/structural/07 §2.1):
+/// a regular chunk grid, or stores tiling the axis in declaration order.
+type SegLevel =
+    | SegRegular of edge: int64
+    /// Stores tiling the axis in declaration order: (label, extent, that
+    /// file's own chunk edge if it is chunked). The per-file edge is what
+    /// makes the chunk level DEPENDENT on the file level (§2.7): two files
+    /// may be chunked differently.
+    | SegFiles of (string * int64 * int64 option) list
+
+/// The segmentation registered beside a `type A = Chunked<I, spec>`: the
+/// axis it partitions (I's own record -- the alias IS I), I's static extent,
+/// and the levels, outermost first. Read by `segments(A)`; nothing else in
+/// the type system sees it, which is what keeps `Chunked<I, K>` unifying as
+/// `I` (storage is unchanged in this arc).
+type Segmentation = {
+    Alias: string
+    Source: IRIndexType
+    Extent: int64
+    Levels: SegLevel list
+}
+
+/// The run boundaries of the INNERMOST level, flattened over the whole axis:
+/// `[b_0 = 0; ...; b_G = N]`. A regular grid over a file level is applied
+/// within each file's run, so a file's last chunk may be short.
+let segmentationOffsets (s: Segmentation) : int64 list =
+    let regular (lo: int64) (hi: int64) (edge: int64) : int64 list =
+        // interior boundaries of [lo, hi) at multiples of edge from lo
+        [ for b in lo + edge .. edge .. hi - 1L -> b ]
+    let rec go (runs: (int64 * int64) list) (levels: SegLevel list) : (int64 * int64) list =
+        match levels with
+        | [] -> runs
+        | SegFiles files :: rest ->
+            let runs' =
+                runs |> List.collect (fun (lo, hi) ->
+                    let mutable at = lo
+                    [ for (_, ext, edge) in files do
+                        let flo, fhi = at, min hi (at + ext)
+                        at <- at + ext
+                        match edge with
+                        | Some k -> yield! List.pairwise (flo :: regular flo fhi k @ [ fhi ])
+                        | None -> yield (flo, fhi) ])
+            go runs' rest
+        | SegRegular edge :: rest ->
+            let runs' =
+                runs |> List.collect (fun (lo, hi) ->
+                    let cuts = lo :: regular lo hi edge @ [ hi ]
+                    List.pairwise cuts)
+            go runs' rest
+    let runs = go [ (0L, s.Extent) ] s.Levels
+    match runs with
+    | [] -> [ 0L; s.Extent ]
+    | _ -> (runs |> List.map fst) @ [ s.Extent ]
+
+/// The labels of the OUTERMOST level when it is a file level: the
+/// `EnumIdx` states of a file-segmented axis (decision D3).
+let segmentationLabels (s: Segmentation) : string list option =
+    match s.Levels with
+    | SegFiles files :: _ -> Some (files |> List.map (fun (l, _, _) -> l))
+    | _ -> None
+
+/// The FILE-level run boundaries `[0; ..; N]` of a file-segmented axis (the
+/// outer grouping of §2.7), or None when the axis has no file level.
+let segmentationFileOffsets (s: Segmentation) : int64 list option =
+    match s.Levels with
+    | SegFiles files :: _ ->
+        let cuts = files |> List.scan (fun at (_, ext, _) -> at + ext) 0L
+        Some cuts
+    | _ -> None
+
 type TypeModuleExport = {
     Variables: Map<string, VarInfo>
     TypeDefs: Map<string, TypeDefInfo>
@@ -118,6 +188,15 @@ type TypeModuleExport = {
     /// rewriteImportedStaticRefs seed these under "alias.name" (qualified) or
     /// "name" (selective) ahead of StaticEval.resolveStatics.
     StaticValues: Map<string, StaticEval.StaticValue>
+    /// This module's defaults-carrying callables (bare names), snapshotted
+    /// from the shared `FuncDefaults` table when the module's check ends --
+    /// BEFORE a later module can overwrite the bare-name entry with its own
+    /// `f`. A qualified import re-registers them as `alias.name` and a
+    /// selective one as `name`, so a call resolves the defaults of the
+    /// module it actually named.
+    Defaults: Map<string, (string * TypeExpr option * Expr option) list>
+    /// The matching FuncDefaultCaptures entries (see TypeEnv.FuncDefaultCaptures).
+    DefaultCaptures: Map<string, Map<string, IRId>>
 }
 
 /// Type checking environment
@@ -196,12 +275,31 @@ type TypeEnv = {
     /// synthesis needs the bound EXPRESSIONS, so it resolves alias chains
     /// through this map instead. Populated by registerTypeDecl per `type X = ...`.
     SurfaceAliases: Map<string, TypeExpr>
+    /// Segmentations registered by `type A = Chunked<I, spec>`, by alias
+    /// (docs/plans/structural/07). Read by `segments(A)`.
+    Segmentations: Map<string, Segmentation>
+    /// The OUTER slot ids of `group_by(_, segments(A))` results, by the
+    /// alias they came from: how `ungroup(G)` finds the axis to restore
+    /// when G's outer slot carries one of these ids (inferGroupBy mints the
+    /// slot fresh, so the id is the only handle that survives).
+    SegmentedOuters: System.Collections.Generic.Dictionary<IRId, string>
+    /// The `Chunked` aliases named by a value binding's ANNOTATION, per slot
+    /// (None for a slot that is not a Chunked alias), by binding name: what
+    /// `segments(a)` over a VALUE reads. An array whose slots are all
+    /// `Chunked` already says its tiling; the aliases need not be repeated.
+    SlotAliases: System.Collections.Generic.Dictionary<string, string option list>
     /// Names declared `static struct` (the static-eligibility fence).
     /// Registration validates fields against StaticValue shapes and records
     /// the name on success, so later static structs can nest earlier ones.
     /// A name set, not a TDIStruct flag: only decl-time checks and the
     /// constrained-index layers consult it.
     StaticStructs: Set<string>
+    /// Every declared struct's static-evaluator record (fields, raw field
+    /// decls with their bounds, declared and full conjunct lists, the static
+    /// marker), registered beside TDIStruct so the index fence and the
+    /// enumeration route (StructIdxFence / StructIdxSpec) can be asked from
+    /// the checker and the lowerer through `staticEnvOf`.
+    StructStatics: Map<string, StaticEval.StructStaticInfo>
     /// Non-fatal diagnostics accumulated during type-checking. A mutable
     /// ResizeArray so `{ env with ... }` updates share one collector across
     /// scopes. Surfaced only via `typeCheck`'s Ok return; skipped on the error path.
@@ -221,6 +319,16 @@ type TypeEnv = {
     /// default at the call site). Name-keyed like FuncConstraints, and shares
     /// its known shadowing weakness. Shared by reference.
     FuncDefaults: System.Collections.Generic.Dictionary<string, (string * TypeExpr option * Expr option) list>
+    /// The BINDING IDENTITY of every free name a default expression reads
+    /// from its declaration scope: callee name -> (free name -> VarId at the
+    /// declaration). A default is spliced into the CALL SITE as surface
+    /// syntax and re-inferred there, so a name it reads resolves in the
+    /// caller's scope -- `function f(x = k)` called from `function g(k) =
+    /// f()` used to read g's parameter. The splice compares each free name's
+    /// call-site binding against the identity recorded here and refuses on
+    /// disagreement (BL3012). Keyed exactly like FuncDefaults, including the
+    /// `alias.name` entries a qualified import registers. Shared by reference.
+    FuncDefaultCaptures: System.Collections.Generic.Dictionary<string, Map<string, IRId>>
     /// Mutually constrained alias groups: groupId -> group info.
     MutualGroups: Map<string, MutualGroupInfo>
     /// Member alias name -> owning groupId, for annotation scanning.
@@ -237,6 +345,30 @@ type TypeEnv = {
     /// FuncConstraints/FuncDefaults, and shares their known shadowing
     /// weakness. Shared by reference.
     MutParamPositions: System.Collections.Generic.Dictionary<string, int list>
+    /// Callee name -> the co-iterations its body performs over its own
+    /// PARAMETERS: each entry is (parameter positions walked, literal leading
+    /// extents of that co-iteration's other operands), all of which must agree.
+    ///
+    /// The agreement obligation a zip carries is discharged AT the zip
+    /// (`TypeLower.zipHeadClash`, BL3016) only when both extents are literals
+    /// there. Through abstract `T^1` parameters they are not -- the body sees
+    /// two rank-1 arrays with nothing to compare -- so the obligation has to
+    /// travel to the call, which is where the extents become concrete. This
+    /// records it; `CoIterArgExtentMismatch` on the call-site ladder discharges
+    /// it. Without it, a body that zips its two parameters accepted a 6-cell
+    /// and a 3-cell argument and read three doubles past the shorter one, in
+    /// both lanes, with no diagnostic.
+    ///
+    /// Two populating sources, both in checkFunctionDecl: a zip DIRECTLY over
+    /// parameters, and a call to an already-obligated callee passing this
+    /// body's own parameters into its obligated positions (so the obligation
+    /// travels up a forwarding chain). Declaration order makes one forward pass
+    /// enough -- a body sees only names bound before it, and mutual recursion
+    /// is rejected (BL2001).
+    ///
+    /// Name-keyed like MutParamPositions, and shares its shadowing weakness.
+    /// Shared by reference.
+    FuncCoIterObligations: System.Collections.Generic.Dictionary<string, (int list * int64 list) list>
     /// Callee name -> how its return's UNIT is built from its arguments':
     /// `(exponents, residual)` means the result measures
     /// `residual * PROD_i (unit of argument i) ^ exponents[i]`.
@@ -296,6 +428,16 @@ type TypeEnv = {
     /// Keyed by BINDER ID, not name, so a local that SHADOWS a function name
     /// still captures (its VarId is a different binder).
     DeclaredFuncIds: System.Collections.Generic.HashSet<IRId>
+    /// Function BINDER ID -> the conservative effect summary of its typed
+    /// body (Blade.Effects.EffectSummary; TypeCheckSupport.effectsOfBody).
+    /// Populated by checkFunctionDecl after the body is checked, so a body
+    /// sees summaries for every function declared before it (declaration
+    /// order; mutual recursion is rejected, BL2001) and its own recursive
+    /// calls are assumed pure while its summary is being computed. Read by
+    /// inferRecArray's freeze-recognition callee test. Keyed by id like
+    /// DeclaredFuncIds: a shadowing local never borrows a summary. Shared
+    /// by reference.
+    FuncEffects: System.Collections.Generic.Dictionary<IRId, Blade.Effects.EffectSummary>
     /// CERTIFIED half of the typed equivariance lattice (FuncRepSpec below is
     /// the speculative half): per-function rep signatures for functions
     /// carrying an `__ml_equiv` conjunct (a source `where ml.equiv(G)` pin, or
@@ -359,6 +501,9 @@ type TypeEnv = {
 let emptyEnv () = {
     Variables = Map.empty
     TypeDefs = Map.empty
+    Segmentations = Map.empty
+    SegmentedOuters = System.Collections.Generic.Dictionary<IRId, string>()
+    SlotAliases = System.Collections.Generic.Dictionary<string, string option list>()
     VariantTags = Map.empty
     Subst = Subst()
     Builder = IRBuilder()
@@ -378,20 +523,24 @@ let emptyEnv () = {
     StaticValues = Map.empty
     SurfaceAliases = Map.empty
     StaticStructs = Set.empty
+    StructStatics = Map.empty
     Warnings = ResizeArray<string>()
     Provenance = System.Collections.Generic.Dictionary<IRId, Set<string>>()
     FuncConstraints = System.Collections.Generic.Dictionary<string, string list * (string * string list) list>()
     FuncDefaults = System.Collections.Generic.Dictionary<string, (string * TypeExpr option * Expr option) list>()
+    FuncDefaultCaptures = System.Collections.Generic.Dictionary<string, Map<string, IRId>>()
     MutualGroups = Map.empty
     MutualMembers = Map.empty
     MutualReturnFuncs = System.Collections.Generic.Dictionary<string, string>()
     MutParamPositions = System.Collections.Generic.Dictionary<string, int list>()
+    FuncCoIterObligations = System.Collections.Generic.Dictionary<string, (int list * int64 list) list>()
     FuncUnitTransform = System.Collections.Generic.Dictionary<string, int list * UnitSig>()
     FuncCommGroups = System.Collections.Generic.Dictionary<string, int list list>()
     FuncAntisymGroups = System.Collections.Generic.Dictionary<string, int list list>()
     FuncDeducedPairs = System.Collections.Generic.Dictionary<string, string list * Blade.Deduce.Parity list>()
     FuncSignParities = System.Collections.Generic.Dictionary<IRId, Blade.Deduce.SignParity list>()
     DeclaredFuncIds = System.Collections.Generic.HashSet<IRId>()
+    FuncEffects = System.Collections.Generic.Dictionary<IRId, Blade.Effects.EffectSummary>()
     FuncRepSigs = System.Collections.Generic.Dictionary<IRId, Blade.DeduceRep.RepSigT>()
     FuncRepSpec = Blade.DeduceRep.RepSpecTable()
     PackDeducedComm = System.Collections.Generic.Dictionary<string, string * Blade.Deduce.Parity>()
@@ -523,11 +672,63 @@ let locateError (span: Span) (env: TypeEnv) (err: TypeError) : CompileError =
 /// in TypeCheck.fs pass this; formatTypeError words the message around it.
 let unitAnnoContext = "<type annotation>"
 
+/// The extra line a TYPE MISMATCH earns when its two sides RENDER IDENTICALLY.
+///
+/// `ppIndexType` prints an index record from its extent and symmetry and reads
+/// no Tag at all, so `expected Array<Float64 like Idx<5>>, got Array<Float64
+/// like Idx<5>>` is exactly what a user sees when two DIFFERENT provider axis
+/// identities meet -- two checkouts whose `lat` diverged, or two repos' `lat`.
+/// The message is then not merely unhelpful, it reads as a compiler bug.
+///
+/// Fixed HERE and not in the printer on purpose: many corpus categories pin
+/// `Idx<n>` in error text, and teaching the global type printer about tags
+/// would rewrite all of them. This is one appended line, so every
+/// ERROR-CONTAINS pin on the sentence above it keeps matching.
+///
+/// Scoped to PROVIDER tags (`isProviderAxisTag`) for the same containment
+/// reason: `__`-prefixed KIND sentinels also vanish from the render, and a note
+/// reading "'__raggedidx' vs '__group_outer'" would be noise in categories that
+/// have nothing to do with providers.
+let private indexIdentityNote (exp: IRType) (act: IRType) : string =
+    let recsOf (t: IRType) =
+        match t with
+        | ArrayElem at -> at.IndexTypes
+        | _ -> []
+    let a, b = recsOf exp, recsOf act
+    if a.Length <> b.Length || a.IsEmpty then ""
+    else
+        List.zip a b
+        |> List.tryPick (fun (x, y) ->
+            match x.Tag, y.Tag with
+            | Some tx, Some ty when tx <> ty && (isProviderAxisTag tx || isProviderAxisTag ty) ->
+                let clause =
+                    match providerSplitClause tx ty with
+                    | Some c -> " " + c
+                    | None -> ""
+                Some $"\nnote: the index types differ by identity: '{(displayTagName tx)}' vs '{(displayTagName ty)}'{clause}"
+            | _ -> None)
+        |> Option.defaultValue ""
+
 /// Format a TypeError as a human-readable string
 let formatTypeError (err: TypeError) : string =
     match err with
-    | UnboundVariable name -> $"Unbound variable: {name}"
-    | TypeMismatch (exp, act) -> $"Type mismatch: expected {ppIRType exp}, got {ppIRType act}"
+    | UnboundVariable name ->
+        // The steer for imperative-loop refugees. `while`/`do` are not
+        // keywords (deliberately: programs may bind them), so a Fortran/C
+        // programmer's first `while cond { ... }` dies HERE as a bare
+        // unbound-variable error -- the language's whole thesis, with no
+        // pointer to it. Same rationale as the removed-`for` BL1003 steer,
+        // fired at the one place we know the name is genuinely unbound, so
+        // a real variable named `while` never trips it.
+        match name with
+        | "while" | "do" ->
+            $"Unbound variable: {name}. Blade has no imperative loops -- iteration is declarative. A converge/accumulate loop is a recursive array (`let rec q: Array<T like Step> = match q with | zero -> zero | prefix :: n -> prefix :: <step>`), and iterate-until-converged is that array's inductive arm carrying a `while` guard over a BUDGET extent (`| prefix :: n while <cond> -> prefix :: <step>` -- frozen once the guard goes false, BL8010 if it never does). A fold is `reduce(...)`, and a parallel map is `method_for(range<...>) <@> lambda(...)` or plain array arithmetic. See formalism 7.5."
+        | _ -> $"Unbound variable: {name}"
+    | DuplicateFunctionDecl (name, firstSite) ->
+        $"duplicate declaration of function '{name}': this scope already declares it at {firstSite}. A function name may be declared only once per scope -- without this refusal the later declaration silently shadows the earlier one, and calls matching the first signature fail blaming the call site. Rename one of the declarations. (Dispatching one name across several signatures -- function clauses -- is a planned feature, not yet supported.)"
+    | TypeMismatch (exp, act) ->
+        let rendered = $"Type mismatch: expected {ppIRType exp}, got {ppIRType act}"
+        if ppIRType exp = ppIRType act then rendered + indexIdentityNote exp act else rendered
     | ArityMismatch (exp, act) -> $"Arity mismatch: expected {exp} args, got {act}"
     | KernelPackArity msg -> msg
     | ArgRankMismatch (pos, expRank, actRank, expTy, actTy) ->
@@ -542,6 +743,8 @@ let formatTypeError (err: TypeError) : string =
     | PatternTypeMismatch (pat, ty) -> sprintf "Pattern '%s' incompatible with type %A" pat ty
     | ProviderNativeLoadFailure (provider, path, detail) ->
         $"provider '{provider}' cannot load its native library, so the store '{path}' cannot be read at compile time: {detail}. Every type this store binds is unresolvable until the library loads -- install the provider's runtime, or point its install-root variable at it (NETCDF_DIR for netcdf: the compiler and generated programs then use that install's own libraries)."
+    | ProviderStoreUnresolvable (provider, path, detail) ->
+        $"provider '{provider}' cannot resolve the store '{path}' at compile time: {detail}"
     // Promoted variants (Stage 5): text reproduced verbatim.
     | IndexTagMismatchNamed (expected, actual) -> $"Array index tag mismatch: slot expects '{expected}' but argument has type '{actual}'."
     | IndexTagMismatchAnon expected -> $"Array index tag mismatch: slot expects named tag '{expected}' but argument is an anonymous index value."
@@ -561,6 +764,8 @@ let formatTypeError (err: TypeError) : string =
     // ONLY difference between the two spellings ("depth >= 2" here, "depth d"
     // there); everything else is identical and corpus-pinned. KEEP THEM IN
     // STEP or a half-updated pair tells the user two different stories.
+    | ConstrainedDomainRefused (name, why) ->
+        $"range<{name}>: {why}"
     | OrbitStorageUnsupported (levels, where_) ->
         sprintf "%s: OrbIdx<%s, n> is a declarable index class of depth >= 2, and a DEDUCED one can now be \
 allocated, written, printed, READ at an arbitrary tuple (the per-level canon fold, the accumulated \
@@ -623,8 +828,17 @@ class IS implemented, and the dense result folds like any other array." op level
         $"argument {pos}: extent mismatch on index slot {dim} -- the parameter declares Idx<{expected}> but the argument has Idx<{actual}>. A LITERAL parameter extent is baked into the emitted loop bounds and result allocations (a symbolic extent like Idx<n> reads the argument's extent at runtime instead), so this reads past the argument's allocation rather than merely disagreeing. Make the extents match, or declare the parameter over a symbolic extent."
     | ZipExtentMismatch (pos, expected, actual) ->
         $"elementwise co-iteration: operand {pos} has extent {actual} on the shared axis, but operand 1 has extent {expected}. A zip walks ONE index space, taken from the first operand, so the longer walk reads past the shorter operand's allocation -- silent out-of-bounds, not a broadcast (Blade does not broadcast mismatched extents). Bring the operands to a common extent, or index/slice the longer one first."
+    | CoIterArgExtentMismatch (callee, posA, posB, extA, extB) ->
+        $"arguments {posA} and {posB} of '{callee}': the body of '{callee}' CO-ITERATES these two parameters (an elementwise zip walks them as one index space), but argument {posA} has extent {extA} on the shared axis and argument {posB} has extent {extB}. The walk takes its bound from the first operand, so the longer one runs off the end of the shorter one's allocation -- silent out-of-bounds, not a broadcast (Blade does not broadcast mismatched extents). Because '{callee}' declares those parameters abstractly (`T^1`), the body has no extents to compare and this call is the first place the disagreement is visible. Pass arrays of equal extent, or slice the longer one to the shorter one's index space first."
+    | CoIterBodyExtentMismatch (callee, pos, argExt, bodyExt) ->
+        $"argument {pos} of '{callee}': the body of '{callee}' CO-ITERATES this parameter with an array of extent {bodyExt} (an elementwise zip walks them as one index space), but this argument has extent {argExt} on the shared axis. The walk takes its bound from the first operand, so whichever is longer runs off the end of the shorter one's allocation -- silent out-of-bounds, not a broadcast (Blade does not broadcast mismatched extents). The zip has one concrete side and one abstract (`T^1`) side, so the body could not compare them and this call is the first place both are known. Pass an array of extent {bodyExt}, or slice this one to that index space first."
+    | ProviderReadExtentMismatch (provider, dim, annotated, actual) ->
+        $"provider read: the annotation declares extent {annotated} on index slot {dim}, but the read's own type has extent {actual}. A provider read is typed BY THE STORE -- the annotation cannot reshape it -- while codegen allocates the store's true shape and compiles every later subscript against the ANNOTATED one, so a disagreement here is an out-of-bounds read with no runtime symptom, not a naming quarrel. Correct the annotation to the {provider} store's shape, or drop it and let the read supply the type (slice or reshape the value afterwards if a different shape is what you want)."
     | HaloExtentMismatch (declared, dim, targetName, actual) ->
         $"halo extent mismatch: the halo declares an inner extent of {declared}, but '{targetName}' (read through the window at index slot {dim}) has extent {actual}. The window walk is bounded by the DECLARED extent, so an oversized halo reads past '{targetName}''s allocation and an undersized one silently emits fewer windows. Make the halo's inner index match the array it windows over."
+    | HaloOffsetOutsideSet (offset, declared, targetName) ->
+        let set = declared |> List.map string |> String.concat ", "
+        $"halo offset outside the declared set: '{targetName}' is read at window offset {offset}, but the halo declares the offsets [{set}], whose reach is {min 0 (List.min declared)}..{max 0 (List.max declared)}. The interior is shrunk for that reach only, so this read lands past the array's allocation at the boundary. Add {offset} to the halo's offset list (which widens the reach), or read within it."
     | QuantityTerminal (quantity, declName) ->
         $"unit '{declName}': the quantity '{quantity}' cannot be used inside a unit expression. Quantities are TERMINAL -- the nominal layer is exactly one level deep -- so a quantity name can neither be composed (`Unit x = {quantity} * m`) nor re-derived from (`Unit q: {quantity}`). Compose from the structural units the quantity was declared over instead."
     | UnknownUnitName (name, declName, candidates) ->
@@ -637,6 +851,8 @@ class IS implemented, and the dense result folds like any other array." op level
         $"{func}: parameter '{requiredParam}' has no default but follows the defaulted parameter '{defaultedParam}'. Defaults are TRAILING: once a parameter has a default, every later parameter needs one too (otherwise an omitted-argument call is ambiguous). Reorder the parameters or give '{requiredParam}' a default."
     | DefaultParamScope (func, param, referenced) ->
         $"{func}: the default for parameter '{param}' references '{referenced}', which is itself a defaulted parameter. A default may reference the REQUIRED parameters only -- defaults evaluate left-to-right at call entry with just the required arguments bound, so another default's value is not available."
+    | DefaultParamShadowed (func, param, name) ->
+        $"{func}: the default for parameter '{param}' reads '{name}' from the scope where the function was declared, but at this call site '{name}' is a different binding (a parameter or local that shadows it). A default keeps its declaration-site meaning, so it cannot be filled in here: pass the argument explicitly, or rename the local '{name}'."
     | FactoryDupQuantityDecl (func, quantity, param1, param2) ->
         $"{func}: defaulted parameters '{param1}' and '{param2}' both carry the quantity '{quantity}'. By-nominal argument routing (`f(x, 3 : {quantity})`) needs each quantity to name exactly ONE defaulted slot -- give the second slot a distinct quantity, or make it a plain (non-quantity) parameter."
     | FactoryDupFill (callee, quantity, slot) ->
@@ -650,6 +866,8 @@ class IS implemented, and the dense result folds like any other array." op level
     | IntrinsicNotComplex name -> $"{name} is not defined for complex operands."
     | IntrinsicNeedsNumeric name -> $"{name} expects a numeric operand."
     | InvalidCast msg -> msg
+    | SpecIndexMatchNotStatic (scrutinee, offender) ->
+        $"match on {scrutinee}: arm selection happens at specialization (each arity/rank clone keeps exactly one arm), but {offender}. Arms of a specialization-index match must be unguarded integer literals plus at most one catch-all (`_` or a name); move the runtime condition inside the chosen arm's body instead: `| 1 -> if threshold > 0.0 then ... else ...`."
     | AbsNeedsNumericScalar got -> $"abs expects a numeric scalar operand, got {got}"
     | IntrinsicComplexScalarOnly name -> $"{name} applies to complex scalars; map it over the array elementwise (e.g. method_for(A) <@> lambda(z) -> {name}(z) |> compute)."
     | IntrinsicNeedsComplex (name, got) -> $"{name} expects a complex operand, got {got}"
@@ -680,6 +898,8 @@ complex half)." where_
     | ChainOpUndecidable (leftDesc, rightDesc) -> $"cannot infer the roles of the <@> operands: the left side is {leftDesc} and the right side is {rightDesc}, so the arrays/kernel roles are ambiguous. A former is implicit only when one side is decisive: a kernel (lambda, operator section, named function, reynolds(...), zero) or a former. Write it explicitly: method_for(arrays) <@> kernel, or object_for(kernel) <@> (arrays)."
     | CommContradictsBody (p1, p2) -> $"`where comm({p1}, {p2})` contradicts the kernel body, which is provably ANTIcommutative under that swap (f({p2}, {p1}) = -f({p1}, {p2})): triangular storage would silently corrupt half the output. Remove the comm clause, or wrap the kernel in reynolds(...) if a signed iteration license over the permutation sum is what you intend."
     | AntisymmContradictsBody (p1, p2) -> $"`where anticomm({p1}, {p2})` contradicts the kernel body, which is provably COMMUTATIVE under that swap (f({p2}, {p1}) = f({p1}, {p2})): strict-triangular anticommutative storage would drop the diagonal and negate half the output. Remove the anticomm clause (use `where comm({p1}, {p2})` for the symmetric triangle), or wrap the kernel in reynolds(..., Antisymmetric) if a signed antisymmetrization is what you intend."
+    | CommContradictsConjBody (p1, p2) -> $"`where comm({p1}, {p2})` contradicts the kernel body, which provably CONJUGATES under that swap (f({p2}, {p1}) = conj(f({p1}, {p2}))): symmetric storage recovers mirrored cells by IDENTITY, so every read across the diagonal would return the stored value un-conjugated -- the imaginary part of half the output silently flips sign. Remove the comm clause (dense storage computes both triangles); if the symmetric real part is what you intend, real(...) of this kernel IS commutative; if a Hermitian Gram matrix is the goal, `gram(A, A)` routes to Hermitian storage, whose mirrored reads conjugate."
+    | AntisymmContradictsConjBody (p1, p2) -> $"`where anticomm({p1}, {p2})` contradicts the kernel body, which provably CONJUGATES under that swap (f({p2}, {p1}) = conj(f({p1}, {p2}))): strict-triangular storage recovers mirrored cells by NEGATION, but the true mirror is the conjugate -- the real part of half the output silently flips sign (only the imaginary half happens to agree). Remove the anticomm clause (dense storage computes both triangles); if the antisymmetric imaginary part is what you intend, imag(...) of this kernel IS anticommutative."
     | AntisymMapNotOdd (param, proved) -> $"mapping this kernel over an ANTISYMMETRIC (AntisymIdx) array would keep the input's strict-triangular storage, and that is only correct for a SIGN-ODD kernel (f(-x) = -f(x)); the deduction says this one is {proved} in '{param}'. An even or unknown-parity map of an antisymmetric array is SYMMETRIC -- it has a diagonal, and the strict iteration the input forces cannot produce one -- so the compact result would negate every mirrored read. Map over a dense copy instead (`decompact(A, 0)` materializes the full tensor, and the kernel over THAT is symmetric with the right diagonal), or use a sign-odd kernel."
     | WreathTieKernelNotOdd (param, proved, levels) -> $"the declared clause ties every argument over a compact class with a '-' inner level ({levels}), and that tie is only sound for a kernel SIGN-ODD in each argument separately (h(-p, q) = -h(p, q)): a '-' level claims that mirroring ONE argument's sub-block negates the value, so an even or unknown-parity kernel would store a class whose mirrored reads and decompaction answer with signs the values do not satisfy. The deduction says this kernel is {proved} in '{param}'. Use a per-argument sign-odd kernel (e.g. p * q; note p + q is NOT odd in each argument), or map over dense copies instead: decompact(_, 0) materializes the full tensor, and the kernel over THAT carries no wreath claim."
     | HermitianMapNotReal param -> $"mapping this kernel over a HERMITIAN (HermitianIdx) array would keep the input's Hermitian storage, whose mirrored reads recover H(j,i) as conj(H(i,j)); that is only correct when the kernel commutes with conjugation (f(conj z) = conj(f z)), which is not deducible for '{param}'. A kernel built from the parameter, real constants, + - * /, and neg/conj/real qualifies; a complex constant, imag(z), arg(z), `^` and the math intrinsics (exp/log/sqrt/...) do not. Map over a dense copy instead: `decompact(A, 0)` materializes the full conjugate-mirrored matrix, and the kernel over THAT carries no storage claim."
@@ -830,10 +1050,17 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
         | None ->
             match e.Error with
             | UnboundVariable _ -> "BL2001"
+            // Same-scope duplicate `function` name: a name-binding refusal,
+            // so it lives in the BL2xxx resolution band, not BL3xxx.
+            | DuplicateFunctionDecl _ -> "BL2009"
             // Environment condition, not a type judgment: the provider's
             // native library is unloadable, so the store's names cannot
             // resolve -- same band as BL2004's "module not found".
             | ProviderNativeLoadFailure _ -> "BL2007"
+            // Same band, same reason: the store named at the load site does not
+            // resolve, so no name it binds can. BL2007's sibling, one condition
+            // over (library vs store).
+            | ProviderStoreUnresolvable _ -> "BL2008"
             | TypeMismatch _ | ArgRankMismatch _ | ArgTypeMismatch _ -> "BL3001"
             | ArityMismatch _ | KernelPackArity _ -> "BL3002"
             | InvalidApplication _ -> "BL3003"
@@ -842,9 +1069,11 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // Promoted variants (Stage 5)
             | UnitMismatch _ -> "BL3006"
             | QuantityArgMismatch _ -> "BL3010"
-            | ExtentArgMismatch _ | HaloExtentMismatch _ | ZipExtentMismatch _ -> "BL3016"
+            | ExtentArgMismatch _ | HaloExtentMismatch _ | ZipExtentMismatch _
+            | CoIterArgExtentMismatch _ | CoIterBodyExtentMismatch _ -> "BL3016"
+            | ProviderReadExtentMismatch _ -> "BL3016"
             | QuantityTerminal _ -> "BL3011"
-            | DefaultParamOrder _ | DefaultParamScope _ -> "BL3012"
+            | DefaultParamOrder _ | DefaultParamScope _ | DefaultParamShadowed _ -> "BL3012"
             | FactoryDupQuantityDecl _ -> "BL3013"
             | FactoryDupFill _ | FactoryUnknownTag _ | FactoryAmbiguousMix _ -> "BL3014"
             | UnknownUnitName _ -> "BL3015"
@@ -874,6 +1103,12 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // "invalid builtin argument" bucket would bury the one message
             // users need (how to license the conversion they meant).
             | InvalidCast _ -> "BL3019"
+            // A guard (or non-int pattern) on a `match arity(p)` /
+            // `match rank(p)` scrutinee: arm selection happens at
+            // specialization, where a runtime guard has no answer. Its own
+            // code, because the fix (move the condition into the arm's
+            // body) is nothing like BL3004's pattern-type story.
+            | SpecIndexMatchNotStatic _ -> "BL3021"
             | StructFieldDuplicate _ | StructNoField _ | StructMissingField _
             | StructFieldType _ | UnknownStructType _ | StructBoundScope _
             | StaticStructField _
@@ -883,7 +1118,8 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // BL3007's generic "invalid builtin argument" bucket: it's an
             // annotation contradicting its own body -- drop the clause, or
             // wrap in `reynolds` for the signed iteration license.
-            | CommContradictsBody _ | AntisymmContradictsBody _ -> "BL4013"
+            | CommContradictsBody _ | AntisymmContradictsBody _
+            | CommContradictsConjBody _ | AntisymmContradictsConjBody _ -> "BL4013"
             // Same family, other direction: nothing is DECLARED here -- the
             // output would inherit the input's compact class, and the
             // deduction can't certify the kernel commutes with its mirror
@@ -908,6 +1144,10 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // "invalid tree shape", and the message text is what tells them
             // apart. The `detail` string carries it.
             | TreeIdxShape _ | TreeIdxShapeFn _ -> "BL4021"
+            | HaloOffsetOutsideSet _ -> "BL4019"
+            // BL4020: a constrained domain that no route can enumerate --
+            // not closed-form (class B) and over the box cap for a table.
+            | ConstrainedDomainRefused _ -> "BL4020"
             | StructWhereNotBool _ | StructWhereError _ | WherePredicateUnannotated _
             | PplConstraintNeedsImport _
             | UnknownWhereConstraint _ -> "BL4001"

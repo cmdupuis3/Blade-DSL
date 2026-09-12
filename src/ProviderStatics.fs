@@ -74,6 +74,10 @@ let netcdfSpec : Blade.ProviderRegistry.ProviderSpec = {
     GenWriteVar = Blade.NetcdfProvider.CppNetcdf.genWriteVar
     GenStreamOpen = Some Blade.NetcdfProvider.CppNetcdf.genStreamOpen
     GenStreamFiber = Some Blade.NetcdfProvider.CppNetcdf.genStreamFiber
+    GenStreamRowsOpen = None
+    GenStreamRows = None
+    StreamRowsBlock = None
+    GenStreamWindow = None
     Includes = Blade.NetcdfProvider.CppNetcdf.genIncludes
     VarDimNames = fun path varName ->
         try
@@ -96,7 +100,34 @@ let netcdfSpec : Blade.ProviderRegistry.ProviderSpec = {
 let private foldCache =
     System.Collections.Concurrent.ConcurrentDictionary<string * string * string * int64, Result<StaticValue, string>>()
 
-let private readAndFoldUncached (provider: string) (path: string) (varName: string) : Result<StaticValue, string> =
+/// The content hash each cached fold was taken over, keyed as `foldCache` is,
+/// so a cache HIT can still be logged with its identity.
+let private foldHashes =
+    System.Collections.Concurrent.ConcurrentDictionary<string * string * string * int64, string>()
+
+/// Per-compilation log of folded inputs -- `(provider, path, variable,
+/// sha256)` -- the manifest's `content`-identity entries (Blade.RunRecord).
+/// Reset by `TypeCheck.typeCheck` at the start of every program and drained
+/// by the plan verb and by codegen's assembly, so a harness compiling many
+/// programs in one process attributes each fold to its own program. A cache
+/// hit logs too: the fold IS an input of this program whether or not the
+/// bytes were re-read. Async-local like Effects.Decisions.
+let private foldLog = System.Threading.AsyncLocal<ResizeArray<string * string * string * string>>()
+let resetFoldLog () = foldLog.Value <- ResizeArray()
+let drainFoldLog () : (string * string * string * string) list =
+    match foldLog.Value with
+    | null -> []
+    | l ->
+        let xs = List.ofSeq l
+        l.Clear()
+        xs
+let private logFold (entry: string * string * string * string) =
+    (match foldLog.Value with
+     | null -> foldLog.Value <- ResizeArray()
+     | _ -> ())
+    if not (foldLog.Value.Contains entry) then foldLog.Value.Add entry
+
+let private readAndFoldUncached (provider: string) (path: string) (varName: string) (key: string * string * string * int64) : Result<StaticValue, string> =
     match Blade.ProviderRegistry.tryFind provider with
     | None ->
         Error $"provider '{provider}' is not registered -- was ProviderStatics.install () run?"
@@ -111,6 +142,7 @@ let private readAndFoldUncached (provider: string) (path: string) (varName: stri
             else
                 let h = spec.Fingerprint path
                 provenance.Add((path, varName, h))
+                foldHashes.[key] <- h
                 eprintfn "[provenance] folded %s from %s@%s" varName path (h.Substring(0, min 12 h.Length))
                 match data.Payload with
                 | Blade.ProviderRegistry.PFloats xs -> Ok (shapeValue data.DimLengths (fun i -> SVFloat xs.[i]))
@@ -121,7 +153,12 @@ let private readAndFold (provider: string) (path: string) (varName: string) : Re
         match Blade.ProviderRegistry.tryFind provider with
         | Some spec -> spec.VersionStamp path
         | None -> 0L
-    foldCache.GetOrAdd((provider, path, varName, stamp), fun _ -> readAndFoldUncached provider path varName)
+    let key = (provider, path, varName, stamp)
+    let r = foldCache.GetOrAdd(key, fun _ -> readAndFoldUncached provider path varName key)
+    (match r, foldHashes.TryGetValue key with
+     | Ok _, (true, h) -> logFold (provider, path, varName, h)
+     | _ -> ())
+    r
 
 /// Axis extents of a store: dim name -> extent, read from the provider's
 /// own metadata module -- the same read TypeCheck performs at `let store =
@@ -157,11 +194,21 @@ let private axisExtent (provider: string) (path: string) (root: string) (dim: st
     |> Map.tryFind dim
 
 /// Idempotent installation: register every provider spec, then bridge the
-/// compile-time readers and the provider-name set into StaticEval's hooks.
+/// compile-time readers and the provider-name set into StaticEval's hooks --
+/// and the axis-tag DECODERS into Types', which is the same seam one layer
+/// over: a refusal message renders in TypeLower/TypeEnv, both of which compile
+/// long before any provider and must not name one.
 let install () =
     Blade.ProviderRegistry.register netcdfSpec
     Blade.ProviderRegistry.register Blade.ZarrProvider.spec
+    Blade.ProviderRegistry.DimChunks.registerReader "zarr" Blade.ZarrProvider.dimChunkEdges
     Blade.ProviderRegistry.register Blade.CsvProvider.spec
+    Blade.ProviderRegistry.register Blade.IcechunkProvider.spec
     registerProviderReader readAndFold
     registerProviderIndexReader axisExtent
     registerProviderNames (Blade.ProviderRegistry.names () |> Set.ofList)
+    // Diagnostics-only: what turns `__icaxis|lat@wx:9f3a1c...` into `lat` in a
+    // refusal message, and what recovers the mint table's recorded reason for a
+    // split. Unregistered, both sites print exactly what they printed before.
+    Blade.Types.registerProviderAxisTagDecoder Blade.IcechunkProvider.tryProviderTagName
+    Blade.Types.registerProviderAxisSplitReason Blade.IcechunkProvider.trySplitReasonOfTag

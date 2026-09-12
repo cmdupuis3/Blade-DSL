@@ -1,0 +1,31 @@
+// TEST: Rank Dispatch In A Generic Function
+// ============================================================================
+// `match rank(x)` inside a T^r-generic body dispatches PER SPECIALIZATION:
+// the scrutinee lowers symbolically while the operand's type is an inference
+// var, and the constant-match fold resolves it once the HM clone's types are
+// concrete. Before that, lowering's blanket rank-0 fallback baked `0` into
+// the shared body, so every call answered the rank-0 arm -- a silent wrong
+// answer at every rank but zero. The unit-annotated scalar pins the
+// wrapped-type walk (a unit changes nothing about rank).
+
+Unit meters
+function describe(x: T^r) -> Int64 = match rank(x) with
+    | 0 -> 100
+    | 1 -> 200
+    | _ -> 300
+
+type I = Idx<3>
+type Y = Idx<2>
+let s = 4.0
+let sp: Float<meters> = 5.0
+let v: Array<Float like I> = [1.0, 2.0, 3.0]
+let m = method_for(range<Y>, range<I>) <@> lambda(y, i) -> Float64(y) + Float64(i) |> compute
+
+let a = describe(s)
+// EXPECT: a = 100
+let u = describe(sp)
+// EXPECT: u = 100
+let b = describe(v)
+// EXPECT: b = 200
+let c = describe(m)
+// EXPECT: c = 300

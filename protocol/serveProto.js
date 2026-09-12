@@ -90,6 +90,28 @@ function encodeEval(id, session, source, cwd) {
 
 /** One "resetSession" request line: {"id","cmd":"resetSession","session"}\n
  *  — discard the named session's accumulated bindings (Restart Kernel). */
+/**
+ * One "render" request line:
+ * {"id","cmd":"render","session","bindings":[..],"values":[..][,"cwd"]}\n
+ *
+ * THE RENDER FAST PATH. Recompute an already-evaluated session under a new
+ * camera WITHOUT re-running it: the compiler builds the program once with the
+ * named bindings erased into a run-time read, then re-runs that executable per
+ * gesture with only the numbers changed. Measured on the Mandelbrot notebook,
+ * about 400ms a frame against 5.5s for a session evaluation.
+ *
+ * The camera stays IN THE CELL -- the caller still rewrites it, so the notebook
+ * keeps saying where the lens points; the compiled program simply never sees a
+ * literal, which is what lets the executable be reused.
+ *
+ * Frames arrive as live {"event":"display"} lines exactly as a streaming eval's
+ * do; the response itself carries no display array.
+ */
+function encodeRender(id, session, bindings, values, cwd) {
+  const req = { id, cmd: "render", session, bindings, values };
+  if (cwd) req.cwd = cwd;
+  return JSON.stringify(req) + "\n";
+}
 function encodeResetSession(id, session) {
   return JSON.stringify({ id, cmd: "resetSession", session }) + "\n";
 }
@@ -183,6 +205,7 @@ module.exports = {
   encodeCheckCells,
   encodePing,
   encodeEval,
+  encodeRender,
   encodeResetSession,
   encodeRenderPlot,
   encodeShutdown,

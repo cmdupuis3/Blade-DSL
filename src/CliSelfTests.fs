@@ -24,6 +24,7 @@ open Blade.Tests.Guards
 open Blade.Tests.Combinators
 open Blade.Tests.Tuples
 open Blade.Tests.RecursiveArrays
+open Blade.Tests.Segments
 open Blade.Tests.StackJoin
 open Blade.Tests.Bracketed
 open Blade.Tests.IndexTypes
@@ -86,6 +87,90 @@ let runCliSmokeTests () : TH.BlockResult =
                     record "no intermediates left behind" TH.Fail (String.concat ", " leftovers)
         finally
             try Directory.Delete(tmpDir, true) with _ -> ()
+
+    // --- `--print <names>`: which top-level bindings the program prints ---
+    //
+    // The CLI has always printed EVERY top-level binding, which is what makes
+    // a program's own output dominate its cost on a large array (the scale run
+    // of docs/plans/structural/04: 231 MB of stdout hid every saved chunk
+    // read). The selection is a MODE, pinned process-wide (BLADE_PRINT), read
+    // by codegen's print pass AND the interpreter's, so the two lanes print
+    // one set and a differential run still compares like with like.
+    //
+    // Emission-only cases need no toolchain; the run cases skip without g++.
+    let printSrc =
+        "let x = 1 + 2 * 3\n\
+         let y = x * 2\n\
+         let z = [1.0, 2.0, 3.0]\n"
+    let withPrint (v: string option) (f: unit -> unit) =
+        let prior = System.Environment.GetEnvironmentVariable "BLADE_PRINT"
+        System.Environment.SetEnvironmentVariable("BLADE_PRINT", (match v with Some s -> s | None -> null))
+        try f () finally System.Environment.SetEnvironmentVariable("BLADE_PRINT", prior)
+    let cppOf (label: string) (src: string) : Result<string, string> =
+        match Blade.Lowering.lower src with
+        | Error e -> Error e
+        | Ok ir -> Ok (fst (Blade.CodeGen.genSelfContainedProgramFromIR ir label))
+    let recordCase name cond detail = record name (if cond then TH.Pass else TH.Fail) detail
+    (match cppOf "print_all" printSrc with
+     | Error e -> record "print: default emission" TH.Fail e
+     | Ok all ->
+         recordCase "print: unset prints every binding"
+             (all.Contains "\"x = \"" && all.Contains "\"y = \"" && all.Contains "\"z = [\"") ""
+         withPrint (Some "y") (fun () ->
+             match cppOf "print_y" printSrc with
+             | Error e -> record "print: --print y emission" TH.Fail e
+             | Ok sel ->
+                 recordCase "print: a selection emits the named binding's print and no other"
+                     (sel.Contains "\"y = \"" && not (sel.Contains "\"x = \"") && not (sel.Contains "\"z = [\"")) ""
+                 // Everything ELSE about the program is untouched: a selection
+                 // changes what is printed, never what is computed.
+                 recordCase "print: a selection changes only the print block"
+                     (sel.Contains "int64_t x = " && sel.Contains "int64_t y = ") "")
+         withPrint (Some "y, z") (fun () ->
+             match cppOf "print_yz" printSrc with
+             | Error e -> record "print: multi-name selection" TH.Fail e
+             | Ok sel ->
+                 recordCase "print: names separate on commas and spaces"
+                     (sel.Contains "\"y = \"" && sel.Contains "\"z = [\"" && not (sel.Contains "\"x = \"")) "")
+         withPrint (Some "totl") (fun () ->
+             // A typo must be LOUD: a silently empty print block looks exactly
+             // like a program that computed nothing.
+             match cppOf "print_typo" printSrc with
+             | Error e -> record "print: an unknown name refuses" TH.Fail e
+             | Ok sel ->
+                 recordCase "print: an unknown name splices a refusal naming it and the real bindings"
+                     (sel.Contains "#error" && sel.Contains "totl" && sel.Contains "x, y, z") ""))
+    // The two lanes agree under one pin: the interpreter prints the same set.
+    withPrint (Some "y") (fun () ->
+        match Blade.Lowering.lower printSrc with
+        | Error e -> record "print: interpreter honours the pin" TH.Fail e
+        | Ok ir ->
+            let r = Blade.Interp.Run.runProgram ir "print_interp" Blade.Interp.Value.defaultLimits
+            let out = r.Stdout.Replace("\r\n", "\n")
+            recordCase "print: the interpreter prints the same selection as codegen"
+                (out.Contains "y = 14" && not (out.Contains "x = 7")) out)
+    // End to end through the user-facing compile+run path.
+    if not capabilities.Value.HasGpp then
+        record "print: compiled run honours the selection" TH.Skip "requires g++, not found"
+    else
+        let pDir = Path.Combine(Path.GetTempPath(), "blade_print_sel_" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(pDir) |> ignore
+        try
+            let srcFile = Path.Combine(pDir, "psel.blade")
+            File.WriteAllText(srcFile, printSrc)
+            withPrint (Some "y") (fun () ->
+                match compileToExe srcFile None false false with
+                | Error e -> record "print: compiled run honours the selection" TH.Fail e
+                | Ok exe ->
+                    match runExecutable exe with
+                    | Ok (0, out) ->
+                        recordCase "print: compiled run honours the selection"
+                            (out.Contains "y = 14" && not (out.Contains "x = 7") && not (out.Contains "z = ")) out
+                    | Ok (code, out) -> record "print: compiled run honours the selection" TH.Fail $"exit {code}: {out}"
+                    | Error e -> record "print: compiled run honours the selection" TH.Fail e)
+        finally
+            try Directory.Delete(pDir, true) with _ -> ()
+
     let count o = results |> Seq.filter (fun (_, r) -> r = o) |> Seq.length
     let passed, failed, skipped = count TH.Pass, count TH.Fail, count TH.Skip
     let failedNames = results |> Seq.filter (fun (_, r) -> r = TH.Fail) |> Seq.map fst |> List.ofSeq
@@ -383,6 +468,11 @@ let private runIdeServeTests () : TH.BlockResult =
     let checkReq (id: int) (tier: string) (file: string) (source: string) =
         $"{{\"id\":{id},\"cmd\":\"check\",\"tier\":\"{tier}\",\"file\":\"{(esc file)}\",\"source\":\"{(esc source)}\"}}"
     let pingReq (id: int) = $"{{\"id\":{id},\"cmd\":\"ping\"}}"
+    let renderReq (id: int) (session: string) (bindings: string list) (values: float list) =
+        let bs = bindings |> List.map (fun b -> "\"" + b + "\"") |> String.concat ","
+        let vs = values |> List.map (sprintf "%g") |> String.concat ","
+        $"{{\"id\":{id},\"cmd\":\"render\",\"session\":\"{session}\","
+        + $"\"bindings\":[{bs}],\"values\":[{vs}]}}"
     let shutdownReq = "{\"cmd\":\"shutdown\"}"
     /// Feed a whole conversation and split the transcript on the framing
     /// newline. The trailing "" is the proof that the LAST response was
@@ -490,6 +580,66 @@ let private runIdeServeTests () : TH.BlockResult =
             record name TH.Pass ""
         | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
 
+        // 6b. Provider-read provenance, one binding per verb shape: `read`
+        // and `stream` take the store view directly, `load_compound` takes
+        // it first of two, and a `write` chases the named binding it
+        // persists back to THAT binding's provenance. Hermetic: a real 2x2
+        // int csv on disk, so the load typechecks and the fast tier keeps
+        // its bindings; nothing here lowers, so csv's codegen-time
+        // stream/load_compound refusals never fire.
+        Blade.ProviderStatics.install ()
+        let provStoreCsv = Path.Combine(tmpDir, "prov_store.csv")
+        File.WriteAllText(provStoreCsv, "1,2\n3,4\n")
+        let provReadSource =
+            "import csv as c\n"
+            + sprintf "let store = c.load(\"%s\")\n" (provStoreCsv.Replace('\\', '/'))
+            + "let obs = store.vars.data |> c.read\n"
+            + "let strm = c.stream(store.vars.data)\n"
+            + "let cmp = c.load_compound(store.vars.data, store.vars.data)\n"
+            + sprintf "let saved = c.write(\"%s\", obs)\n"
+                      ((Path.Combine(tmpDir, "prov_out.csv")).Replace('\\', '/'))
+        let (provJson, provReadCode) =
+            Blade.Ide.ideCheckSource (Path.Combine(tmpDir, "provread.blade")) provReadSource
+        // The literal `"<field>":{...}` object inside `bname`'s binding
+        // (bounded by the next `"name":` key), or a marker when absent.
+        let fieldOf (field: string) (bname: string) =
+            let key = sprintf "\"name\":\"%s\"" bname
+            let start = provJson.IndexOf key
+            if start < 0 then "no-binding" else
+            let next = provJson.IndexOf("\"name\":\"", start + key.Length)
+            let seg = if next < 0 then provJson.Substring start else provJson.Substring(start, next - start)
+            let pk = sprintf "\"%s\":" field
+            let ps = seg.IndexOf pk
+            if ps < 0 then "none" else
+            let pe = seg.IndexOf('}', ps)
+            seg.Substring(ps + pk.Length, pe - ps - pk.Length + 1)
+        let provOf = fieldOf "providerRead"
+        let writeOf = fieldOf "providerWrite"
+        let expectedProv = "{\"store\":\"store\",\"member\":\"vars.data\"}"
+        let name = "check payload: providerRead covers read/stream/load_compound"
+        if provReadCode = 0 && provOf "obs" = expectedProv && provOf "strm" = expectedProv
+           && provOf "cmp" = expectedProv then
+            record name TH.Pass ""
+        else
+            record name TH.Fail
+                   (sprintf "exit %d, obs=%s strm=%s cmp=%s" provReadCode
+                            (provOf "obs") (provOf "strm") (provOf "cmp"))
+        // A write faces the OPPOSITE direction: `saved` PERSISTS `obs`, so it
+        // names where that array came from under `providerWrite` and carries
+        // no `providerRead` at all.
+        let name = "check payload: a write binding carries providerWrite, never providerRead"
+        if provReadCode = 0 && writeOf "saved" = expectedProv && provOf "saved" = "none" then
+            record name TH.Pass ""
+        else
+            record name TH.Fail
+                   (sprintf "exit %d, saved providerWrite=%s providerRead=%s" provReadCode
+                            (writeOf "saved") (provOf "saved"))
+        let name = "check payload: providers[] describes the loaded csv store"
+        if provJson.Contains "\"store\":\"store\",\"alias\":\"c\",\"provider\":\"csv\"" then
+            record name TH.Pass ""
+        else
+            record name TH.Fail (provJson.Substring(0, min 400 provJson.Length))
+
         // 7. A parse error is data, not an incident: diagnostics come back and
         // the loop takes the next request.
         let (code, responses, _) = drive [checkReq 13 "fast" hmPath "let ="; pingReq 14; shutdownReq]
@@ -578,6 +728,115 @@ let private runIdeServeTests () : TH.BlockResult =
             record name TH.Pass ""
         else
             record name TH.Fail $"exit {code}, json: {out.Trim()}"
+
+        // THE RENDER FAST PATH. The camera stays in the CELL -- the notebook
+        // keeps saying where the lens points -- and what the lane COMPILES is
+        // that program with the camera erased into a run-time CSV read. The
+        // erased source is the same bytes for every camera, which is the whole
+        // mechanism: build once, re-run per gesture.
+        //
+        // Pinned on the erasure rather than end to end, because e2e costs a
+        // g++ build and the risk lives here: a slot mapped to the wrong
+        // binding renders a plausible picture of the wrong place.
+        let camSrc =
+            "import plot\n\nlet a = 1\n\nlet cam_cx = -0.5\n"
+            + "let cam_cy = 0.25\nlet cam_r = 0.004\nlet cam_px = 256\n"
+            + "\nlet z = cam_cx + cam_r\n"
+        let name = "the camera erasure rewrites each binding to its own CSV slot"
+        match Blade.IdeServe.cameraErasedSource camSrc ["cam_cx"; "cam_cy"; "cam_r"]
+                                                @"C:\tmp\camera.csv" with
+        | Ok out when out.StartsWith "import csv as __blade_cam_csv"
+                      && out.Contains "let cam_cx = __blade_cam_slots(0, 0)"
+                      && out.Contains "let cam_cy = __blade_cam_slots(0, 1)"
+                      && out.Contains "let cam_r = __blade_cam_slots(0, 2)"
+                      // Not named, so not erased: the resolution stays literal.
+                      && out.Contains "let cam_px = 256"
+                      // Forward slashes -- a Windows separator inside a Blade
+                      // string literal would read as an escape.
+                      && out.Contains "__blade_cam_csv.load(\"C:/tmp/camera.csv\")"
+                      // The reader precedes the EARLIEST camera binding, and so
+                      // precedes every use of the camera.
+                      && out.IndexOf "__blade_cam_slots = " < out.IndexOf "let cam_cx =" ->
+            record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        // ...and the refusals, which are the safety property. A camera name the
+        // erasure cannot pin down exactly once would leave a literal standing
+        // and render from a camera the caller never set -- silently, and to a
+        // picture that looks entirely reasonable.
+        let name = "the camera erasure refuses a name bound more than once"
+        let dupSrc = "let cam_r = 0.1\n\nlet cam_r = 0.2\n"
+        match Blade.IdeServe.cameraErasedSource dupSrc ["cam_r"] "c.csv" with
+        | Error e when e.Contains "cam_r" && e.Contains "2 times" -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        let name = "the camera erasure refuses a name that is not bound at all"
+        match Blade.IdeServe.cameraErasedSource ("let q = 1\n") ["cam_r"] "c.csv" with
+        | Error e when e.Contains "cam_r" && e.Contains "0 times" -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        // The camera crosses as text, so it has to cross EXACTLY: a lens moved
+        // by one ulp at a 1e-13 half-span is a different picture.
+        let name = "a camera row round-trips its Float64s exactly"
+        let camVals = [ -0.743643887037151; 0.131825904205330; 0.004 ]
+        let camBack =
+            (Blade.IdeServe.cameraCsvText camVals).Trim().Split(',')
+            |> Array.map float |> List.ofArray
+        if camBack = camVals then record name TH.Pass ""
+        else record name TH.Fail (sprintf "%A" camBack)
+
+        // A render re-runs the WHOLE program, so it re-emits every plot the
+        // notebook has -- but a camera change can only alter the plots that read
+        // the camera. Sending the rest replays the notebook into the panel: a
+        // fixed tour under a stable id animates its entire descent again on
+        // every zoom and lands back where it started, which is exactly how this
+        // was reported.
+        let name = "an unchanged frame is not re-sent"
+        let same = [| "a"; "b"; "c" |]
+        match Blade.IdeServe.changedFrameIndices same same with
+        | [||] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        // ...and the direction that must never be wrong. Holding back a frame
+        // that DID move leaves a stale picture on screen, so a differing digest
+        // and anything past the end of the previous run both count as changed.
+        let name = "a moved frame is sent, and only that one"
+        match Blade.IdeServe.changedFrameIndices [| "a"; "b"; "c" |] [| "a"; "B"; "c" |] with
+        | [| 1 |] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        let name = "frames past the previous run's end are always sent"
+        match Blade.IdeServe.changedFrameIndices [| "a" |] [| "a"; "b"; "c" |] with
+        | [| 1; 2 |] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        // The first render of a session has nothing to compare against, and the
+        // panel has not seen this executable's output: send all of it.
+        let name = "the first render sends every frame"
+        match Blade.IdeServe.changedFrameIndices [||] [| "a"; "b" |] with
+        | [| 0; 1 |] -> record name TH.Pass ""
+        | other -> record name TH.Fail (sprintf "%A" other)
+
+        // Protocol refusals, and that the loop SURVIVES them: a bad render
+        // request must not take the notebook's language server down with it.
+        let (code, responses, _) =
+            drive [ renderReq 1 "nb" ["cam_r"] [1.0; 2.0]; pingReq 2; shutdownReq ]
+        let name = "render refuses a bindings/values mismatch and keeps serving"
+        match responses with
+        | [err; pong] when code = 0 && err.Contains "\"error\""
+                           && err.Contains "1 bindings and 2 values"
+                           && pong.Contains "\"ok\":true" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        let (code, responses, _) =
+            drive [ renderReq 1 "ghost" ["cam_r"] [0.1]; pingReq 2; shutdownReq ]
+        let name = "render on a session that has evaluated nothing says so"
+        match responses with
+        | [err; pong] when code = 0 && err.Contains "evaluated nothing to render"
+                           && pong.Contains "\"ok\":true" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
     finally
         Directory.SetCurrentDirectory entryDir
         try Directory.Delete(tmpDir, true) with _ -> ()
@@ -688,7 +947,7 @@ let private runSurfaceTests () : TH.BlockResult =
     let coreBuiltins =
         [ "exp"; "log"; "log10"; "sqrt"; "sin"; "cos"; "tan"
           "sinh"; "cosh"; "tanh"; "asin"; "acos"; "atan"
-          "floor"; "ceil"; "atan2"; "log_base"
+          "floor"; "ceil"; "atan2"; "log_base"; "fma"
           "abs"; "min"; "max"; "length"; "prodsum" ]
     let name = "every list is present, ordered from its source of truth, and complete"
     let failures =
@@ -701,6 +960,8 @@ let private runSurfaceTests () : TH.BlockResult =
             yield $"{operators.Length} operators, {Blade.Lexer.operatorEntries.Length} entries"
           if mathIntrinsic "binary" <> ["atan2"; "log_base"] then
             yield sprintf "binary intrinsics = %A" (mathIntrinsic "binary")
+          if mathIntrinsic "ternary" <> ["fma"] then
+            yield sprintf "ternary intrinsics = %A" (mathIntrinsic "ternary")
           if mathIntrinsic "unary" |> List.isEmpty then yield "unary intrinsics empty"
           if mathIntrinsic "complex" |> List.isEmpty then yield "complex intrinsics empty"
           if scalarTypes.Length <> 16 then yield $"{scalarTypes.Length} scalar types"
@@ -923,6 +1184,59 @@ let private runIdeEvalTests () : TH.BlockResult =
                                      && rebind.Contains "\"kept\":true"
                                      && rebind.Contains "\"bindings\":[]"
                                      && after.Contains "{\"name\":\"\",\"type\":\"Int64\",\"value\":\"50\"}" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        // 3b. The same rebind, but the cell OPENS WITH A COMMENT -- a prose
+        // banner above the bindings, which is how a notebook cell is normally
+        // written. `bindingName` used to read the raw snippet with a `^\s*`
+        // anchor: `\s` spans newlines, so a BLANK-led declaration matched and a
+        // COMMENT-led one did not. spliceDeclaration reads None as "no earlier
+        // definition to supersede" and APPENDS, so the stale binding stayed put
+        // and the rebind landed AFTER the dependent that had spliced in place --
+        // which then read the old value. Nothing failed; the answer was wrong.
+        //
+        // Multi-binding, because that is the shape that shows the whole bug: `b`
+        // (no comment above it) spliced correctly while `a` did not, so the
+        // cell half-applied. 456 is the fixed answer; 756 was the bug.
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "let a = 1.0\nlet b = 2.0\nlet c = 3.0"
+                    evalReq 2 "nb" "let s = a * 100.0 + b * 10.0 + c"
+                    evalReq 3 "nb" "// the camera\nlet a = 4.0\nlet b = 5.0\nlet c = 6.0"
+                    evalReq 4 "nb" "s"; shutdownReq ]
+        let name = "a comment-led rebind still supersedes (every binding in the cell)"
+        match responses with
+        | [_; _; rebind; after] when code = 0
+                                     && rebind.Contains "\"kept\":true"
+                                     && after.Contains "\"value\":\"456.0\"" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        // 3c. DESTRUCTURING lets across cells. Every top-level `let (a, b) =`
+        // used to lower to a binding named `_`, and the interpreter's session
+        // memo is keyed by binding NAME -- so the second cell's destructure
+        // adopted the FIRST cell's cached tuple ([1.5, 3.0] for pair(10.0)),
+        // and a rebind of the same leaves, which the splice did not recognise
+        // as a declaration, was appended and adopted the stale value too.
+        // Now the binding is `_(a,b)`, the splice keys the cell by it, and the
+        // memo drops it AND its leaves on a rebind. Three answers pin the three
+        // fixes: the second pair, the rebound pair, and a dependent (17 = 7 + 10).
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "function pair(x: Float64) -> (Float64, Float64) = (x, x * 2.0)"
+                    evalReq 2 "nb" "let (a, b) = pair(1.5)"
+                    evalReq 3 "nb" "let (c, d) = pair(10.0)
+[c, d]"
+                    evalReq 4 "nb" "let s = a + c"
+                    evalReq 5 "nb" "// the pair
+let (a, b) = pair(7.0)
+[a, b]"
+                    evalReq 6 "nb" "s"; shutdownReq ]
+        let name = "destructuring lets are distinct across cells and rebind in place"
+        match responses with
+        | [_; _; second; _; rebound; after] when code = 0
+                                                 && second.Contains "\"value\":\"[10.0, 20.0]\""
+                                                 && rebound.Contains "\"value\":\"[7.0, 14.0]\""
+                                                 && after.Contains "\"value\":\"17.0\"" ->
             record name TH.Pass ""
         | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
 
@@ -1354,6 +1668,205 @@ let private runIdeEvalTests () : TH.BlockResult =
                     && valueCell.Contains "{\"name\":\"\",\"type\":\"Int64\",\"value\":\"6\"}" ->
             record name TH.Pass ""
         | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        // 27. STREAMED DISPLAY FRAMES (display-frames.md section 3). A cell
+        // that runs for minutes wants its plot moving while it runs, so a
+        // frame carrying the live-plot stream mime is forwarded the instant it
+        // is produced as an out-of-band event line -- which the client parses
+        // BEFORE the pending-id lookup, so it never settles the request.
+        //
+        // Three things are pinned, and the third is the one that costs if it
+        // is wrong: the event line's exact shape, that a NON-stream frame is
+        // untouched and still arrives in the response's `display` array, and
+        // that a streamed frame is NOT also in that array. Section 3 forbids
+        // delivering one frame twice, and the panel would draw it twice.
+        let streamCell =
+            "import display as d\nlet ok = d.emit_id(\"application/vnd.blade.plotstream.v1+json\", \"chan\", "
+            + "\"{\\\"channel\\\":\\\"chan\\\",\\\"epoch\\\":-1,\\\"x\\\":[0],\\\"y\\\":[1]}\", "
+            + "\"{\\\"stream\\\":true,\\\"backend\\\":\\\"plotly\\\"}\")"
+        let plainCell =
+            "import display as d\nlet png = d.emit(\"image/png\", \"AA==\")"
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" streamCell; evalReq 2 "nb" plainCell; shutdownReq ]
+        let name = "a stream frame is forwarded live as an event line, not in display[]"
+        let expectedEvent =
+            "{\"event\":\"display\",\"id\":1,\"frame\":"
+            + "{\"v\":1,\"mime\":\"application/vnd.blade.plotstream.v1+json\",\"encoding\":\"json\","
+            + "\"data\":{\"channel\":\"chan\",\"epoch\":-1,\"x\":[0],\"y\":[1]},"
+            + "\"meta\":{\"id\":\"chan\",\"stream\":true,\"backend\":\"plotly\"}}}"
+        match responses with
+        // The event precedes the response it belongs to: it is written as the
+        // program runs, and the response only exists once the run is over.
+        | [ev; streamed; replayEv; plain] when code = 0
+                                               && ev = expectedEvent
+                                               && streamed.Contains "\"id\":1" && streamed.Contains "\"kept\":true"
+                                               && not (streamed.Contains "display")
+                                               // A session re-runs every kept
+                                               // cell, so eval 2 re-emits cell
+                                               // 1's frame -- forwarded again
+                                               // under ITS id. The id is
+                                               // stable, so the panel merges
+                                               // rather than appending.
+                                               && replayEv.StartsWith "{\"event\":\"display\",\"id\":2,"
+                                               && replayEv.Contains "\"id\":\"chan\""
+                                               && plain.Contains "\"display\":[{\"v\":1,\"mime\":\"image/png\""
+                                               && not (plain.Contains "plotstream") ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        // 28. THE SESSION MEMO across fresh domain elaboration. A cell whose
+        // only novelty is a new `ml.*` op config makes MLElaborate splice its
+        // generated function at the FRONT of the module, which shifts every
+        // later declaration's lowering-pass SSA ids -- including the index-type
+        // `Id`s inside an earlier ARRAY binding's type. The memo's type guard
+        // compared those ids, so the whole session's arrays re-ran: measured at
+        // 17 s/cell in a real notebook, and invisible from the outside, since a
+        // memo hit and a recompute print the same value. `ad.grad` never showed
+        // it because Grad splices each derivative beside its ROOT declaration
+        // rather than at the front.
+        //
+        // Pinned on the adoption counts, because there is no other observable.
+        // The last eval's tally is the one that survives to be read.
+        let mlCell = "let static s2 = [(0, 0, 2)]\nlet lout = ml.linear(s2, s2, [2.0, 1.0, 0.0, 3.0], [5.0, 7.0])"
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "import ml as ml"
+                    evalReq 2 "nb" "let base_a = [1.0, 2.0, 3.0]"
+                    evalReq 3 "nb" mlCell
+                    shutdownReq ]
+        let adopted = Blade.Interp.Run.lastMemoAdopted
+        let evaluated = Blade.Interp.Run.lastMemoEvaluated
+        let name = "a new ml.* op in a later cell keeps the earlier binding's memo"
+        match responses with
+        | [_; _; ml] when code = 0 && ml.Contains "\"kept\":true" && ml.Contains "\"exitCode\":0"
+                          // base_a adopted (initializer skipped); the ml cell's
+                          // own two bindings are the only ones evaluated.
+                          && adopted = 1 && evaluated = 2 ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, adopted %d, evaluated %d, responses: %A"
+                                        code adopted evaluated responses)
+
+        // ...and the value it kept is still the right one. Adoption is only
+        // worth anything if the skipped initializer would have produced this.
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "import ml as ml"
+                    evalReq 2 "nb" "let base_a = [1.0, 2.0, 3.0]"
+                    evalReq 3 "nb" mlCell
+                    evalReq 4 "nb" "base_a"
+                    shutdownReq ]
+        let name = "a binding adopted across ml elaboration still reads back correctly"
+        match responses with
+        | [_; _; _; readback] when code = 0
+                                   && readback.Contains "\"value\":\"[1.0, 2.0, 3.0]\"" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        // 29. The negative control for 28, and the line the fix must not
+        // cross: a REBIND splices in place, so the cached snippet range no
+        // longer matches and the whole memo goes. Shape agreement is not
+        // permission to reuse a value whose defining text changed.
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "let base_a = [1.0, 2.0, 3.0]"
+                    evalReq 2 "nb" "let derived = reduce(base_a, (+))"
+                    evalReq 3 "nb" "let base_a = [4.0, 5.0, 6.0]"
+                    shutdownReq ]
+        let adopted = Blade.Interp.Run.lastMemoAdopted
+        let name = "editing an earlier binding still drops the memo"
+        match responses with
+        | [_; _; rebind] when code = 0 && rebind.Contains "\"kept\":true" && adopted = 0 ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, adopted %d, responses: %A" code adopted responses)
+
+        // ...and the dependent recomputes off the NEW value, not the cached one.
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "let base_a = [1.0, 2.0, 3.0]"
+                    evalReq 2 "nb" "let derived = reduce(base_a, (+))"
+                    evalReq 3 "nb" "let base_a = [4.0, 5.0, 6.0]"
+                    evalReq 4 "nb" "derived"
+                    shutdownReq ]
+        let name = "a dependent of an edited binding recomputes from the new value"
+        match responses with
+        | [_; _; _; readback] when code = 0 && readback.Contains "\"value\":\"15.0\"" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, responses: %A" code responses)
+
+        // 30. FRAME REPLAY. A binding that emits a display frame used to be
+        // barred from the memo outright: it had to re-run so it could re-emit,
+        // which made every plot in a session a fixed tax on EVERY later cell's
+        // evaluation -- on a notebook that renders, most of the wall clock.
+        // Now the frames travel in the memo beside the value and are replayed
+        // in the binding's own position, so the plot costs nothing and the
+        // run's frame sequence is the one it would have computed.
+        //
+        // Pinned on the adoption tally, because a memo hit and a recompute
+        // produce the same frame -- which is the point, and the reason this
+        // needs a counter to observe at all.
+        let plotCell = "import display as d
+let pic = d.emit(\"image/png\", \"AA==\")"
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "let seed = [1.0, 2.0, 3.0]"
+                    evalReq 2 "nb" plotCell
+                    evalReq 3 "nb" "let tail_v = reduce(seed, (+))"
+                    shutdownReq ]
+        let adopted = Blade.Interp.Run.lastMemoAdopted
+        let name = "a plot binding is adopted from the memo and its frame replayed"
+        match responses with
+        // seed and pic both adopted -- the emitter no longer forces a re-run --
+        // and the replayed frame still reaches the response's display array.
+        | [_; _; last] when code = 0 && last.Contains "\"kept\":true"
+                           && adopted = 2
+                           && last.Contains "\"display\":[{\"v\":1,\"mime\":\"image/png\"" ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, adopted %d, responses: %A"
+                                        code adopted responses)
+
+        // ...and the line the replay must not cross. A cached PICTURE is as
+        // stale as a cached value the moment the text above it changes: edit
+        // the cell the plot reads and the memo must go, frames included, or
+        // the panel shows a render of data no longer in the session. Pinned on
+        // the tally rather than the frame, because `adopted = 0` says the
+        // stronger thing -- nothing was reused, so nothing COULD be stale.
+        let readingPlot =
+            "import display as d
+let total = reduce(seed, (+))
+let shown = d.emit(\"image/png\", \"AA==\")"
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" "let seed = [1.0, 2.0, 3.0]"
+                    evalReq 2 "nb" readingPlot
+                    evalReq 3 "nb" "let seed = [10.0, 20.0, 30.0]"
+                    shutdownReq ]
+        let adopted = Blade.Interp.Run.lastMemoAdopted
+        let name = "editing the data under a plot drops its cached frame too"
+        match responses with
+        | [_; _; rebind] when code = 0 && rebind.Contains "\"kept\":true" && adopted = 0 ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d, adopted %d, responses: %A"
+                                        code adopted responses)
+
+        // ...and the replayed frame is the one the run would have computed,
+        // not merely A frame: same id, same bytes, in the same position.
+        let (code, responses, _) =
+            drive [ evalReq 1 "nb" plotCell; shutdownReq ]
+        let firstRun = responses |> List.tryHead |> Option.defaultValue ""
+        let (code2, responses2, _) =
+            drive [ evalReq 1 "nb" plotCell
+                    evalReq 2 "nb" "let unrelated = 1"
+                    shutdownReq ]
+        let name = "a replayed frame is byte-identical to the computed one"
+        // Just the display array: the rest of the response legitimately
+        // differs between the two evals (the second binds `unrelated`), and
+        // the frame payload here carries no `]` of its own to confuse this.
+        let frameOf (r: string) =
+            let i = r.IndexOf "\"display\":["
+            if i < 0 then "" else
+            let j = r.IndexOf("]", i)
+            if j < 0 then "" else r.Substring(i, j - i + 1)
+        match responses2 with
+        | [_; second] when code = 0 && code2 = 0
+                           && frameOf firstRun <> ""
+                           && frameOf second = frameOf firstRun ->
+            record name TH.Pass ""
+        | _ -> record name TH.Fail (sprintf "exit %d/%d, first %s, second %A"
+                                        code code2 (frameOf firstRun) responses2)
 
         try Directory.Delete(tmpDir, true) with _ -> ()
     finally
@@ -1942,6 +2455,28 @@ let rec internal dispatchTest (rest: string list) : int =
         // Pure lowering + codegen, no toolchain.
         let failed = (Blade.Tests.ShapeSpecTests.runShapeSpecTests ()).Failed
         if failed = 0 then 0 else 1
+    | [ "flatpath" ] | [ "flat-path" ] ->
+        // Which index tags reach the flat elementwise path and which decline.
+        // Pure lowering + codegen, no toolchain.
+        let failed = (Blade.Tests.FlatPathTests.runFlatPathTests ()).Failed
+        if failed = 0 then 0 else 1
+    | [ "access" ] ->
+        // The halo access record and the reverse-mode halo route
+        // differential: gather vs scatter, byte-for-byte on the same
+        // programs. Emission pins run everywhere; the differential needs g++.
+        let failed = (Blade.Tests.AccessTests.runAccessTests ()).Failed
+        if failed = 0 then 0 else 1
+    | [ "rand-mirror" ] ->
+        // The RNG mirror's Philox4x32-10 generator against Random123's
+        // published known-answer vectors, and the `_at` address identities.
+        let failed = (Blade.Tests.RandMirrorTests.runRandMirrorTests ()).Failed
+        if failed = 0 then 0 else 1
+    | [ "optimize" ] ->
+        // The semantic-equivalence layer's emission pins: freeze-idiom
+        // recognition derives the break without the abort, `while` keeps
+        // both, non-absorbing guards decline. Pure lowering + codegen.
+        let failed = (Blade.Tests.OptimizeTests.runOptimizeTests ()).Failed
+        if failed = 0 then 0 else 1
     | [ "lapack" ] ->
         // math.eigh routes to blade_lapack::blade_eigh_{packed,dense}_{s,d,c,z}
         // when the LAPACK gate is on with no explicit sweeps budget, else the
@@ -2241,6 +2776,22 @@ let rec internal dispatchTest (rest: string list) : int =
         // CSV provider tests. Fully hermetic; only the e2e compile+run blocks
         // need g++ and skip without it.
         Blade.Tests.CsvTests.runCsvTests ()
+    | [ "icechunk" ] ->
+        // Icechunk provider tests. Fully hermetic; fixture repos are generated
+        // on the fly by IcechunkWrite; only the e2e compile+run block needs
+        // g++ and skips without it.
+        Blade.Tests.IcechunkTests.runIcechunkTests ()
+    | [ "run-record" ] | [ "runrecord" ] ->
+        // Input manifests + run records (plan-fortran-killer-2 section 7).
+        // Also in the default suite (RunAll.fs yields `runRecord`).
+        let failed = (Blade.Tests.RunRecordTests.runRunRecordTests ()).Failed
+        if failed = 0 then 0 else 1
+    | [ "provider-desugar" ] | [ "providerdesugar" ] ->
+        // The icechunk checkout desugar (src/ProviderDesugar.fs). Pure
+        // in-process AST rewrite; no toolchain, no fixtures, never skips.
+        // Also in the default suite (RunAll.fs yields `providerDesugar`),
+        // unlike the store-backed provider lanes.
+        Blade.Tests.ProviderDesugarTests.runProviderDesugarTests ()
     | [ "hybrid" ] ->
         // Mixed-parallelism tests: order-table parse + gate-off degradation
         // run always; mpi+omp differentials need mpiexec and skip without it.
@@ -2280,6 +2831,7 @@ let rec internal dispatchTest (rest: string list) : int =
             | "replicate" -> Some ("Replicate", replicateTests)
             | "anon-ranges" | "anonranges" -> Some ("Anonymous Ranges", anonRangeTests)
             | "recursive-arrays" | "recursivearrays" -> Some ("Recursive Arrays", recursiveArrayTests)
+            | "segments" -> Some ("Segments", segmentsTests)
             | "tuple-views" | "tupleviews" -> Some ("Tuple Views", tupleViewTests)
             | "bracketed" -> Some ("Bracketed", bracketedTests)
             // The `Tuple<N>` surface layer (docs/plan-tuples-vs-arg-packs.md

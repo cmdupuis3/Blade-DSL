@@ -1184,8 +1184,8 @@ let runCublasSwapTests () : Blade.Tests.TestHarness.BlockResult =
             psi.CreateNoWindow <- true
             psi.WorkingDirectory <- cppDir
             use p = Process.Start(psi)
-            let o = p.StandardOutput.ReadToEndAsync()
-            let e = p.StandardError.ReadToEndAsync()
+            let o = Blade.Runtime.readToEndOffPool p.StandardOutput
+            let e = Blade.Runtime.readToEndOffPool p.StandardError
             let exited = p.WaitForExit(timeoutMs)
             if not exited then (try p.Kill(true) with _ -> ())
             (exited, (if exited then p.ExitCode else -1), o.Result, e.Result)

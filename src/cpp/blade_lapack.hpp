@@ -277,6 +277,38 @@ namespace blade_lapack {
         return (int)info;
     }
 
+    // lu -- the factorization KEPT: `m.lu(A)` -> (LU, piv) through ?getrf, then
+    // `m.lu_solve[_t](LU, piv, b)` through ?getrs. The row-major <-> column-major
+    // bridge is the solve adapter's, both ways; `piv` is stored 0-BASED (LAPACK's
+    // ipiv less one) so the native twin and this arm agree on the pivot rows.
+    // Within one program the factor and its solves take the same arm (the gate
+    // is process-wide), so a routed factor is never consumed natively.
+
+    inline int blade_lu_d(size_t n, double** Arows, double** LUrows, int64_t* piv) {
+        std::vector<double> a(n * n);
+        for (size_t i = 0; i < n; i++)
+            for (size_t j = 0; j < n; j++) a[j * n + i] = Arows[i][j];
+        std::vector<lapack_int> ipiv(n ? n : 1);
+        lapack_int info = LAPACKE_dgetrf(LAPACK_COL_MAJOR, (lapack_int)n, (lapack_int)n,
+                                         a.data(), (lapack_int)n, ipiv.data());
+        for (size_t i = 0; i < n; i++)
+            for (size_t j = 0; j < n; j++) LUrows[i][j] = a[j * n + i];
+        for (size_t k = 0; k < n; k++) piv[k] = (int64_t)ipiv[k] - 1;
+        return (int)info;
+    }
+
+    inline int blade_lu_solve_d(size_t n, double** LUrows, const int64_t* piv, const double* b, double* x, int trans) {
+        std::vector<double> a(n * n);
+        for (size_t i = 0; i < n; i++)
+            for (size_t j = 0; j < n; j++) a[j * n + i] = LUrows[i][j];
+        std::vector<lapack_int> ipiv(n ? n : 1);
+        for (size_t k = 0; k < n; k++) ipiv[k] = (lapack_int)(piv[k] + 1);
+        for (size_t i = 0; i < n; i++) x[i] = b[i];
+        lapack_int info = LAPACKE_dgetrs(LAPACK_COL_MAJOR, trans ? 'T' : 'N', (lapack_int)n, 1,
+                                         a.data(), (lapack_int)n, ipiv.data(), x, (lapack_int)n);
+        return (int)info;
+    }
+
     // NOT PROVIDED, and why.
     //
     // OTHER PRECISIONS OF `solve` (`sgesv` / `cgesv` / `zgesv`). They exist and

@@ -1,0 +1,22 @@
+// TEST: Freeze Idiom Recognized
+// ============================================================================
+// The hand-written convergence idiom -- `if G then STEP else prefix(n - 1)`
+// with a lag-1 guard -- is recognized by the optimization layer and rides
+// the guarded machinery (early exit + freeze epilogue) WITHOUT the `while`
+// spelling's budget abort. These pins hold with recognition on or off
+// (BLADE_FREEZE_IDIOM): the rewrite is cost-only, and the frozen tail's
+// values are exactly what the else-arm would have written.
+
+type It = Idx<30>
+let tol = 0.000000001
+let rec xs: Array<Float like It> =
+    match xs with
+    | zero -> zero
+    | zero :: s -> zero :: 1.0
+    | prefix :: n -> prefix :: (if abs(prefix(n - 1) * prefix(n - 1) - 2.0) > tol then (prefix(n - 1) + 2.0 / prefix(n - 1)) * 0.5 else prefix(n - 1))
+
+let root = xs((29 : It))
+// EXPECT: root = 1.41421356237469
+
+let early = xs((2 : It))
+// EXPECT: early = 1.41666666666667

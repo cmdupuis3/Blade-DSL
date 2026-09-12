@@ -1117,7 +1117,7 @@ let runOmpCoverageTests () : Blade.Tests.TestHarness.BlockResult =
                 cpsi.RedirectStandardError <- true
                 cpsi.UseShellExecute <- false
                 use cproc = Process.Start(cpsi)
-                let cerr = cproc.StandardError.ReadToEndAsync()
+                let cerr = Blade.Runtime.readToEndOffPool cproc.StandardError
                 // WaitForExit(ms) returns false on TIMEOUT; ExitCode is
                 // meaningless then, so a hung g++ used to be read as success.
                 let cExited = cproc.WaitForExit(60000)
@@ -1139,8 +1139,8 @@ let runOmpCoverageTests () : Blade.Tests.TestHarness.BlockResult =
                     rpsi.WorkingDirectory <- Path.GetDirectoryName(exeAbs)
                     rpsi.Environment.["OMP_NUM_THREADS"] <- forcedThreads
                     use rproc = Process.Start(rpsi)
-                    let rout = rproc.StandardOutput.ReadToEndAsync()
-                    let rerr = rproc.StandardError.ReadToEndAsync()
+                    let rout = Blade.Runtime.readToEndOffPool rproc.StandardOutput
+                    let rerr = Blade.Runtime.readToEndOffPool rproc.StandardError
                     let rExited = rproc.WaitForExit(30000)
                     if not rExited then (try rproc.Kill(true) with _ -> ())
                     let lines = rout.Result.Split('\n') |> Array.filter (_.Contains("[omp-coverage]"))
@@ -1263,7 +1263,7 @@ let runOmpCoverageTests () : Blade.Tests.TestHarness.BlockResult =
             cpsi.RedirectStandardError <- true
             cpsi.UseShellExecute <- false
             use cproc = Process.Start(cpsi)
-            let cerr = cproc.StandardError.ReadToEndAsync()
+            let cerr = Blade.Runtime.readToEndOffPool cproc.StandardError
             let cExited = cproc.WaitForExit(60000)
             if not cExited then
                 (try cproc.Kill(true) with _ -> ())
@@ -1298,8 +1298,8 @@ let runOmpCoverageTests () : Blade.Tests.TestHarness.BlockResult =
                         rpsi.WorkingDirectory <- Path.GetDirectoryName(exeAbs)
                         rpsi.Environment.["OMP_NUM_THREADS"] <- forcedThreads
                         use rproc = Process.Start(rpsi)
-                        let rout = rproc.StandardOutput.ReadToEndAsync()
-                        let rerrV = rproc.StandardError.ReadToEndAsync()
+                        let rout = Blade.Runtime.readToEndOffPool rproc.StandardOutput
+                        let rerrV = Blade.Runtime.readToEndOffPool rproc.StandardError
                         let rExited = rproc.WaitForExit(30000)
                         if not rExited then
                             (try rproc.Kill(true) with _ -> ())
@@ -1385,7 +1385,7 @@ let private compileProgram (outputDir: string) (name: string) (src: string) : Re
                 cpsi.RedirectStandardError <- true
                 cpsi.UseShellExecute <- false
                 use cproc = Process.Start(cpsi)
-                let cerr = cproc.StandardError.ReadToEndAsync()
+                let cerr = Blade.Runtime.readToEndOffPool cproc.StandardError
                 if not (cproc.WaitForExit(120000)) then
                     (try cproc.Kill(true) with _ -> ())
                     Error "compile timed out (120s)"
@@ -1402,8 +1402,8 @@ let private runProgram (exeAbs: string) (threads: string) : Result<string, strin
     rpsi.WorkingDirectory <- Path.GetDirectoryName(exeAbs)
     rpsi.Environment.["OMP_NUM_THREADS"] <- threads
     use rproc = Process.Start(rpsi)
-    let rout = rproc.StandardOutput.ReadToEndAsync()
-    let rerr = rproc.StandardError.ReadToEndAsync()
+    let rout = Blade.Runtime.readToEndOffPool rproc.StandardOutput
+    let rerr = Blade.Runtime.readToEndOffPool rproc.StandardError
     if not (rproc.WaitForExit(60000)) then
         (try rproc.Kill(true) with _ -> ())
         Error "run timed out (60s)"

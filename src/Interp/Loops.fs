@@ -167,6 +167,7 @@ let private applyFunctorWrappers (st: InterpState) (info: ApplyInfo) (wrappers: 
                     | IRIndex (a2, idxs, ty) -> IRIndex (subst a2, idxs |> List.map subst, ty)
                     | IRTuple es -> IRTuple (es |> List.map subst)
                     | IRComplex (re, im) -> IRComplex (subst re, subst im)
+                    | IRFma (a, b, c) -> IRFma (subst a, subst b, subst c)
                     | IRTupleProj (e, i, flat) -> IRTupleProj (subst e, i, flat)
                     | IRFieldAccess (e, f) -> IRFieldAccess (subst e, f)
                     | IRLet (id, v, b) -> IRLet (id, subst v, subst b)
@@ -371,6 +372,32 @@ and private forceExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         match envTryFind renv id with
         | Some cell -> applyWrappersToValue st renv wrappers (force st renv cell.V)
         | None -> raise (InterpUnsupported "force of unbound var")
+    // A BARE range forced as a value (`let xs = 0..n` via evalBinding's eager
+    // force, `reduce(0..n, (+))`, `0..n |> compute`): materialize the iota,
+    // x[i] = offset + i -- the differential twin of genRangeBinding /
+    // materializeRangeForm. Nest inputs never come here (resolveArraySource
+    // keeps ranges SVirtual). Without this arm the fallback below re-defers
+    // (Core.evalExpr's IRRange arm answers VDeferred) and the force is a
+    // no-op. Same single-slot plain dense scope as the compiled side;
+    // everything else stays a gate SKIP.
+    | IRRange (ixs, offset) ->
+        (match ixs with
+         | [ ix ] when ix.IxKind = IxKPlain && ix.Rank = 1
+                       && (match ix.Tag with
+                           | Some t -> not (t.StartsWith haloWinTagPrefix)
+                           | None -> true) ->
+             let evalInt (e: IRExpr) (what: string) =
+                 match Core.evalExpr st renv e with
+                 | VInt n -> n
+                 | VInt32 n -> int64 n
+                 | _ -> raise (InterpUnsupported $"range {what} did not evaluate to an integer")
+             let n = evalInt ix.Extent "extent"
+             let off = match offset with Some o -> evalInt o "offset" | None -> 0L
+             let arrType : IRArrayType =
+                 { ElemType = IRTScalar ETInt64; IndexTypes = [ix]; IsVirtual = false; Identity = None }
+             let vals = [ for i in 0L .. n - 1L -> VInt (off + i) ]
+             applyWrappersToValue st renv wrappers (VArray (A.arrayLitFromValues arrType vals))
+         | _ -> raise (InterpUnsupported "force of a compound/sparse/halo or multi-slot range"))
     | other -> applyWrappersToValue st renv wrappers (Core.evalExpr st renv other)
 
 // ----------------------------------------------------------------------------
@@ -650,10 +677,34 @@ and private materializeComposeApply (st: InterpState) (env: Env) (cinfo: Compose
                 else
                     for i in 0L .. src.Extents.[level] - 1L do walk src dst call (level + 1) (i :: acc)
             // Stage 1 then stage 2, each its own pass (matching CodeGen's two
-            // loops); both stores carry the INPUT element type.
-            let s1 = A.allocDense a.ElemType a.IndexTypes a.Extents
+            // loops). Each store carries ITS STAGE'S result type -- the twin
+            // of genComposeApply's `stageElemOf`: an Int64 input through
+            // `half(Int64) -> Float64` used to allocate the intermediate as
+            // Int64 and truncate every cell (`[0, 2, 2]` for `[1, 2, 3]`).
+            // A stage that does not resolve, or returns an array, keeps the
+            // element type flowing into it, as the compiled lane does.
+            let stageElemOf (k: IRExpr) (fallback: IRType) : IRType =
+                match resolveKernel k with
+                | Some rk ->
+                    let ret =
+                        match rk.Callable.RetType with
+                        | IRTInfer _ -> typeOf rk.Callable.Body
+                        | t -> t
+                    (match ret with
+                     | ArrayElem _ | IRTUnit | IRTInfer _ -> fallback
+                     | t -> t)
+                | None -> fallback
+            let s1Elem = stageElemOf (kernelOf o1) a.ElemType
+            let s2Elem = stageElemOf (kernelOf o2) s1Elem
+            // The trailing wrappers run after stage 2 into the same store.
+            let outElem =
+                wrappers |> List.fold (fun acc w ->
+                    match w with
+                    | IRCompose _ -> acc
+                    | _ -> stageElemOf w acc) s2Elem
+            let s1 = A.allocDense s1Elem a.IndexTypes a.Extents
             walk a s1 call1 0 []
-            let out = A.allocDense a.ElemType a.IndexTypes a.Extents
+            let out = A.allocDense outElem a.IndexTypes a.Extents
             walk s1 out call2Wrapped 0 []
             VArray out
         | _ -> raise (InterpUnsupported "compose-apply with multiple input arrays (M2.3)")
@@ -799,8 +850,8 @@ and private materializeApply (st: InterpState) (env: Env) (info0: ApplyInfo) (wr
         |> List.choose (fun ix ->
             match ix.Tag with
             | Some tag when tag.StartsWith (haloWinTagPrefix + "d:") ->
-                (match ix.Extent, haloShrinkOfTag tag with
-                 | IRLit (IRLitInt shrunk), Some shrink -> Some (tag, shrunk + shrink)
+                (match ix.Extent, haloAccessOfTag tag with
+                 | IRLit (IRLitInt shrunk), Some h -> Some (tag, snd (haloDemand h (0L, shrunk)))
                  | _ -> None)
             | _ -> None)
         // Same-tag ambiguity rule as the compiled guard: equal-offset anonymous
@@ -812,28 +863,19 @@ and private materializeApply (st: InterpState) (env: Env) (info0: ApplyInfo) (wr
             | _ -> None)
         |> Map.ofList
      if not (Map.isEmpty haloDecl) then
-        let haloTagOfIdx (e: IRExpr) =
-            match e with
-            | IRBinOp (_, IRAdd, IRVar (_, IRTIdxTagged (_, IRefNamed t)), _)
-            | IRBinOp (_, IRAdd, IRParam (_, _, IRTIdxTagged (_, IRefNamed t)), _)
-                when t.StartsWith (haloWinTagPrefix + "d:") -> Some t
-            | _ -> None
-        mapIRExpr (fun e ->
-            (match e with
-             | IRIndex (IRVar (tid, _), idxs, _) ->
-                 idxs |> List.iteri (fun d ix ->
-                     match haloTagOfIdx ix |> Option.bind (fun t -> Map.tryFind t haloDecl) with
-                     | Some declared ->
-                         (match envTryFind env tid with
-                          | Some cell ->
-                              (match force st env cell.V with
-                               | VArray a when d < a.Extents.Length && a.Extents.[d] <> declared ->
-                                   raise (InterpPanic ("BL8009", "halo extent mismatch", None, 0))
-                               | _ -> ())
-                          | None -> ())
-                     | None -> ())
-             | _ -> ())
-            e) cg.KernelExpr |> ignore)
+        // The same shared scan the compiled guard consumes
+        // (IRAccess.windowReadsOf): one matcher, two callers.
+        for r in Blade.IRAccess.windowReadsOf (fun wv -> (Blade.IRAccess.denseHaloTagOf wv).IsSome) cg.KernelExpr do
+            match Blade.IRAccess.denseHaloTagOf r.Window |> Option.bind (fun t -> Map.tryFind t haloDecl) with
+            | Some declared ->
+                (match envTryFind env r.ArrayId with
+                 | Some cell ->
+                     (match force st env cell.V with
+                      | VArray a when r.Dim < a.Extents.Length && a.Extents.[r.Dim] <> declared ->
+                          raise (InterpPanic ("BL8009", "halo extent mismatch", None, 0))
+                      | _ -> ())
+                 | None -> ())
+            | None -> ())
     // Symmetric/antisymmetric/Hermitian output storage (compact) and Reynolds
     // kernels (permutation sum) are interpreted -- see the ArrayElem arm's
     // compact allocation and interpretNest's Reynolds path. Fused-joint output
@@ -865,6 +907,21 @@ and private materializeApply (st: InterpState) (env: Env) (info0: ApplyInfo) (wr
             match inputs.TryGetValue pos with
             | true, SReal a -> a.Extents.[b.ExtentDimRef]
             | _ -> toI64 (Core.evalExpr st env b.Extent)
+    // CO-ITERATION EXTENT GUARD (BL8011) -- the interpreter twin of
+    // genApplyCombinator's guard, checked ONCE before the nest: every REAL
+    // operand peeled at a co-iteration level must have the level's extent
+    // (the first operand's) on the axis it is peeled along, or the walk
+    // reads the shorter one past its end.
+    for b in cg.Bindings do
+        match b.FusedRank, b.Elements with
+        | None, e0 :: rest when not rest.IsEmpty && (match e0.Virtual with RealArray -> true | _ -> false) ->
+            let bound = levelExtent b
+            for e in rest do
+                match e.Virtual, inputs.TryGetValue e.ArrayPosition with
+                | RealArray, (true, SReal a) when a.Extents.[e.DimIndex] <> bound ->
+                    raise (InterpPanic ("BL8011", "co-iteration extent mismatch", None, 0))
+                | _ -> ()
+        | _ -> ()
     match cg.OutputType with
     | IRTScalar et ->
         let acc = { V = zeroOfElem et }
@@ -1136,6 +1193,9 @@ and private resolveSparseKeys (st: InterpState) (env: Env) (src: SparseKeysSourc
     match src with
     | SkStatic entries ->
         entries |> List.map Array.ofList |> Array.ofList
+    // the closed-form domain: the same plan the C++ key builder walks,
+    // enumerated here in F# (docs/plans/structural/06)
+    | SkDomain plan -> enumerateDomain plan |> Array.ofList
     | SkRuntime keysExpr ->
         let keysArr =
             match force st env (Core.evalExpr st env keysExpr) with
@@ -1457,7 +1517,7 @@ and materializeSparseBinding
 /// double-consumer memoization, 0.3).
 and private resolveArraySource (st: InterpState) (env: Env) (arr: IRExpr) : ArraySource =
     match arr with
-    | IRRange _ | IRVirtualReverse _ | IRBlocked _ -> SVirtual
+    | IRRange _ | IRVirtualReverse _ -> SVirtual
     | IRVar (id, _) ->
         match envTryFind env id with
         | Some cell ->
@@ -1977,6 +2037,64 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let idxTys = match typeOf expr with ArrayElem at -> at.IndexTypes | _ -> []
         VArray (A.buildGroupBy idxTys gk vals)
 
+    // -- ungroup(G): the rows of a segment-grouped array written back over the
+    //    source axis (genUngroupBinding's twin).
+    | IRUngroup (gExpr, src) ->
+        let g = forceInputArray st env gExpr
+        (match g.Data with
+         | SRagged (rows, lens, _) ->
+             let cells =
+                 [| for r in 0 .. rows.Length - 1 do
+                        for k in 0L .. lens.[r] - 1L do
+                            yield A.readCell g [ int64 r; k ] |]
+             VArray { ElemType = g.ElemType
+                      IndexTypes = [ src ]
+                      Extents = [| int64 cells.Length |]
+                      Data = A.storeOfValues g.ElemType cells }
+         | _ -> raise (InterpUnsupported "ungroup: operand is not a ragged (grouped) array"))
+
+    // -- ungroup(G) of a tile grouping: tiles back over the two axes
+    //    (genUngroupGridBinding's twin).
+    | IRUngroupGrid (gExpr, srcs, bounds) ->
+        let g = forceInputArray st env gExpr
+        let b0, b1 = Array.ofList bounds.[0], Array.ofList bounds.[1]
+        let n0, n1 = int b0.[b0.Length - 1], int b1.[b1.Length - 1]
+        let g1 = b1.Length - 1
+        let cells : Value[] = Array.zeroCreate (n0 * n1)
+        (match g.Data with
+         | SRagged (rows, _, _) ->
+             for t in 0 .. rows.Length - 1 do
+                 let t0, t1 = t / g1, t % g1
+                 let lo0, hi0 = int b0.[t0], int b0.[t0 + 1]
+                 let lo1, hi1 = int b1.[t1], int b1.[t1 + 1]
+                 let w = hi1 - lo1
+                 for i in lo0 .. hi0 - 1 do
+                     for j in lo1 .. hi1 - 1 do
+                         cells.[i * n1 + j] <- A.readCell g [ int64 t; int64 ((i - lo0) * w + (j - lo1)) ]
+         | _ -> raise (InterpUnsupported "ungroup: operand is not a ragged (grouped) array"))
+        // a rank-2 dense value is NESTED rows in the interpreter (peelDim's
+        // view contract), not a flat pool
+        let rows = Array.init n0 (fun i -> A.storeOfValues g.ElemType cells.[i * n1 .. i * n1 + n1 - 1])
+        VArray { ElemType = g.ElemType
+                 IndexTypes = srcs
+                 Extents = [| int64 n0; int64 n1 |]
+                 Data = SNested rows }
+
+    // -- ungroup([r1..rF], A): per-file arrays assembled over the tiled axis
+    //    (genUngroupRowsBinding's twin).
+    | IRUngroupRows (rowExprs, _, src) ->
+        let rows = rowExprs |> List.map (forceInputArray st env)
+        (match rows with
+         | [] -> raise (InterpUnsupported "ungroup: no rows")
+         | first :: _ ->
+             let cells =
+                 rows |> List.toArray |> Array.collect (fun r ->
+                     Array.init (int r.Extents.[0]) (fun k -> A.readCell r [ int64 k ]))
+             VArray { ElemType = first.ElemType
+                      IndexTypes = [ src ]
+                      Extents = [| int64 cells.Length |]
+                      Data = A.storeOfValues first.ElemType cells })
+
     // -- group_bucket(gk): the CSR pair inverted into a dense row -> bucket map
     //    (genGroupBucketBinding). Same VGroupKeys operand as group_by; typecheck
     //    has already refused anything but a bare gk name.
@@ -2001,7 +2119,6 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     // -- Virtual arrays (standalone materialization; usually consumed as inputs).
     | IRRange (idxTys, offset) -> materializeVirtual st env idxTys (VirtualRange offset)
     | IRVirtualReverse ix -> materializeVirtual st env [ ix ] VirtualReverse
-    | IRBlocked _ -> raise (InterpUnsupported "IRBlocked standalone materialization (M2.7)")
 
     // -- Array expression ops.
     | IRIndex (arrExpr, idxExprs, _) ->
@@ -2098,6 +2215,13 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let l = forceInputArray st env lExpr
         let r = forceInputArray st env rExpr
         VArray (A.gramArray l r (typeOf expr))
+    | IRGramApply (lExpr, rExpr, xExpr) ->
+        // gram_apply = the action A (B^H x). Same FORCE-then-materialize
+        // shape as gram; two ascending folds, twin of materializeGramApplyForm.
+        let l = forceInputArray st env lExpr
+        let r = forceInputArray st env rExpr
+        let x = forceInputArray st env xExpr
+        VArray (A.gramApplyArray l r x (typeOf expr))
     | IRMatmul (lExpr, rExpr) ->
         // matmul = the dense A.B product. Same FORCE-then-materialize
         // shape as gram; the naive i/j/t-ascending fold mirrors the shim's
@@ -2114,6 +2238,18 @@ let rec evalArrayNode (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let s = forceInputArray st env operandExpr
         let (q, lam) = A.eighArrays s (typeOf expr)
         VTuple [| VArray q; VArray lam |]
+    | IRLu mExpr ->
+        // lu = the factorization kept: a TUPLE (LU, piv), like eigh's shape;
+        // `A.luArrays` is the operation-for-operation twin of
+        // materializeLuForm's native arm.
+        let m = forceInputArray st env mExpr
+        let (lu, piv) = A.luArrays m (typeOf expr)
+        VTuple [| VArray lu; VArray piv |]
+    | IRLuSolve (lExpr, pExpr, rExpr, transposed) ->
+        let l = forceInputArray st env lExpr
+        let p = forceInputArray st env pExpr
+        let r = forceInputArray st env rExpr
+        VArray (A.luSolveArray l p r transposed (typeOf expr))
     | IRSolve (mExpr, rExpr) ->
         // solve = the dense LU linear solve. Same FORCE-then-materialize shape
         // as gram/matmul, and like matmul (and unlike eigh) it is the twin of

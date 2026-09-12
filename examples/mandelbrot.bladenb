@@ -1,0 +1,390 @@
+// %% [markdown]
+// # The Mandelbrot set, and the notebook as a zoom lens
+//
+// The Mandelbrot set is the set of complex numbers $c$ for which the orbit
+// $z_{k+1} = z_k^2 + c$, started at $z_0 = 0$, stays bounded. The picture
+// everyone knows colors each point by how many steps its orbit takes to
+// leave the radius-2 disc.
+//
+// This notebook is that picture, made zoomable: the camera is a cell, so a
+// scroll on the plot rewrites three numbers and recomputes the window at
+// full resolution. Then, once a double can no longer tell one pixel from
+// the next, a second lens that never runs out — the same gesture, a camera
+// that grows more digits as you descend.
+//
+// %%
+import plot
+
+// %%
+/// The orbit of c, run until it leaves the radius-2 disc or hits the cap.
+/// Returns the smooth escape time $k + 1 - \log_2 \log_2 |z|$, which is
+/// continuous across the integer steps, or 0 for a point that never left --
+/// stable points sit on the colorscale's floor and paint black.
+function esc(z: Complex128, c: Complex128, k: Float64, kmax: Float64) -> Float64 =
+    if k >= kmax then 0.0 else (
+    if abs(z) > 2.0 then k + 1.0 - log(log(abs(z)) / log(2.0)) / log(2.0) else
+    esc(z * z + c, c, k + 1.0, kmax))
+
+/// The main cardioid and the period-2 bulb are known in closed form, and they
+/// are exactly where iterating costs the most (every such orbit rides to the
+/// cap): two multiplications answer for the whole interior.
+function in_body(cr: Float64, ci: Float64) -> Bool = {
+    let xq = cr - 0.25
+    let q = xq * xq + ci * ci
+    q * (q + xq) <= 0.25 * ci * ci || (cr + 1.0) * (cr + 1.0) + ci * ci <= 0.0625
+}
+function mandel(cr: Float64, ci: Float64, kmax: Float64) -> Float64 =
+    if in_body(cr, ci) then 0.0 else esc(complex(0.0, 0.0), complex(cr, ci), 0.0, kmax)
+
+function fmin(a: Float64, b: Float64) -> Float64 = if a < b then a else b
+function fmax(a: Float64, b: Float64) -> Float64 = if a > b then a else b
+
+/// The colorbar's span, computed from the window so it re-spans on every
+/// render: the escaped band, with the floor a hair below its fastest escape.
+/// Stable pixels (0) clip to the floor and keep exact black; the slowest
+/// escape lands just above the scale's jump and stays visibly colored.
+function field_range(g: Array<Float64 like Idx<nr>, Idx<nc>>, kmax: Float64) -> (Float64, Float64) = {
+    let escaped = (method_for(g) <@> lambda(v) -> if v == 0.0 then kmax else v) |> compute
+    let lo = reduce(reduce(escaped, fmin, 1.0e300), fmin, 1.0e300)
+    let hi = reduce(reduce(g, fmax, 0.0), fmax, 0.0)
+    let pad = (hi - lo) * 0.002 + 1.0e-12
+    if hi > 0.0 then (lo - pad, hi) else (0.0, -1.0)
+}
+function total(g: Array<Float64 like Idx<nr>, Idx<nc>>) -> Float64 = reduce(reduce(g, (+)), (+))
+
+/// Iterations as a function of depth: boundary detail needs more per decade
+/// of magnification, steeply so once the filaments are thinner than a pixel.
+function view_kmax(r: Float64) -> Float64 = {
+    let knee = 1.0e-6
+    let shallow = 116.0 + 45.0 * log(1.5 / r) / log(10.0)
+    if r >= knee then shallow else shallow + 1155.0 * log(knee / r) / log(10.0)
+}
+
+// %% [markdown]
+// ## The zoomable set
+//
+// A window is a center and a half-width, so it is three bindings, and they
+// live in the same cell as the picture they position. The plot declares them
+// as its *camera*: scroll on it and the editor rewrites `cx`, `cy`, `r` and
+// recomputes the grid at the new window, so every zoom level is a fresh image
+// rather than stretched pixels. The axes are arithmetic on a range, and the
+// grid is the escape time over their outer product.
+//
+// %%
+let cx = -0.75
+let cy = 0.0
+let r = 1.0
+
+let xs = cx - 1.5 * r + (3.0 * r / 450.0) * Float64(0..450)
+let ys = cy - r + (2.0 * r / 300.0) * Float64(0..300)
+let kmax = view_kmax(r)
+let set = (method_for(ys, xs) <@> lambda(y, x) where omp(y: 1) -> mandel(x, y, kmax)) |> compute
+
+let (lo, hi) = field_range(set, kmax)
+let shown = plot.heatmap(xs, ys, set, 5: cmap, lo: zmin, hi: zmax,
+    "The Mandelbrot set (scroll to zoom)": title, "Re(c)": xlabel, "Im(c)": ylabel,
+    "cx,cy,r": camera)
+let set_sum = total(set)
+set_sum
+// EXPECT: set_sum = 665647.752584183
+
+// %% [markdown]
+// ## Where a double stops
+//
+// Zoom far enough and the camera itself fails before the arithmetic does. A
+// double carries sixteen digits *relative to where it sits*; near $|c| = 1$
+// that is a grid of $10^{-16}$, and a window narrower than about $10^{-14}$
+// asks for pixel steps smaller than the grid. Neighboring pixels round to the
+// same number, and the picture is one value repeated.
+//
+// %%
+let floor_r = 1.0e-14
+let floor_xs = cx + (2.0 * floor_r / 256.0) * Float64(0..4)
+let collided = floor_xs(2) - floor_xs(1) == 0.0
+collided
+// EXPECT: collided = true
+
+// %% [markdown]
+// ## The lens without a floor
+//
+// **How it works.** Write every pixel as $c = C + \delta c$ and its orbit as
+// $z_n = Z_n + \delta z_n$, where $(C, Z_n)$ is one *reference* orbit for the
+// whole window. Subtracting the reference's recurrence from the pixel's:
+//
+// $$\delta z_{n+1} = 2 Z_n\, \delta z_n + \delta z_n^2 + \delta c$$
+//
+// The pixel's iteration runs entirely on the small quantities, which a double
+// represents with its full sixteen digits however deep the window is — a
+// number near $10^{-50}$ is as precise as one near 1. Only $C$ and the
+// reference orbit need more digits than a double holds, and there is exactly
+// one of those per frame. When a pixel's delta outgrows the orbit it rides
+// ($|z| < |\delta z|$) it *rebases*: $\delta z := z$, exactly, and continues
+// from the reference's start. That one rule keeps the method glitch-free.
+//
+// **So precision is a parameter, and it is the camera's.** The reference is
+// computed in *quad-double*: a number is four non-overlapping doubles whose
+// sum is exact to ~64 digits. Its one primitive is *grow* — add a double into
+// the expansion by a chain of `two_sum`, the transformation that recovers an
+// addition's rounding error exactly; a product is the same chain over the
+// limb products and their `fma` residuals. One subtlety, found by testing:
+// the chain can leave a zero limb above a nonzero one, and dropping the
+// smallest limb before compacting loses a whole limb of precision. Distilling
+// all five before dropping the fifth is what makes the fourth limb real.
+//
+// The camera is then four limbs per coordinate — nine bindings — and the
+// editor folds a scroll into them with the same `grow`, so what it writes is
+// a number the program could have computed. Double-double, two limbs, runs
+// out at about $10^{-32}$; four reach $10^{-60}$; six is the same edit again.
+//
+// %%
+/// (s, e) with s + e == a + b exactly, and (p, e) with p + e == a * b exactly:
+/// the error-free transformations. The fma is what makes the second one a
+/// single correctly-rounded operation, and it is bit-identical on every lane.
+function two_sum(a: Float64, b: Float64) -> (Float64, Float64) = {
+    let s = a + b
+    let bb = s - a
+    (s, (a - (s - bb)) + (b - bb))
+}
+function two_prod(a: Float64, b: Float64) -> (Float64, Float64) = {
+    let p = a * b
+    (p, fma(a, b, 0.0 - p))
+}
+
+/// Four non-overlapping doubles, largest first.
+struct QD { l0: Float64, l1: Float64, l2: Float64, l3: Float64 }
+let qd_zero = QD { l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0 }
+function qd_lift(x: Float64) -> QD = QD { l0 = x, l1 = 0.0, l2 = 0.0, l3 = 0.0 }
+
+/// Add one double: grow from the small end (exact, five limbs out), distill
+/// the five, drop the fifth.
+function qd_grow(e: QD, x: Float64) -> QD = {
+    let (q1, h1) = two_sum(x, e.l3)
+    let (q2, h2) = two_sum(q1, e.l2)
+    let (q3, h3) = two_sum(q2, e.l1)
+    let (q4, h4) = two_sum(q3, e.l0)
+    let (c0, e0) = two_sum(q4, h4)
+    let (c1, e1) = two_sum(e0, h3)
+    let (c2, e2) = two_sum(e1, h2)
+    let (c3, e3) = two_sum(e2, h1)
+    QD { l0 = c0, l1 = c1, l2 = c2, l3 = c3 }
+}
+function qd_add(a: QD, b: QD) -> QD = qd_grow(qd_grow(qd_grow(qd_grow(a, b.l3), b.l2), b.l1), b.l0)
+function qd_neg(a: QD) -> QD = QD { l0 = 0.0 - a.l0, l1 = 0.0 - a.l1, l2 = 0.0 - a.l2, l3 = 0.0 - a.l3 }
+function qd_scale(a: QD, k: Float64) -> QD = QD { l0 = k * a.l0, l1 = k * a.l1, l2 = k * a.l2, l3 = k * a.l3 }
+
+/// The exact sum of a vector of doubles: a fold of grow over the terms, each
+/// lifted so the accumulator and the elements share a type.
+function qd_fold(acc: QD, t: QD) -> QD = qd_grow(acc, t.l0)
+function qd_norm(terms: Array<Float64 like Idx<n>>) -> QD =
+    reduce((method_for(terms) <@> lambda(x) -> qd_lift(x)) |> compute, qd_fold, qd_zero)
+
+/// a * b: of the sixteen limb products the ten with i + j <= 3 reach the
+/// fourth limb, each contributing its rounded product and its fma residual.
+let __qi = [0, 0, 0, 0, 1, 1, 1, 2, 2, 3]
+let __qj = [0, 1, 2, 3, 0, 1, 2, 0, 1, 0]
+function qd_mul(a: QD, b: QD) -> QD = {
+    let al = [a.l0, a.l1, a.l2, a.l3]
+    let bl = [b.l0, b.l1, b.l2, b.l3]
+    let terms = (method_for(range<Idx<20>>) <@> lambda(k) -> {
+        let (p, e) = two_prod(al(__qi(k / 2)), bl(__qj(k / 2)))
+        if k % 2 == 0 then p else e
+    }) |> compute
+    qd_norm(terms)
+}
+
+// Four scales stay four limbs, and 0.1 x 10 leaves its residual in the second.
+let scales = qd_norm([1.0e-60, 1.0e-40, 1.0e-20, 1.0])
+let tenth = qd_mul(qd_lift(0.1), qd_lift(10.0))
+let qd_pins = [scales.l1, scales.l2, scales.l3, tenth.l1]
+qd_pins
+// EXPECT: qd_pins = [1e-20, 1e-40, 1e-60, 5.55111512312578e-17]
+
+// %% [markdown]
+// **A center worth sixty-four digits, computed here.** The real root of
+// $c^3 + 2c^2 + 2c + 2 = 0$ is a Misiurewicz point — the tip of the period-3
+// midget's antenna, $c \approx -1.5437$ — on the boundary, self-similar at
+// every depth, and not a double. Newton's method in quad-double finds it;
+// with a Float64 reciprocal of the derivative the iteration is linear, but
+// at the reciprocal's own rounding rate, so each step still buys sixteen
+// digits. Six steps buy them all: two more move no limb.
+//
+// %%
+function star_poly(c: QD) -> QD = {
+    let two = qd_lift(2.0)
+    qd_add(qd_mul(qd_add(qd_mul(qd_add(c, two), c), two), c), two)
+}
+/// One Newton step, c - p(c) / p'(c0), with the reciprocal a Float64.
+let star_seed = -1.5436890126920764
+let star_recip = 1.0 / (3.0 * star_seed * star_seed + 4.0 * star_seed + 2.0)
+function newton_step(c: QD) -> QD = qd_add(c, qd_neg(qd_mul(star_poly(c), qd_lift(star_recip))))
+
+// Six steps, one per sixteen digits. (Written out rather than recursed: the
+// interpreter does not yet run a self-recursion over a record argument.)
+let n1 = newton_step(qd_lift(star_seed))
+let n2 = newton_step(n1)
+let n3 = newton_step(n2)
+let n4 = newton_step(n3)
+let n5 = newton_step(n4)
+let star = newton_step(n5)
+let star_limbs = [star.l0, star.l1, star.l2, star.l3]
+star_limbs
+// EXPECT: star_limbs = [-1.54368901269208, 6.15676673813378e-18, -1.18793187483785e-34, 8.25241642793637e-51]
+let more = newton_step(newton_step(star))
+let star_converged = star.l0 == more.l0 && star.l1 == more.l1 && star.l2 == more.l2 && star.l3 == more.l3
+star_converged
+// EXPECT: star_converged = true
+
+// %% [markdown]
+// **The reference orbit and the pixel.** The orbit is one `let rec` over the
+// step axis, frozen once $|Z| > 4$. A recursive array has to be a plain
+// numeric type, so a row is eight doubles — the four limbs of the real part,
+// then of the imaginary — and `ref_step` is the one place they are unpacked
+// into the record the arithmetic uses. The pixel iteration reads only the top
+// limb of each part: it never learns how many sit behind them, which is why
+// the same kernel would serve six.
+//
+// %%
+/// One reference step Z -> Z^2 + C in quad-double. A recursive array must be a
+/// plain numeric type, so a row is eight doubles -- the four limbs of the real
+/// part, then of the imaginary -- and this is the one place they are unpacked.
+function ref_step(z: Array<Float64 like Idx<8>>, cr: QD, ci: QD) -> Array<Float64 like Idx<8>> = {
+    let zr = QD { l0 = z(0), l1 = z(1), l2 = z(2), l3 = z(3) }
+    let zi = QD { l0 = z(4), l1 = z(5), l2 = z(6), l3 = z(7) }
+    let nr = qd_add(qd_add(qd_mul(zr, zr), qd_neg(qd_mul(zi, zi))), cr)
+    let ni = qd_add(qd_scale(qd_mul(zr, zi), 2.0), ci)
+    let row = [nr.l0, nr.l1, nr.l2, nr.l3, ni.l0, ni.l1, ni.l2, ni.l3]
+    if z(0) * z(0) + z(4) * z(4) > 16.0 then z else row
+}
+let ref_zero = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+/// Rebase when the delta has outgrown the orbit it rides (|z| < |dz|), when
+/// the reference has escaped, or when its buffer would run out.
+function pert_rebase(m: Int64, dzr: Float64, dzi: Float64, ref: Array<Float64 like Idx<nr>, Idx<8>>, last: Int64) -> Bool = {
+    let zr = ref(m, 0) + dzr
+    let zi = ref(m, 4) + dzi
+    zr * zr + zi * zi < dzr * dzr + dzi * dzi || ref(m, 0) * ref(m, 0) + ref(m, 4) * ref(m, 4) > 4.0 || m + 1 >= last
+}
+/// dz' = 2 Z dz + dz^2 + dc, real and imaginary parts, after the optional rebase.
+function pert_next_r(m: Int64, dzr: Float64, dzi: Float64, dcr: Float64, ref: Array<Float64 like Idx<nr>, Idx<8>>, last: Int64) -> Float64 = {
+    let rb = pert_rebase(m, dzr, dzi, ref, last)
+    let zr = if rb then 0.0 else ref(m, 0)
+    let zi = if rb then 0.0 else ref(m, 4)
+    let wr = if rb then ref(m, 0) + dzr else dzr
+    let wi = if rb then ref(m, 4) + dzi else dzi
+    2.0 * (zr * wr - zi * wi) + (wr * wr - wi * wi) + dcr
+}
+function pert_next_i(m: Int64, dzr: Float64, dzi: Float64, dci: Float64, ref: Array<Float64 like Idx<nr>, Idx<8>>, last: Int64) -> Float64 = {
+    let rb = pert_rebase(m, dzr, dzi, ref, last)
+    let zr = if rb then 0.0 else ref(m, 0)
+    let zi = if rb then 0.0 else ref(m, 4)
+    let wr = if rb then ref(m, 0) + dzr else dzr
+    let wi = if rb then ref(m, 4) + dzi else dzi
+    2.0 * (zr * wi + zi * wr) + 2.0 * wr * wi + dci
+}
+/// Smooth escape time of the pixel at C + dc, iterated as a Float64 delta off
+/// the reference's top limbs. Binds nothing, so it compiles to a loop.
+function esc_pert(n: Float64, m: Int64, dzr: Float64, dzi: Float64, dcr: Float64, dci: Float64,
+                  ref: Array<Float64 like Idx<nr>, Idx<8>>, last: Int64, kmax: Float64) -> Float64 =
+    if n >= kmax then 0.0 else (
+    if (ref(m, 0) + dzr) * (ref(m, 0) + dzr) + (ref(m, 4) + dzi) * (ref(m, 4) + dzi) > 4.0 then
+        n + 1.0 - log(0.5 * log((ref(m, 0) + dzr) * (ref(m, 0) + dzr) + (ref(m, 4) + dzi) * (ref(m, 4) + dzi)) / log(2.0)) / log(2.0) else
+    esc_pert(n + 1.0, (if pert_rebase(m, dzr, dzi, ref, last) then 1 else m + 1),
+             pert_next_r(m, dzr, dzi, dcr, ref, last), pert_next_i(m, dzr, dzi, dci, ref, last), dcr, dci, ref, last, kmax))
+
+/// The lens on a square canvas whose extent is the axis's, in offsets of r:
+/// the caller chooses the resolution by building the axis.
+function far_grid(ax: Array<Float64 like Idx<n>>, ref: Array<Float64 like Idx<nr>, Idx<8>>, last: Int64,
+                  r: Float64, kmax: Float64) -> Array<Float64 like Idx<n>, Idx<n>> =
+    (method_for(ax, ax) <@> lambda(y, x) where omp(y: 1) ->
+        esc_pert(0.0, 0, 0.0, 0.0, r * x, r * y, ref, last, kmax)) |> compute
+
+// %% [markdown]
+// ## The far camera
+//
+// Nine bindings: four limbs of the center's real part, four of its imaginary
+// part, and the radius — Newton's digits, as literals (to the last bit,
+// since a print rounded to fifteen digits is a different point), because a
+// scroll rewrites them. The plot's axes are offsets in units of the radius, so a
+// gesture is a point in $[-1, 1]^2$ that the editor folds into the limbs. The
+// reference is 8192 steps and the cap is held to it: near a Misiurewicz point
+// an orbit leaves within a few hundred steps or sits on the antenna, where it
+// is stable whichever orbit it rides, and the pinned sum below is the same
+// number with the cap at 8191 or at the forty thousand a $10^{-40}$ window
+// would nominally ask for. Near a minibrot the cap has to be honest, and that
+// is a compiled render — every gesture already is one.
+//
+// %%
+let far_re0 = -1.5436890126920764
+let far_re1 = 6.156766738133783e-18
+let far_re2 = -1.1879318748378514e-34
+let far_re3 = 8.252416427936383e-51
+let far_im0 = 0.0
+let far_im1 = 0.0
+let far_im2 = 0.0
+let far_im3 = 0.0
+let far_r = 1.0e-40
+let far_px = 64
+
+// %%
+let rec far_ref: Array<Float64 like Idx<8192>, Idx<8>> =
+    match far_ref with
+    | zero -> zero
+    | zero :: s -> zero :: ref_zero
+    | prefix :: n -> prefix :: ref_step(prefix(n - 1),
+        QD { l0 = far_re0, l1 = far_re1, l2 = far_re2, l3 = far_re3 },
+        QD { l0 = far_im0, l1 = far_im1, l2 = far_im2, l3 = far_im3 })
+
+// %%
+function far_show(ax: Array<Float64 like Idx<n>>, ref: Array<Float64 like Idx<8192>, Idx<8>>, r: Float64) -> Float64 = {
+    let kmax = fmin(floor(view_kmax(r)), 8191.0)
+    let g = far_grid(ax, ref, 8191, r, kmax)
+    let (lo, hi) = field_range(g, kmax)
+    let shown = plot.heatmap(ax, ax, g, 5: cmap, lo: zmin, hi: zmax,
+        "The far lens (scroll to dive)": title, "Re(c - C) / r": xlabel, "Im(c - C) / r": ylabel,
+        "mandelbrot-far": plotid, "far_re0,far_re1,far_re2,far_re3,far_im0,far_im1,far_im2,far_im3,far_r": camera)
+    total(g)
+}
+let unit64 = -1.0 + (2.0 / 64.0) * Float64(0..64)
+let unit128 = -1.0 + (2.0 / 128.0) * Float64(0..128)
+let unit256 = -1.0 + (2.0 / 256.0) * Float64(0..256)
+/// One camera, one call: the canvas from the px knob.
+function render_far(ref: Array<Float64 like Idx<8192>, Idx<8>>, r: Float64, px: Int64) -> Float64 =
+    if px >= 256 then far_show(unit256, ref, r) else (
+    if px >= 128 then far_show(unit128, ref, r) else
+    far_show(unit64, ref, r))
+
+let far_sum = render_far(far_ref, far_r, far_px)
+far_sum
+// EXPECT: far_sum = 736404.980967016
+
+// %% [markdown]
+// **What the extra limbs buy, measured.** The same window through the same
+// lens, with the camera truncated to the two limbs a double-double could
+// hold. Both references are valid orbits; only where the camera points
+// differs. Counting pixels whose escape time moved by more than a step: at
+// $r = 10^{-25}$ none of 256 — the truncation is a hundred-millionth of a
+// pixel; at $r = 10^{-50}$, 240 of 256 — every pixel not on the antenna
+// itself — because the dropped limbs moved the camera by $10^{16}$ windows. Past a depth set by the limb count,
+// the missing digits are not detail; they are where you are.
+//
+// %%
+let cam_trunc = QD { l0 = far_re0, l1 = far_re1, l2 = 0.0, l3 = 0.0 }
+let rec trunc_ref: Array<Float64 like Idx<4096>, Idx<8>> =
+    match trunc_ref with
+    | zero -> zero
+    | zero :: s -> zero :: ref_zero
+    | prefix :: n -> prefix :: ref_step(prefix(n - 1), cam_trunc, qd_zero)
+function flips(a: Array<Float64 like Idx<n>, Idx<n>>, b: Array<Float64 like Idx<n>, Idx<n>>) -> Int64 =
+    reduce(reduce((method_for(zip(a, b)) <@> lambda(x, y) -> if abs(x - y) > 1.0 then 1 else 0) |> compute, (+)), (+))
+let unit16 = -1.0 + (2.0 / 16.0) * Float64(0..16)
+let at25 = flips(far_grid(unit16, far_ref, 8191, 1.0e-25, 2000.0), far_grid(unit16, trunc_ref, 4095, 1.0e-25, 2000.0))
+let at50 = flips(far_grid(unit16, far_ref, 8191, 1.0e-50, 2000.0), far_grid(unit16, trunc_ref, 4095, 1.0e-50, 2000.0))
+let limb_flips = [at25, at50]
+limb_flips
+// EXPECT: limb_flips = [0, 240]
+
+// %% [markdown]
+// To keep going: scroll either plot. The first recomputes its window in
+// double precision until the camera collides with the grid; the second is
+// the same gesture over nine numbers, and when four limbs run out at about
+// $10^{-60}$, the next is the same edit again.

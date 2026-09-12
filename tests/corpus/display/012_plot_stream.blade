@@ -1,0 +1,65 @@
+// TEST: Plot Live Stream Frames
+// ============================================================================
+// `plot.stream(name, x, y[, slots])` and the primitive under it,
+// `display.emit_id(mime, id, data[, meta])`.
+//
+// A stream frame is the OTHER kind this module emits: one instalment of a
+// chart a long-running cell keeps extending, carried under its own mime
+// (application/vnd.blade.plotstream.v1+json) as a backend-neutral
+// {channel, epoch, x, y, labels} object rather than as a plotly figure.
+//
+// What this file guards:
+//
+//   * the surface compiles and every call answers `true`, exactly like the
+//     five figure factories;
+//   * `epoch` and the three label slots route by NOMINAL, in any order, and
+//     an omitted label is left OUT of the payload rather than sent empty;
+//   * `display.emit_id` is reachable directly, with the same literal-mime /
+//     literal-meta discipline `display.emit` has and a RUNTIME id;
+//   * through `blade test interp display`, that the interpreter and the
+//     compiled binary put byte-identical frames on stdout -- the id splice
+//     and the ordinal counter it deliberately does NOT consume included.
+//     `plain` below is the pin for that last point: it emits AFTER three
+//     emit_id calls and must still be `blade-1`, in both lanes.
+//
+// The frame BYTES (id splicing, escaping) are pinned in-process in
+// tests/Test_Display.fs; this file pins the surface and the two-lane parity.
+// ============================================================================
+import plot
+import display as d
+
+let xs = [0.0, 1.0, 2.0]
+let ys = [0.9, 0.5, 0.3]
+
+// Every slot, out of declaration order: epoch and all three labels.
+let marked = plot.stream("train_loss", xs, ys, "mse": ylabel, 3: epoch, "batch": xlabel, "loss": title)
+
+// The bare call: no epoch (defaults to -1, "unmarked") and no labels, so the
+// payload carries channel/epoch/x/y and nothing else.
+let bare = plot.stream("train_loss", [3.0, 4.0], [0.25, 0.2])
+
+// The primitive, called directly. The id is a runtime String -- here a
+// binding, which is what makes it a runtime value rather than a literal the
+// elaborator could have folded.
+let channel = "manual"
+let raw = d.emit_id("application/vnd.blade.plotstream.v1+json", channel,
+                    "{\"channel\":\"manual\",\"epoch\":7,\"x\":[0],\"y\":[1.5]}",
+                    "{\"stream\":true,\"backend\":\"plotly\"}")
+
+// A channel name carrying the two characters that would break out of the id
+// string. The id travels through the frame ESCAPE table, in both lanes -- the
+// F# `Frame.escape` and the generated `blade_display::__blade_display_esc` --
+// and this is the only pin that drives the compiled lane's copy of it, so a
+// divergence between the two shows up here as a stdout byte diff rather than
+// as a frame the editor silently drops.
+let tricky = plot.stream("a\" b\\c", [0.0], [1.0])
+
+// An ordinary figure frame after all of them: emit_id consumes no ordinal, so
+// this one is still the run's FIRST `<tag><ordinal>` id.
+let plain = plot.line(xs, ys)
+
+// EXPECT: marked = true
+// EXPECT: bare = true
+// EXPECT: raw = true
+// EXPECT: tricky = true
+// EXPECT: plain = true

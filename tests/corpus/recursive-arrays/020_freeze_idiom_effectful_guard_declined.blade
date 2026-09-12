@@ -1,0 +1,30 @@
+// TEST: Freeze Idiom Declines Effectful Guard
+// ============================================================================
+// Recognition is sound only when the skipped guard evaluations are REPEATS,
+// and a guard that calls a helper with a `mut` parameter mutates its own
+// input: here `tick` bumps a counter every call and answers true once it
+// passes 2. Run to budget, the counter climbs (1, 2, 3, ...) and the guard
+// is false-false-true-true-...: xs = [1, 1, 1, 2, 3, 4, 5, 6] with seven
+// calls. Recognized as a freeze (plan-fortran-killer-2.md appendix A), the
+// first false answer was treated as absorbing: the trajectory froze at 1 and
+// six of the seven calls vanished. The recognizer now declines any callee
+// that is not a pure, unshadowed scalar intrinsic, so these pins hold with
+// recognition on or off (BLADE_FREEZE_IDIOM) and in both lanes.
+
+type C = Idx<1>
+type It = Idx<8>
+function tick(c: mut Array<Float like C>) -> Bool = {
+    c((0 : C)) += 1.0
+    c((0 : C)) > 2.0
+}
+let mut counter: Array<Float like C> = [0.0]
+let rec xs: Array<Float like It> =
+    match xs with
+    | zero -> zero
+    | zero :: s -> zero :: 1.0
+    | prefix :: n -> prefix :: (if tick(counter) then prefix(n - 1) + 1.0 else prefix(n - 1))
+
+let last = xs((7 : It))
+// EXPECT: last = 6
+let calls = counter((0 : C))
+// EXPECT: calls = 7

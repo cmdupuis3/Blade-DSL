@@ -258,6 +258,8 @@ let rec ppIRExprWithNames (names: Map<int, string>) indent (expr: IRExpr) =
         $"""({(es |> List.map pp |> String.concat ", ")})"""
     | IRComplex (re, im) ->
         $"complex({pp re}, {pp im})"
+    | IRFma (a, b, c) ->
+        $"fma({pp a}, {pp b}, {pp c})"
     | IRTupleProj (e, i, _) ->
         $"{pp e}.{i}"
     | IRIf (c, t, e) ->
@@ -332,8 +334,10 @@ let rec ppIRExprWithNames (names: Map<int, string>) indent (expr: IRExpr) =
         $"({pp f} >>@ {pp g})"
     | IRComposeMeth (f, g) ->
         $"({pp f} @>> {pp g})"
-    | IRConstraintCheck (c, msg, _) ->
-        $"check({pp c}, \"{msg}\")"
+    | IRConstraintCheck (c, code, msg, _) ->
+        $"check[{code}]({pp c}, \"{msg}\")"
+    | IRBreakIf c ->
+        $"break_if({pp c})"
     | IRAssign (target, v) ->
         let targetStr =
             match target with
@@ -534,8 +538,10 @@ let rec exprAttrs (expr: IRExpr) : ExprAttrs =
     //    them, or drop one whose value is unused. This is the "future impure
     //    construct" the header anticipated; the payload's own attrs still
     //    merge in (it can reference bindings like anything else).
-    | IRDisplayEmit (_, _, data, _) ->
-        { exprAttrs data with IsPure = false }
+    | IRDisplayEmit (_, _, data, _, idOpt) ->
+        // The emit_id id is an ordinary operand: its own free vars merge in
+        // beside the payload's, and the whole node stays impure.
+        { mergeMany (exprAttrs data :: (idOpt |> Option.toList |> List.map exprAttrs)) with IsPure = false }
 
     | IRApp (f, args, _) ->
         let baseAttrs = mergeMany (exprAttrs f :: List.map exprAttrs args)

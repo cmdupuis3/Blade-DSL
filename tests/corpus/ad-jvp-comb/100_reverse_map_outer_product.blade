@@ -1,0 +1,89 @@
+// TEST: C2-Reverse -- Multi-Slot Map Is The Outer Product, Both Spellings
+// Several loop operands are the OUTER PRODUCT, so their axes concatenate and
+// the construction buffer is rank-2. plan-ad-combinators.md 2.5.3 rates the
+// multi-slot reverse rule DESIGN because the Tier-2 adjoint of slot i is a
+// contraction over the other slots' axes -- a partial fold grad refuses.
+// Lowering sidesteps that entirely: the loop nest writes each cell once, and
+// the reverse sweep's replay accumulates each operand's cotangent cell by
+// cell, which is the contraction, spelled as the scatter-add it already does.
+//
+// Both constructor spellings land here (`formalism.md` rank-0 convergence:
+// `object_for(f) <@> (A, B)` and `method_for(A, B) <@> f` are one loop), and
+// a named-function kernel is normalized by the same `asKernelLambda` the
+// tangent rule uses -- so the two modes cannot drift on what counts as a
+// kernel.
+//
+// x = [1, 2, 3], y = [10, 20]
+//   m(i, j) = x(i) * x(i) + y(j)
+//   m = [[11, 21], [14, 24], [19, 29]]
+//   loss = m(0, 0) + 3 m(2, 1) = 11 + 87 = 98
+//   dx(i): only i = 0 (weight 1) and i = 2 (weight 3) -> [2*1*1, 0, 3*2*3] = [2, 0, 18]
+//   dy(j): weights land at j = 0 (1) and j = 1 (3)     -> [1, 3]
+import ad as ad
+
+type I = Idx<3>
+type J = Idx<2>
+
+function kern(a: Float, b: Float) -> Float = a * a + b
+
+function loss_obj(x: Array<Float like I>, y: Array<Float like J>) -> Float = {
+    let m = object_for(kern) <@> (x, y) |> compute
+    m(0, 0) + 3.0 * m(2, 1)
+}
+
+function loss_meth(x: Array<Float like I>, y: Array<Float like J>) -> Float = {
+    let m = method_for(x, y) <@> lambda(a: Float, b: Float) -> a * a + b |> compute
+    m(0, 0) + 3.0 * m(2, 1)
+}
+
+// And the third spelling: `<*>` concatenates two loops' operand lists and is
+// symmetry-neutral -- "commutativity comes from the kernel later"
+// (`formalism.md` 10.2) -- so `method_for(x) <*> method_for(y)` IS
+// `method_for(x, y)`. The lowering flattens it and the outer-product rule
+// applies unchanged; there is nothing else to say about `<*>`, which is why
+// C1 rates it FREE. (Forward mode still refuses it -- `tangentOfMap`
+// decomposes `method_for`/`object_for` loop sides only -- so no jvp leg.)
+function loss_prod(x: Array<Float like I>, y: Array<Float like J>) -> Float = {
+    let P = method_for(x) <*> method_for(y)
+    let m = P <@> lambda(a: Float, b: Float) -> a * a + b |> compute
+    m(0, 0) + 3.0 * m(2, 1)
+}
+
+// WARN: BL4003
+let x0 = [1.0, 2.0, 3.0]
+let y0 = [10.0, 20.0]
+let mut dx = [0.0, 0.0, 0.0]
+let mut dy = [0.0, 0.0]
+let lv = ad.grad(loss_obj)(x0, y0, dx, dy)
+// EXPECT: lv = 98
+// EXPECT: dx = [2, 0, 18]
+// EXPECT: dy = [1, 3]
+
+// The two spellings must agree to the digit, gradients included.
+let mut ex = [0.0, 0.0, 0.0]
+let mut ey = [0.0, 0.0]
+let mv = ad.grad(loss_meth)(x0, y0, ex, ey)
+let vresid = mv - lv
+let gresid = reduce(abs(ex - dx), (+)) + reduce(abs(ey - dy), (+))
+// EXPECT: vresid = 0
+// EXPECT: gresid = 0
+
+let mut px = [0.0, 0.0, 0.0]
+let mut py = [0.0, 0.0]
+let pv = ad.grad(loss_prod)(x0, y0, px, py)
+let pvresid = pv - lv
+let pgresid = reduce(abs(px - dx), (+)) + reduce(abs(py - dy), (+))
+// EXPECT: pvresid = 0
+// EXPECT: pgresid = 0
+
+let sx = [1.0, 0.5, -2.0]
+let sy = [0.25, 4.0]
+let (jp, jt) = ad.jvp(loss_meth)(x0, y0, sx, sy)
+let resid = jt - (reduce(dx * sx, (+)) + reduce(dy * sy, (+)))
+// EXPECT: jp = 98
+// EXPECT: resid = 0
+
+let h = 0.000001
+let fdx = (loss_obj([1.0, 2.0, 3.0 + h], y0) - loss_obj([1.0, 2.0, 3.0 - h], y0)) / (2.0 * h)
+let fd_ok = abs(fdx - dx(2)) < 0.000001 * (abs(dx(2)) + 1.0)
+// EXPECT: fd_ok = true

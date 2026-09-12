@@ -41,8 +41,8 @@ let private runTool (path: string) (args: string) (cppDir: string) : (int * stri
     psi.CreateNoWindow <- true
     psi.WorkingDirectory <- cppDir
     use p = Process.Start(psi)
-    let out = p.StandardOutput.ReadToEndAsync()
-    let err = p.StandardError.ReadToEndAsync()
+    let out = Blade.Runtime.readToEndOffPool p.StandardOutput
+    let err = Blade.Runtime.readToEndOffPool p.StandardError
     if not (p.WaitForExit(60000)) then
         (try p.Kill(true) with _ -> ())
         None
@@ -188,8 +188,8 @@ let runOrbWreathTests () : Blade.Tests.TestHarness.BlockResult =
         psi.CreateNoWindow <- true
         psi.WorkingDirectory <- cppDir
         use cproc = Process.Start(psi)
-        let cOut = cproc.StandardOutput.ReadToEndAsync()
-        let cErr = cproc.StandardError.ReadToEndAsync()
+        let cOut = Blade.Runtime.readToEndOffPool cproc.StandardOutput
+        let cErr = Blade.Runtime.readToEndOffPool cproc.StandardError
         // 300s (was 120s), matching Build.fs's own budget: this is the
         // slowest single translation unit in the tree and the Phase 0 flag
         // bump made it slower still. MEASURED (g++ 15.2, ucrt64, idle):
@@ -212,8 +212,8 @@ let runOrbWreathTests () : Blade.Tests.TestHarness.BlockResult =
             rpsi.CreateNoWindow <- true
             rpsi.WorkingDirectory <- cppDir
             use rproc = Process.Start(rpsi)
-            let rOut = rproc.StandardOutput.ReadToEndAsync()
-            let rErr = rproc.StandardError.ReadToEndAsync()
+            let rOut = Blade.Runtime.readToEndOffPool rproc.StandardOutput
+            let rErr = Blade.Runtime.readToEndOffPool rproc.StandardError
             let rExited = rproc.WaitForExit(60000)
             if not rExited then
                 (try rproc.Kill(true) with _ -> ())

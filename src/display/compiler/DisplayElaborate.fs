@@ -6,6 +6,10 @@
 ///
 ///   display.emit(mime, data)          -- one frame; `encoding` inferred from `mime`
 ///   display.emit(mime, data, meta)    -- same, with a user `meta` object merged after the generated `"id"`
+///   display.emit_id(mime, id, data[, meta])
+///                                     -- same frame, with `meta.id` taken from the RUNTIME `id` string instead
+///                                        of the run's `<SessionTag><ordinal>`. A chart whose identity the
+///                                        program chooses is what the live plot stream merges on.
 ///
 /// `mime` and `meta` must be STRING LITERALS, the same discipline `rand` puts on its shapes: everything in a frame
 /// except `data` is fixed at elaboration time, so the encoding rule, the JSON head and the meta tail are computed here
@@ -35,30 +39,50 @@ let private literalString (what: string) (e: Expr) : Result<string, string> =
 
 /// Elaborate one `display.<op>(...)` call.
 let private elabOp (op: string) (args: Expr list) : Result<Expr, string> =
-    let build (mimeE: Expr) (dataE: Expr) (metaE: Expr option) =
-        literalString "display.emit: the mime type" mimeE |> Result.bind (fun mime ->
+    /// Shared by `emit` and `emit_id`: validate the two elaboration-time
+    /// literals (mime, meta) and hand the head / quoting flag / meta tail to
+    /// `k`, which builds the internal call. `what` names the surface op so a
+    /// bad `emit_id` does not report itself as `display.emit`.
+    let withLiterals (what: string) (mimeE: Expr) (metaE: Expr option)
+                     (k: string -> bool -> string -> Expr) =
+        literalString $"{what}: the mime type" mimeE |> Result.bind (fun mime ->
         if not (Blade.Display.Frame.isMimeType mime) then
-            Error ($"display.emit: '{mime}' is not a mime type (expected type/subtype, e.g. \"application/vnd.plotly.v1+json\")")
+            Error ($"{what}: '{mime}' is not a mime type (expected type/subtype, e.g. \"application/vnd.plotly.v1+json\")")
         else
             let metaText =
                 match metaE with
                 | None -> Ok "{}"
-                | Some e -> literalString "display.emit: the meta argument" e
+                | Some e -> literalString $"{what}: the meta argument" e
             metaText |> Result.bind (fun metaJson ->
                 match Blade.Display.Frame.metaTailOf metaJson with
                 | None ->
-                    Error ($"display.emit: meta must be a JSON object literal like \"{{\\\"title\\\": \\\"my plot\\\"}}\" (got {metaJson})")
+                    Error ($"{what}: meta must be a JSON object literal like \"{{\\\"title\\\": \\\"my plot\\\"}}\" (got {metaJson})")
                 | Some metaTail ->
-                    Ok (syn (ExprApp (v "__display_emit",
-                                      [ strLit (Blade.Display.Frame.headFor mime)
-                                        boolLit (Blade.Display.Frame.quotedFor mime)
-                                        dataE
-                                        strLit metaTail ])))))
+                    Ok (k (Blade.Display.Frame.headFor mime)
+                          (Blade.Display.Frame.quotedFor mime)
+                          metaTail)))
+    let build (mimeE: Expr) (dataE: Expr) (metaE: Expr option) =
+        withLiterals "display.emit" mimeE metaE (fun head quoted metaTail ->
+            syn (ExprApp (v "__display_emit",
+                          [ strLit head; boolLit quoted; dataE; strLit metaTail ])))
+    // `emit_id`'s ONLY difference from `emit`: the frame's `meta.id` is the
+    // runtime `id` expression instead of the run's `<SessionTag><ordinal>`.
+    // That is what gives a chart an identity the program chooses -- stable
+    // across calls, across a session replay, and independent of how many other
+    // plots ran first -- which is what the live plot stream merges on.
+    let buildId (mimeE: Expr) (idE: Expr) (dataE: Expr) (metaE: Expr option) =
+        withLiterals "display.emit_id" mimeE metaE (fun head quoted metaTail ->
+            syn (ExprApp (v "__display_emit_id",
+                          [ strLit head; boolLit quoted; idE; dataE; strLit metaTail ])))
     match op, args with
     | "emit", [mimeE; dataE] -> build mimeE dataE None
     | "emit", [mimeE; dataE; metaE] -> build mimeE dataE (Some metaE)
     | "emit", _ ->
         Error "display.emit: expected display.emit(mime, data) or display.emit(mime, data, meta)"
+    | "emit_id", [mimeE; idE; dataE] -> buildId mimeE idE dataE None
+    | "emit_id", [mimeE; idE; dataE; metaE] -> buildId mimeE idE dataE (Some metaE)
+    | "emit_id", _ ->
+        Error "display.emit_id: expected display.emit_id(mime, id, data) or display.emit_id(mime, id, data, meta)"
     // JSON serialization helpers (the plot package's substrate): a rank-1 or
     // rank-2 numeric array (`json_array`) or a numeric scalar (`json_num`)
     // rendered as JSON text. Formatting is the byte-parity 15-significant-
@@ -93,7 +117,7 @@ let private elabOp (op: string) (args: Expr list) : Result<Expr, string> =
         Ok (syn (ExprApp (v "__display_unit_label", [e])))
     | "unit_label", _ ->
         Error "display.unit_label: expected display.unit_label(x)"
-    | _ -> Error $"display: unknown op '{op}' (available: emit, json_array, json_num, json_string, unit_label)"
+    | _ -> Error $"display: unknown op '{op}' (available: emit, emit_id, json_array, json_num, json_string, unit_label)"
 
 // Rewrite walker (same shape as RandElaborate.rewriteExpr; the catch-all wildcard is deliberately absent so an
 // unhandled constructor is an FS0025 build warning rather than a qualified call surviving unrewritten).
@@ -162,9 +186,10 @@ let rec private rewriteExpr (aliases: Set<string>) (e: Expr) : Result<Expr, stri
             |> Result.map (fun cs' -> inheritSpan e (ExprMatch (s', cs'))))
     | ExprKind.ExprRecArray def ->
         rOpt (def.SeedArm |> Option.map snd) |> Result.bind (fun seedE ->
+        rOpt def.Guard |> Result.bind (fun guardE ->
         r def.SliceExpr |> Result.map (fun slice' ->
             let seed' = Option.map2 (fun (sv, _) se -> (sv, se)) def.SeedArm seedE
-            inheritSpan e (ExprRecArray { def with SeedArm = seed'; SliceExpr = slice' })))
+            inheritSpan e (ExprRecArray { def with SeedArm = seed'; SliceExpr = slice'; Guard = guardE }))))
     | ExprKind.ExprCompute inner -> r inner |> Result.map (fun i -> inheritSpan e (ExprCompute i))
     | ExprKind.ExprRead inner -> r inner |> Result.map (fun i -> inheritSpan e (ExprRead i))
     | ExprKind.ExprPure inner -> r inner |> Result.map (fun i -> inheritSpan e (ExprPure i))
@@ -178,7 +203,6 @@ let rec private rewriteExpr (aliases: Set<string>) (e: Expr) : Result<Expr, stri
     | ExprKind.ExprPartialApp (op, inner, isLeft) -> r inner |> Result.map (fun i -> inheritSpan e (ExprPartialApp (op, i, isLeft)))
     | ExprKind.ExprTranspose (a, d1, d2) -> r a |> Result.map (fun a' -> inheritSpan e (ExprTranspose (a', d1, d2)))
     | ExprKind.ExprDecompact (a, d) -> r a |> Result.map (fun a' -> inheritSpan e (ExprDecompact (a', d)))
-    | ExprKind.ExprBlocked (t, inner) -> r inner |> Result.map (fun i -> inheritSpan e (ExprBlocked (t, i)))
     | ExprKind.ExprHalo (t, offs) -> r offs |> Result.map (fun o -> inheritSpan e (ExprHalo (t, o)))
     | ExprKind.ExprMethodFor es -> rList es |> Result.map (fun es' -> inheritSpan e (ExprMethodFor es'))
     | ExprKind.ExprZip es -> rList es |> Result.map (fun es' -> inheritSpan e (ExprZip es'))
@@ -212,6 +236,8 @@ let rec private rewriteExpr (aliases: Set<string>) (e: Expr) : Result<Expr, stri
         r a |> Result.bind (fun a' -> r k |> Result.map (fun k' -> inheritSpan e (ExprSort (a', k'))))
     | ExprKind.ExprGram (l, rr) ->
         r l |> Result.bind (fun l' -> r rr |> Result.map (fun r' -> inheritSpan e (ExprGram (l', r'))))
+    | ExprKind.ExprGramApply (l, rr, x) ->
+        r l |> Result.bind (fun l' -> r rr |> Result.bind (fun r' -> r x |> Result.map (fun x' -> inheritSpan e (ExprGramApply (l', r', x')))))
     | ExprKind.ExprReduce (a, k, init, ax) ->
         r a |> Result.bind (fun a' ->
         r k |> Result.bind (fun k' ->

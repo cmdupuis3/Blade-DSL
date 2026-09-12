@@ -1,0 +1,22 @@
+// TEST: An Exact Division And A Whole-Axis Segment
+// Twelve cells at edge four is three equal runs; edge twelve is one run,
+// which is the flat array itself under a group view.
+type I = Idx<12>
+type C4 = Chunked<I, 4>
+type C12 = Chunked<I, 12>
+let a: Array<Float like I> = 1.0 + 0.5 * Float64(0..12)
+let s4 = segments(C4)
+let s12 = segments(C12)
+let n4 = extents(s4)
+// EXPECT: n4 = [4, 4, 4]
+let n12 = extents(s12)
+// EXPECT: n12 = [12]
+let g4 = group_by(a, s4)
+let g12 = group_by(a, s12)
+let sums4 = method_for(g4) <@> lambda(r) -> reduce(r, (+)) |> compute
+// EXPECT: sums4 = [7, 15, 23]
+let sum12 = method_for(g12) <@> lambda(r) -> reduce(r, (+)) |> compute
+// EXPECT: sum12 = [45]
+let back = ungroup(g4)
+let dev = reduce(back - a, (+))
+// EXPECT: dev = 0

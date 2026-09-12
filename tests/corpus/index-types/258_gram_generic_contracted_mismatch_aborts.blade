@@ -1,0 +1,12 @@
+// TEST: Gram Generic Contracted Mismatch Aborts (aborts)
+// ============================================================================
+// inferGram compares the contracted extents when both are literal. Inside a
+// function over `T^2` parameters they are the caller's, so a 1x3 against a
+// 1x2 compiled and printed `[[3]]` (the k-loop ran to A's 3 and read B's
+// row past its end; the interpreter threw an index exception). The
+// contracted-dim runtime guard (BL8011) aborts on both lanes.
+function g(a: T^2, b: T^2) = gram(a, b)
+let A: Array<Float64 like Idx<1>, Idx<3>> = [[1.0, 2.0, 3.0]]
+let B: Array<Float64 like Idx<1>, Idx<2>> = [[1.0, 1.0]]
+let G = g(A, B)
+// ABORT: BL8011

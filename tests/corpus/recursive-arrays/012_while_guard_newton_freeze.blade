@@ -1,0 +1,20 @@
+// TEST: While Guard Newton Converges And Freezes
+// ============================================================================
+// The `while` guard on the inductive arm (plan-match-statements.md 3):
+// Newton for sqrt(2) from 1.0 under an 8-step budget. The family is defined
+// up to the first n where the guard goes false (the step-4 residual is below
+// tol), and FROZEN after it -- the last written slice repeats, so the
+// hand-written idempotent-freeze idiom and the guarded spelling agree
+// bitwise. Downstream reads and folds see the frozen trajectory.
+// ============================================================================
+type It = Idx<8>
+let rec x: Array<Float like It> =
+    match x with
+    | zero -> zero
+    | zero :: s -> zero :: 1.0
+    | prefix :: n while abs(prefix(n - 1) * prefix(n - 1) - 2.0) > 0.0000000001 -> prefix :: 0.5 * (prefix(n - 1) + 2.0 / prefix(n - 1))
+// EXPECT: x = [1, 1.5, 1.41666666666667, 1.41421568627451, 1.41421356237469, 1.41421356237469, 1.41421356237469, 1.41421356237469]
+let last = x((7 : It))
+// EXPECT: last = 1.41421356237469
+let total = reduce(x, (+))
+// EXPECT: total = 10.9877366024399

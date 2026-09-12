@@ -1,0 +1,16 @@
+// TEST: Comm licensed on real of conjugating kernel
+// The lattice composes PConj through real(): real(conj w) = real(w), so
+// `real(x * conj(y))` deduces PInv -- genuinely commutative -- and the
+// declared `comm` is licensed, not refused. Triangular storage with the
+// identity mirror is correct here: g(1, 0) reads the stored g(0, 1) and
+// 11 is the right answer both ways. This is also the steering the
+// symmetry/039 diagnostic offers ("real(...) of this kernel IS
+// commutative"), pinned so it stays true.
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let g = method_for(A, A) <@> lambda(x, y) where comm(x, y) -> real(x * conj(y)) |> compute
+let g00 = g(0, 0)
+let g01 = g(0, 1)
+let g10 = g(1, 0)
+// EXPECT: g00 = 5
+// EXPECT: g01 = 11
+// EXPECT: g10 = 11

@@ -1,0 +1,19 @@
+// TEST: Fused Elementwise Chain
+// ============================================================================
+// A chain of elementwise array binops. TypeCheck desugars each operator into
+// its own deferred zip pipeline; fuseElementwiseChainsModule flattens the
+// nest into ONE co-iteration (one loop, no intermediate pools). These pins
+// hold with fusion on or off (BLADE_FUSION) -- the rewrite is bitwise: it
+// reorders no cell's arithmetic, it only stops materializing between ops.
+
+type I = Idx<6>
+let a = method_for(range<I>) <@> lambda(i) -> Float64(i) * 0.5 |> compute
+let b = method_for(range<I>) <@> lambda(i) -> Float64(i) + 1.0 |> compute
+let c = method_for(range<I>) <@> lambda(i) -> Float64(i) * 2.0 |> compute
+let d = method_for(range<I>) <@> lambda(i) -> Float64(i) - 3.0 |> compute
+
+let r = a + b * c - d
+// EXPECT: r = [3, 6.5, 14, 25.5, 41, 60.5]
+
+let s = reduce(r, (+))
+// EXPECT: s = 150.5

@@ -205,7 +205,7 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
     // order table is closed and purely syntactic, so illegal pairs reject
     // here with steering; shape-dependent checks (device eligibility, fold
     // reassociation) stay in codegen.
-    let rec loop comms (antis: string list list) (par: ParallelStrategy list) custom toks =
+    let rec loop comms (antis: string list list) (par: ParallelStrategy list) custom (repro: bool) toks =
         let isOmp (s: ParallelStrategy) = s.IsOmp
         let isCuda (s: ParallelStrategy) = s.IsCuda
         let isMpi (s: ParallelStrategy) = s.IsMpi
@@ -231,7 +231,7 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
             advance toks |> expect TokLParen >>= fun _ afterLParen ->
             parseIdentList afterLParen >>= fun names afterNames ->
             expect TokRParen afterNames >>= fun _ remaining ->
-            loop (names :: comms) antis par custom remaining
+            loop (names :: comms) antis par custom repro remaining
         | Some (TokKeyword KwAntisymm) ->
             // `anticomm(a, b, ...)`: the signed sibling of `comm`. Needs at
             // least two parameters -- an anticommutativity relation is about
@@ -243,7 +243,7 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
             if List.length names < 2 then
                 error "anticomm(...) needs at least two parameters: anticommutativity is a relation between two exchanged arguments (f(b, a) = -f(a, b))" line col
             else
-                loop comms (names :: antis) par custom remaining
+                loop comms (names :: antis) par custom repro remaining
         | Some (TokKeyword KwOmp) ->
             // Legal as: sole strategy, or the INNER of `mpi, omp(...)`.
             if not (par = [] || par = [Mpi]) then
@@ -258,9 +258,9 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
                     expect TokLParen afterOmp >>= fun _ afterLParen ->
                     parseOmpArgs [] afterLParen >>= fun pairs afterArgs ->
                     expect TokRParen afterArgs >>= fun _ remaining ->
-                    loop comms antis (par @ [Omp { Vars = pairs }]) custom remaining
+                    loop comms antis (par @ [Omp { Vars = pairs }]) custom repro remaining
                 | _ ->
-                    loop comms antis (par @ [Omp { Vars = [] }]) custom afterOmp
+                    loop comms antis (par @ [Omp { Vars = [] }]) custom repro afterOmp
         | Some (TokKeyword KwMpi) ->
             // Legal only as the sole (and hence OUTER) strategy.
             if not (List.isEmpty par) then
@@ -268,7 +268,7 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
                 rejectPair line col "mpi"
             else
                 // bare `mpi`: rank count is supplied at launch (mpiexec -n N)
-                loop comms antis (par @ [Mpi]) custom (advance toks)
+                loop comms antis (par @ [Mpi]) custom repro (advance toks)
         | Some (TokKeyword KwCuda) ->
             // Legal as: sole strategy, or the INNER of `mpi, cuda(...)`.
             if not (par = [] || par = [Mpi]) then
@@ -291,12 +291,19 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
                             match t.Kind with
                             | TokInt n ->
                                 expect TokRParen rest >>= fun _ remaining ->
-                                loop comms antis (par @ [Cuda { BlockSize = int n }]) custom remaining
+                                loop comms antis (par @ [Cuda { BlockSize = int n }]) custom repro remaining
                             | _ -> error $"Expected integer block size but got {describeToken t.Kind}" t.Line t.Col
                         | [] -> errorEof "Expected integer block size but got end of file"
                 | _ ->
                     // bare `cuda` => default block size
-                    loop comms antis (par @ [Cuda { BlockSize = 256 }]) custom afterCuda
+                    loop comms antis (par @ [Cuda { BlockSize = 256 }]) custom repro afterCuda
+        | Some (TokIdent "repro") when (match peek (advance toks) with Some TokLParen -> false | _ -> true) ->
+            // Bare `repro`: reproducible-evaluation demand. Idempotent (a
+            // second spelling changes nothing); its one illegal partner --
+            // cuda -- is checked at the end of the clause so the two may
+            // appear in either order. `repro(` falls through to the open
+            // conjunct arm and errors there with the registry vocabulary.
+            loop comms antis par custom true (advance toks)
         | Some (TokIdent alias) when (match peek (advance toks) with Some TokDot -> true | _ -> false) ->
             // Module-qualified constraint conjunct: `<alias>.<name>(<idents>)`
             // (e.g. `p.indep(a, b)` with `import ppl as p`). Stored as DATA
@@ -307,7 +314,7 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
             expect TokLParen afterName >>= fun _ afterLParen ->
             parseConjunctArgList afterLParen >>= fun args afterArgs ->
             expect TokRParen afterArgs >>= fun _ remaining ->
-            loop comms antis par (custom @ [(alias + "." + name, args)]) remaining
+            loop comms antis par (custom @ [(alias + "." + name, args)]) repro remaining
         | Some (TokIdent name) when (match peek (advance toks) with Some TokLParen -> true | _ -> false) ->
             // Open constraint conjunct: `<name>(<idents>)` for any identifier
             // the grammar doesn't own. Parsed as data (name, args) and
@@ -318,9 +325,9 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
             advance toks |> expect TokLParen >>= fun _ afterLParen ->
             parseConjunctArgList afterLParen >>= fun args afterArgs ->
             expect TokRParen afterArgs >>= fun _ remaining ->
-            loop comms antis par (custom @ [(name, args)]) remaining
+            loop comms antis par (custom @ [(name, args)]) repro remaining
         | Some TokComma ->
-            loop comms antis par custom (advance toks)
+            loop comms antis par custom repro (advance toks)
         | _ ->
             // A parameter cannot be declared both commutative and
             // antisymmetric (nor antisymmetric twice): the two clauses would
@@ -340,14 +347,23 @@ let parseWhereClause (tokens: Token list) : ParseResult<WhereClause> =
             | _, Some n ->
                 error $"'{n}' is declared both comm(...) and anticomm(...): one exchange cannot be both commutative (inclusive triangle, diagonal stored) and anticommutative (strict triangle, diagonal zero)" line col
             | None, None ->
+            // repro x cuda: a device kernel's contraction and rounding are the
+            // GPU's, not the interpreter's -- the reproducibility demand cannot
+            // be discharged there, so the pair refuses rather than silently
+            // meaning less than it says. Checked here (order-independent),
+            // like the comm/anticomm overlap above.
+            if repro && (par |> List.exists (fun s -> s.IsCuda)) then
+                error "`repro` cannot be combined with `cuda`: a device kernel's contraction and rounding are the GPU's own, so the reproducibility demand (the interpreter's operation sequence) cannot be discharged there" line col
+            else
             success {
                 Commutativity = List.rev comms
                 Antisymmetry = List.rev antis
                 Parallel = par
+                Repro = repro
                 TDims = []
                 Custom = custom
             } toks
-    loop [] [] [] [] tokens
+    loop [] [] [] [] false tokens
 
 /// The BL1003 steer for the removed imperative `for`. Shared verbatim by the
 /// two positions the shape can appear in -- a block statement (parseBlock) and

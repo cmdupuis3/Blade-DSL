@@ -1,0 +1,11 @@
+// TEST: Anon Range Function Body
+// A bare range and its reduce inside a function body (expression-form fold).
+function iota_sum() -> Int64 = { reduce(0..5, (+)) }
+function axis_at(k: Int64) -> Float64 = {
+    let xs = Float64(0..5) * 0.5
+    xs(k)
+}
+let s = iota_sum()
+let a2 = axis_at(2)
+// EXPECT: s = 10
+// EXPECT: a2 = 1

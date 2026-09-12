@@ -354,6 +354,92 @@ let internal noLoopResolve : string -> Expr option = fun _ -> None
 
 let internal (|MapApply|_|) (e: Expr) : MapApplyView option = (|MapApplyWith|_|) noLoopResolve e
 
+// ---------------------------------------------------------------------------
+// Halo stencil maps (docs/plans/structural/02, sections 3.2-3.3). A
+// `method_for(halo<I, [offs]>) <@> lambda(w) -> ...` reads its operands
+// through the window, `x(w(k))`; both reverse routes need the same three
+// facts about it: its ACCESS record (built here from the surface literals,
+// the same record the checker and the runtime guards parse from the slot
+// tag), whether a map is a SOLE-halo map, and the rewrite of `w(k)` into
+// the interior ordinal plus a static offset.
+// ---------------------------------------------------------------------------
+
+/// A literal or negated-literal offset.
+let internal literalOffsetOf (e: Expr) : int option =
+    match e.Kind with
+    | ExprKind.ExprLit (LitInt k) -> Some (int k)
+    | ExprKind.ExprUnaryOp (OpNeg, { Kind = ExprKind.ExprLit (LitInt k) }) -> Some (int -k)
+    | _ -> None
+
+/// The access record and the inner extent N of a surface `halo<I, [offs]>`
+/// operand: literal `Idx<n>` inner, literal offset set. None otherwise (a
+/// compound inner or a computed set has no static interior here).
+let internal haloAccessOfSurface (ctx: Ctx) (inner: TypeExpr) (offs: Expr) : (Blade.Types.HaloAccess * int) option =
+    match resolveTy ctx inner, offs.Kind with
+    | TyIdx { Kind = ExprKind.ExprLit (LitInt n) }, ExprKind.ExprArrayLit os when not os.IsEmpty ->
+        let lits = os |> List.map literalOffsetOf
+        if lits |> List.forall Option.isSome then
+            Some (Blade.Types.haloAccessOf "" (lits |> List.map Option.get) false, int n)
+        else None
+    | _ -> None
+
+/// A map whose ONE loop operand is a halo, looked at through `pure` /
+/// `compute` (materialization barriers with no value content): the inner
+/// index, the offset expression and the kernel.
+let internal soleHaloOfWith (resolve: string -> Expr option) (e: Expr) : (TypeExpr * Expr * Expr) option =
+    let rec peel (x: Expr) =
+        match x.Kind with
+        | ExprKind.ExprCompute i | ExprKind.ExprPure i -> peel i
+        | _ -> x
+    match peel e with
+    | MapApplyWith resolve mv ->
+        (match mv.Ops with
+         | [ { Kind = ExprKind.ExprHalo (inner, offs) } ] -> Some (inner, offs, mv.Kern)
+         | _ -> None)
+    | _ -> None
+
+let internal soleHaloOf (e: Expr) : (TypeExpr * Expr * Expr) option = soleHaloOfWith noLoopResolve e
+
+/// The head every subset refusal shares -- what differentiated code DOES
+/// support, said once.
+let internal subsetHead =
+    "differentiable code supports straight-line arithmetic, additive `reduce`, and rank-1 recursive arrays (v1)"
+
+/// The refusal for ONE combinator operator met in differentiated code.
+///
+/// One message per operator instead of one message listing eleven of them.
+/// That list was the right shape while reverse mode refused the whole family
+/// uniformly; after the C2-reverse map lowering
+/// (`plan-equivariant-nn-notebooks.md` 5.2) the survivors are genuinely
+/// different problems with different fixes -- a `<@>` outside `let`
+/// initializer position wants a `let`, `<|>` is DISCONTINUOUS and wants
+/// `guard`, `<&!>` wants separate folds -- and naming the family named none
+/// of them. Each message says what was met and the nearest spelling that
+/// works.
+let internal combinatorOpMsg (op: BinOp) : string =
+    let grad = (errMode.Value <> "jvp")   // grad and vjp share the reverse sweep
+    match op with
+    | OpApply ->
+        if grad then
+            $"{subsetHead}; reverse mode differentiates an eager map by lowering it to a construction loop, and it can only expand one that is the WHOLE initializer of a `let` whose loop side resolves to a `method_for`/`object_for` -- bind it first (`let m = method_for(...) <@> <kernel> |> compute`) and read `m` by index"
+        else
+            $"{subsetHead}; the `<@>` map rule needs a loop side that is a `method_for`/`object_for` (or a name bound to one) -- this application's left operand is neither"
+    | OpChoice ->
+        $"{subsetHead}; `<|>` (value-keyed choice) is not differentiable in ANY mode and will not become so: it selects the first NON-ZERO cell, so the output JUMPS by the size of the right operand across the switching set -- a discontinuity, not merely a kink, and its failover idiom is engineered to sit on it. Use `guard(p, c)`, whose predicate is explicit and whose false branch is a genuine zero, or a smooth blend. (`<|:>`, the storage-keyed sibling, IS differentiable -- allocation is not a value.)"
+    | OpFusion | OpParallel ->
+        let nm = if op = OpFusion then "`<&!>` (full fusion)" else "`<&>` (prefix fusion)"
+        $"{subsetHead}; {nm} joins several computations into one traversal, and its result is a TUPLE that neither sweep can bind -- write each leg as its own `let` and fold it with its own `reduce`, which computes the same numbers in as many traversals as there are legs"
+    | OpArrayProd ->
+        $"{subsetHead}; `<*>` concatenates two loops' operand lists -- spell the combined list directly instead (`method_for(A, B) <@> <kernel>`), which is the same loop and is differentiable"
+    | OpBind ->
+        $"{subsetHead}; `>>=` is a `let` in disguise (materialize, bind, continue) -- write the bind as a `let` and the continuation as ordinary statements"
+    | OpFunctor | OpComposeObj | OpComposeMeth | OpCompose ->
+        $"{subsetHead}; this pipeline operator survived the fuse-then-differentiate pre-pass, which means fusion DECLINED it -- compose the stages by hand into a single kernel (`lambda(x) -> g(f(x))`), which is the same value by the Compose-Apply identity"
+    | OpCons ->
+        $"{subsetHead}; `::` builds a recursive-array slice and is differentiable only inside a top-level `let rec` binding in the body"
+    | _ ->
+        $"{subsetHead}; loop-object combinator operators are not differentiable"
+
 /// Walk an expression, validating it stays inside the differentiable
 /// fragment, and call `onVar` for every variable REFERENCE (not index
 /// positions, which are int-typed and non-differentiable, but we still
@@ -396,6 +482,11 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
     // gram is bilinear, not linear -- its own arm (C6 reverse, jvp tangent)
     | { Kind = ExprKind.ExprGram (ga, gb) } ->
         walkExpr fname ctx onVar inKernel ga |> Result.bind (fun () -> walkExpr fname ctx onVar inKernel gb)
+    // gram_apply is trilinear -- its own arms (reverse, jvp tangent)
+    | { Kind = ExprKind.ExprGramApply (ga, gb, gx) } ->
+        walkExpr fname ctx onVar inKernel ga
+        |> Result.bind (fun () -> walkExpr fname ctx onVar inKernel gb)
+        |> Result.bind (fun () -> walkExpr fname ctx onVar inKernel gx)
     // Grouping data is constant plumbing in BOTH modes: keys are Int/index
     // data, so a `group_keys`/`group_bucket`/`extents` binding carries no
     // derivative and the explicit-bucket gather pattern (2.17a) rides the
@@ -440,7 +531,11 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
     // taint sees them; virtual halo/range operands have nothing to visit)
     // and the kernel BODY; kernel params are bound by the lambda, and the
     // tangent rule substitutes indexed reads for them.
-    | { Kind = ExprKind.ExprBinOp (_, OpApply, lo2, kn) } when errMode.Value = "jvp"
+    // In reverse mode every map has been lowered before this walk runs --
+    // except a sole-halo stencil map the gather route KEEPS (route G,
+    // GradNormalize.haloGatherPlan), which is admitted here on the same
+    // terms as the forward-mode map.
+    | { Kind = ExprKind.ExprBinOp (_, OpApply, lo2, kn) } when (errMode.Value = "jvp" || (soleHaloOf e).IsSome)
             && (match lo2.Kind with ExprKind.ExprMethodFor _ | ExprKind.ExprObjectFor _ | ExprKind.ExprVar _ -> true | _ -> false) ->
         // Both spellings decompose the same way. A VAR loop side does not
         // resolve here (this walk has no loop-binding environment): the name
@@ -474,8 +569,8 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
     // `<|:>` (OpFallback) is deliberately ABSENT: LinearForm admits it above
     // (storage branching is linear in both legs), so listing it here would be
     // both unreachable and a lie in the message.
-    | { Kind = ExprKind.ExprBinOp (_, (OpApply | OpBind | OpParallel | OpFusion | OpArrayProd | OpFunctor | OpChoice | OpComposeObj | OpComposeMeth | OpCompose | OpCons), _, _) } ->
-        err fname "differentiable code supports straight-line arithmetic, additive `reduce`, and rank-1 recursive arrays (v1); loop-object combinator operators (`<@>`, `>>=`, `<&>`, `<&!>`, `<*>`, `<$>`, `<|>`, `>>@`, `@>>`, `>>`, `::`) are not differentiable"
+    | { Kind = ExprKind.ExprBinOp (_, ((OpApply | OpBind | OpParallel | OpFusion | OpArrayProd | OpFunctor | OpChoice | OpComposeObj | OpComposeMeth | OpCompose | OpCons) as op), _, _) } ->
+        err fname (combinatorOpMsg op)
     | { Kind = ExprKind.ExprBinOp (_, _, l, r) } ->
         walkExpr fname ctx onVar inKernel l |> Result.bind (fun () -> walkExpr fname ctx onVar inKernel r)
     | { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar name }, args) } ->
@@ -484,6 +579,9 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
         onVar name
         args |> iterR (walkExpr fname ctx onVar inKernel)
     | { Kind = ExprKind.ExprApp _ } -> err fname "only named calls and array reads are supported in differentiated code"
+    // A tuple projection (`f[0]`, the elaborated spelling of a solve's factor
+    // operand): the tuple's name carries whatever taint it has.
+    | { Kind = ExprKind.ExprTupleIndex (t, _) } -> walkExpr fname ctx onVar inKernel t
     | { Kind = ExprKind.ExprArrayLit elems } ->
         elems |> iterR (walkExpr fname ctx onVar inKernel)
     | { Kind = ExprKind.ExprIf (c, t, f) } ->
@@ -514,8 +612,18 @@ let rec internal walkExpr (fname: string) (ctx: Ctx) (onVar: string -> unit) (in
         err fname "differentiable code supports straight-line arithmetic, additive `reduce`, and rank-1 recursive arrays (v1); this reduce could not be normalized (only `reduce(A, (+)[, init])` over an array variable or inline literal is differentiable)"
     | { Kind = ExprKind.ExprRecArray _ } ->
         err fname "differentiable code supports straight-line arithmetic, additive `reduce`, and rank-1 recursive arrays (v1); a recursive array is differentiable only as a top-level `let rec` binding in the body"
-    | { Kind = ExprKind.ExprLambda _ } | { Kind = ExprKind.ExprMethodFor _ } | { Kind = ExprKind.ExprObjectFor _ } | { Kind = ExprKind.ExprCompute _ } | { Kind = ExprKind.ExprPure _ } ->
-        err fname "differentiable code supports straight-line arithmetic, additive `reduce`, and rank-1 recursive arrays (v1); loop-object combinators (lambda/method_for/object_for/compute/pure) are not differentiable"
+    // A bare loop object or kernel that never reached an APPLICATION the
+    // rules could expand. (`compute`/`pure` never arrive here -- they are
+    // LinearForms, admitted above -- and are listed only so a future grammar
+    // change trips the exhaustiveness check rather than falling through.)
+    | { Kind = ExprKind.ExprLambda _ } ->
+        err fname (if errMode.Value = "grad"
+                   then $"{subsetHead}; this kernel lambda is never applied to a loop object in a position reverse mode can lower, so there is nothing to differentiate it AGAINST -- apply it (`let m = <loop> <@> <kernel> |> compute`) where its result is used"
+                   else $"{subsetHead}; a kernel lambda is differentiable only as the kernel of a `<@>` application, not as a value in its own right")
+    | { Kind = ExprKind.ExprMethodFor _ } | { Kind = ExprKind.ExprObjectFor _ } ->
+        err fname $"{subsetHead}; a bare loop object computes nothing until it is APPLIED -- bind it and apply it (`let L = method_for(...)` then `let m = L <@> <kernel> |> compute`), which is the shape both sweeps expand"
+    | { Kind = ExprKind.ExprCompute _ } | { Kind = ExprKind.ExprPure _ } ->
+        err fname $"{subsetHead}; loop-object combinators (compute/pure) are not differentiable here"
     | { Kind = ExprKind.ExprTuple _ } -> err fname "tuple values are not supported in differentiated code"
     | { Kind = ExprKind.ExprField _ } -> err fname "struct field access is not supported in differentiated code"
     | _ -> err fname "unsupported expression form in differentiated code"
@@ -579,7 +687,7 @@ let rec internal occursFree (name: string) (e: Expr) : bool =
     | ExprKind.ExprNth | ExprKind.ExprZero | ExprKind.ExprSection _
     | ExprKind.ExprRange _ | ExprKind.ExprReverse _ -> false
     | ExprKind.ExprUnaryOp (_, i) -> o i
-    | ExprKind.ExprTyped (i, _) | ExprKind.ExprBlocked (_, i) | ExprKind.ExprHalo (_, i)
+    | ExprKind.ExprTyped (i, _) | ExprKind.ExprHalo (_, i)
     | ExprKind.ExprPure i | ExprKind.ExprCompute i | ExprKind.ExprRead i
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprGroupBucket i
     | ExprKind.ExprExtents i | ExprKind.ExprStatic i | ExprKind.ExprObjectFor i
@@ -594,6 +702,7 @@ let rec internal occursFree (name: string) (e: Expr) : bool =
     | ExprKind.ExprContains (l, r) | ExprKind.ExprGroupBy (l, r)
     | ExprKind.ExprSort (l, r) | ExprKind.ExprGram (l, r)
     | ExprKind.ExprAssign (l, r) -> o l || o r
+    | ExprKind.ExprGramApply (a, b, x) -> o a || o b || o x
     | ExprKind.ExprApp (f, args) -> o f || any args
     | ExprKind.ExprIf (c, t, f) -> o c || o t || o f
     | ExprKind.ExprTuple es | ExprKind.ExprArrayLit es | ExprKind.ExprMethodFor es
@@ -649,7 +758,7 @@ let rec internal occursFree (name: string) (e: Expr) : bool =
         // outer map; the prefix/step vars shadow the slice, the seed var its
         // own arm.
         d.Name = name
-        || under [d.PrefixVar; d.StepVar] [d.SliceExpr]
+        || under [d.PrefixVar; d.StepVar] ([d.SliceExpr] @ Option.toList d.Guard)
         || (match d.SeedArm with
             | Some (sv, se) -> under [sv] [se]
             | None -> false)
@@ -699,7 +808,6 @@ let rec internal renameExpr (ren: Map<string, string>) (e: Expr) : Result<Expr, 
     | ExprKind.ExprObjectFor k -> r k |> Result.map (fun k' -> re (ExprObjectFor k'))
     | ExprKind.ExprDotDot (l, h) ->
         r l |> Result.bind (fun l' -> r h |> Result.map (fun h' -> re (ExprDotDot (l', h'))))
-    | ExprKind.ExprBlocked (t, inner) -> r inner |> Result.map (fun i -> re (ExprBlocked (t, i)))
     | ExprKind.ExprHalo (t, offs) -> r offs |> Result.map (fun o -> re (ExprHalo (t, o)))
     | ExprKind.ExprZip es -> rlist es |> Result.map (fun es' -> re (ExprZip es'))
     | ExprKind.ExprAlign (es, spec) -> rlist es |> Result.map (fun es' -> re (ExprAlign (es', spec)))
@@ -742,6 +850,8 @@ let rec internal renameExpr (ren: Map<string, string>) (e: Expr) : Result<Expr, 
     | ExprKind.ExprDecompact (a, d) -> r a |> Result.map (fun a' -> re (ExprDecompact (a', d)))
     | ExprKind.ExprGram (a, b) ->
         r a |> Result.bind (fun a' -> r b |> Result.map (fun b' -> re (ExprGram (a', b'))))
+    | ExprKind.ExprGramApply (a, b, x) ->
+        r a |> Result.bind (fun a' -> r b |> Result.bind (fun b' -> r x |> Result.map (fun x' -> re (ExprGramApply (a', b', x')))))
     | ExprKind.ExprExtents a -> r a |> Result.map (fun a' -> re (ExprExtents a'))
     | ExprKind.ExprStruct (nm, fields, spread) ->
         fields
@@ -853,8 +963,14 @@ let rec internal renameExpr (ren: Map<string, string>) (e: Expr) : Result<Expr, 
         // the slice/seed scopes).
         let sliceNames = [def.PrefixVar; def.StepVar]
         let renSlice = shadowNames sliceNames ren
-        captureCheck renSlice sliceNames [def.SliceExpr] |> Result.bind (fun () ->
+        // The guard scopes exactly like the slice (reads prefix/step under
+        // the same binders), so it renames under the same shadowed map.
+        captureCheck renSlice sliceNames ([def.SliceExpr] @ Option.toList def.Guard) |> Result.bind (fun () ->
         renameExpr renSlice def.SliceExpr |> Result.bind (fun slice' ->
+        (match def.Guard with
+         | None -> Ok None
+         | Some g -> renameExpr renSlice g |> Result.map Some)
+        |> Result.bind (fun guard' ->
         (match def.SeedArm with
          | None -> Ok None
          | Some (sv, se) ->
@@ -862,7 +978,7 @@ let rec internal renameExpr (ren: Map<string, string>) (e: Expr) : Result<Expr, 
              captureCheck renSeed [sv] [se] |> Result.bind (fun () ->
              renameExpr renSeed se |> Result.map (fun se' -> Some (sv, se'))))
         |> Result.map (fun seed' ->
-            re (ExprRecArray { def with Name = rn def.Name; SeedArm = seed'; SliceExpr = slice' }))))
+            re (ExprRecArray { def with Name = rn def.Name; SeedArm = seed'; SliceExpr = slice'; Guard = guard' })))))
 
 /// A shadowed scope captures a renamed reference only when a SURVIVING
 /// mapping's target equals a binder name AND its source occurs FREE in the
@@ -1025,16 +1141,33 @@ let internal mentionsVar (name: string) (e: Expr) : bool =
 /// ambient reduce-source extent env). The bound NAME is reused as the buffer
 /// so downstream reads of it keep resolving.
 ///
-///   * additive prefix recurrence `prefix :: prefix(n-1) + INC` (with a
-///     `zero :: n` seed arm, INC prefix-free) -> a TRIANGULAR accumulation
-///     `s(k) += INC[n:=m]` over `m in 1..k+1`. A same-direction adjoint loop
-///     is wrong for a genuine scan, so the scan is unrolled into independent
-///     scatter-adds -- semantically identical, and exactly differentiable.
+///   * a recurrence reading its immediate predecessor `prefix(n-1)` (with a
+///     `zero :: n` seed arm) -> the DIRECT loop `s(0) = seed; for n in 1..N
+///     { s(n) = SLICE[prefix := s] }`, in BOTH modes. Forward mode
+///     differentiates it in place (the tangent recurrence mirrors it).
+///     Reverse mode admits any smooth first-order slice `g(prefix(n-1), ..)`:
+///     its adjoint is the same loop run BACKWARDS -- the `CarryLoop`
+///     recognizer (GradNormalize) exempts it from the loop discipline and
+///     the `NFor` adjoint arm (GradSweeps) emits the descending sweep, O(n)
+///     work (docs/plans/structural/01, milestones A and B). The trajectory
+///     buffer is the tape: at descending step t the general-overwrite rule
+///     evaluates `dg/ds` at the primal `s(t-1)`, which is final. The
+///     triangular scatter-add this used to unroll into was O(n^2) in both
+///     the replayed primal and the adjoint, and admitted the additive shape
+///     only.
 ///   * prefix-free construction `prefix :: f(n)` -> direct element writes.
-///   * anything else (nonlinear recurrence, rank >= 2, no seed) is rejected.
+///   * anything else (deeper lags, rank >= 2, no seed) is rejected.
 let internal expandRecArray (fname: string) (ctx: Ctx)
                            (name: string) (annot: TypeExpr) (def: RecArrayDef)
     : Result<Stmt list * int, string> =
+    // A `while` guard makes the stopping ordinal DATA-DEPENDENT: the adjoint
+    // loop's trip count would depend on primal values, which the fixed-extent
+    // sweep below cannot express. Refused in v1. (v2: the guard declares a
+    // fixed point -- exactly the structure an implicit-function-theorem
+    // adjoint wants; see plan-fortran-killer.md arc 6.)
+    if def.Guard.IsSome then
+        err fname $"recursive array '{name}': a `while`-guarded recursive array is not differentiable (v1) -- the stopping ordinal is data-dependent"
+    else
     match arrayLiteralExtents (resolveArrayTy ctx annot) with
     | None ->
         err fname $"recursive array '{name}': a differentiable recursive array needs an `Array<Float like Idx<n>>` annotation with a literal extent (v1)"
@@ -1071,21 +1204,15 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
                  | _ -> false)
             | _ -> false
         let hasPrefix (e: Expr) = mentionsVar prefixVar e
-        // additive-prefix slice `prefix(n-1) + REST` / `REST + prefix(n-1)`,
-        // REST prefix-free -> Some REST (the per-step increment).
-        let additiveRest =
-            match def.SliceExpr.Kind with
-            | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevPrefixRead a && not (hasPrefix b) -> Some b
-            | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevPrefixRead b && not (hasPrefix a) -> Some a
-            | _ -> None
-        if errMode.Value = "jvp" && hasPrefix def.SliceExpr then
-            // FORWARD lowering of a genuine recurrence: it differentiates in
-            // place (the tangent recurrence mirrors it), so ANY smooth slice
-            // lowers to the direct element-write loop -- no triangular
-            // unroll, no additive restriction, and O(n) where grad's unroll
-            // is O(n^2). Prefix reads become reads of the buffer being
-            // built; v1 admits the immediate predecessor only -- deeper lags
-            // rely on the implicit-zero reads a plain loop cannot supply.
+        if hasPrefix def.SliceExpr then
+            // A genuine recurrence lowers to the DIRECT element-write loop in
+            // both modes. Forward mode differentiates it in place (the
+            // tangent recurrence mirrors it); reverse mode runs the same loop
+            // backwards (the CarryLoop arm in GradSweeps), the trajectory
+            // buffer serving as the tape. Both admit any smooth slice of the
+            // immediate predecessor. Prefix reads become reads of the buffer
+            // being built; v1 admits the immediate predecessor only -- deeper
+            // lags rely on the implicit-zero reads a plain loop cannot supply.
             let rec onlyPrevReads (x: Expr) : bool =
                 match x.Kind with
                 | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar p }, [idx]) when p = prefixVar ->
@@ -1104,7 +1231,7 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
             | None -> err fname $"recursive array '{name}': a recurrence needs a `zero :: n` seed arm to be differentiable (v1)"
             | Some (seedStep, seedExpr) ->
                 if not (onlyPrevReads def.SliceExpr) then
-                    err fname $"recursive array '{name}': forward mode differentiates recurrences reading the immediate predecessor `prefix(n - 1)` only (deeper lags rely on implicit-zero reads a direct loop cannot supply, v1)"
+                    err fname $"recursive array '{name}': a differentiable recurrence may read the immediate predecessor `prefix(n - 1)` only (deeper lags rely on implicit-zero reads a direct loop cannot supply, v1)"
                 else
                     let sliceB = subst prefixVar bufVar def.SliceExpr
                     let seedWrite = [ StmtExpr (syn (ExprAssign (sAt (iLit 0L), subst seedStep (iLit 0L) seedExpr))) ]
@@ -1114,27 +1241,6 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
                                    [ StmtExpr (syn (ExprAssign (sAt (v stepVar), sliceB))) ])
                     Ok (bufLet :: (seedWrite @ [loop]), n)
         else
-        match additiveRest, def.SeedArm with
-        | Some rest, Some (seedStep, seedExpr) ->
-            let seeded = subst seedStep (iLit 0L) seedExpr
-            let isZeroSeed = (match seeded.Kind with ExprKind.ExprLit (LitFloat 0.0) -> true | _ -> false)
-            let kVar = fresh ctx "__rk"
-            let mVar = fresh ctx "__rm"
-            let restM = subst stepVar (v mVar) rest
-            let innerLoop =
-                StmtForIn (mVar,
-                           syn (ExprDotDot (iLit 1L, add (v kVar) (iLit 1L))),
-                           [ StmtExpr (syn (ExprAssign (sAt (v kVar), add (sAt (v kVar)) restM))) ])
-            let seedCarry =
-                if isZeroSeed then []
-                else [ StmtExpr (syn (ExprAssign (sAt (v kVar), add (sAt (v kVar)) seeded))) ]
-            let outerLoop =
-                StmtForIn (kVar, syn (ExprDotDot (iLit 1L, iLit (int64 n))), seedCarry @ [innerLoop])
-            let seedWrite =
-                if isZeroSeed then []
-                else [ StmtExpr (syn (ExprAssign (sAt (iLit 0L), seeded))) ]
-            Ok (bufLet :: (seedWrite @ [outerLoop]), n)
-        | None, _ when not (hasPrefix def.SliceExpr) ->
             // Pure construction (no carried state): direct element writes.
             let loopStart, seedStmts =
                 match def.SeedArm with
@@ -1146,8 +1252,6 @@ let internal expandRecArray (fname: string) (ctx: Ctx)
                            syn (ExprDotDot (iLit loopStart, iLit (int64 n))),
                            [ StmtExpr (syn (ExprAssign (sAt (v stepVar), def.SliceExpr))) ])
             Ok (bufLet :: (seedStmts @ [loop]), n)
-        | _ ->
-            err fname $"recursive array '{name}' is not differentiable (v1): only additive prefix recurrences `prefix :: prefix(n-1) + <increment>` (with a `zero :: n` seed arm and a prefix-free increment) and prefix-free construction are supported"
     | Some (true, exts) ->
         err fname $"recursive array '{name}': only rank-1 (scalar-slice) recursive arrays are differentiable (v1); a rank-{exts.Length} recursive array is not supported"
 
@@ -1267,22 +1371,16 @@ let rec internal staticExtentOf (ctx: Ctx) (env: Map<string, int>) (e: Expr) : i
         parts |> List.fold (fun acc p ->
             acc |> Option.bind (fun tot -> staticExtentOf ctx env p |> Option.map (fun n -> tot + n)))
             (Some 0)
-    // A halo traversal's extent is the SHRUNK interior: N - (max - min)
-    // over its literal offsets (shrink is the only boundary policy).
-    | ExprKind.ExprHalo (inner, { Kind = ExprKind.ExprArrayLit offs }) ->
-        (match resolveTy ctx inner with
-         | TyIdx { Kind = ExprKind.ExprLit (LitInt n) } ->
-             let lits =
-                 offs |> List.map (fun o ->
-                     match o.Kind with
-                     | ExprKind.ExprLit (LitInt k) -> Some (int k)
-                     | ExprKind.ExprUnaryOp (OpNeg, { Kind = ExprKind.ExprLit (LitInt k) }) -> Some (-(int k))
-                     | _ -> None)
-             if not lits.IsEmpty && lits |> List.forall Option.isSome then
-                 let vs = lits |> List.map Option.get
-                 Some (int n - (List.max vs - List.min vs))
-             else None
-         | _ -> None)
+    // A halo traversal's extent is the SHRUNK interior, N - Shrink, read
+    // off the same access record the checker and the runtime guards use
+    // (docs/plans/structural/02, 2.1). This arm used to compute
+    // `max - min` over the DECLARED offsets, which is only the shrink when
+    // 0 is among them: for a one-sided lag set like `[-2, -4]` (loops/078)
+    // it said 6 of 8 where the interior is 4 of 8 -- the centre is always
+    // in the reach -- and both AD lanes' reduce loops over the map ran two
+    // cells past its buffer (ASan-caught by tests/AccessTests.fs).
+    | ExprKind.ExprHalo (inner, offs) ->
+        haloAccessOfSurface ctx inner offs |> Option.map (fun (h, n) -> n - int h.Shrink)
     // a loop side the decomposition above could not read (an unrecorded name,
     // or the `>>@`-composed object of a DECLINED fusion): the right side is
     // then the operand list, and its leading operand is the extent
@@ -1318,9 +1416,58 @@ let rec internal staticExtentOf (ctx: Ctx) (env: Map<string, int>) (e: Expr) : i
 /// exactly the ones `adjointOfInit` has a reverse flow for -- adding a shape
 /// to this table without adding its flow only moves the refusal, it does not
 /// remove one.
+/// Rewrite the window reads of a halo kernel body: `w(k)` becomes
+/// `idx + (Start + k)` -- the interior ordinal `idx` plus the static offset
+/// into the inner space -- for a literal k (refused when outside the
+/// declared reach, the checker's BL4019 rule), and `idx + (Start + e)` for a
+/// computed offset e (never refused here: the declared reach is a runtime
+/// property of e, as the checker also holds). The window itself may not be
+/// passed on, and the walk covers the forms a stencil kernel is made of:
+/// literals, names, arithmetic, calls, `if`, tuples, annotations. Anything
+/// else that mentions the window is declined -- never silently kept.
+let internal substWindowReads (fname: string) (wname: string) (h: Blade.Types.HaloAccess) (idx: Expr) (body: Expr) : Result<Expr, string> =
+    let rec go (e: Expr) : Result<Expr, string> =
+        let re (k: ExprKind) = inheritSpan e k
+        match e.Kind with
+        | ExprKind.ExprLit _ -> Ok e
+        | ExprKind.ExprVar n when n = wname ->
+            err fname $"the halo window '{wname}' may only be read through, as `{wname}(o)`; passing the window itself on is not differentiable in reverse mode (v1)"
+        | ExprKind.ExprVar _ -> Ok e
+        | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar n }, [ off ]) when n = wname ->
+            (match literalOffsetOf off with
+             | Some k when not (Blade.Types.haloOffsetInReach h k) ->
+                 let reach = h.Offsets |> List.map string |> String.concat ", "
+                 err fname $"the window read `{wname}({k})` is outside the declared halo reach [{reach}]"
+             | Some k -> Ok (add idx (iLit (h.Start + int64 k)))
+             | None -> go off |> Result.map (fun off' -> add idx (add (iLit h.Start) off')))
+        | ExprKind.ExprApp (f, args) ->
+            go f |> Result.bind (fun f' ->
+            traverseR go args |> Result.map (fun args' -> re (ExprApp (f', args'))))
+        | ExprKind.ExprBinOp (m, op, l, r) ->
+            go l |> Result.bind (fun l' -> go r |> Result.map (fun r' -> re (ExprBinOp (m, op, l', r'))))
+        | ExprKind.ExprUnaryOp (op, x) -> go x |> Result.map (fun x' -> re (ExprUnaryOp (op, x')))
+        | ExprKind.ExprTyped (x, t) -> go x |> Result.map (fun x' -> re (ExprTyped (x', t)))
+        | ExprKind.ExprIf (c, t, f) ->
+            go c |> Result.bind (fun c' -> go t |> Result.bind (fun t' -> go f |> Result.map (fun f' -> re (ExprIf (c', t', f')))))
+        | ExprKind.ExprTuple es -> traverseR go es |> Result.map (fun es' -> re (ExprTuple es'))
+        | _ ->
+            if mentionsVar wname e then
+                err fname $"this kernel form reads the halo window '{wname}' in a way reverse mode does not support (v1): the window may be read as `{wname}(o)` inside arithmetic, intrinsic calls, array reads, `if` and tuples"
+            else Ok e
+    go body
+
 let rec internal staticDimsOf (ctx: Ctx) (denv: Map<string, int list>) (e: Expr) : int list option =
     match e with
     | ConstFill ({ Kind = ExprKind.ExprLit (LitInt n) }, _) -> Some [int n]
+    // A sole-halo stencil map kept as a local by the reverse gather route:
+    // its shape is the shrunk interior N - Shrink, from the surface
+    // literals. Its FLOW is GradSweeps.adjointOfInit's gather arm (the
+    // shape is only offered where that flow exists: reverse mode).
+    | _ when errMode.Value = "grad" && (soleHaloOf e).IsSome ->
+        (match soleHaloOf e with
+         | Some (inner, offs, _) ->
+             haloAccessOfSurface ctx inner offs |> Option.map (fun (h, n) -> [ n - int h.Shrink ])
+         | None -> None)
     | _ ->
     match e.Kind with
     | ExprKind.ExprVar n -> Map.tryFind n denv
@@ -1358,8 +1505,15 @@ let rec internal staticDimsOf (ctx: Ctx) (denv: Map<string, int list>) (e: Expr)
         (match staticDimsOf ctx denv a, staticDimsOf ctx denv b with
          | Some (i :: _), Some (j :: _) -> Some [i; j]
          | _ -> None)
+    // gram_apply(A, B, x): a vector over A's leading axis
+    | ExprKind.ExprGramApply (a, _, _) ->
+        (match staticDimsOf ctx denv a with
+         | Some (i :: _) -> Some [i]
+         | _ -> None)
     // C7: a sort is a permutation -- same shape as its (rank-1) operand
     | ExprKind.ExprSort (a, _) -> staticDimsOf ctx denv a
+    // a solve against LU factors: the right-hand side's shape
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar n }, [ _; _; b ]) when isLuSolveName n -> staticDimsOf ctx denv b
     | _ -> None
 
 /// Zero array literal for a dims list (rank-general).

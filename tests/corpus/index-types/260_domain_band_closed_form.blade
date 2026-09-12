@@ -1,0 +1,24 @@
+// TEST: Enumerable Domain: A Band Iterated In Closed Form
+// A `static struct` name stands where an index type stands
+// (docs/plans/structural/06): `range<Band>` iterates exactly the solution set
+// of the struct's constraints -- here the band |i - j| <= 2 over a 9 x 9 box
+// -- enumerated in CLOSED FORM: level j runs over [max(0, i - 2), min(8, i + 2)],
+// its ends affine in i, so the loop visits the 39 solutions and never the 42
+// excluded cells. Positional params in declaration order; the output is a
+// sparse-shaped array over the same key set (full-key reads `R((i, j))`,
+// a flat fold in lex order). The count agrees with the counting layer's
+// certificate: n(2w+1) - w(w+1) = 9*5 - 6 = 39.
+static struct Band {
+    i: Int<min=0, max=8>,
+    j: Int<min=0, max=8>
+} where abs(i - j) <= 2
+
+let static CARD = idx_card(Band)
+// EXPECT: CARD = 39
+let R = method_for(range<Band>) <@> lambda(i, j) -> i * 10 + j |> compute
+let total = reduce(R, (+))
+// EXPECT: total = 1716
+let corner = R((8, 6))
+// EXPECT: corner = 86
+let first = R((0, 2))
+// EXPECT: first = 2

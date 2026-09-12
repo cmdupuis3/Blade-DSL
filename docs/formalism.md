@@ -410,6 +410,25 @@ extents — lookup hashes the tuple directly. Keys keep their **given order**
 (never sorted): iteration visits |keys| entries in key order, and the compact
 buffer is laid out in that order. Duplicate keys are a construction error.
 
+**A `static struct` name as an index type** (enumerable constrained domains,
+docs/plans/structural/06) — `range<R>` and `Array<T like R>` accept the name of
+a `static struct R { f₁: Int<min=a, max=b>, ... } where p₁, p₂, ...` whose
+fields are `Int` or `Nat` with static bounds: the iteration space is the
+struct's SOLUTION SET, in lex order of the fields (first field outermost), and
+the kernel takes one positional parameter per field. When every conjunct is a
+linear inequality on the fields (`i - j <= w`, `abs(i - j) <= w`,
+`l3 <= l1 + l2`, `m1 + m2 == m_out`; `<`, `>`, `>=`, `==`, `&&` accepted) the
+solutions are enumerated in CLOSED FORM — nested loops whose bounds are affine
+in the earlier fields, difference constraints Fourier–Motzkin-projected so no
+prefix is dead — exactly the solutions are visited and the box is never scanned
+nor capped. Otherwise the solutions are enumerated once at compile time by the
+counting layer (`idx_card`'s certified routes, box ≤ 100,000 cells) and baked
+as a key table, with a BL4010 advisory; a non-linear domain over the cap is
+refused (BL4020). Either way the slot is SparseIdx-shaped: the output is a
+sparse array over the solution set (full-key reads `R((i, j))`, flat folds in
+lex order), a domain slot is the whole iteration space (`range<R, J>` is
+refused), and an empty domain warns and iterates zero times.
+
 Tuple indexing with wildcards: a full key is an O(1) hash lookup (a missing
 key is a runtime error); a wildcard/short-prefix partial returns the matching
 entries **by gather** — with no sorted table there is no contiguous-window
@@ -717,13 +736,28 @@ the annotation hook only.
 
 - `gram(...)` — Gram matrix construction over dense, symmetric, or Hermitian
   structure (value-checked against independent oracles).
+- `gram_apply(A, B, x)` — the ACTION of `gram(A, B)` on a vector, `A·(Bᴴ·x)`,
+  without forming the Gram matrix: A is m × n, B is p × n, x has p cells,
+  the result m; two rank-1 temporaries and never an m × p pool. The factors
+  obey `gram`'s rules (rank 2, plain axes, one element type, contracted
+  extents agree), x must have B's leading extent (static: refused; dynamic:
+  BL8011), units multiply through both contractions, and complex factors
+  conjugate B exactly as `gram` does. Its reverse-mode adjoint action is
+  itself a `gram_apply` (`x̄ += gram_apply(B, A, ȳ)`); the factor cotangents
+  are outer products of the cotangent with the two n-cell intermediates.
 - `hermitian(A)` — adjoint.
 - `conj(x)` — componentwise conjugation (identity on reals).
 - `reduce(A[, kernel[, init]][, axes = n])` — right-to-left fold of the
   innermost `n` dimensions, `n = 1` by default (rank k in, rank k−n out;
   `n = rank(A)` is the full fold to a scalar); default kernel `(+)`; see
   [features/sql.md](features/sql.md) §10 for typing details, the axis-count
-  rules and the empty-input rule.
+  rules and the empty-input rule. Under the default `n = 1`, an anonymous
+  deferred outer product `reduce(method_for(A, B) <@> lambda(a, b) -> f(a, b),
+  op[, init])` (named rank-1 sources, no `where` clause on the map kernel, a
+  `(+)`/`(*)` section or a seeded fold) is evaluated row by row -- an outer
+  apply over `A` whose row kernel is the fused fold over `B` -- and the
+  |A| × |B| product is never materialized; the values are those of the
+  materialized route (the same left fold per row).
 - `extents(A)` — rank-1: scalar; dense rank-k: tuple, outermost first;
   compound: cardinality. Rejected where a per-dimension scalar doesn't exist
   (ragged/grouped) — use `extents(row)`.
@@ -782,14 +816,32 @@ Type-level iteration sources with `Void` element type; they erase completely:
 ```blade
 range<I>       // enumerate I in storage (= lex) order:  λi:I. i
 reverse<I>     // reversed
-blocked<I, K>  // K-sized cache blocks (spec level)
 ```
+
+(`blocked<I, K>` was a spec-level placeholder for block iteration; it never had a
+parser arm and is gone. Block structure is a property of the AXIS: `Chunked<I, K>`
+and `segments(A)`, plans/structural/07.)
 
 `range<CompoundIdx<...>>` emits mask-true tuples. Virtual and real arrays
 compose in one loop:
 `method_for(range<I>, A, B) <@> lambda(i.., a, b) -> ...` — this is how
-kernels receive indices without breaking index anonymity. Anonymous range
-forms (zero-based, offset, literal extents) are supported.
+kernels receive indices without breaking index anonymity.
+
+**Anonymous ranges.** `m..n` (half-open, Int64 elements) is a virtual array
+equivalent to `range<Idx<n-m>> + m`: `0..5` enumerates `0,1,2,3,4`. Bounds
+must be static (a `let static` name folds). The index type is anonymous, so
+its elements index any plain-`Idx` slot without a tag cast — which makes it
+the natural spelling for index generation feeding *arithmetic*, where
+`range<I>` would tag the result and demand `(k : I)` casts downstream.
+
+A plain dense range — `m..n` or single-slot `range<I>` — is an ordinary
+rank-1 array value: it lifts elementwise (`(0..5) + 10`,
+`x0 + dx * Float64(0..n)` — the coordinate-axis idiom), folds
+(`reduce(0..n, (+))`), and materializes when bound bare or forced
+(`let xs = 0..n`, `|> compute`). Inside a loop nest it never materializes —
+the nest peels it as induction values. Compound/sparse/halo ranges and
+multi-slot `range<I, J>` enumerate coordinate *sets*, not element values, and
+exist only as nest inputs.
 
 **`range<SymIdx<r,N>>` / `range<AntisymIdx<r,N>>` hand the kernel PREFIX
 OFFSETS, not canonical indices.** A multi-rank slot contributes one param per
@@ -981,6 +1033,43 @@ array (a CFL max, a loss trace) folds in enumeration order without a second
 pass. State continuation is a second definition seeded from the first's
 final slice.
 
+#### 7.5.1 The `while` guard: iterate to convergence
+
+The inductive arm may carry a **convergence guard**, which turns the declared
+extent from a trip count into a **budget**:
+
+```blade
+type It = Idx<200>                       // a BUDGET, not a trip count
+let rec u: Array<Float like It, Y, X> =
+    match u with
+    | zero -> zero
+    | zero :: s -> zero :: u0
+    | prefix :: n while residual(prefix(n - 1)) > tol -> prefix :: sweep(prefix(n - 1))
+```
+
+Semantics, in three parts:
+
+- **Defined** up to the first `n` at which the guard is false. The guard is
+  a predicate (it unifies with `Bool`) and reads the prefix under exactly the
+  rules the slice does — same legal index shapes, same implicit zero history,
+  so a guard reading `prefix(n - 1)` at `n = 0` reads zero rather than
+  garbage.
+- **Frozen** afterwards: the last written slice repeats to the end of the
+  extent. The family therefore stays total at its declared type — every
+  consumer, fold, and interior read sees a full trajectory, and the
+  hand-written idempotent-freeze idiom this replaces agrees with it bitwise.
+- **Aborts** (BL8010, naming the array and the budget) if the guard is still
+  true when the budget is exhausted. This is the point of the construct: a
+  solve that did not converge cannot silently pretend it did, which is
+  precisely what a fixed-trip-count loop offers no way to distinguish.
+
+The guard can only stop the sweep EARLY, so the extent stays static and the
+decidability fence above is untouched. What it buys is cost (the emitted
+sweep exits instead of running the full budget) and diagnosis, not
+expressiveness. A `while`-guarded array is not differentiable in v1: the
+stopping ordinal is data-dependent, so `grad` refuses it rather than
+linearizing a trip count that depends on primal values.
+
 ## 8. Arity Polymorphism
 
 ### 8.1 The concept
@@ -1139,7 +1228,9 @@ come from the same MethodLoop: they must only agree on the joint index space
 writes no cells and so has no output shape to reconcile.
 
 Legs referring to the same **named deferred** computation evaluate it once per
-joint cell; the name is the declaration. One leg is the identity (a scalar, not
+joint cell; the name is the declaration, whether it stands in an operand slot
+(`prodsum(e, v)`) or is a leg's own traversal (`reduce(e, (+))`) -- the leg
+folds the shared cell, not a second evaluation. One leg is the identity (a scalar, not
 a 1-tuple); zero legs has no index space and is refused. Both spellings are
 `docs/plan-reduction-joins.md`; note that `object_for(<&!>) <@> (c₁, …, c_k)`
 over deferred MAPS keeps its existing reading (n-ary map fusion answering k
@@ -1527,7 +1618,12 @@ library concern.
 - Sequential recurrences: there is no imperative `for x in RANGE { body }`
   statement — it is expressed as a recursive array (structural induction on
   extent; see §7.5), with folds as `reduce(...)` and parallel maps as
-  `method_for(range<...>) <@> lambda(...)`.
+  `method_for(range<...>) <@> lambda(...)`. Iterate-to-convergence is the
+  inductive arm's `while` guard, `| prefix :: n while COND -> prefix :: e`
+  (§7.5.1): defined until the guard goes false, frozen after, BL8010 if the
+  budget runs out with the guard still true. `while` is not a keyword — it is
+  recognized positionally between the step variable and `->`, so a program
+  may still bind the name.
 - Tuples: `(a, b)` literals; destructuring exact / wildcard / `head :: tail`;
   `()` unit; `(e)` is grouping, not a 1-tuple.
 - Sum types: `type Option<T> = Some : T | None`; construction `Some(42)`;
@@ -1551,6 +1647,8 @@ for (A, B) in range<I> <@> lambda(i, j, a, b) -> ...
 c₁ <&> c₂    (M<@>f) <&!> (M<@>g)    L₁ <*> L₂    o₁ >>@ o₂    c₁ @>> c₂
 c >>= k      pure v     f <$> c      guard(p, c)  sequence [..]  replicate n c
 c |> compute
+0..n         // anonymous range (§7.3): a rank-1 Int64 array value —
+             // method_for(0..n), reduce(0..n, (+)), x0 + dx * Float64(0..n)
 ```
 
 ### 15.6 Pseudo-native mathematics
@@ -1602,9 +1700,9 @@ application; sectioned operators `(+)`, `(/) x`.
 | `comm(...)` `poly(args)` `arity` `nth` | commutativity, arity polymorphism |
 | `omp(x: n)` `cuda` `tdim(...)` | backend/parallelism/T-dim clauses |
 | `mask` `compound` `intersect` `union` `unique` `contains` `group_keys` `group_by` `sort` `reduce` `extents` | relational forms |
-| `gram` `hermitian` `conj` | linear-algebra value operators |
+| `gram` `gram_apply` `hermitian` `conj` | linear-algebra value operators |
 | `reynolds(g[, Antisymmetric])` | symmetrizing kernel wrapper |
-| `range<I>` `reverse<I>` `blocked<I,K>` | virtual arrays |
+| `range<I>` `reverse<I>` `m..n` | virtual arrays (`m..n` anonymous, half-open) |
 | `Nat<I>` | unit-tagged index value |
 
 ## Appendix B: Glossary

@@ -1,0 +1,2113 @@
+// %% [markdown]
+// # The matched-moment discriminator: a dataset where K >= 1 is the only signal
+//
+// Moment jets were tried first on real MD17-aspirin energies, and lost,
+// honestly: the K = 0 windowed occupancies carry the energy and the K >= 1
+// jet blocks add nothing measurable — a verdict that survived an 8–64×
+// step budget, learnable windows, and atom-centered variants (the campaign
+// record lives in `docs/plans/plan-equivariant-nn-notebooks.md` §3). This
+// notebook is the dataset that verdict asks for — one where the situation is
+// **inverted by construction**. Four classes of 3-D point clouds are
+// engineered so that everything up to and including second moments is not
+// merely matched in distribution but **identical, per sample, to machine
+// precision** — and so that each class is then visible to exactly one block
+// of the moment jet:
+//
+// | class | generator | the one block that sees it |
+// |---|---|---|
+// | `iso` | Gaussian | — (the null) |
+// | `octa` | 6 lobes along the +-axes | K4, l = 4 (even anisotropy) |
+// | `tetra` | 4 lobes at tetrahedral vertices | K3 (parity-odd anisotropy) |
+// | `heavy` | radial scale-mixture | K4, l = 0 (kurtosis) |
+//
+// Two exactness devices, applied by the generator
+// (`examples/tools/make_moments_zarr.fsx`): **per-sample whitening** — center,
+// then apply the sample's own symmetric Sigma^(-1/2), so K1 = 0 and the
+// sample covariance = I exactly, closing the finite-N leak by which
+// covariance-estimator fluctuations carry fourth-moment information — and
+// **radial quantile matching** — each iso/octa/tetra sample's radii are
+// monotonically re-mapped onto one fixed reference profile, a
+// direction-preserving (hence equivariant, hence anisotropy-preserving) map
+// after which every radial functional, including the K = 0 shell occupancies
+// that won on aspirin, is identical across the matched three. The heavy
+// class skips the radial step; it IS the radial class. The generator
+// iterates the two maps to joint convergence with whitening LAST, so the
+// K <= 2 statements below are exact and the radial ones carry a ~1e-13
+// residual (printed by the `.fsx`, asserted here).
+//
+// This is not an exotic setup; it is the shape of a family of real problems.
+// ICA whitens first precisely so that fourth cumulants are the signal that
+// remains. In diffusion MRI, crossing fibers are invisible to the tensor
+// (l <= 2) model and resolved at l = 4. Bond-orientational order in
+// supercooled liquids is measured by the Steinhardt Q4/W4 invariants after
+// the pair-distance structure is controlled; water's local tetrahedrality is
+// an l = 3, parity-odd order parameter; and CMB non-Gaussianity is by
+// definition structure beyond the power spectrum. In each case the first two
+// moments are held fixed and the physics lives above them.
+//
+// The notebook proves its construction as **theorems pinned on the data**
+// (K <= 2 features are sample-independent; the K = 0 winner from aspirin
+// scores chance here on the matched three), then trains the same certified
+// stack four times — reading K0-only, K <= 2, +K3, +K3+K4 — with the rung x
+// class confusion structure **predicted from representation theory before
+// the training cells run**, and measured after.
+
+// %%
+import ml as ml
+import ad as ad
+import ppl as ppl
+import zarr as z
+import rand as r
+import plot
+
+let store = z.load("examples/data/moments.zarr")
+type SampTr = store.index.samp_tr
+type SampTe = store.index.samp_te
+type Pt = store.index.pt
+type Xyz = store.index.xyz
+type Klass = store.index.klass
+type Epoch = store.index.epoch
+type RotK = store.index.rotk
+type Nine = store.index.nine
+type Shell = store.index.shell
+
+// `__` marks an internal buffer: these are read with computed integer
+// subscripts (BL4003 tag-note exemption). The `_yzx` copies are the store's
+// permuted coordinates: the raw l = 1 basis inside the irreps machinery is
+// ordered (y, z, x) (the convention both sibling notebooks pin), and
+// everything jet-shaped below feeds `ml.derive_poly` directly. The plain
+// Cartesian copies are for the rotation certificate at the end, where the
+// stored 3x3 matrices act.
+let __ptr: Array<Float like SampTr, Pt, Xyz> = store.vars.pos_train_yzx |> z.read
+let __pte: Array<Float like SampTe, Pt, Xyz> = store.vars.pos_test_yzx |> z.read
+let __ctr: Array<Float like SampTr, Pt, Xyz> = store.vars.pos_train |> z.read
+let __cte: Array<Float like SampTe, Pt, Xyz> = store.vars.pos_test |> z.read
+let __ytr: Array<Float like SampTr, Klass> = store.vars.y_train |> z.read
+let __yte: Array<Float like SampTe, Klass> = store.vars.y_test |> z.read
+let __perm: Array<Int64 like Epoch, SampTr> = store.vars.perm |> z.read
+let __rot: Array<Float like RotK, Nine> = store.vars.rot3 |> z.read
+let __smu: Array<Float like Shell> = store.vars.shell_mu |> z.read
+let __ssg: Array<Float like Shell> = store.vars.shell_sg |> z.read
+let __dpi: Array<Float like Pt, Xyz> = store.vars.demo_icosa_yzx |> z.read
+
+let static NPOINT = 120
+let static NP3 = 360
+let static NTR = 400
+let static NTE = 200
+let static NC = 4
+let static NSHELL = 5
+
+// Class-major layout: train rows 0..99 iso, 100..199 octa, 200..299 tetra,
+// 300..399 heavy; test rows in blocks of 50, same order.
+let sizing = [NTR, NTE, NPOINT, NC, NSHELL]
+sizing
+// EXPECT: sizing = [400, 200, 120, 4, 5]
+
+// %% [markdown]
+// ## Representations: what each order of the jet is allowed to contain
+//
+// `PT` is the representation of a single 3-vector — one odd l = 1 copy — and
+// `ml.sym_spec(PT, K)` is its K-th symmetric power, the representation a
+// degree-K moment of a point cloud lives in. The spec is the theorem in
+// miniature, before any data arrives: Sym^2 = l 0+2 (both even), Sym^3 =
+// l 1+3 (both ODD — this is why the tetrahedral class needs K3 and why a
+// centrosymmetric cloud has no K3 at all), Sym^4 = l 0+2+4 (the kurtosis
+// slot, and the finest even anisotropy this compiler can represent: K is
+// capped at 4, so l = 6 order is beyond every jet below — a fact the
+// icosahedral cell turns into a pin).
+//
+// `ISPEC4` is the concatenated K1..K4 jet a sample presents to the top rung;
+// its block offsets come from `ml.irreps_offset`, so the layout is written
+// down in exactly one place — the spec itself.
+
+// %%
+let static PT = [(1, 1, 1)]
+let static SK1 = ml.sym_spec(PT, 1)
+let static SK2 = ml.sym_spec(PT, 2)
+let static SK3 = ml.sym_spec(PT, 3)
+let static SK4 = ml.sym_spec(PT, 4)
+let static DS2 = ml.total_dim(SK2)
+let static DS3 = ml.total_dim(SK3)
+let static DS4 = ml.total_dim(SK4)
+let static S2L0 = ml.irreps_offset(SK2, 0)
+let static S2L2 = ml.irreps_offset(SK2, 1)
+let static S3L1 = ml.irreps_offset(SK3, 0)
+let static S3L3 = ml.irreps_offset(SK3, 1)
+let static S4L0 = ml.irreps_offset(SK4, 0)
+let static S4L2 = ml.irreps_offset(SK4, 1)
+let static S4L4 = ml.irreps_offset(SK4, 2)
+let __w1 = [1.0]
+let __w2 = [1.0, 1.0]
+let __w3 = [1.0, 1.0]
+let __w4 = [1.0, 1.0, 1.0]
+
+// The four rung input specs. ISPEC2 is K1 + K2; ISPEC3 adds Sym^3 (the l = 1
+// multiplicity doubles: K1 and K3's own l = 1 block); ISPEC4 adds Sym^4.
+// OSPEC is the K = 0 rung: five shell occupancies, five invariant scalars.
+let static OSPEC = [(0, 0, 5)]
+let static ISPEC2 = [(0, 0, 1), (1, 1, 1), (2, 0, 1)]
+let static ISPEC3 = [(0, 0, 1), (1, 1, 2), (2, 0, 1), (3, 1, 1)]
+let static ISPEC4 = [(0, 0, 2), (1, 1, 2), (2, 0, 2), (3, 1, 1), (4, 0, 1)]
+let static DI2 = ml.total_dim(ISPEC2)
+let static DI3 = ml.total_dim(ISPEC3)
+let static DI4 = ml.total_dim(ISPEC4)
+let static XL1 = ml.irreps_offset(ISPEC4, 1)
+let static XL2 = ml.irreps_offset(ISPEC4, 2)
+let static XL3 = ml.irreps_offset(ISPEC4, 3)
+let static XL4 = ml.irreps_offset(ISPEC4, 4)
+let spec_dims = [DS2, DS3, DS4, DI2, DI3, DI4, XL1, XL2, XL3, XL4]
+spec_dims
+// EXPECT: spec_dims = [6, 10, 15, 9, 19, 34, 2, 8, 18, 25]
+
+// The jet former. One point contributes all three derive_poly orders at once
+// (31 numbers: Sym^2 ++ Sym^3 ++ Sym^4); a sample's jet is the mean over its
+// 120 points, taken as a running-sum recursive array — the language's
+// replacement for an accumulator loop, compiled to one pre-allocated buffer.
+function tr_flat(n: Int) -> Array<Float like Idx<NP3>> = {
+    let __row = __ptr(n)
+    let rec q: Array<Float like Idx<360>> =
+        match q with
+        | zero -> zero
+        | prefix :: k -> prefix :: __row(k / 3, k - (k / 3) * 3)
+    q
+}
+function te_flat(n: Int) -> Array<Float like Idx<NP3>> = {
+    let __row = __pte(n)
+    let rec q: Array<Float like Idx<360>> =
+        match q with
+        | zero -> zero
+        | prefix :: k -> prefix :: __row(k / 3, k - (k / 3) * 3)
+    q
+}
+function ctr_flat(n: Int) -> Array<Float like Idx<NP3>> = {
+    let __row = __ctr(n)
+    let rec q: Array<Float like Idx<360>> =
+        match q with
+        | zero -> zero
+        | prefix :: k -> prefix :: __row(k / 3, k - (k / 3) * 3)
+    q
+}
+function pvec(p: Array<Float like Idx<NP3>>, k: Int) -> Array<Float like IrrepsIdx<PT>> =
+    [p(k * 3), p(k * 3 + 1), p(k * 3 + 2)]
+function jvec(p: Array<Float like Idx<NP3>>, k: Int) -> Array<Float like Idx<31>> = {
+    let v = pvec(p, k)
+    let d2 = ml.derive_poly(PT, 2, SK2, v, __w2)
+    let d3 = ml.derive_poly(PT, 3, SK3, v, __w3)
+    let d4 = ml.derive_poly(PT, 4, SK4, v, __w4)
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m < 6 then d2(m)
+                                    else (if m < 16 then d3(m - 6) else d4(m - 16)))
+    o
+}
+function jtab(p: Array<Float like Idx<NP3>>) -> Array<Float like Idx<121>, Idx<31>> = {
+    let rec t: Array<Float like Idx<121>, Idx<31>> =
+        match t with
+        | zero -> zero
+        | zero :: q -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: q -> prefix :: (prefix(q - 1) + jvec(p, q - 1))
+    t
+}
+function jmean(p: Array<Float like Idx<NP3>>) -> Array<Float like Idx<31>> = {
+    let t = jtab(p)
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: t(120, m) / 120.0
+    o
+}
+// The centrosymmetrized order-3 contribution of one point: derive_poly at
+// odd K is an odd map, so P3(-v) = -P3(v) with bitwise-identical magnitudes,
+// and each pair sums to zero EXACTLY. The tetra theorem cell folds this over
+// a whole sample; it is evaluated once here so the kernel exists before the
+// expensive cells (new `ml.*` elaboration invalidates the session memo).
+function negv(v: Array<Float like IrrepsIdx<PT>>) where ml.equiv(O3) -> Array<Float like IrrepsIdx<PT>> =
+    [0.0 - v(0), 0.0 - v(1), 0.0 - v(2)]
+function j3sym(p: Array<Float like Idx<NP3>>, k: Int) -> Array<Float like Idx<10>> = {
+    let v = pvec(p, k)
+    let a = ml.derive_poly(PT, 3, SK3, v, __w3)
+    let b = ml.derive_poly(PT, 3, SK3, negv(v), __w3)
+    0.5 * (a + b)
+}
+let __j3probe = j3sym(tr_flat(200), 0)
+let j3sym_point0 = __j3probe(0)
+j3sym_point0
+// EXPECT: j3sym_point0 = 0
+
+// derive_poly at K = 1 is the identity on the vector — pinned here once, so
+// the K1 feature slots below may be the plain per-sample coordinate means.
+let __v0: Array<Float like IrrepsIdx<PT>> = [0.3, -1.2, 0.7]
+let __d1 = ml.derive_poly(PT, 1, SK1, __v0, __w1)
+let k1_identity_gap = abs(__d1(0) - __v0(0)) + abs(__d1(1) - __v0(1)) + abs(__d1(2) - __v0(2))
+k1_identity_gap
+// EXPECT: k1_identity_gap = 0
+
+// The K2 jet of train sample 0, straight from the store: the l = 0 slot is
+// -sqrt(3) — the whitening property in jet coordinates (mean |v|^2 = 3) —
+// and the l = 2 block is zero at rounding level. The theorem cells below
+// make this a property of EVERY sample.
+let __jm0 = jmean(tr_flat(0))
+let k2_jet_sample0 = [__jm0(0), __jm0(1), __jm0(2), __jm0(3), __jm0(4), __jm0(5)]
+k2_jet_sample0
+
+// %% [markdown]
+// ## The three-route pin: the jet IS the moment matrix
+//
+// Before reading the jet as statistics, the sibling notebooks' identity is
+// re-pinned on this store: for an order-2 moment there is an independent
+// route through `ppl.comoments` (the packed covariance) bridged to the
+// irreps basis by `ml.sym_to_irreps`, and it must agree with the mean of the
+// per-point `ml.derive_poly`, block by block, up to one fixed constant per
+// block — **-1 on l = 0, +1 on l = 2**, the trace convention. The check runs
+// on a 12-point sub-cloud of a tetra sample (a sub-cloud, so its covariance
+// is generic rather than whitened-to-identity and the ratios divide
+// cleanly). The one line that matters is the basis permutation:
+// `ppl.comoments`/`ml.sym_to_irreps` take Cartesian (x, y, z);
+// `ml.derive_poly` takes the raw (y, z, x) l = 1 order.
+
+// %%
+function cmean12(v: Int) -> Float = {
+    let __c0 = ctr_flat(200)
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: __c0(k * 3 + v)
+    reduce(a, (+)) / 12.0
+}
+function cc12(v: Int, k: Int) -> Float = {
+    let __c0 = ctr_flat(200)
+    __c0(k * 3 + v) - cmean12(v)
+}
+type CVar = Idx<3>
+type SubPt = Idx<12>
+let __ccloud: Array<Float64 like CVar, SubPt> = [
+    [cc12(0, 0), cc12(0, 1), cc12(0, 2), cc12(0, 3), cc12(0, 4), cc12(0, 5), cc12(0, 6), cc12(0, 7), cc12(0, 8), cc12(0, 9), cc12(0, 10), cc12(0, 11)],
+    [cc12(1, 0), cc12(1, 1), cc12(1, 2), cc12(1, 3), cc12(1, 4), cc12(1, 5), cc12(1, 6), cc12(1, 7), cc12(1, 8), cc12(1, 9), cc12(1, 10), cc12(1, 11)],
+    [cc12(2, 0), cc12(2, 1), cc12(2, 2), cc12(2, 3), cc12(2, 4), cc12(2, 5), cc12(2, 6), cc12(2, 7), cc12(2, 8), cc12(2, 9), cc12(2, 10), cc12(2, 11)]]
+let __cov12 = ppl.comoments(__ccloud, 2)
+let __irr12 = ml.sym_to_irreps(__cov12)
+// The same twelve points, (x, y, z) -> (y, z, x), through the polynomial route.
+function cvec12(k: Int) -> Array<Float like IrrepsIdx<PT>> = [cc12(1, k), cc12(2, k), cc12(0, k)]
+let __cjet12 = {
+    let rec t: Array<Float like Idx<13>, Idx<6>> =
+        match t with
+        | zero -> zero
+        | zero :: k -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: k -> prefix :: (prefix(k - 1) + ml.derive_poly(PT, 2, SK2, cvec12(k - 1), __w2))
+    t
+}
+let three_route_ratio = method_for(range<Idx<6>>) <@> lambda(m) -> (__cjet12(12, m) / 12.0) / __irr12(m) |> compute
+three_route_ratio
+function ind(a: Float, b: Float) -> Float = if a > b then 1.0 else 0.0
+function route_res(m: Int) -> Float = {
+    let want = if m == S2L0 then 0.0 - 1.0 else 1.0
+    abs((__cjet12(12, m) / 12.0) / __irr12(m) - want)
+}
+let __route_bad = method_for(range<Idx<6>>) <@> lambda(m) -> ind(route_res(m), 0.000000001) |> compute
+let three_route_bad = reduce(__route_bad, (+))
+three_route_bad
+// EXPECT: three_route_bad = 0
+
+// %% [markdown]
+// ## The certified stack, four times
+//
+// One architecture, four input representations. Each rung embeds its features
+// with a Schur-derived linear map, runs two Clebsch-Gordan blocks
+// (`tensor_product` -> `gated` -> `linear`), and exits through `ml.norms` —
+// eighteen, fifteen, twelve or nine invariant channels depending on how much
+// of the jet the rung is allowed to see. Every parameter count below is the
+// dimension of a Hom-space or of a space of admissible CG paths, printed
+// before a weight exists.
+//
+// The K = 0 rung is the aspirin winner transplanted: five Gaussian-shell
+// occupancies, five invariant scalars, the same stack (a tensor product of
+// scalars is a certified polynomial in them). It gets no special treatment —
+// which is the point: the dataset, not the model, will decide what it can do.
+//
+// The certified body of each rung is FROZEN at a seeded random point and only
+// the invariant readout trains (the tetris notebook's regime): every channel
+// the body emits is provably the right kind of number, the readout on
+// invariants is a convex least-squares problem, and `ml.hom_dim(EV, OUT4)`
+// counts its weights. What a rung's representation cannot carry, no amount
+// of training will fish out of it — that is the experiment.
+
+// %%
+let static EMB0 = [(0, 0, 3)]
+let static EMB2 = [(0, 0, 2), (1, 1, 1), (2, 0, 1)]
+let static EMB3 = [(0, 0, 2), (1, 1, 1), (2, 0, 1), (3, 1, 1)]
+let static EMB4 = [(0, 0, 2), (1, 1, 1), (2, 0, 1), (3, 1, 1), (4, 0, 1)]
+let static CFG0 = (EMB0, EMB0, EMB0)
+let static CFG2 = (EMB2, EMB2, EMB2)
+let static CFG3 = (EMB3, EMB3, EMB3)
+let static CFG4 = (EMB4, EMB4, EMB4)
+let static WE0 = ml.hom_dim(OSPEC, EMB0)
+let static WE2 = ml.hom_dim(ISPEC2, EMB2)
+let static WE3 = ml.hom_dim(ISPEC3, EMB3)
+let static WE4 = ml.hom_dim(ISPEC4, EMB4)
+let static WT0 = ml.tp_weight_dim(CFG0)
+let static WT2 = ml.tp_weight_dim(CFG2)
+let static WT3 = ml.tp_weight_dim(CFG3)
+let static WT4 = ml.tp_weight_dim(CFG4)
+let static WL0 = ml.linear_weight_dim(EMB0, EMB0)
+let static WL2 = ml.linear_weight_dim(EMB2, EMB2)
+let static WL3 = ml.linear_weight_dim(EMB3, EMB3)
+let static WL4 = ml.linear_weight_dim(EMB4, EMB4)
+// Invariant channels per rung: norms of the embed and of both block outputs.
+let static NEV0 = 9
+let static NEV2 = 12
+let static NEV3 = 15
+let static NEV4 = 18
+let static EV0 = [(0, 0, 9)]
+let static EV2 = [(0, 0, 12)]
+let static EV3 = [(0, 0, 15)]
+let static EV4 = [(0, 0, 18)]
+let static OUT4 = [(0, 0, 4)]
+let static WR0 = ml.hom_dim(EV0, OUT4)
+let static WR2 = ml.hom_dim(EV2, OUT4)
+let static WR3 = ml.hom_dim(EV3, OUT4)
+let static WR4 = ml.hom_dim(EV4, OUT4)
+// Frozen + trained totals per rung (readout weights + 4 biases train).
+let static NPAR0 = WE0 + WT0 + WL0 + WT0 + WL0 + WR0 + 4
+let static NPAR2 = WE2 + WT2 + WL2 + WT2 + WL2 + WR2 + 4
+let static NPAR3 = WE3 + WT3 + WL3 + WT3 + WL3 + WR3 + 4
+let static NPAR4 = WE4 + WT4 + WL4 + WT4 + WL4 + WR4 + 4
+let rung_params = [NPAR0, NPAR2, NPAR3, NPAR4]
+rung_params
+// EXPECT: rung_params = [127, 116, 162, 224]
+let rung_weight_dims = [WE0, WE2, WE3, WE4, WT0, WT2, WT3, WT4, WL0, WL2, WL3, WL4, WR0, WR2, WR3, WR4]
+rung_weight_dims
+// EXPECT: rung_weight_dims = [15, 4, 6, 10, 27, 24, 39, 61, 9, 6, 7, 8, 36, 48, 60, 72]
+
+function embed0(x: Array<Float like IrrepsIdx<OSPEC>>, we: Array<Float like Idx<WE0>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB0>> =
+    ml.derive_linear(OSPEC, EMB0, we, x)
+function embed2(x: Array<Float like IrrepsIdx<ISPEC2>>, we: Array<Float like Idx<WE2>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB2>> =
+    ml.derive_linear(ISPEC2, EMB2, we, x)
+function embed3(x: Array<Float like IrrepsIdx<ISPEC3>>, we: Array<Float like Idx<WE3>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB3>> =
+    ml.derive_linear(ISPEC3, EMB3, we, x)
+function embed4(x: Array<Float like IrrepsIdx<ISPEC4>>, we: Array<Float like Idx<WE4>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB4>> =
+    ml.derive_linear(ISPEC4, EMB4, we, x)
+function eqblk0(x: Array<Float like IrrepsIdx<EMB0>>, wtp: Array<Float like Idx<WT0>>, wl: Array<Float like Idx<WL0>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB0>> = {
+    let t = ml.tensor_product(CFG0, x, x, wtp)
+    let g = ml.gated(EMB0, t)
+    ml.linear(EMB0, EMB0, wl, g)
+}
+function eqblk2(x: Array<Float like IrrepsIdx<EMB2>>, wtp: Array<Float like Idx<WT2>>, wl: Array<Float like Idx<WL2>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB2>> = {
+    let t = ml.tensor_product(CFG2, x, x, wtp)
+    let g = ml.gated(EMB2, t)
+    ml.linear(EMB2, EMB2, wl, g)
+}
+function eqblk3(x: Array<Float like IrrepsIdx<EMB3>>, wtp: Array<Float like Idx<WT3>>, wl: Array<Float like Idx<WL3>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB3>> = {
+    let t = ml.tensor_product(CFG3, x, x, wtp)
+    let g = ml.gated(EMB3, t)
+    ml.linear(EMB3, EMB3, wl, g)
+}
+function eqblk4(x: Array<Float like IrrepsIdx<EMB4>>, wtp: Array<Float like Idx<WT4>>, wl: Array<Float like Idx<WL4>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMB4>> = {
+    let t = ml.tensor_product(CFG4, x, x, wtp)
+    let g = ml.gated(EMB4, t)
+    ml.linear(EMB4, EMB4, wl, g)
+}
+
+// The frozen bodies: two seeded draws, sliced per rung (`rand.<family>` is
+// legal only as a bare top-level binding value, so the draws come first).
+let __nb0 = r.normal(20260827, 300)
+let __wb = 0.4 * __nb0
+let __nb1 = r.normal(8272027, 300)
+let __wc = 0.4 * __nb1
+function bpick(base: Int, k: Int) -> Float = __wb(base + k)
+function cpick(base: Int, k: Int) -> Float = __wc(base + k)
+function bslice15(base: Int) -> Array<Float like Idx<15>> = {
+    let rec o: Array<Float like Idx<15>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice27(base: Int) -> Array<Float like Idx<27>> = {
+    let rec o: Array<Float like Idx<27>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice9(base: Int) -> Array<Float like Idx<9>> = {
+    let rec o: Array<Float like Idx<9>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice4(base: Int) -> Array<Float like Idx<4>> = {
+    let rec o: Array<Float like Idx<4>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice24(base: Int) -> Array<Float like Idx<24>> = {
+    let rec o: Array<Float like Idx<24>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice6(base: Int) -> Array<Float like Idx<6>> = {
+    let rec o: Array<Float like Idx<6>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice39(base: Int) -> Array<Float like Idx<39>> = {
+    let rec o: Array<Float like Idx<39>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice7(base: Int) -> Array<Float like Idx<7>> = {
+    let rec o: Array<Float like Idx<7>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function cslice10(base: Int) -> Array<Float like Idx<10>> = {
+    let rec o: Array<Float like Idx<10>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cpick(base, k)
+    o
+}
+function cslice61(base: Int) -> Array<Float like Idx<61>> = {
+    let rec o: Array<Float like Idx<61>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cpick(base, k)
+    o
+}
+function cslice8(base: Int) -> Array<Float like Idx<8>> = {
+    let rec o: Array<Float like Idx<8>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cpick(base, k)
+    o
+}
+// Rung 0 body: embed 15, tp 27, lin 9, tp 27, lin 9 (offsets 0/15/42/51/78).
+let __e0we = bslice15(0)
+let __e0t1 = bslice27(15)
+let __e0l1 = bslice9(42)
+let __e0t2 = bslice27(51)
+let __e0l2 = bslice9(78)
+// Rung 2 body: embed 4, tp 24, lin 6, tp 24, lin 6 (offsets 87/91/115/121/145).
+let __e2we = bslice4(87)
+let __e2t1 = bslice24(91)
+let __e2l1 = bslice6(115)
+let __e2t2 = bslice24(121)
+let __e2l2 = bslice6(145)
+// Rung 3 body: embed 6, tp 39, lin 7, tp 39, lin 7 (offsets 151/157/196/203/242).
+let __e3we = bslice6(151)
+let __e3t1 = bslice39(157)
+let __e3l1 = bslice7(196)
+let __e3t2 = bslice39(203)
+let __e3l2 = bslice7(242)
+// Rung 4 body, from the second draw (offsets 0/10/71/79/140).
+let __e4we = cslice10(0)
+let __e4t1 = cslice61(10)
+let __e4l1 = cslice8(71)
+let __e4t2 = cslice61(79)
+let __e4l2 = cslice8(140)
+
+// Invariant channels per rung: norms of embed, block 1, block 2. These
+// clauses were written by the compiler: left unclaused, every chans body
+// draws BL4011 with exactly this conjunct and the deduced signature
+// "IrrepsIdx<...> -> invariant" — the tetris notebook makes a whole cell of
+// that; here we simply accept the offer.
+function chans0(x: Array<Float like IrrepsIdx<OSPEC>>) where ml.equiv(O3) -> Array<Float like Idx<NEV0>> = {
+    let e = embed0(x, __e0we)
+    let b1 = eqblk0(e, __e0t1, __e0l1)
+    let b2 = eqblk0(b1, __e0t2, __e0l2)
+    let ne = ml.norms(EMB0, e)
+    let n1 = ml.norms(EMB0, b1)
+    let n2 = ml.norms(EMB0, b2)
+    [ne(0), ne(1), ne(2), n1(0), n1(1), n1(2), n2(0), n2(1), n2(2)]
+}
+function chans2(x: Array<Float like IrrepsIdx<ISPEC2>>) where ml.equiv(O3) -> Array<Float like Idx<NEV2>> = {
+    let e = embed2(x, __e2we)
+    let b1 = eqblk2(e, __e2t1, __e2l1)
+    let b2 = eqblk2(b1, __e2t2, __e2l2)
+    let ne = ml.norms(EMB2, e)
+    let n1 = ml.norms(EMB2, b1)
+    let n2 = ml.norms(EMB2, b2)
+    [ne(0), ne(1), ne(2), ne(3), n1(0), n1(1), n1(2), n1(3), n2(0), n2(1), n2(2), n2(3)]
+}
+function chans3(x: Array<Float like IrrepsIdx<ISPEC3>>) where ml.equiv(O3) -> Array<Float like Idx<NEV3>> = {
+    let e = embed3(x, __e3we)
+    let b1 = eqblk3(e, __e3t1, __e3l1)
+    let b2 = eqblk3(b1, __e3t2, __e3l2)
+    let ne = ml.norms(EMB3, e)
+    let n1 = ml.norms(EMB3, b1)
+    let n2 = ml.norms(EMB3, b2)
+    [ne(0), ne(1), ne(2), ne(3), ne(4), n1(0), n1(1), n1(2), n1(3), n1(4),
+     n2(0), n2(1), n2(2), n2(3), n2(4)]
+}
+function chans4(x: Array<Float like IrrepsIdx<ISPEC4>>) where ml.equiv(O3) -> Array<Float like Idx<NEV4>> = {
+    let e = embed4(x, __e4we)
+    let b1 = eqblk4(e, __e4t1, __e4l1)
+    let b2 = eqblk4(b1, __e4t2, __e4l2)
+    let ne = ml.norms(EMB4, e)
+    let n1 = ml.norms(EMB4, b1)
+    let n2 = ml.norms(EMB4, b2)
+    [ne(0), ne(1), ne(2), ne(3), ne(4), ne(5), n1(0), n1(1), n1(2), n1(3), n1(4), n1(5),
+     n2(0), n2(1), n2(2), n2(3), n2(4), n2(5)]
+}
+// Elaboration probe: run each stack once, here, so every ml.* kernel this
+// notebook needs exists before the expensive cells.
+let __ex0: Array<Float like IrrepsIdx<OSPEC>> = [0.1, 0.2, 0.3, 0.4, 0.5]
+let __ex2: Array<Float like IrrepsIdx<ISPEC2>> = [1.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+let __ex3: Array<Float like IrrepsIdx<ISPEC3>> = [1.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+let __ex4: Array<Float like IrrepsIdx<ISPEC4>> = [1.0, 2.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+let elab_probe = [chans0(__ex0)(0), chans2(__ex2)(0), chans3(__ex3)(0), chans4(__ex4)(0)]
+elab_probe
+
+// %% [markdown]
+// ## Theorem 1: whitening, stated as a property of the data
+//
+// Plain arithmetic, no jets: for every one of the 600 stored samples, the
+// per-sample mean is the zero vector and the per-sample covariance is the
+// identity — not on average, per sample. The pin counts samples whose summed
+// K1 + |K2 - I| residual exceeds 1e-12; the count is zero and the printed
+// total sits at the rounding floor. This is the cell that makes the K <= 2
+// rung's fate below a theorem rather than an observation: whatever a model
+// reads through K1 and K2, it reads the same bytes for every sample.
+//
+// The same cell lays down the plain-arithmetic tables everything downstream
+// shares: per-sample coordinate means (the K1 feature slots — exactly zero,
+// read from the data rather than assumed), per-sample radii, radial moments,
+// and the five Gaussian-shell occupancies that are the K = 0 rung's whole
+// world.
+
+// %%
+function k1res(p: Array<Float like Idx<NP3>>, v: Int) -> Float = {
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: p(k * 3 + v)
+    abs(reduce(a, (+)) / 120.0)
+}
+function covres(p: Array<Float like Idx<NP3>>, u: Int) -> Float = {
+    let i = u / 3
+    let j = u - i * 3
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: p(k * 3 + i) * p(k * 3 + j)
+    let d = if i == j then 1.0 else 0.0
+    abs(reduce(a, (+)) / 120.0 - d)
+}
+function wres(p: Array<Float like Idx<NP3>>) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: u -> prefix :: (if u < 3 then k1res(p, u) else covres(p, u - 3))
+    reduce(a, (+))
+}
+let __wrtr = {
+    let rec t: Array<Float like Idx<400>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: wres(tr_flat(n))
+    t
+}
+let __wrte = {
+    let rec t: Array<Float like Idx<200>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: wres(te_flat(n))
+    t
+}
+let __wbad_tr = method_for(range<Idx<400>>) <@> lambda(n) -> ind(__wrtr(n), 0.000000000001) |> compute
+let __wbad_te = method_for(range<Idx<200>>) <@> lambda(n) -> ind(__wrte(n), 0.000000000001) |> compute
+let whitening_bad = reduce(__wbad_tr, (+)) + reduce(__wbad_te, (+))
+whitening_bad
+// EXPECT: whitening_bad = 0
+let whitening_total_residual = reduce(__wrtr, (+)) + reduce(__wrte, (+))
+whitening_total_residual
+
+function k1of(p: Array<Float like Idx<NP3>>, v: Int) -> Float = {
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: p(k * 3 + v)
+    reduce(a, (+)) / 120.0
+}
+function m1row_tr(n: Int) -> Array<Float like Idx<3>> =
+    [k1of(tr_flat(n), 0), k1of(tr_flat(n), 1), k1of(tr_flat(n), 2)]
+function m1row_te(n: Int) -> Array<Float like Idx<3>> =
+    [k1of(te_flat(n), 0), k1of(te_flat(n), 1), k1of(te_flat(n), 2)]
+let __m1tr = {
+    let rec t: Array<Float like Idx<400>, Idx<3>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: m1row_tr(n)
+    t
+}
+let __m1te = {
+    let rec t: Array<Float like Idx<200>, Idx<3>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: m1row_te(n)
+    t
+}
+// Radii, radial moments, occupancies.
+function radrow(p: Array<Float like Idx<NP3>>) -> Array<Float like Idx<120>> = {
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: sqrt(p(k * 3) * p(k * 3) + p(k * 3 + 1) * p(k * 3 + 1) + p(k * 3 + 2) * p(k * 3 + 2))
+    a
+}
+let __rtr = {
+    let rec t: Array<Float like Idx<400>, Idx<120>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: radrow(tr_flat(n))
+    t
+}
+let __rte = {
+    let rec t: Array<Float like Idx<200>, Idx<120>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: radrow(te_flat(n))
+    t
+}
+function rp_tr(n: Int, k: Int, e: Int) -> Float = {
+    let r2 = __rtr(n, k) * __rtr(n, k)
+    if e == 0 then r2 else r2 * r2
+}
+function rp_te(n: Int, k: Int, e: Int) -> Float = {
+    let r2 = __rte(n, k) * __rte(n, k)
+    if e == 0 then r2 else r2 * r2
+}
+function rmom_tr(n: Int, e: Int) -> Float = {
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: rp_tr(n, k, e)
+    reduce(a, (+)) / 120.0
+}
+function rmom_te(n: Int, e: Int) -> Float = {
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: rp_te(n, k, e)
+    reduce(a, (+)) / 120.0
+}
+let __rmtr = {
+    let rec t: Array<Float like Idx<400>, Idx<2>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: [rmom_tr(n, 0), rmom_tr(n, 1)]
+    t
+}
+let __rmte = {
+    let rec t: Array<Float like Idx<200>, Idx<2>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: [rmom_te(n, 0), rmom_te(n, 1)]
+    t
+}
+let radial_moments_sample0 = [__rmtr(0, 0), __rmtr(0, 1)]
+radial_moments_sample0
+function shellw(rr: Float, s: Int) -> Float = {
+    let d = (rr - __smu(s)) / __ssg(s)
+    exp(0.0 - 0.5 * d * d)
+}
+function occ_tr1(n: Int, s: Int) -> Float = {
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: shellw(__rtr(n, k), s)
+    reduce(a, (+)) / 120.0
+}
+function occ_te1(n: Int, s: Int) -> Float = {
+    let rec a: Array<Float like Idx<120>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: shellw(__rte(n, k), s)
+    reduce(a, (+)) / 120.0
+}
+function occrow_tr(n: Int) -> Array<Float like Idx<5>> =
+    [occ_tr1(n, 0), occ_tr1(n, 1), occ_tr1(n, 2), occ_tr1(n, 3), occ_tr1(n, 4)]
+function occrow_te(n: Int) -> Array<Float like Idx<5>> =
+    [occ_te1(n, 0), occ_te1(n, 1), occ_te1(n, 2), occ_te1(n, 3), occ_te1(n, 4)]
+let __otr = {
+    let rec t: Array<Float like Idx<400>, Idx<5>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: occrow_tr(n)
+    t
+}
+let __ote = {
+    let rec t: Array<Float like Idx<200>, Idx<5>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: occrow_te(n)
+    t
+}
+let occupancy_sample0 = method_for(range<Idx<5>>) <@> lambda(s) -> __otr(0, s) |> compute
+occupancy_sample0
+
+// %% [markdown]
+// ## The featurization
+//
+// Six hundred samples, 120 points each, three `derive_poly` orders per
+// point. It runs once, split over two cells; every later cell reads these
+// tables out of the session memo. (All `ml.*` elaboration happened above, on
+// purpose — a cell that elaborated a new kernel here would invalidate the
+// memo and pay for these tables again on every later evaluation.)
+
+// %%
+let __jtr = {
+    let rec h: Array<Float like Idx<400>, Idx<31>> =
+        match h with
+        | zero -> zero
+        | prefix :: n -> prefix :: jmean(tr_flat(n))
+    h
+}
+__jtr(399, 0)
+
+// %%
+let __jte = {
+    let rec h: Array<Float like Idx<200>, Idx<31>> =
+        match h with
+        | zero -> zero
+        | prefix :: n -> prefix :: jmean(te_flat(n))
+    h
+}
+__jte(199, 0)
+
+// %% [markdown]
+// ## Theorem 2: the K <= 2 features are sample-independent
+//
+// The K <= 2 feature vector — K1 (three slots) and the K2 jet (six) — has
+// now been computed for every sample, and its across-sample variance is
+// pinned below 1e-24 per slot, over all 600 samples, all four classes. Nine
+// numbers describe six hundred clouds, because the generator made it so.
+//
+// The consequence deserves the strong phrasing: **any model whose input is
+// the K <= 2 jet is a constant function on this dataset.** Not "will
+// struggle", not "underfits" — its features do not depend on the sample, so
+// its scores cannot either. On the balanced test set a constant scorer's
+// argmax picks one fixed class and collects exactly that class's 50 samples:
+// 25%, as a theorem with an integer in it. The K <= 2 rung below trains
+// anyway — watching the descent do nothing is the demonstration — and the
+// measured matrix pins exactly that count.
+//
+// The same argument covers the K = 0 rung on the matched three: identical
+// radial quantiles make every radial functional — the five occupancies
+// included — identical across iso, octa and tetra. The occupancies DO vary
+// on heavy (the contrast pin below), so the K = 0 rung is predicted to
+// separate heavy and nothing else.
+
+// %%
+function k2s_tr(n: Int, m: Int) -> Float =
+    if m < 3 then __m1tr(n, m) else __jtr(n, m - 3)
+function k2s_te(n: Int, m: Int) -> Float =
+    if m < 3 then __m1te(n, m) else __jte(n, m - 3)
+function slotvar(m: Int) -> Float = {
+    let rec a: Array<Float like Idx<600>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (if n < 400 then k2s_tr(n, m) else k2s_te(n - 400, m))
+    let mu = reduce(a, (+)) / 600.0
+    let rec d: Array<Float like Idx<600>> =
+        match d with
+        | zero -> zero
+        | prefix :: n -> prefix :: ((if n < 400 then k2s_tr(n, m) else k2s_te(n - 400, m)) - mu) * ((if n < 400 then k2s_tr(n, m) else k2s_te(n - 400, m)) - mu)
+    reduce(d, (+)) / 600.0
+}
+let __k2vars = method_for(range<Idx<9>>) <@> lambda(m) -> slotvar(m) |> compute
+let k2_var_over_1e24 = reduce(method_for(range<Idx<9>>) <@> lambda(m) -> ind(__k2vars(m), 0.000000000000000000000001) |> compute, (+))
+k2_var_over_1e24
+// EXPECT: k2_var_over_1e24 = 0
+let k2_var_total = reduce(__k2vars, (+))
+k2_var_total
+
+// The K = 0 contrast: occupancy variance across the 300 matched train
+// samples versus across the 100 heavy ones.
+function occvar_matched(s: Int) -> Float = {
+    let rec a: Array<Float like Idx<300>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __otr(n, s)
+    let mu = reduce(a, (+)) / 300.0
+    let rec d: Array<Float like Idx<300>> =
+        match d with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__otr(n, s) - mu) * (__otr(n, s) - mu)
+    reduce(d, (+)) / 300.0
+}
+function occvar_heavy(s: Int) -> Float = {
+    let rec a: Array<Float like Idx<100>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __otr(300 + n, s)
+    let mu = reduce(a, (+)) / 100.0
+    let rec d: Array<Float like Idx<100>> =
+        match d with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__otr(300 + n, s) - mu) * (__otr(300 + n, s) - mu)
+    reduce(d, (+)) / 100.0
+}
+let __ovm = method_for(range<Idx<5>>) <@> lambda(s) -> occvar_matched(s) |> compute
+let __ovh = method_for(range<Idx<5>>) <@> lambda(s) -> occvar_heavy(s) |> compute
+let occ_matched_var = reduce(__ovm, (+))
+let occ_heavy_var = reduce(__ovh, (+))
+let occ_contrast = [ind(0.0000000000000000000001, occ_matched_var), ind(occ_heavy_var, 0.0001)]
+occ_contrast
+// EXPECT: occ_contrast = [1, 1]
+
+// %% [markdown]
+// ## Theorem 3: one class, one block
+//
+// Class-mean jets over the 100 training samples of each class, differenced
+// against iso, per block. The matched design shows up as structural zeros
+// and announced leaks, both pinned:
+//
+// - **octa vs iso in K4's l = 0 slot**: identical radii make the fourth
+//   radial moment identical per sample, so the class-mean gap sits at the
+//   1e-13 matching residual — thirteen orders of magnitude below the same
+//   pair's **l = 4** gap. Even anisotropy, with the kurtosis door pinned
+//   shut.
+// - **heavy vs iso**: the l = 0 gap towers over the l = 4 gap. Heavy's raw
+//   l = 4 number is NOT tiny — a heavy-tailed cloud's K4 estimator is noisy,
+//   so its class-mean l = 4 gap is sampling noise that would shrink as
+//   1/sqrt(S) — which is why the honest pin is dominance (l0 over l4 by more
+//   than 5x), not an absolute threshold.
+// - **tetra's K3** class mean stands above octa's K3 noise floor — and its
+//   centrosymmetrized twin (every point paired with its negation, the
+//   aspirin notebook's symmetrization) has an order-3 jet of EXACTLY zero:
+//   `0.5 * (P3(v) + P3(-v))` cancels bitwise, point by point, before any
+//   summation. Parity is structural, not statistical.
+// - **heavy's K3 class mean is the largest of all four** — about 4x iso's —
+//   with no third-moment structure whatsoever. That is the variance leak
+//   the prediction cell below stakes its +K3 row on: heavy's kurtosis
+//   inflates the sampling noise of every higher moment, and a class mean of
+//   zero-mean noise scales with the noise amplitude.
+
+// %%
+function cmjet(cls: Int, m: Int) -> Float = {
+    let rec a: Array<Float like Idx<100>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __jtr(cls * 100 + n, m)
+    reduce(a, (+)) / 100.0
+}
+function cmrow(cls: Int) -> Array<Float like Idx<31>> = {
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: cmjet(cls, m)
+    o
+}
+let __cm = {
+    let rec t: Array<Float like Idx<4>, Idx<31>> =
+        match t with
+        | zero -> zero
+        | prefix :: c -> prefix :: cmrow(c)
+    t
+}
+function gap_k4l0(cls: Int) -> Float = abs(__cm(cls, 16) - __cm(0, 16))
+function gap_k4l4(cls: Int) -> Float = {
+    let rec a: Array<Float like Idx<9>> =
+        match a with
+        | zero -> zero
+        | prefix :: m -> prefix :: (__cm(cls, 22 + m) - __cm(0, 22 + m)) * (__cm(cls, 22 + m) - __cm(0, 22 + m))
+    sqrt(reduce(a, (+)))
+}
+function k3_energy(cls: Int) -> Float = {
+    let rec a: Array<Float like Idx<10>> =
+        match a with
+        | zero -> zero
+        | prefix :: m -> prefix :: __cm(cls, 6 + m) * __cm(cls, 6 + m)
+    sqrt(reduce(a, (+)))
+}
+let octa_gaps = [gap_k4l0(1), gap_k4l4(1)]
+octa_gaps
+let heavy_gaps = [gap_k4l0(3), gap_k4l4(3)]
+heavy_gaps
+let k3_norms = [k3_energy(0), k3_energy(1), k3_energy(2), k3_energy(3)]
+k3_norms
+let attribution = [ind(0.000000001, gap_k4l0(1)), ind(gap_k4l4(1), 0.1),
+                   ind(gap_k4l0(3), 1.0), ind(gap_k4l0(3), 5.0 * gap_k4l4(3)),
+                   ind(k3_energy(2), 2.0 * k3_energy(1)), ind(k3_energy(3), 3.0 * k3_energy(0))]
+attribution
+// EXPECT: attribution = [1, 1, 1, 1, 1, 1]
+
+// The centrosymmetrized twin of tetra train sample 0: its whole K3 is the
+// zero vector, literally — a sum of exact per-point zeros.
+function j3s_at(q: Int, m: Int) -> Float = j3sym(tr_flat(200), q)(m)
+let __t3s = {
+    let rec t: Array<Float like Idx<121>, Idx<10>> =
+        match t with
+        | zero -> zero
+        | zero :: q -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: q -> prefix :: (prefix(q - 1) + j3sym(tr_flat(200), q - 1))
+    t
+}
+let __t3fin = method_for(range<Idx<10>>) <@> lambda(m) -> __t3s(120, m) * __t3s(120, m) |> compute
+let tetra_sym_k3 = reduce(__t3fin, (+))
+tetra_sym_k3
+// EXPECT: tetra_sym_k3 = 0
+
+// %% [markdown]
+// ## Theorem 4: the K <= 4 boundary, and what lives beyond it
+//
+// This compiler caps `derive_poly` at K = 4 (BL5000), so l = 5 and l = 6
+// structure is invisible to every jet it can build. That is not a limitation
+// to apologize for; it is a resolution statement with a symmetry class
+// attached, and the icosahedron makes it exact. Icosahedral symmetry admits
+// no invariant between l = 1 and l = 5, so the 12 icosahedron vertices — a
+// cloud with obvious, rigid directional order — present K2, K3 and K4 jets
+// with NO anisotropy at all: every non-l0 slot is zero at rounding level.
+// The 6 octahedron vertices, one symmetry class down, put macroscopic energy
+// into K4's l = 4 block by the same construction.
+//
+// The stored `demo_icosa` cloud carries the statement at this dataset's own
+// scale: 12 icosahedral lobes, whitened and radially matched exactly like a
+// member of the matched three. Its sampled-jet anisotropy is measured below
+// beside the iso class's mean (the same sampling floor) and a real octa
+// sample's (an order of magnitude higher). A fifth class built this way would sit at
+// chance against iso at every rung this compiler can express — l = 6 order
+// needs a K = 6 jet, and the type system knows where its own resolution
+// ends.
+
+// %%
+// The exact vertex sets. Both are closed under coordinate permutation, so
+// the (y, z, x) feeding order only relabels members. The octahedron is
+// written twice over (12 rows) so both sets share one 12-point former.
+let __ico_b = 1.0 / sqrt(2.0 + (1.0 + sqrt(5.0)) / 2.0)
+let __ico_a = __ico_b * (1.0 + sqrt(5.0)) / 2.0
+function ico_slot(k: Int) -> Float = {
+    let vtx = k / 3
+    let ax = vtx / 4
+    let s1 = if vtx - (vtx / 2) * 2 == 0 then 1.0 else 0.0 - 1.0
+    let s2 = if (vtx / 2) - (vtx / 4) * 2 == 0 then 1.0 else 0.0 - 1.0
+    let c = k - vtx * 3
+    let rel = (c + 3 - ax) - ((c + 3 - ax) / 3) * 3
+    if rel == 0 then 0.0 else (if rel == 1 then s1 * __ico_a else s2 * __ico_b)
+}
+function oct_slot(k: Int) -> Float = {
+    let vtx6 = (k / 3) - ((k / 3) / 6) * 6
+    let ax = vtx6 / 2
+    let sg = if vtx6 - (vtx6 / 2) * 2 == 0 then 1.0 else 0.0 - 1.0
+    if k - (k / 3) * 3 == ax then sg else 0.0
+}
+let __icof = {
+    let rec q: Array<Float like Idx<36>> =
+        match q with
+        | zero -> zero
+        | prefix :: k -> prefix :: ico_slot(k)
+    q
+}
+let __octf = {
+    let rec q: Array<Float like Idx<36>> =
+        match q with
+        | zero -> zero
+        | prefix :: k -> prefix :: oct_slot(k)
+    q
+}
+function jvec12(p: Array<Float like Idx<36>>, k: Int) -> Array<Float like Idx<31>> = {
+    let v: Array<Float like IrrepsIdx<PT>> = [p(k * 3), p(k * 3 + 1), p(k * 3 + 2)]
+    let d2 = ml.derive_poly(PT, 2, SK2, v, __w2)
+    let d3 = ml.derive_poly(PT, 3, SK3, v, __w3)
+    let d4 = ml.derive_poly(PT, 4, SK4, v, __w4)
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m < 6 then d2(m)
+                                    else (if m < 16 then d3(m - 6) else d4(m - 16)))
+    o
+}
+function jmean12(p: Array<Float like Idx<36>>) -> Array<Float like Idx<31>> = {
+    let rec t: Array<Float like Idx<13>, Idx<31>> =
+        match t with
+        | zero -> zero
+        | zero :: q -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: q -> prefix :: (prefix(q - 1) + jvec12(p, q - 1))
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: t(12, m) / 12.0
+    o
+}
+// Anisotropy energy of a 31-slot jet: everything except the two l = 0 slots.
+function aniso(__j: Array<Float like Idx<31>>) -> Float = {
+    let rec a: Array<Float like Idx<31>> =
+        match a with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m == 0 then 0.0 else (if m == 16 then 0.0 else __j(m) * __j(m)))
+    reduce(a, (+))
+}
+let __jico = jmean12(__icof)
+let __joct = jmean12(__octf)
+let vertex_aniso = [aniso(__jico), aniso(__joct)]
+vertex_aniso
+let icosa_exact = [ind(0.000000000001, aniso(__jico)), ind(aniso(__joct), 0.1)]
+icosa_exact
+// EXPECT: icosa_exact = [1, 1]
+
+// The stored demo cloud beside real samples: iso train row 0 and octa train
+// row 100, all through the same sampled-jet former.
+let __dflat = {
+    let rec q: Array<Float like Idx<360>> =
+        match q with
+        | zero -> zero
+        | prefix :: k -> prefix :: __dpi(k / 3, k - (k / 3) * 3)
+    q
+}
+let __jdemo = jmean(__dflat)
+function jrow_tr(n: Int) -> Array<Float like Idx<31>> = {
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: __jtr(n, m)
+    o
+}
+function aniso_tr(n: Int) -> Float = aniso(jrow_tr(n))
+let __ianiso = method_for(range<Idx<100>>) <@> lambda(n) -> aniso_tr(n) |> compute
+let iso_mean_aniso = reduce(__ianiso, (+)) / 100.0
+let demo_vs_classes = [aniso(__jdemo), iso_mean_aniso, aniso(jrow_tr(100))]
+demo_vs_classes
+let demo_isotropic = [ind(3.0 * iso_mean_aniso, aniso(__jdemo)), ind(aniso(jrow_tr(100)), 3.0 * aniso(__jdemo))]
+demo_isotropic
+// EXPECT: demo_isotropic = [1, 1]
+
+// %% [markdown]
+// ## The calibration identities, re-pinned on this store
+//
+// The invariant slots of the even orders are radial moments with fixed
+// normalizations: `K2 l0 * sqrt(3) = -mean |v|^2` and
+// `K4 l0 * sqrt(5) = +mean |v|^4` — the signs the sibling notebooks pinned.
+// Checked across all 600 samples against the plain-arithmetic radius tables;
+// on this store the first identity doubles as one more whitening statement,
+// since mean |v|^2 = 3 for every sample.
+
+// %%
+function momres_tr(n: Int, kk: Int) -> Float =
+    if kk == 0 then abs(__jtr(n, 0) * 1.7320508075688772 + __rmtr(n, 0)) else abs(__jtr(n, 16) * 2.23606797749979 - __rmtr(n, 1))
+function momres_te(n: Int, kk: Int) -> Float =
+    if kk == 0 then abs(__jte(n, 0) * 1.7320508075688772 + __rmte(n, 0)) else abs(__jte(n, 16) * 2.23606797749979 - __rmte(n, 1))
+function momres(u: Int) -> Float = {
+    let n = u / 2
+    let kk = u - n * 2
+    if n < 400 then momres_tr(n, kk) else momres_te(n - 400, kk)
+}
+let __mombad = method_for(range<Idx<1200>>) <@> lambda(u) -> ind(momres(u), 0.000000001) |> compute
+let moment_pins_bad = reduce(__mombad, (+))
+moment_pins_bad
+// EXPECT: moment_pins_bad = 0
+
+// %% [markdown]
+// ## The pre-training diagnostic: what a LINEAR probe could ever find
+//
+// Before any training, the calibrated linear ceiling (the diagnostic the
+// MD17 moment-jet campaign ended on): for
+// each rung's feature set, the sum over (feature, class) of squared
+// correlations with the one-hot labels — on the real labels and on two
+// shuffled-label nulls (the store's own permutation table). The predictions
+// follow from one observation: **every sample is under its own random
+// rotation, so every l > 0 feature column is isotropized into zero-mean
+// noise** — a linear probe on raw equivariant features can only ever see the
+// l = 0 columns. Hence:
+//
+// - the K = 0 ceiling sits far above its null (occupancies are invariants,
+//   and heavy moves them);
+// - the K <= 2 ceiling is **exactly zero**: its one l = 0 column is
+//   constant, and constant features correlate with nothing (the
+//   zero-variance guard returns 0, and that is the honest value);
+// - the +K3 ceiling is INDISTINGUISHABLE from its null — Sym^3 contributes
+//   no l = 0 block, so the rung's only new columns are rotation-scrambled.
+//   Tetra's entire K3 signal, which the trained rung below converts into a
+//   perfect 50/50, is **invisible to every linear probe**;
+// - the full-jet ceiling clears its null again, through exactly one column:
+//   K4's l = 0, the kurtosis slot, which is heavy's.
+//
+// The ladder's real content — tetra's K3, octa's l = 4 — is reachable only
+// through an invariant-forming nonlinearity. The certified stack's first
+// move after the embed is a norm; that is not a modelling choice here, it
+// is the only move that works.
+
+// %%
+function x4slot(n: Int, m: Int) -> Float = {
+    if m < 1 then __jtr(n, 0)
+    else (if m < 2 then __jtr(n, 16)
+    else (if m < 5 then __m1tr(n, m - 2)
+    else (if m < 8 then __jtr(n, 6 + (m - 5))
+    else (if m < 13 then __jtr(n, 1 + (m - 8))
+    else (if m < 18 then __jtr(n, 17 + (m - 13))
+    else (if m < 25 then __jtr(n, 9 + (m - 18))
+    else __jtr(n, 22 + (m - 25))))))))
+}
+function fslot(n: Int, m: Int) -> Float =
+    if m < 5 then __otr(n, m) else x4slot(n, m - 5)
+function frow(n: Int) -> Array<Float like Idx<39>> = {
+    let rec o: Array<Float like Idx<39>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: fslot(n, m)
+    o
+}
+let __ftab = {
+    let rec t: Array<Float like Idx<400>, Idx<39>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: frow(n)
+    t
+}
+function ylab(e: Int, n: Int, c: Int) -> Float =
+    if e == 0 then __ytr(n, c) else __ytr(__perm(e - 1, n), c)
+function r2of(e: Int, k: Int, c: Int) -> Float = {
+    let rec f: Array<Float like Idx<400>> =
+        match f with
+        | zero -> zero
+        | prefix :: n -> prefix :: __ftab(n, k)
+    let muf = reduce(f, (+)) / 400.0
+    let rec fv: Array<Float like Idx<400>> =
+        match fv with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__ftab(n, k) - muf) * (__ftab(n, k) - muf)
+    let varf = reduce(fv, (+)) / 400.0
+    let rec fy: Array<Float like Idx<400>> =
+        match fy with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__ftab(n, k) - muf) * ylab(e, n, c)
+    let cov = reduce(fy, (+)) / 400.0
+    if varf < 0.00000000000000000001 then 0.0 else (cov * cov) / (varf * 0.1875)
+}
+function ceilmask(e: Int, __mk: Array<Float like Idx<39>>) -> Float = {
+    let rec a: Array<Float like Idx<156>> =
+        match a with
+        | zero -> zero
+        | prefix :: u -> prefix :: __mk(u / 4) * r2of(e, u / 4, u - (u / 4) * 4)
+    reduce(a, (+))
+}
+let __mk0: Array<Float like Idx<39>> = [1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let __mk2: Array<Float like Idx<39>> = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let __mk3: Array<Float like Idx<39>> = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let __mk4: Array<Float like Idx<39>> = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+let ceil_k0 = [ceilmask(0, __mk0), ceilmask(1, __mk0), ceilmask(2, __mk0)]
+ceil_k0
+let ceil_k2 = [ceilmask(0, __mk2), ceilmask(1, __mk2), ceilmask(2, __mk2)]
+ceil_k2
+// EXPECT: ceil_k2 = [0, 0, 0]
+let ceil_k3 = [ceilmask(0, __mk3), ceilmask(1, __mk3), ceilmask(2, __mk3)]
+ceil_k3
+let ceil_k4 = [ceilmask(0, __mk4), ceilmask(1, __mk4), ceilmask(2, __mk4)]
+ceil_k4
+// The pattern pin: K0 real clears 3x its null average, +K3 real does NOT,
+// the full jet does again.
+let ceil_pattern = [ind(ceil_k0(0), 1.5 * (ceil_k0(1) + ceil_k0(2))),
+                    ind(1.5 * (ceil_k3(1) + ceil_k3(2)), ceil_k3(0)),
+                    ind(ceil_k4(0), 1.5 * (ceil_k4(1) + ceil_k4(2)))]
+ceil_pattern
+// EXPECT: ceil_pattern = [1, 1, 1]
+
+// %% [markdown]
+// ## The prediction, before any training happens
+//
+// Everything below this cell is mechanical; here is the confusion structure
+// the representation theory dictates, written down before the training cells
+// run. Rows are rungs, entries are predicted test hits out of 50 per class:
+//
+// | rung | iso | octa | tetra | heavy | mechanism |
+// |---|---|---|---|---|---|
+// | K0 | one matched class takes all 150, the other two take 0 | | | ~50 | occupancies constant on matched, varying on heavy |
+// | K <= 2 | one class takes all 200, the rest 0 — total EXACTLY 50 | | | | the constant scorer (theorem 2) |
+// | +K3 | iso and octa share one winner | | ~50 | ~50 | tetra by K3's mean; heavy by K3's VARIANCE through the norms |
+// | +K3+K4 | ~50 | ~50 | ~50 | ~50 | octa joins by K4 l = 4; iso becomes "small everything" |
+//
+// Two entries deserve their reasoning spelled out. **Heavy at +K3**: the
+// whitening device kills every K <= 2 statistic per sample, but no
+// per-sample device can equalize the SAMPLING NOISE of a K3 estimator — its
+// variance is set by sixth radial moments, matched among iso/octa/tetra by
+// the quantile map but not for heavy, whose sixth moment is ~19x iso's. So
+// heavy's K3 block is zero-mean noise at ~4x the amplitude: invisible to
+// the linear ceiling above, plainly visible to a norm channel. The same
+// finite-N mechanism that motivated exact whitening, one order up, now
+// working FOR the model.
+//
+// **Octa vs iso at +K3**: by the spherical-harmonic addition theorem the
+// expected squared norm of a Sym^3 sample average depends on the direction
+// distribution only through radial moments — which are matched — so octa's
+// K3 noise is statistically indistinguishable from iso's at this order.
+// Octa waits for K4's l = 4.
+//
+// Success bar, stated in advance: the K <= 2 row is EXACT (50 hits). The
+// other rows should land within a few samples of the prediction; any
+// structured deviation is a finding — a leak in the construction or a bug
+// in the compiler's moment machinery, both reportable.
+
+// %% [markdown]
+// ## The rung ladder
+//
+// One cell per rung: build the rung's feature vectors, push them through the
+// frozen certified body once (600 stack evaluations, memoized), calibrate
+// the channels on the training split — the spread floor zeroes dead
+// channels, and on the K <= 2 rung that is ALL of them, theorem 2 becoming
+// arithmetic — and descend. The optimizer is the sibling notebooks' flat
+// state: readout weights, biases, momentum and a loss slot in one array; the
+// mini-batches are the four interleaved quarters n = 4j + b, each class-
+// balanced by the class-major layout; `ad.grad` gets one `mut` buffer and
+// the batch index arrives as a trailing Int primal.
+
+// %%
+// ---- rung K0: shell occupancies --------------------------------------------
+function o_tr(n: Int) -> Array<Float like IrrepsIdx<OSPEC>> =
+    [__otr(n, 0), __otr(n, 1), __otr(n, 2), __otr(n, 3), __otr(n, 4)]
+function o_te(n: Int) -> Array<Float like IrrepsIdx<OSPEC>> =
+    [__ote(n, 0), __ote(n, 1), __ote(n, 2), __ote(n, 3), __ote(n, 4)]
+let __e0tr = {
+    let rec t: Array<Float like Idx<400>, Idx<9>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans0(o_tr(n))
+    t
+}
+let __e0te = {
+    let rec t: Array<Float like Idx<200>, Idx<9>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans0(o_te(n))
+    t
+}
+function cal0mu(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __e0tr(n, j)
+    reduce(a, (+)) / 400.0
+}
+function cal0sd(j: Int) -> Float = {
+    let mu = cal0mu(j)
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__e0tr(n, j) - mu) * (__e0tr(n, j) - mu)
+    sqrt(reduce(a, (+)) / 400.0)
+}
+let __mu0 = {
+    let rec m: Array<Float like Idx<9>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: cal0mu(j)
+    m
+}
+let __sc0 = {
+    let rec m: Array<Float like Idx<9>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: (if cal0sd(j) < 0.00000001 then 0.0 else 1.0 / cal0sd(j))
+    m
+}
+function calrow0tr(n: Int) -> Array<Float like Idx<9>> = {
+    let rec o: Array<Float like Idx<9>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e0tr(n, j) - __mu0(j)) * __sc0(j)
+    o
+}
+function calrow0te(n: Int) -> Array<Float like Idx<9>> = {
+    let rec o: Array<Float like Idx<9>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e0te(n, j) - __mu0(j)) * __sc0(j)
+    o
+}
+let __c0tr = {
+    let rec t: Array<Float like Idx<400>, Idx<9>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow0tr(n)
+    t
+}
+let __c0te = {
+    let rec t: Array<Float like Idx<200>, Idx<9>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow0te(n)
+    t
+}
+let static NW0 = 40
+let static NW0X2 = 80
+let static SW0 = 81
+let static LR = 0.05
+let static MU = 0.9
+let static NSTEP = 120
+function score0(__s: Array<Float like Idx<SW0>>, n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<9>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __s(c * 9 + j) * __c0tr(n, j)
+    reduce(a, (+)) + __s(36 + c)
+}
+function sqe0(__s: Array<Float like Idx<SW0>>, n: Int) -> Float = {
+    let e0 = score0(__s, n, 0) - __ytr(n, 0)
+    let e1 = score0(__s, n, 1) - __ytr(n, 1)
+    let e2 = score0(__s, n, 2) - __ytr(n, 2)
+    let e3 = score0(__s, n, 3) - __ytr(n, 3)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3
+}
+function loss0(__s: Array<Float like Idx<SW0>>, b: Int) -> Float = {
+    let rec errs: Array<Float like Idx<100>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sqe0(__s, j * 4 + b)
+    reduce(errs, (+)) / 100.0
+}
+function pick0(__s: Array<Float like Idx<SW0>>, base: Int, k: Int) -> Float = __s(base + k)
+function blk0w(__s: Array<Float like Idx<SW0>>, base: Int) -> Array<Float like Idx<NW0>> = {
+    let rec o: Array<Float like Idx<40>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pick0(__s, base, k)
+    o
+}
+function cat0(__wn: Array<Float like Idx<NW0>>, __vn: Array<Float like Idx<NW0>>, lv: Float, k: Int) -> Float =
+    if k < NW0 then __wn(k) else (if k < NW0X2 then __vn(k - NW0) else lv)
+function step0(s: Array<Float like Idx<SW0>>, b: Int) -> Array<Float like Idx<SW0>> = {
+    let mut ds = replicate(SW0, pure(0.0)) |> compute
+    let lv = ad.grad(loss0)(s, b, ds)
+    let vn = MU * blk0w(s, NW0) - LR * blk0w(ds, 0)
+    let wn = blk0w(s, 0) + vn
+    let rec o: Array<Float like Idx<81>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cat0(wn, vn, lv, k)
+    o
+}
+let __r0n = r.normal(31460, SW0)
+let __s00 = {
+    let rec m: Array<Float like Idx<SW0>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NW0 then 0.1 * __r0n(k) else 0.0)
+    m
+}
+let __tj0 = {
+    let rec t: Array<Float like Idx<121>, Idx<SW0>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __s00
+        | prefix :: n -> prefix :: step0(prefix(n - 1), (n - 1) - ((n - 1) / 4) * 4)
+    t
+}
+let __f0 = __tj0(NSTEP)
+function l0_at(n: Int) -> Float = __tj0(n + 1)(NW0X2)
+let loss0_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> l0_at(n) |> compute
+let final_loss_k0 = __f0(NW0X2)
+final_loss_k0
+
+// %%
+let __sax = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> Float64(n) |> compute
+let stream_k0 = plot.stream("rung_k0", __sax, loss0_curve, 0: epoch,
+                            "rung K0 (occupancies): mini-batch loss": title,
+                            "step": xlabel, "one-vs-rest squared error": ylabel)
+stream_k0
+
+// %%
+// ---- rung K <= 2: the constant model ---------------------------------------
+// Watch the descent do nothing: that is the demonstration. Same code path as
+// every other rung; the calibration zeroes all twelve channels (their spread
+// is rounding noise), and only the biases move.
+function x2_tr(n: Int) -> Array<Float like IrrepsIdx<ISPEC2>> =
+    [__jtr(n, 0), __m1tr(n, 0), __m1tr(n, 1), __m1tr(n, 2),
+     __jtr(n, 1), __jtr(n, 2), __jtr(n, 3), __jtr(n, 4), __jtr(n, 5)]
+function x2_te(n: Int) -> Array<Float like IrrepsIdx<ISPEC2>> =
+    [__jte(n, 0), __m1te(n, 0), __m1te(n, 1), __m1te(n, 2),
+     __jte(n, 1), __jte(n, 2), __jte(n, 3), __jte(n, 4), __jte(n, 5)]
+let __e2tr = {
+    let rec t: Array<Float like Idx<400>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans2(x2_tr(n))
+    t
+}
+let __e2te = {
+    let rec t: Array<Float like Idx<200>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans2(x2_te(n))
+    t
+}
+function cal2mu(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __e2tr(n, j)
+    reduce(a, (+)) / 400.0
+}
+function cal2sd(j: Int) -> Float = {
+    let mu = cal2mu(j)
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__e2tr(n, j) - mu) * (__e2tr(n, j) - mu)
+    sqrt(reduce(a, (+)) / 400.0)
+}
+let __mu2 = {
+    let rec m: Array<Float like Idx<12>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: cal2mu(j)
+    m
+}
+let __sc2 = {
+    let rec m: Array<Float like Idx<12>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: (if cal2sd(j) < 0.00000001 then 0.0 else 1.0 / cal2sd(j))
+    m
+}
+// The theorem in one number: how many of the twelve channels survived
+// calibration on this rung. Zero — every channel is constant.
+let __live2 = method_for(range<Idx<12>>) <@> lambda(j) -> ind(__sc2(j), 0.0) |> compute
+let k2_live_channels = reduce(__live2, (+))
+k2_live_channels
+// EXPECT: k2_live_channels = 0
+function calrow2tr(n: Int) -> Array<Float like Idx<12>> = {
+    let rec o: Array<Float like Idx<12>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e2tr(n, j) - __mu2(j)) * __sc2(j)
+    o
+}
+function calrow2te(n: Int) -> Array<Float like Idx<12>> = {
+    let rec o: Array<Float like Idx<12>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e2te(n, j) - __mu2(j)) * __sc2(j)
+    o
+}
+let __c2tr = {
+    let rec t: Array<Float like Idx<400>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow2tr(n)
+    t
+}
+let __c2te = {
+    let rec t: Array<Float like Idx<200>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow2te(n)
+    t
+}
+let static NW2 = 52
+let static NW2X2 = 104
+let static SW2 = 105
+function score2(__s: Array<Float like Idx<SW2>>, n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __s(c * 12 + j) * __c2tr(n, j)
+    reduce(a, (+)) + __s(48 + c)
+}
+function sqe2(__s: Array<Float like Idx<SW2>>, n: Int) -> Float = {
+    let e0 = score2(__s, n, 0) - __ytr(n, 0)
+    let e1 = score2(__s, n, 1) - __ytr(n, 1)
+    let e2 = score2(__s, n, 2) - __ytr(n, 2)
+    let e3 = score2(__s, n, 3) - __ytr(n, 3)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3
+}
+function loss2(__s: Array<Float like Idx<SW2>>, b: Int) -> Float = {
+    let rec errs: Array<Float like Idx<100>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sqe2(__s, j * 4 + b)
+    reduce(errs, (+)) / 100.0
+}
+function pick2(__s: Array<Float like Idx<SW2>>, base: Int, k: Int) -> Float = __s(base + k)
+function blk2w(__s: Array<Float like Idx<SW2>>, base: Int) -> Array<Float like Idx<NW2>> = {
+    let rec o: Array<Float like Idx<52>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pick2(__s, base, k)
+    o
+}
+function cat2(__wn: Array<Float like Idx<NW2>>, __vn: Array<Float like Idx<NW2>>, lv: Float, k: Int) -> Float =
+    if k < NW2 then __wn(k) else (if k < NW2X2 then __vn(k - NW2) else lv)
+function step2(s: Array<Float like Idx<SW2>>, b: Int) -> Array<Float like Idx<SW2>> = {
+    let mut ds = replicate(SW2, pure(0.0)) |> compute
+    let lv = ad.grad(loss2)(s, b, ds)
+    let vn = MU * blk2w(s, NW2) - LR * blk2w(ds, 0)
+    let wn = blk2w(s, 0) + vn
+    let rec o: Array<Float like Idx<105>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cat2(wn, vn, lv, k)
+    o
+}
+let __r2n = r.normal(31462, SW2)
+let __s20 = {
+    let rec m: Array<Float like Idx<SW2>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NW2 then 0.1 * __r2n(k) else 0.0)
+    m
+}
+let __tj2 = {
+    let rec t: Array<Float like Idx<121>, Idx<SW2>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __s20
+        | prefix :: n -> prefix :: step2(prefix(n - 1), (n - 1) - ((n - 1) / 4) * 4)
+    t
+}
+let __f2 = __tj2(NSTEP)
+function l2_at(n: Int) -> Float = __tj2(n + 1)(NW2X2)
+let loss2_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> l2_at(n) |> compute
+// The floor a constant scorer can reach on balanced one-vs-rest targets is
+// 4 * 0.25 * 0.75 = 0.75; the curve sits on it almost immediately.
+let final_loss_k2 = __f2(NW2X2)
+final_loss_k2
+
+// %%
+let stream_k2 = plot.stream("rung_k2", __sax, loss2_curve, 0: epoch,
+                            "rung K<=2 (the constant model): mini-batch loss": title,
+                            "step": xlabel, "one-vs-rest squared error": ylabel)
+stream_k2
+
+// %%
+// ---- rung +K3 --------------------------------------------------------------
+function x3_tr(n: Int) -> Array<Float like IrrepsIdx<ISPEC3>> =
+    [__jtr(n, 0), __m1tr(n, 0), __m1tr(n, 1), __m1tr(n, 2),
+     __jtr(n, 6), __jtr(n, 7), __jtr(n, 8),
+     __jtr(n, 1), __jtr(n, 2), __jtr(n, 3), __jtr(n, 4), __jtr(n, 5),
+     __jtr(n, 9), __jtr(n, 10), __jtr(n, 11), __jtr(n, 12), __jtr(n, 13), __jtr(n, 14), __jtr(n, 15)]
+function x3_te(n: Int) -> Array<Float like IrrepsIdx<ISPEC3>> =
+    [__jte(n, 0), __m1te(n, 0), __m1te(n, 1), __m1te(n, 2),
+     __jte(n, 6), __jte(n, 7), __jte(n, 8),
+     __jte(n, 1), __jte(n, 2), __jte(n, 3), __jte(n, 4), __jte(n, 5),
+     __jte(n, 9), __jte(n, 10), __jte(n, 11), __jte(n, 12), __jte(n, 13), __jte(n, 14), __jte(n, 15)]
+let __e3tr = {
+    let rec t: Array<Float like Idx<400>, Idx<15>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans3(x3_tr(n))
+    t
+}
+let __e3te = {
+    let rec t: Array<Float like Idx<200>, Idx<15>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans3(x3_te(n))
+    t
+}
+function cal3mu(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __e3tr(n, j)
+    reduce(a, (+)) / 400.0
+}
+function cal3sd(j: Int) -> Float = {
+    let mu = cal3mu(j)
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__e3tr(n, j) - mu) * (__e3tr(n, j) - mu)
+    sqrt(reduce(a, (+)) / 400.0)
+}
+let __mu3 = {
+    let rec m: Array<Float like Idx<15>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: cal3mu(j)
+    m
+}
+let __sc3 = {
+    let rec m: Array<Float like Idx<15>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: (if cal3sd(j) < 0.00000001 then 0.0 else 1.0 / cal3sd(j))
+    m
+}
+function calrow3tr(n: Int) -> Array<Float like Idx<15>> = {
+    let rec o: Array<Float like Idx<15>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e3tr(n, j) - __mu3(j)) * __sc3(j)
+    o
+}
+function calrow3te(n: Int) -> Array<Float like Idx<15>> = {
+    let rec o: Array<Float like Idx<15>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e3te(n, j) - __mu3(j)) * __sc3(j)
+    o
+}
+let __c3tr = {
+    let rec t: Array<Float like Idx<400>, Idx<15>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow3tr(n)
+    t
+}
+let __c3te = {
+    let rec t: Array<Float like Idx<200>, Idx<15>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow3te(n)
+    t
+}
+let static NW3 = 64
+let static NW3X2 = 128
+let static SW3 = 129
+function score3(__s: Array<Float like Idx<SW3>>, n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<15>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __s(c * 15 + j) * __c3tr(n, j)
+    reduce(a, (+)) + __s(60 + c)
+}
+function sqe3(__s: Array<Float like Idx<SW3>>, n: Int) -> Float = {
+    let e0 = score3(__s, n, 0) - __ytr(n, 0)
+    let e1 = score3(__s, n, 1) - __ytr(n, 1)
+    let e2 = score3(__s, n, 2) - __ytr(n, 2)
+    let e3 = score3(__s, n, 3) - __ytr(n, 3)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3
+}
+function loss3(__s: Array<Float like Idx<SW3>>, b: Int) -> Float = {
+    let rec errs: Array<Float like Idx<100>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sqe3(__s, j * 4 + b)
+    reduce(errs, (+)) / 100.0
+}
+function pick3(__s: Array<Float like Idx<SW3>>, base: Int, k: Int) -> Float = __s(base + k)
+function blk3w(__s: Array<Float like Idx<SW3>>, base: Int) -> Array<Float like Idx<NW3>> = {
+    let rec o: Array<Float like Idx<64>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pick3(__s, base, k)
+    o
+}
+function cat3(__wn: Array<Float like Idx<NW3>>, __vn: Array<Float like Idx<NW3>>, lv: Float, k: Int) -> Float =
+    if k < NW3 then __wn(k) else (if k < NW3X2 then __vn(k - NW3) else lv)
+function step3(s: Array<Float like Idx<SW3>>, b: Int) -> Array<Float like Idx<SW3>> = {
+    let mut ds = replicate(SW3, pure(0.0)) |> compute
+    let lv = ad.grad(loss3)(s, b, ds)
+    let vn = MU * blk3w(s, NW3) - LR * blk3w(ds, 0)
+    let wn = blk3w(s, 0) + vn
+    let rec o: Array<Float like Idx<129>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cat3(wn, vn, lv, k)
+    o
+}
+let __r3n = r.normal(31463, SW3)
+let __s30 = {
+    let rec m: Array<Float like Idx<SW3>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NW3 then 0.1 * __r3n(k) else 0.0)
+    m
+}
+let __tj3 = {
+    let rec t: Array<Float like Idx<121>, Idx<SW3>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __s30
+        | prefix :: n -> prefix :: step3(prefix(n - 1), (n - 1) - ((n - 1) / 4) * 4)
+    t
+}
+let __f3 = __tj3(NSTEP)
+function l3_at(n: Int) -> Float = __tj3(n + 1)(NW3X2)
+let loss3_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> l3_at(n) |> compute
+let final_loss_k3 = __f3(NW3X2)
+final_loss_k3
+
+// %%
+let stream_k3 = plot.stream("rung_k3", __sax, loss3_curve, 0: epoch,
+                            "rung +K3: mini-batch loss": title,
+                            "step": xlabel, "one-vs-rest squared error": ylabel)
+stream_k3
+
+// %%
+// ---- rung +K3+K4: the full jet ---------------------------------------------
+function x4_tr(n: Int) -> Array<Float like IrrepsIdx<ISPEC4>> =
+    [__jtr(n, 0), __jtr(n, 16),
+     __m1tr(n, 0), __m1tr(n, 1), __m1tr(n, 2),
+     __jtr(n, 6), __jtr(n, 7), __jtr(n, 8),
+     __jtr(n, 1), __jtr(n, 2), __jtr(n, 3), __jtr(n, 4), __jtr(n, 5),
+     __jtr(n, 17), __jtr(n, 18), __jtr(n, 19), __jtr(n, 20), __jtr(n, 21),
+     __jtr(n, 9), __jtr(n, 10), __jtr(n, 11), __jtr(n, 12), __jtr(n, 13), __jtr(n, 14), __jtr(n, 15),
+     __jtr(n, 22), __jtr(n, 23), __jtr(n, 24), __jtr(n, 25), __jtr(n, 26), __jtr(n, 27), __jtr(n, 28), __jtr(n, 29), __jtr(n, 30)]
+function x4_te(n: Int) -> Array<Float like IrrepsIdx<ISPEC4>> =
+    [__jte(n, 0), __jte(n, 16),
+     __m1te(n, 0), __m1te(n, 1), __m1te(n, 2),
+     __jte(n, 6), __jte(n, 7), __jte(n, 8),
+     __jte(n, 1), __jte(n, 2), __jte(n, 3), __jte(n, 4), __jte(n, 5),
+     __jte(n, 17), __jte(n, 18), __jte(n, 19), __jte(n, 20), __jte(n, 21),
+     __jte(n, 9), __jte(n, 10), __jte(n, 11), __jte(n, 12), __jte(n, 13), __jte(n, 14), __jte(n, 15),
+     __jte(n, 22), __jte(n, 23), __jte(n, 24), __jte(n, 25), __jte(n, 26), __jte(n, 27), __jte(n, 28), __jte(n, 29), __jte(n, 30)]
+let __e4tr = {
+    let rec t: Array<Float like Idx<400>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans4(x4_tr(n))
+    t
+}
+let __e4te = {
+    let rec t: Array<Float like Idx<200>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chans4(x4_te(n))
+    t
+}
+function cal4mu(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __e4tr(n, j)
+    reduce(a, (+)) / 400.0
+}
+function cal4sd(j: Int) -> Float = {
+    let mu = cal4mu(j)
+    let rec a: Array<Float like Idx<400>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__e4tr(n, j) - mu) * (__e4tr(n, j) - mu)
+    sqrt(reduce(a, (+)) / 400.0)
+}
+let __mu4 = {
+    let rec m: Array<Float like Idx<18>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: cal4mu(j)
+    m
+}
+let __sc4 = {
+    let rec m: Array<Float like Idx<18>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: (if cal4sd(j) < 0.00000001 then 0.0 else 1.0 / cal4sd(j))
+    m
+}
+function calrow4tr(n: Int) -> Array<Float like Idx<18>> = {
+    let rec o: Array<Float like Idx<18>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e4tr(n, j) - __mu4(j)) * __sc4(j)
+    o
+}
+function calrow4te(n: Int) -> Array<Float like Idx<18>> = {
+    let rec o: Array<Float like Idx<18>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__e4te(n, j) - __mu4(j)) * __sc4(j)
+    o
+}
+let __c4tr = {
+    let rec t: Array<Float like Idx<400>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow4tr(n)
+    t
+}
+let __c4te = {
+    let rec t: Array<Float like Idx<200>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrow4te(n)
+    t
+}
+let static NW4 = 76
+let static NW4X2 = 152
+let static SW4 = 153
+function score4(__s: Array<Float like Idx<SW4>>, n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<18>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __s(c * 18 + j) * __c4tr(n, j)
+    reduce(a, (+)) + __s(72 + c)
+}
+function sqe4(__s: Array<Float like Idx<SW4>>, n: Int) -> Float = {
+    let e0 = score4(__s, n, 0) - __ytr(n, 0)
+    let e1 = score4(__s, n, 1) - __ytr(n, 1)
+    let e2 = score4(__s, n, 2) - __ytr(n, 2)
+    let e3 = score4(__s, n, 3) - __ytr(n, 3)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3
+}
+function loss4(__s: Array<Float like Idx<SW4>>, b: Int) -> Float = {
+    let rec errs: Array<Float like Idx<100>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sqe4(__s, j * 4 + b)
+    reduce(errs, (+)) / 100.0
+}
+function pick4(__s: Array<Float like Idx<SW4>>, base: Int, k: Int) -> Float = __s(base + k)
+function blk4w(__s: Array<Float like Idx<SW4>>, base: Int) -> Array<Float like Idx<NW4>> = {
+    let rec o: Array<Float like Idx<76>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pick4(__s, base, k)
+    o
+}
+function cat4(__wn: Array<Float like Idx<NW4>>, __vn: Array<Float like Idx<NW4>>, lv: Float, k: Int) -> Float =
+    if k < NW4 then __wn(k) else (if k < NW4X2 then __vn(k - NW4) else lv)
+function step4(s: Array<Float like Idx<SW4>>, b: Int) -> Array<Float like Idx<SW4>> = {
+    let mut ds = replicate(SW4, pure(0.0)) |> compute
+    let lv = ad.grad(loss4)(s, b, ds)
+    let vn = MU * blk4w(s, NW4) - LR * blk4w(ds, 0)
+    let wn = blk4w(s, 0) + vn
+    let rec o: Array<Float like Idx<153>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cat4(wn, vn, lv, k)
+    o
+}
+let __r4n = r.normal(31464, SW4)
+let __s40 = {
+    let rec m: Array<Float like Idx<SW4>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NW4 then 0.1 * __r4n(k) else 0.0)
+    m
+}
+let __tj4 = {
+    let rec t: Array<Float like Idx<121>, Idx<SW4>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __s40
+        | prefix :: n -> prefix :: step4(prefix(n - 1), (n - 1) - ((n - 1) / 4) * 4)
+    t
+}
+let __f4 = __tj4(NSTEP)
+function l4_at(n: Int) -> Float = __tj4(n + 1)(NW4X2)
+let loss4_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> l4_at(n) |> compute
+let final_loss_k4 = __f4(NW4X2)
+final_loss_k4
+
+// %%
+let stream_k34 = plot.stream("rung_k34", __sax, loss4_curve, 0: epoch,
+                             "rung +K3+K4 (the full jet): mini-batch loss": title,
+                             "step": xlabel, "one-vs-rest squared error": ylabel)
+let plot_rungs = plot.line(__sax, loss4_curve,
+                           "rung +K3+K4: mini-batch loss": title,
+                           "step": xlabel, "one-vs-rest squared error": ylabel)
+plot_rungs
+
+// %% [markdown]
+// ## The measured matrix
+//
+// Per-rung, per-class test hits out of 50 — the table the prediction cell
+// committed to. A hit is a strict argmax agreeing with the label (the tetris
+// notebook's counting; no ties occur, the biases see to that). The K <= 2
+// row's total of exactly 50 is theorem 2's accuracy consequence, measured.
+
+// %%
+function hit(sc0: Float, sc1: Float, sc2: Float, sc3: Float, __yr: Array<Float like Klass>) -> Float = {
+    let st = sc0 * __yr(0) + sc1 * __yr(1) + sc2 * __yr(2) + sc3 * __yr(3)
+    let ng = ind(sc0, st) + ind(sc1, st) + ind(sc2, st) + ind(sc3, st)
+    if ng < 0.5 then 1.0 else 0.0
+}
+function tescore0(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<9>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __f0(c * 9 + j) * __c0te(n, j)
+    reduce(a, (+)) + __f0(36 + c)
+}
+function tescore2(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __f2(c * 12 + j) * __c2te(n, j)
+    reduce(a, (+)) + __f2(48 + c)
+}
+function tescore3(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<15>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __f3(c * 15 + j) * __c3te(n, j)
+    reduce(a, (+)) + __f3(60 + c)
+}
+function tescore4(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<18>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __f4(c * 18 + j) * __c4te(n, j)
+    reduce(a, (+)) + __f4(72 + c)
+}
+function hit_of(rung: Int, n: Int) -> Float = {
+    if rung == 0 then hit(tescore0(n, 0), tescore0(n, 1), tescore0(n, 2), tescore0(n, 3), __yte(n))
+    else (if rung == 1 then hit(tescore2(n, 0), tescore2(n, 1), tescore2(n, 2), tescore2(n, 3), __yte(n))
+    else (if rung == 2 then hit(tescore3(n, 0), tescore3(n, 1), tescore3(n, 2), tescore3(n, 3), __yte(n))
+    else hit(tescore4(n, 0), tescore4(n, 1), tescore4(n, 2), tescore4(n, 3), __yte(n))))
+}
+function cls_hits(rung: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<50>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: hit_of(rung, c * 50 + k)
+    reduce(a, (+))
+}
+let matrix_k0 = method_for(range<Idx<4>>) <@> lambda(c) -> cls_hits(0, c) |> compute
+matrix_k0
+// EXPECT: matrix_k0 = [50, 0, 0, 50]
+let matrix_k2 = method_for(range<Idx<4>>) <@> lambda(c) -> cls_hits(1, c) |> compute
+matrix_k2
+// EXPECT: matrix_k2 = [0, 0, 50, 0]
+let matrix_k3 = method_for(range<Idx<4>>) <@> lambda(c) -> cls_hits(2, c) |> compute
+matrix_k3
+// EXPECT: matrix_k3 = [13, 45, 50, 49]
+let matrix_k34 = method_for(range<Idx<4>>) <@> lambda(c) -> cls_hits(3, c) |> compute
+matrix_k34
+// EXPECT: matrix_k34 = [50, 48, 50, 50]
+let rung_totals = [reduce(matrix_k0, (+)), reduce(matrix_k2, (+)), reduce(matrix_k3, (+)), reduce(matrix_k34, (+))]
+rung_totals
+// EXPECT: rung_totals = [100, 50, 157, 198]
+// Theorem 2's accuracy consequence, exact: the constant model collects one
+// class's 50 test samples and nothing else.
+let k2_hits_exactly_50 = ind(reduce(matrix_k2, (+)), 49.5) * ind(50.5, reduce(matrix_k2, (+)))
+k2_hits_exactly_50
+// EXPECT: k2_hits_exactly_50 = 1
+
+// %% [markdown]
+// ## Verification: the trained readout under fresh rotations
+//
+// The store bakes 8 Haar rotations from a seed no training data ever saw.
+// For two test samples per class, rotate the raw Cartesian cloud, permute to
+// the (y, z, x) feeding order, recompute the jet from scratch, push it
+// through the frozen body, the calibration, and the TRAINED top-rung readout
+// — and compare all four class scores against the unrotated ones. The pin
+// counts score components that moved by more than 1e-12; certified
+// invariance means the count is zero through the entire pipeline.
+
+// %%
+function rotcomp(k: Int, n: Int, u: Int) -> Float = {
+    let pnt = u / 3
+    let c = u - pnt * 3
+    let src = (c + 1) - ((c + 1) / 3) * 3
+    let __row = __cte(n)
+    __rot(k, src * 3) * __row(pnt, 0) + __rot(k, src * 3 + 1) * __row(pnt, 1) + __rot(k, src * 3 + 2) * __row(pnt, 2)
+}
+function rotflat(k: Int, n: Int) -> Array<Float like Idx<NP3>> = {
+    let rec q: Array<Float like Idx<360>> =
+        match q with
+        | zero -> zero
+        | prefix :: u -> prefix :: rotcomp(k, n, u)
+    q
+}
+// K1 of a centered cloud is zero under any rotation; the literal zeros in the
+// K1 slots differ from the unrotated features' ~1e-17 measured means by far
+// less than the 1e-12 gate.
+function x4_rot(k: Int, n: Int) -> Array<Float like IrrepsIdx<ISPEC4>> = {
+    let __j = jmean(rotflat(k, n))
+    [__j(0), __j(16),
+     0.0, 0.0, 0.0,
+     __j(6), __j(7), __j(8),
+     __j(1), __j(2), __j(3), __j(4), __j(5),
+     __j(17), __j(18), __j(19), __j(20), __j(21),
+     __j(9), __j(10), __j(11), __j(12), __j(13), __j(14), __j(15),
+     __j(22), __j(23), __j(24), __j(25), __j(26), __j(27), __j(28), __j(29), __j(30)]
+}
+function rotscore(k: Int, n: Int, c: Int) -> Float = {
+    let __e = chans4(x4_rot(k, n))
+    let rec a: Array<Float like Idx<18>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __f4(c * 18 + j) * ((__e(j) - __mu4(j)) * __sc4(j))
+    reduce(a, (+)) + __f4(72 + c)
+}
+// u indexes (rotation 0..7) x (class 0..3) x (sample 0..1) x (score 0..3).
+function vprobe(u: Int) -> Float = {
+    let k = u / 32
+    let rest = u - k * 32
+    let cls = rest / 8
+    let lcl = rest - cls * 8
+    let smp = cls * 50 + (lcl / 4) * 25
+    let c = lcl - (lcl / 4) * 4
+    abs(rotscore(k, smp, c) - tescore4(smp, c))
+}
+let __vdev = method_for(range<Idx<256>>) <@> lambda(u) -> vprobe(u) |> compute
+let rotation_bad = reduce(method_for(range<Idx<256>>) <@> lambda(u) -> ind(__vdev(u), 0.000000000001) |> compute, (+))
+rotation_bad
+// EXPECT: rotation_bad = 0
+let rotation_total_dev = reduce(__vdev, (+))
+rotation_total_dev
+
+// %% [markdown]
+// ## One refusal
+//
+// The l = 4 block of the jet is nine numbers, and reading the first of them
+// looks like reading any other array element. Under `where ml.equiv(O3)` it
+// is refused with BL4008 naming the read: those nine numbers are the
+// components of a rank-4 tensor in a basis, and a rotation mixes them. The
+// working code above never read one — `ml.norms` is the sanctioned exit.
+// `examples/tetris_shapes.bladenb` runs the full deduction suite (six
+// refusals, a compiler-written clause, a chirality theorem as a compile
+// error).
+//
+// **This cell fails on purpose.** A failing cell never joins the notebook
+// session, so nothing downstream is disturbed.
+
+// %%
+function leak(x: Array<Float like IrrepsIdx<ISPEC4>>) where ml.equiv(O3) -> Float =
+    x(XL4)
+
+// %% [markdown]
+// ## What just happened
+//
+// The dataset was built so that "which moments carry the signal?" has a
+// provable answer, and the proofs ran as pins: whitening residuals at the
+// rounding floor across all 600 samples (summed residual ~1e-12 over the
+// whole store); the K <= 2 feature vector's across-sample variance at
+// ~2.5e-28 total, making the K <= 2 rung a constant function whose exact
+// test count was predicted before its training cell ran; per-block
+// attribution where the generator put it (octa's l = 0 gap thirteen orders
+// below its l = 4 gap, heavy the reverse in dominance, tetra in K3 with its
+// centrosymmetrized twin at literal zero); and the icosahedral clouds —
+// exact vertices at anisotropy 1.8e-32, the sampled demo at the iso noise
+// floor — invisible to every jet a K <= 4 compiler can build. The cap is a
+// resolution statement with a symmetry class attached.
+//
+// The measured ladder: **100 / 50 / 157 / 198** hits out of 200, against
+// the predicted staircase of ~100 / exactly 50 / ~150 / ~200. Three rows
+// landed on the prediction, including both exact ones (K0's [50,0,0,50] and
+// K <= 2's single-class 50), and heavy did separate a rung early, at +K3
+// (49/50), by exactly the announced mechanism: kurtosis leaks into the
+// sampling VARIANCE of the third-moment estimator — the mechanism exact
+// whitening closes at K <= 2, reappearing one order up, visible to a norm
+// channel and provably invisible to the linear ceiling (which sat at its
+// shuffled-label null for that rung).
+//
+// Two honest findings beyond the prediction. First, the +K3 row read
+// [13, 45, 50, 49]: iso and octa were predicted to share one winner
+// (50 + 0), but the trained readout eked out a weak, real separation —
+// 58/100 on the pair. The construction matches means and second moments of
+// the K3 noise between iso and octa (the addition-theorem argument), but
+// not its fourth moments: the variance-of-the-variance of a lobed cloud's
+// K3 estimator differs from a smooth one's, and 100 training samples were
+// enough for the norms to sip from that. A leak, quantified, exactly where
+// the exactness devices stop. Second, octa gave up two samples at the top
+// rung (48/50) — its l = 4 class signal is ~6x the per-sample noise, and
+// two test clouds drew unlucky orientations of that noise.
+//
+// The door onward (`examples/cod_crystals.bladenb`): the same ladder on
+// data where matched-moment structure occurs naturally rather than by
+// construction — dMRI crossings (l = 4 at
+// fixed tensor), EBSD/texture orientation distributions, Steinhardt-order
+// analysis of supercooled liquids, water tetrahedrality (l = 3). This
+// notebook is the control experiment those would cite.

@@ -1,0 +1,8 @@
+// TEST: Where Repro On Static Function (rejects)
+// ============================================================================
+// A static function evaluates at compile time in the compiler's own
+// arithmetic -- there is no emitted body for the attribute to govern.
+
+static function sq(x: Int64) where repro = x * x
+let y = sq(3)
+// ERROR-CONTAINS: cannot apply to a `static function`

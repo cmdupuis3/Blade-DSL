@@ -1,0 +1,25 @@
+// TEST: C2-Reverse Refuses A range<SymIdx> Loop (rejects)
+// The load-bearing refusal of the whole lowering. `range<SymIdx<r, N>>` hands
+// its kernel PREFIX OFFSETS, not canonical indices -- `canonical[m] = p0 + p1
+// + ... + pm` (plan-ad-combinators.md 1a, verified at r = 2 and r = 3) -- so a
+// dense construction loop that treated the parameters as indices would
+// address the WRONG CELLS and report a plausible number. The extent test is
+// therefore `TyIdx <literal>` and nothing else: `SymIdx`, `AntisymIdx`,
+// `CompoundIdx`, `SparseIdx` and friends all fail it and land here.
+//
+// (Forward mode has the opposite relationship to this type: `range<SymIdx>`
+// is how C5 gets triangular tangent storage, and 075/077 pin that it does.)
+// ERROR: BL5500
+// ERROR-CONTAINS: PREFIX OFFSETS
+import ad as ad
+
+type I = Idx<3>
+
+function loss(x: Array<Float like I>) -> Float = {
+    let m = method_for(range<SymIdx<2, 3>>) <@> lambda(p0, p1) -> x(p0) * x(p1) |> compute
+    m(0, 1)
+}
+
+let mut dx = [0.0, 0.0, 0.0]
+let lv = ad.grad(loss)([1.0, 2.0, 3.0], dx)
+lv

@@ -69,13 +69,67 @@ type SessionMemo =
       /// scratch space and no hazard at all. Using it made every recursive-
       /// array session opt out of the prefix reuse for no reason.
       MutationFree: bool
-      /// Names that must never be adopted, because running them is what
-      /// produces this session's display frames (see `emitted` bracketing in
-      /// execProgram). Recorded so the exclusion survives into later runs.
-      FrameEmitters: Set<string> }
+      /// Names whose evaluation is what produces this session's display frames
+      /// (see the `emitted` bracketing in execProgram). Recorded so the fact
+      /// survives into later runs: such a binding may only be adopted when
+      /// `Frames` also carries what it emitted, since a binding that does not
+      /// re-run cannot re-emit, and a plot that stopped re-emitting would
+      /// vanish from the editor's panel.
+      FrameEmitters: Set<string>
+      /// For each frame emitter, the frames it emitted, ready to REPLAY.
+      /// Cached beside the value and sound for the same reason: under the
+      /// prefix rule a binding eligible for adoption had the same inputs, so
+      /// the frames it would emit now are the frames it emitted then.
+      /// Replaying them is what lets an unchanged plot cost nothing on the
+      /// next cell's evaluation instead of recomputing its whole field --
+      /// which, for a notebook whose cells render, is the difference between
+      /// a fixed per-evaluation tax the size of every plot in the session and
+      /// no tax at all.
+      Frames: Map<string, (string * bool * bool) list> }
 
 let emptyMemo : SessionMemo =
-    { Values = Map.empty; MutationFree = false; FrameEmitters = Set.empty }
+    { Values = Map.empty; MutationFree = false; FrameEmitters = Set.empty; Frames = Map.empty }
+
+/// INSTRUMENT (session-memo tests only; the compiler never reads them). How
+/// many top-level bindings the most recent `runProgramMemo` ADOPTED from its
+/// incoming memo -- initializer skipped -- and how many it had to evaluate.
+/// "The cache survived" has no other observable: a memo hit and a recompute
+/// print the same value, and wall clock is not a pin. Overwritten per run;
+/// single-threaded by construction, since the REPL/notebook lanes evaluate one
+/// candidate at a time in one process.
+let mutable lastMemoAdopted = 0
+let mutable lastMemoEvaluated = 0
+
+/// Does a cached type still describe the same value SHAPE as the binding's
+/// freshly lowered type? Deliberately NOT structural equality, and that is the
+/// whole point of this function existing.
+///
+/// An `IRIndexTypeG.Id` is an SSA ordinal minted by the lowering pass that
+/// produced it (`IRBuilder.FreshId`, counting up from 0 in declaration order).
+/// Two passes over the SAME session therefore hand one array type DIFFERENT
+/// ids as soon as anything ahead of it consumes a different number of ids --
+/// and a later cell that triggers fresh domain elaboration does exactly that,
+/// because `Blade.ML.Elaborate.expand` splices its generated functions at the
+/// FRONT of the module (so every user declaration shifts). `Blade.Grad.expand`
+/// splices each synthesized derivative BESIDE ITS ROOT declaration instead,
+/// which is why `ad.grad` in a later cell never showed this and `ml.*` always
+/// did. Comparing ids rejected every array binding in the session over a
+/// difference the memo's own doc calls unpreservable -- it is precisely why
+/// the cache is keyed on NAMES and not on ids.
+///
+/// What the guard is actually FOR is the inference hazard: Blade infers across
+/// the whole session, so a later cell can pin an earlier binding's element
+/// type or its rank, and a value cached under the old type would be the wrong
+/// shape. `canonTypeKey` (IRMono, written for HM specialization dedup) is
+/// already the occurrence-id-INDEPENDENT structural key -- same element type,
+/// rank, extent and symmetry => same key -- so it decides exactly that
+/// question and nothing else. Its opaque catch-all ("T", for the type forms it
+/// does not describe) is excluded: such a type can still be adopted, but only
+/// on exact equality, never on a key match.
+let private memoTypeAgrees (cachedTy: IRType) (nowTy: IRType) : bool =
+    cachedTy = nowTy
+    || (let k = canonTypeKey cachedTy
+        k <> "T" && k = canonTypeKey nowTy)
 
 /// Is this value safe to carry across a lowering boundary?
 ///
@@ -220,7 +274,7 @@ let private weightsPool (v: Value) (k: int) : float[] =
 /// every other family an SFloat store from `float[]` draws. Routing categorical
 /// through the float path would print its indices as `0` vs `0.0`-formatted
 /// doubles and break byte-parity with the binary.
-let private materializeRandGen (state: Core.InterpState) (root: Env) (binding: IRBinding) (kind: string) (keyExpr: IRExpr) (parExprs: IRExpr list) (weightsExpr: (IRExpr * int) option) : Value =
+let private materializeRandGen (state: Core.InterpState) (root: Env) (binding: IRBinding) (kind: string) (keyExpr: IRExpr) (parExprs: IRExpr list) (weightsExpr: (IRExpr * int) option) (addressExpr: (IRExpr * IRExpr) option) : Value =
     match binding.Type with
     | ArrayElem arrTy ->
         let extents =
@@ -237,12 +291,21 @@ let private materializeRandGen (state: Core.InterpState) (root: Env) (binding: I
         let pars = parExprs |> List.map (fun p -> parToFloat (Core.evalExpr state root p))
         // .NET arrays are int-indexed, so the draw count is int-bounded exactly
         // as the pool it fills; card stays int64 to match codegen's `1L` fold.
+        // The `_at` address channel: stream key and sample offset, cast as
+        // codegen casts them (`(int64_t)`), evaluated once like the key.
+        let address =
+            addressExpr |> Option.map (fun (sExpr, oExpr) ->
+                (keyToInt64 (Core.evalExpr state root sExpr), keyToInt64 (Core.evalExpr state root oExpr)))
         let store =
-            match weightsExpr with
-            | Some (wExpr, k) ->
+            match weightsExpr, address with
+            | Some (wExpr, k), None ->
                 let w = weightsPool (Core.evalExpr state root wExpr) k
                 SInt (RandMirror.drawsCategorical kind key w (int card))
-            | None -> SFloat (RandMirror.draws kind key pars (int card))
+            | Some (wExpr, k), Some (s, o) ->
+                let w = weightsPool (Core.evalExpr state root wExpr) k
+                SInt (RandMirror.drawsCategoricalAt kind key s o w (int card))
+            | None, Some (s, o) -> SFloat (RandMirror.drawsAt kind key s o pars (int card))
+            | None, None -> SFloat (RandMirror.draws kind key pars (int card))
         state.Cells <- state.Cells + card
         VArray (ArrayOps.mkDenseArray arrTy.ElemType arrTy.IndexTypes (Array.ofList extents) store)
     | _ -> raise (Core.InterpUnsupported "rand binding is not an array type")
@@ -358,7 +421,32 @@ let private materializeProviderRead (state: Core.InterpState) (binding: IRBindin
                 raise (Core.InterpUnsupported $"provider read of '{spec.VarName}' from '{spec.FilePath}': {e}")
             | Ok data ->
                 let arrTy = spec.VarType
-                let extents = data.DimLengths |> List.map int64 |> Array.ofList
+                // BL8012 twin of CppNetcdf.ncShapeGuard: the file's rank and
+                // dimension lengths at RUN time must match the extents lowering
+                // baked from the compile-time file. Literal extents only -- a
+                // non-literal extent has nothing to compare, and the compiled
+                // side emits no check for it either. Before this guard the
+                // array below took its extents from the file while its TYPE
+                // kept the baked ones, so a changed file read silently.
+                let baked =
+                    arrTy.IndexTypes |> List.map (fun ix ->
+                        match ix.Extent with
+                        | IRLit (IRLitInt n) -> Some n
+                        | _ -> None)
+                let observed = data.DimLengths |> List.map int64
+                if baked.Length <> observed.Length then
+                    raise (InterpPanic ("BL8012",
+                                        $"NetCDF variable '{spec.VarName}' in '{spec.FilePath}' has rank {observed.Length} at run time; the program was compiled against rank {baked.Length}",
+                                        None, 0))
+                List.zip baked observed
+                |> List.iteri (fun d (b, o) ->
+                    match b with
+                    | Some n when n <> o ->
+                        raise (InterpPanic ("BL8012",
+                                            $"NetCDF variable '{spec.VarName}' in '{spec.FilePath}' has dimension {d} of length {o} at run time; the program was compiled against {n}",
+                                            None, 0))
+                    | _ -> ())
+                let extents = observed |> Array.ofList
                 let store =
                     match ArrayOps.elemThrough arrTy.ElemType, data.Payload with
                     | Some (ETFloat64 | ETFloat32), Blade.ProviderRegistry.PFloats xs -> SFloat xs
@@ -392,6 +480,15 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
     // binding produces no frame, and a plot that stopped re-emitting would
     // vanish from the panel.
     let frameEmitters = System.Collections.Generic.HashSet<string>(memoIn.FrameEmitters)
+    // What each emitter emitted THIS run -- whether it recomputed them or
+    // replayed them from the incoming memo. Published so the next run can
+    // replay in turn, which is what keeps a warm session warm.
+    let outFrames = System.Collections.Generic.Dictionary<string, (string * bool * bool) list>()
+    // The run's own memo tally. Zeroed HERE rather than published at the end,
+    // so a run that raises partway leaves a truthful partial count instead of
+    // the previous run's total.
+    lastMemoAdopted <- 0
+    lastMemoEvaluated <- 0
     // Function bodies may reference module-level bindings (emitted as
     // main-local capturing lambdas in C++) -- expose the root scope to call
     // frames before any binding evaluates.
@@ -402,14 +499,28 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
           // the whole point of the cache. The type guard is load-bearing:
           // Blade infers across the whole session, so a later cell can pin an
           // earlier binding's element type (or its rank), and a value cached
-          // under the old type would then be the wrong shape. Types differ ->
-          // fall through and recompute.
+          // under the old type would then be the wrong shape. Shapes differ ->
+          // fall through and recompute (`memoTypeAgrees` says what "differ"
+          // means, and why it is not `=`).
           let framesBefore = Blade.Display.Frame.emitted ()
+          let producedBefore = Blade.Display.Frame.producedCount ()
           match Map.tryFind b.Name memoIn.Values with
-          | Some (cachedTy, cachedV) when cachedTy = b.Type
-                                          && not (Set.contains b.Name memoIn.FrameEmitters) ->
+          | Some (cachedTy, cachedV) when memoTypeAgrees cachedTy b.Type
+                                          && (not (Set.contains b.Name memoIn.FrameEmitters)
+                                              || Map.containsKey b.Name memoIn.Frames) ->
+              // An emitter is adopted only WITH its frames, which are replayed
+              // here, in the binding's own position -- so the run's frame
+              // sequence, ids included, is the one it would have computed.
+              match Map.tryFind b.Name memoIn.Frames with
+              | Some fs when not (List.isEmpty fs) ->
+                  Blade.Display.Frame.replay fs
+                  frameEmitters.Add b.Name |> ignore
+                  outFrames.[b.Name] <- fs
+              | _ -> ()
+              lastMemoAdopted <- lastMemoAdopted + 1
               envBind root b.Id cachedV |> ignore
           | _ ->
+            lastMemoEvaluated <- lastMemoEvaluated + 1
             // Defer-aware: a deferred combinator binding stores VDeferred (no
             // eager force); a method_for/object_for binding stores VLoopObj;
             // everything else evaluates eagerly, mirroring CodeGen.genBinding.
@@ -432,8 +543,8 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
                     raise (Core.InterpUnsupported "provider write (alias.write -- side effect; flag-gated later)")
                 | None ->
                 match Map.tryFind b.Id m.RandomInits with
-                | Some (RandGen (kind, keyExpr, parExprs, weightsExpr)) ->
-                    materializeRandGen state root b kind keyExpr parExprs weightsExpr
+                | Some (RandGen (kind, keyExpr, parExprs, weightsExpr, addressExpr)) ->
+                    materializeRandGen state root b kind keyExpr parExprs weightsExpr addressExpr
                 | Some (FillModulus _) ->
                     // fill_random(mod) fills with C `rand() % mod`: nondeterministic
                     // and NOT mirrored by RandMirror (only the deterministic
@@ -460,6 +571,7 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
             envBind root b.Id v |> ignore
             if Blade.Display.Frame.emitted () > framesBefore then
                 frameEmitters.Add b.Name |> ignore
+                outFrames.[b.Name] <- Blade.Display.Frame.producedSince producedBefore
 
     // Resolve a binding id to its computed value for the printer. Print decides
     // which bindings render and in what order/format (iostream parity), and
@@ -476,6 +588,14 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
     // the print block), which is what keeps the two lanes byte-identical.
     for frame in Blade.Display.Frame.drain () do
         sb.Append(frame).Append('\n') |> ignore
+    // `--print` (BLADE_PRINT) selects the same bindings in BOTH lanes, so a
+    // differential run compares like with like. An explicit argument -- the
+    // REPL's snippet echo, which shows one binding and hides the session --
+    // is a per-call decision and wins over the ambient pin.
+    let printOnly =
+        match printOnly with
+        | Some _ -> printOnly
+        | None -> Blade.CodeGenState.printSelection ()
     Print.printBindingsOnly testName lookup state.ForcedDeferred merged printOnly sb
 
     // The memo this run hands to its successor: every top-level binding that
@@ -487,7 +607,9 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
         |> List.collect _.Bindings
         |> List.fold (fun acc b ->
             match envTryFind root b.Id with
-            | Some cell when memoizableValue cell.V && not (frameEmitters.Contains b.Name) ->
+            | Some cell when memoizableValue cell.V
+                             && (not (frameEmitters.Contains b.Name)
+                                 || outFrames.ContainsKey b.Name) ->
                 Map.add b.Name (b.Type, cell.V) acc
             | _ -> acc) Map.empty
 
@@ -496,7 +618,8 @@ let private execProgram (state: Core.InterpState) (merged: IRModule) (program: I
      { Values = outValues
        // Filled in by the caller, which can see the session's declarations.
        MutationFree = memoIn.MutationFree
-       FrameEmitters = Set.ofSeq frameEmitters })
+       FrameEmitters = Set.ofSeq frameEmitters
+       Frames = outFrames |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq })
 
 /// Run a lowered program under the tree-walking interpreter, mapping each
 /// outcome onto the exit-code protocol above. The whole run executes on the

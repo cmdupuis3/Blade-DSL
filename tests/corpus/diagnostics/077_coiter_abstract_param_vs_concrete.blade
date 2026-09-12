@@ -1,0 +1,20 @@
+// TEST: Diag CoIter Abstract Param Vs Concrete (rejects)
+// The ONE-SIDED half of 075: a zip with one abstract operand and one already
+// CONCRETE one. `zipHeadClash` compares literal-vs-literal, so a zip with only
+// one literal side never reached its extent check, and the walk (bounded by
+// operand 1, the abstract parameter) ran the argument's extent over `weights`:
+//   C++ : bad = 60 -- 10+20+30 plus three products against memory past the end
+//         of a 3-cell array, which happened to be zero. A plausible number.
+//
+// The body's own literal extents ride FuncCoIterObligations alongside the
+// parameter positions, so the call site has both sides even though the zip
+// never did. Blamed on argument 1 with the extent the body fixes.
+// ERROR: BL3016
+// ERROR-CONTAINS: CO-ITERATES this parameter with an array of extent 3
+type W = Idx<3>
+let weights: Array<Float64 like W> = [1.0, 1.0, 1.0]
+function wsum(a: T^1) -> T^0 =
+    reduce(method_for(zip(a, weights)) <@> lambda(x, y) -> x * y, (+))
+type Bx = Idx<6>
+let q: Array<Float64 like Bx> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+let bad = wsum(q)

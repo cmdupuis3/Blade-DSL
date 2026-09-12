@@ -1,0 +1,15 @@
+// TEST: Halo offset outside the declared set rejected (rejects)
+// `halo<H, [-1, 0, 1]>` shrinks the interior for reach 1 on each side, and
+// nothing used to compare a window read's OFFSET against the declared list:
+// `a(w(2))` typechecked, ran, and on the last window read one cell past the
+// pool (the compiled lane printed a garbage-derived value; the interpreter
+// would panic -- a divergence no test exercised;
+// docs/plans/structural/02 section 1.5). Literal offsets are now judged at
+// the apply seam; a computed offset (loops/080's `S(w(0 - i))`) stays with
+// the runtime guards.
+// ERROR: BL4019
+// ERROR-CONTAINS: offset 2
+type H = Idx<5>
+let a: Array<Float like H> = [1.0, 2.0, 4.0, 7.0, 11.0]
+let d = method_for(halo<H, [-1, 0, 1]>) <@> lambda(w) -> a(w(2)) - a(w(-1)) |> compute
+d

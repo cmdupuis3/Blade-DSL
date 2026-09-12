@@ -79,7 +79,6 @@ let rec mapExprPre (f: Expr -> Expr option) (e: Expr) : Expr =
         | ExprKind.ExprObjectFor k -> re (ExprObjectFor (g k))
         | ExprKind.ExprRange _ | ExprKind.ExprReverse _ | ExprKind.ExprHalo _ -> e
         | ExprKind.ExprDotDot (lo, hi) -> re (ExprDotDot (g lo, g hi))
-        | ExprKind.ExprBlocked (ty, x) -> re (ExprBlocked (ty, g x))
         | ExprKind.ExprZip es -> re (ExprZip (List.map g es))
         | ExprKind.ExprAlign (es, spec) -> re (ExprAlign (List.map g es, spec))
         | ExprKind.ExprStack es -> re (ExprStack (List.map g es))
@@ -109,6 +108,7 @@ let rec mapExprPre (f: Expr -> Expr option) (e: Expr) : Expr =
         | ExprKind.ExprTranspose (a, d1, d2) -> re (ExprTranspose (g a, d1, d2))
         | ExprKind.ExprDecompact (a, d) -> re (ExprDecompact (g a, d))
         | ExprKind.ExprGram (l, r) -> re (ExprGram (g l, g r))
+        | ExprKind.ExprGramApply (l, r, x) -> re (ExprGramApply (g l, g r, g x))
         | ExprKind.ExprExtents a -> re (ExprExtents (g a))
         | ExprKind.ExprStruct (id, fields, spread) -> re (ExprStruct (id, fields |> List.map (fun (n, x) -> (n, g x)), spread |> Option.map g))
         | ExprKind.ExprSection _ -> e
@@ -124,7 +124,8 @@ let rec mapExprPre (f: Expr -> Expr option) (e: Expr) : Expr =
         | ExprKind.ExprRecArray def ->
             re (ExprRecArray { def with
                                 SeedArm = def.SeedArm |> Option.map (fun (v, s) -> (v, g s))
-                                SliceExpr = g def.SliceExpr })
+                                SliceExpr = g def.SliceExpr
+                                Guard = def.Guard |> Option.map g })
 
 and mapStmtPre (f: Expr -> Expr option) (s: Stmt) : Stmt =
     let g = mapExprPre f

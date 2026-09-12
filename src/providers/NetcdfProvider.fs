@@ -413,6 +413,45 @@ module CppNetcdf =
             $"if ({cppVarName}_ncstat != NC_NOERR) {{ std::cerr << \"NetCDF error ({context}): \" << nc_strerror({cppVarName}_ncstat) << std::endl; std::exit(1); }}"
         ]
 
+    /// Runtime shape guard (BL8012), emitted between `nc_inq_varid` and the
+    /// first `nc_get_var*` of a variable: the variable's rank and every
+    /// dimension length on the OPENED handle must equal the extents lowering
+    /// baked from the file that was present at compile time. `nc_get_var_*`
+    /// writes the variable's WHOLE current extent into the caller's buffer,
+    /// and the readers size that buffer from the baked extents -- so a file
+    /// whose dimensions grew since compilation overran the buffer, and one
+    /// that shrank or reordered its axes read garbage into the cells the
+    /// program indexes, both silently (plan-fortran-killer-2.md section 7).
+    /// The interpreter's materializeProviderRead is the twin.
+    ///
+    /// `v` is the binding's C++ stem (owner of `_ncid` / `_ncstat`); `tag`
+    /// keeps the guard's temporaries distinct per variable within one stem
+    /// (a compound read guards the variable AND its mask); `expected` are
+    /// C++ expressions for the baked extents, in dimension order.
+    let private ncShapeGuard (v: string) (tag: string) (varIdExpr: string) (humanName: string)
+                             (filePath: string) (expected: string list) : string list =
+        let rank = expected.Length
+        let mismatch (detail: string) =
+            [ $"    std::cerr << \"Blade runtime: NetCDF variable '{humanName}' in '{filePath}' {detail} << std::endl;"
+              "    blade_rt::panic(\"BL8012\", \"provider shape mismatch\", nullptr, 0);" ]
+        [ $"int {v}_{tag}_ndims;" ]
+        @ ncChecked v $"querying the rank of '{humanName}' in '{filePath}'"
+            $"nc_inq_varndims({v}_ncid, {varIdExpr}, &{v}_{tag}_ndims)"
+        @ [ $"if ({v}_{tag}_ndims != {rank}) {{" ]
+        @ mismatch $"has rank \" << {v}_{tag}_ndims << \" at run time; the program was compiled against rank {rank}\""
+        @ [ "}" ]
+        @ (if rank = 0 then [] else
+            [ $"int {v}_{tag}_dimids[{rank}];" ]
+            @ ncChecked v $"querying the dimensions of '{humanName}' in '{filePath}'"
+                $"nc_inq_vardimid({v}_ncid, {varIdExpr}, {v}_{tag}_dimids)"
+            @ [ for d in 0 .. rank - 1 do
+                    yield $"size_t {v}_{tag}_dimlen_{d};"
+                    yield! ncChecked v $"querying dimension {d} of '{humanName}' in '{filePath}'"
+                              $"nc_inq_dimlen({v}_ncid, {v}_{tag}_dimids[{d}], &{v}_{tag}_dimlen_{d})"
+                    yield $"if ({v}_{tag}_dimlen_{d} != (size_t)({expected.[d]})) {{"
+                    yield! mismatch $"has dimension {d} of length \" << {v}_{tag}_dimlen_{d} << \" at run time; the program was compiled against \" << {expected.[d]}"
+                    yield "}" ])
+
     /// Generate C++ code to open a NetCDF file and read a variable
     let genReadVar (filePath: string) (varName: string) (cppVarName: string) (arrType: IRArrayType) : string list =
         let rank = arrType.IndexTypes.Length
@@ -459,6 +498,9 @@ module CppNetcdf =
             @ ncChecked cppVarName $"locating variable '{varName}' in '{filePath}'"
                 $"nc_inq_varid({cppVarName}_ncid, \"{varName}\", &{cppVarName}_varid)"
             @ extentsFromDims
+            // BL8012 before the buffer exists: nc_get_var fills the variable's
+            // CURRENT extent, the buffer below is sized from the baked one.
+            @ ncShapeGuard cppVarName "var" $"{cppVarName}_varid" varName filePath extentNames
             @ [
                 $"""{elemCpp}* {cppVarName}_flat = new {elemCpp}[{(String.concat " * " extentNames)}];"""
             ]
@@ -577,6 +619,9 @@ module CppNetcdf =
         ]
         @ ncChecked v $"locating variable '{varName}' in '{filePath}'"
             $"nc_inq_varid({v}_ncid, \"{varName}\", &{v}_varid)"
+        // BL8012 twins: the dense variable against all its baked extents, the
+        // mask against the leading (compound) ones -- each before its read.
+        @ ncShapeGuard v "var" $"{v}_varid" varName filePath extentNames
         @ ncChecked v $"reading variable '{varName}' from '{filePath}'"
             $"nc_get_var_{ncGet primElem}({v}_ncid, {v}_varid, {v}_dense)"
         @ [
@@ -585,6 +630,7 @@ module CppNetcdf =
         ]
         @ ncChecked v $"locating mask '{maskName}' in '{filePath}'"
             $"nc_inq_varid({v}_ncid, \"{maskName}\", &{v}_maskid)"
+        @ ncShapeGuard v "mask" $"{v}_maskid" maskName filePath leadExtentNames
         @ ncChecked v $"reading mask '{maskName}' from '{filePath}'"
             $"nc_get_var_{ncGet maskElem}({v}_ncid, {v}_maskid, {v}_maskraw)"
         @ [
@@ -697,6 +743,10 @@ module CppNetcdf =
             $"nc_open(\"{filePath}\", NC_NOWRITE, &{v}_ncid)"
         @ ncChecked v $"locating variable '{varName}' in '{filePath}'"
             $"nc_inq_varid({v}_ncid, \"{varName}\", &{v}_varid)"
+        // BL8012 at open, not at the first fiber: libnetcdf would refuse an
+        // out-of-range nc_get_vara (NC_EEDGE), but only inside the nest, after
+        // the program has begun emitting output from the fibers before it.
+        @ ncShapeGuard v "var" $"{v}_varid" varName filePath (extents |> List.map string)
         @ [ $"size_t {v}_fiber_ext[1] = {{ {fiberLen} }};"
             $"size_t {v}_start[{rank}]; size_t {v}_count[{rank}];" ]
         @ [ for d in 0 .. rank - 2 -> $"{v}_count[{d}] = 1;" ]

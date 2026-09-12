@@ -16,6 +16,18 @@ open Blade.Types
 
 type TypeError =
     | UnboundVariable of string
+    /// BL2009. A second top-level `function` declaration reusing a name its
+    /// module scope already declared. Without this refusal the later
+    /// declaration silently SHADOWED the earlier one, and a call matching the
+    /// first signature died with a rank/type mismatch blaming the CALLER.
+    /// Same-scope only: a nested `function` desugars to a block-scoped
+    /// `let const name = lambda` and never reaches this check, so inner
+    /// shadowing of an outer function name stays legal. `firstSite` is
+    /// preformatted ("line L, column C"). When clause dispatch lands
+    /// (plan-match-statements.md §5 R1), same-name declarations at
+    /// compatible-but-distinct signatures become a clause set; everything
+    /// else stays refused here.
+    | DuplicateFunctionDecl of name: string * firstSite: string
     | TypeMismatch of expected: IRType * actual: IRType
     | ArityMismatch of expected: int * actual: int
     /// BL3002, kernel-apply seam. The WIDTH SCHEMA did not cover the pack
@@ -54,6 +66,24 @@ type TypeError =
     /// element-type mismatch (the defaulted Float64 vs the store's real
     /// element type) at some downstream ascription instead of the cause.
     | ProviderNativeLoadFailure of provider: string * path: string * detail: string
+    /// BL2008. A provider REFUSED to resolve the store named at a
+    /// `let store = alias.load(path)` site (which is also every
+    /// `repo.checkout(...)`, after ProviderDesugar rewrites it into one): the
+    /// repo is missing, the ref is typo'd/ambiguous/a deleted tag, the header
+    /// is not spec 2, the status is Offline, or the snapshot carries
+    /// something this reader refuses by name.
+    ///
+    /// Sibling of ProviderNativeLoadFailure, one condition over: there the
+    /// LIBRARY is unusable, here the STORE is. Both park at the load site
+    /// because with no metadata every dim/variable the store binds is
+    /// untypeable and the opaque fallback dies far downstream as a baffling
+    /// element-type mismatch -- but here the fallback was worse: the refusal
+    /// set IS the feature, and `blade check` reported none of it.
+    ///
+    /// Providers signal this by raising `Types.ProviderResolutionError`;
+    /// zarr/netcdf/csv do not, so their missing-store diagnostics stay in
+    /// Lowering.tryInvokeProvider, untouched.
+    | ProviderStoreUnresolvable of provider: string * path: string * detail: string
     // FIELDS = sprintf args; formatTypeError (TypeEnv.fs) renders each verbatim.
     // Index-type violations (BL4003)
     | IndexTagMismatchNamed of expected: string * actual: string
@@ -87,6 +117,10 @@ type TypeError =
     /// allocator/traversal/compact-read/printer/provider path emits it -- legal
     /// type, unavailable storage. `levels` = rendered level list; `where_` = the seam.
     | OrbitStorageUnsupported of levels: string * where_: string
+    /// `range<R>` / `Array<T like R>` over a `static struct` whose solution
+    /// set cannot be enumerated: the constraints are not closed-form AND the
+    /// box is over the table cap (docs/plans/structural/06). BL4020.
+    | ConstrainedDomainRefused of name: string * why: string
     /// A wreath subscript at the wrong arity. A depth >= 2 OrbIdx record is ONE
     /// index slot spanning prod(ri) RAW AXES, so `W(i,j,k,l)` presents 4 args
     /// against 1 slot; without this case `dispatchAppOrIndex`'s catch-all would
@@ -178,6 +212,14 @@ type TypeError =
     /// undersized one silently emits fewer windows -- a wrong answer with no
     /// symptom. `dim` is 1-based over the indexed array's slots.
     | HaloExtentMismatch of declared: int64 * dim: int * targetName: string * actual: int64
+    /// BL4019: a window read `A(w(o))` whose LITERAL offset `o` lies outside
+    /// the halo's declared offset set (`halo<I, [-1, 0, 1]>` read at `w(2)`).
+    /// The interior is shrunk for the DECLARED reach only, so such a read
+    /// lands past the array's pool at the boundary -- silently in the
+    /// compiled lane, as a BL8003 panic in the interpreter (a latent
+    /// differential red; docs/plans/structural/02 section 1.5). A computed
+    /// offset is not judged here (fail-open, as loops/080 relies on).
+    | HaloOffsetOutsideSet of offset: int * declared: int list * targetName: string
     /// BL3016 (same family, the co-iteration twin): two operands of one
     /// elementwise zip -- `A + B`, `zip(A, B) <@> k`, `method_for(zip ..)` --
     /// carry DIFFERENT compile-time-literal extents on the shared axis. The
@@ -186,6 +228,43 @@ type TypeError =
     /// one is read past its allocation, silently, with no broadcast anywhere
     /// in the language to justify it. `pos` is the offending operand, 1-based.
     | ZipExtentMismatch of pos: int * expected: int64 * actual: int64
+    /// BL3016 (same family, the ABSTRACT-PARAMETER twin of ZipExtentMismatch):
+    /// a callee's body co-iterates two of its parameters, and this call passes
+    /// them arrays whose shared-axis extents are different compile-time
+    /// literals.
+    ///
+    /// ZipExtentMismatch catches the disagreement AT the zip, but only when
+    /// both extents are literals there. Through abstract `T^1` parameters they
+    /// are not: the body sees two rank-1 arrays with no extents to compare, so
+    /// nothing was checked, and the extents only become concrete here, at the
+    /// call. That is the whole hole -- `addup(q6, p3)` on a body that zips its
+    /// two parameters typechecked clean and walked q's 6 cells over p's 3-cell
+    /// allocation, in both lanes. The obligation rides
+    /// `TypeEnv.FuncCoIterObligations`, derived from the callee's body.
+    /// `posA`/`posB` are 1-based ARGUMENT positions in this call.
+    | CoIterArgExtentMismatch of callee: string * posA: int * posB: int * extA: int64 * extB: int64
+    /// BL3016 (the one-sided twin of CoIterArgExtentMismatch): a callee's body
+    /// co-iterates one of its abstract parameters with an array whose extent is
+    /// already CONCRETE there -- `wsum(a: T^1) = reduce(zip(a, weights3) ..)`.
+    /// The zip has one literal and one abstract side, so `zipHeadClash`'s
+    /// literal-vs-literal rule does not fire, and the walk (bounded by operand
+    /// 1) ran the argument's extent over the concrete array's storage. The
+    /// body's literal rides `FuncCoIterObligations` alongside the parameter
+    /// positions; `pos` is the 1-based ARGUMENT position in this call.
+    | CoIterBodyExtentMismatch of callee: string * pos: int * argExt: int64 * bodyExt: int64
+    /// BL3016 (same family, the provider-ascription twin): a `let` annotation
+    /// or `:` ascription on a PROVIDER READ names a compile-time-literal
+    /// extent on some index slot and the read's own type names a different
+    /// one. Wherever two extents can come from DIFFERENT places, this compiler
+    /// already has a check saying so -- param vs argument, operand vs operand,
+    /// halo vs target, literal vs annotation. The provider read is the one
+    /// such seam that had none. The store fixes the ALLOCATION (codegen bakes
+    /// the file's real shape into the buffer and the reader loop) while the
+    /// annotation fixes the TYPE every later index expression compiles
+    /// against -- and the read arm passes the operand's type through
+    /// unchanged, so nothing reconciled them. `dim` is 1-based over the
+    /// array's index slots; `provider` is the registry name for the message.
+    | ProviderReadExtentMismatch of provider: string * dim: int * annotated: int64 * actual: int64
     /// BL3011: a quantity name used inside unit algebra (`Unit x = speed * m`)
     /// or as the RHS of another quantity (`Unit q: speed`). Quantities are
     /// TERMINAL: the nominal layer is exactly one level deep.
@@ -204,6 +283,13 @@ type TypeError =
     /// they evaluate left-to-right at call entry with just the required
     /// arguments bound.
     | DefaultParamScope of func: string * param: string * referenced: string
+    /// BL3012, call site. A default is spliced into the call as surface
+    /// syntax, and a free name it reads resolves THERE -- so when the caller
+    /// has a parameter or local of the same spelling, the default silently
+    /// read that instead of the declaration-site binding (`function f(x =
+    /// k)` from `function g(k) = f()` returned g's argument). The splice
+    /// compares binding identities (TypeEnv.FuncDefaultCaptures) and refuses.
+    | DefaultParamShadowed of func: string * param: string * name: string
     // Factory quantity slots
     /// BL3013 (declaration): two DEFAULTED params of one function carry the
     /// SAME quantity nominal. By-nominal argument routing needs each quantity
@@ -235,6 +321,13 @@ type TypeError =
     /// an operand whose type is not yet known, or a wrong arity. Payload is
     /// the complete message.
     | InvalidCast of message: string
+    /// BL3021. A `match` whose scrutinee is a SPECIALIZATION INDEX --
+    /// `arity(p)` over a pack param, or `rank(p)` over an abstract/caret
+    /// param -- selects its arm when the specialization is cloned, not at
+    /// runtime, so every arm must be statically decidable: unguarded integer
+    /// literals plus at most one catch-all. `scrutinee` is the intrinsic as
+    /// written; `offender` is a clause naming the arm that cannot be decided.
+    | SpecIndexMatchNotStatic of scrutinee: string * offender: string
     | ReduceEmptyArray of extent: int64
     | ProdsumExtentMismatch of a: int64 * b: int64
     | GramNeedsRank2 of leftRank: int * rightRank: int
@@ -272,6 +365,15 @@ type TypeError =
     | ChainOpUndecidable of leftDesc: string * rightDesc: string
     | CommContradictsBody of param1: string * param2: string
     | AntisymmContradictsBody of param1: string * param2: string
+    // The Hermitian third of the pair-swap contradiction family: the body
+    // provably CONJUGATES under the swap (f(y,x) = conj(f(x,y)), deduced
+    // PConj) over complex elements, so both the identity mirror comm
+    // licenses and the sign mirror anticomm licenses answer mirrored
+    // reads wrong. Only minted when the pair's element type is provably
+    // complex -- over reals conj is the identity and the same body is
+    // genuinely symmetric.
+    | CommContradictsConjBody of param1: string * param2: string
+    | AntisymmContradictsConjBody of param1: string * param2: string
     | AntisymMapNotOdd of param: string * proved: string
     | HermitianMapNotReal of param: string
     // The wreath-tie analog of AntisymMapNotOdd (IRLoopStructure.deduceWreathTie
@@ -731,11 +833,37 @@ let indexRankDiffers (i1: IRIndexType) (i2: IRIndexType) : bool =
 ///     equal total_dim; aliases nominative; anon-vs-named compatible;
 ///     irreps never pg-irreps. Tag = None on one side is COMPATIBLE.
 ///   - User-named tags are nominative (lat != lon even if both Idx<180>);
-///     synthetic ("__") tags are structural, never gate.
+///     synthetic ("__") tags are structural, never gate -- EXCEPT the
+///     provider provenance family (`isProviderAxisTag`), which is a name the
+///     STORE wrote and gates like any other (see `gatesNominally`).
 ///   - Extents are NOT compared; Symmetry must be compatible (SymNone
 ///     wildcard); WREATH LEVEL LISTS ARE compared (see the arm below).
 let indexPairIncompatible (i1: IRIndexType) (i2: IRIndexType) : bool =
     let isSyntheticTag (t: string) = t.StartsWith("__")
+    /// Does this tag GATE -- i.e. is it an identity two records must share,
+    /// rather than a structural sentinel every record of a kind carries?
+    ///
+    /// User-written names always gate. `__` tags normally do not, and that
+    /// exemption LAUNDERED provider provenance: `__icaxis|`/`__icpool|` are
+    /// `__`-prefixed only so the four seams that read a Tag as a user-facing
+    /// name (`checkArrayIndexTags`, `elemTypeForIterationIndex`,
+    /// `Ide.indexNamesOf`, and this predicate's own exemption) leave them
+    /// alone -- but they are IDENTITIES, and this arm is the one place that
+    /// distinction decides the answer. Before this, ascribing two DIVERGED
+    /// checkouts' arrays to one `type L = ck1.index.lat` alias (or to any
+    /// user-written `type L = Idx<5>`) passed here, so the arithmetic that
+    /// followed saw a single tag and co-iterated happily -- the refusal the
+    /// axis tag exists to produce, walked around by an annotation. It also
+    /// closes the function BOUNDARY: a param typed through a checkout's own
+    /// axis alias now refuses the other checkout's array.
+    ///
+    /// Provider-vs-untagged stays COMPATIBLE (this arm needs `Some` on both
+    /// sides): an unnamed index is "some axis of this extent" and co-iterates
+    /// with either -- the escape hatch BL3999's own message advertises, and
+    /// the route by which a user can still assert two diverged axes are one.
+    /// Provider-vs-other-`__` stays compatible too: those are kind sentinels,
+    /// and gating them would refuse sound code.
+    let gatesNominally (t: string) = not (isSyntheticTag t) || isProviderAxisTag t
     // The wreath arm, ahead of everything but the rank check. Rank +
     // Symmetry alone are NOT sufficient: OrbIdx<[(2,+),(2,+)], n> and
     // OrbIdx<[(2,-),(2,-)], n> are both Rank 4, SymWreath, share the
@@ -775,8 +903,8 @@ let indexPairIncompatible (i1: IRIndexType) (i2: IRIndexType) : bool =
                      | Some a, Some b -> a <> b
                      | _ -> false)
     | Some t1, Some t2 when t1 <> t2
-                            && not (isSyntheticTag t1)
-                            && not (isSyntheticTag t2) -> true
+                            && gatesNominally t1
+                            && gatesNominally t2 -> true
     | _ ->
         i1.Symmetry <> i2.Symmetry && i1.Symmetry <> SymNone && i2.Symmetry <> SymNone
 

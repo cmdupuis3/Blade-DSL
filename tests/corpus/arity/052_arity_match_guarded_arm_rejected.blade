@@ -1,0 +1,26 @@
+// TEST: Guarded arm on an arity match (rejects)
+// ERROR: BL3021
+// ERROR-CONTAINS: arm selection happens at specialization
+// ============================================================================
+// docs/plans/plan-match-statements.md section 5, R9: `match arity(A)` selects
+// its arm when the ARITY SPECIALIZATION is cloned, not at runtime. A guarded
+// arm reads runtime values, so the order-sound constant-match fold correctly
+// BAILS on it -- and for a recursive pack the specializer then cannot pick
+// the base arm, specialization shrinks past arity 0, and (before this
+// refusal) the program died as a raw g++ error naming `packsum_arity_0`
+// despite a green `blade check`. The refusal lands at typecheck instead:
+// arms of a specialization-index match must be unguarded integer literals
+// plus at most one catch-all. The condition belongs INSIDE the chosen arm's
+// body -- see 054 for the accepted spelling.
+// ============================================================================
+let threshold = 1.5
+function packsum(A: Poly<T^0>) -> T^0 = {
+    match arity(A) with
+    | 1 if threshold > 0.0 -> A[0]
+    | 1 -> A[0] * 2.0
+    | _ -> {
+        let head :: tail = A
+        head + packsum(tail)
+    }
+}
+let result = packsum(1.0, 2.0, 3.0, 4.0)

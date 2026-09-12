@@ -1,0 +1,16 @@
+// TEST: Fused Scalar Broadcast Chain
+// ============================================================================
+// The coordinate-axis idiom: scalar broadcasts compose through fusion, and
+// the captured scalars of BOTH stages ride the one composed kernel. The
+// fused loop computes x0 + dx * base in a single pass.
+
+type I = Idx<5>
+let dx = 0.25
+let x0 = 10.0
+let base_arr = method_for(range<I>) <@> lambda(i) -> Float64(i) |> compute
+
+let axis = x0 + dx * base_arr
+// EXPECT: axis = [10, 10.25, 10.5, 10.75, 11]
+
+let s = reduce(axis, (+))
+// EXPECT: s = 52.5

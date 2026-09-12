@@ -379,7 +379,10 @@ residual pins are the differential gate. Equivariance posture mirrors
 grad's: tangents are not re-judged (equivariance of the directional
 derivative is a theorem given the primal).
 
-Remaining: combinator rules (`<@>`/`>>@`/…) for BOTH modes (the C-track;
+Remaining: combinator rules (`<@>`/`>>@`/…) for FORWARD mode (reverse mode
+lowers eager rank-0 maps as of 2026-08-26 — `GradNormalize.expandEagerMap`,
+with the surviving reverse refusals enumerated in
+`docs/plans/plan-equivariant-nn-notebooks.md` §5/census row 15; the C-track;
 `proofs/BladeJacobian.v`'s `tangent_joint_swap` already licenses
 joint-pair symmetric tangent storage for when kernels land),
 triangular-tape exploitation for symmetric intermediates, wrt-lists for

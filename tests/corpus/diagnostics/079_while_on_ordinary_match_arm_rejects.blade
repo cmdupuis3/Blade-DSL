@@ -1,0 +1,19 @@
+// TEST: While On Ordinary Match Arm (rejects)
+// ============================================================================
+// `while` belongs to the recursive-array arm and only there: it declares when
+// the INDUCTION stops (and the array freezes). An ordinary match arm has no
+// induction to stop -- its guard is `if`, and a failing `if` falls through to
+// the next arm -- so the two clauses are not interchangeable in either
+// direction. The mirror case (`if` on a rec-array arm) steers back the other
+// way, in recursive-arrays/014's neighbourhood.
+//
+// The steer also has to SURVIVE the arm-list combinator: `many` treats any
+// arm failure as "the list ends here", which used to discard this message and
+// re-report the generic "Expected declaration but got '|'" at the next arm.
+
+let x = 5
+let r = match x with
+    | n while n > 3 -> 1
+    | _ -> 0
+// ERROR: BL1003
+// ERROR-CONTAINS: guards a RECURSIVE-ARRAY arm

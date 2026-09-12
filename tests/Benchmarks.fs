@@ -104,7 +104,7 @@ let private timeEdgiProgramOnly (outputDir: string) (caseName: string) (edgiSrc:
             cpsi.UseShellExecute <- false
             cpsi.WorkingDirectory <- Path.GetDirectoryName(srcAbs)
             use cproc = Process.Start(cpsi)
-            let cerr = cproc.StandardError.ReadToEndAsync()
+            let cerr = Blade.Runtime.readToEndOffPool cproc.StandardError
             // Guard ExitCode behind WaitForExit's return: reading ExitCode on a
             // still-running (timed-out) process throws "Process must exit ...".
             // Dense baselines emit large C++ whose -O2 compile can be slow, so
@@ -123,7 +123,7 @@ let private timeEdgiProgramOnly (outputDir: string) (caseName: string) (edgiSrc:
                     rpsi.UseShellExecute <- false
                     rpsi.WorkingDirectory <- Path.GetDirectoryName(exeAbs)
                     use rproc = Process.Start(rpsi)
-                    let rout = rproc.StandardOutput.ReadToEndAsync()
+                    let rout = Blade.Runtime.readToEndOffPool rproc.StandardOutput
                     // Kill a runaway run on timeout so rout.Result returns
                     // instead of blocking indefinitely on a process that may
                     // never exit. A timed-out or nonzero-exit run is an ERROR,

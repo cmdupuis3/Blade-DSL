@@ -1,0 +1,11 @@
+// TEST: Enumerable Domain: A Domain Slot Is The Whole Iteration Space (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: sparse range slot cannot be combined
+// Like a compound or sparse slot, a domain slot IS the iteration space; it
+// cannot share a range<> with another index type.
+static struct Band {
+    i: Int<min=0, max=8>,
+    j: Int<min=0, max=8>
+} where abs(i - j) <= 2
+type K = Idx<3>
+let R = method_for(range<Band, K>) <@> lambda(i, j, k) -> i + j + k |> compute

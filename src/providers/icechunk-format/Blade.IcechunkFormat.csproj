@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Vendored Icechunk on-disk format accessors: flatc-generated C# from the
+       schemas in schema/ (see README.md for the pinned source commit and the
+       exact flatc invocation). C# because flatc emits no F#; Blade.fsproj takes
+       a ProjectReference. Regenerate ONLY by the README recipe, never by hand-
+       editing generated/ - the golden-bytes tests in tests/IcechunkTests.fs pin
+       the wire behavior. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Blade.IcechunkFormat</RootNamespace>
+    <Nullable>disable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- The repo-wide Directory.Build.props sets EnableDefaultItems=false (it is
+       written for Blade.fsproj, which sits at the repo ROOT and would otherwise
+       sweep docs/, proofs/ and the fixtures into its item groups). That property
+       reaches THIS project too, so without an explicit glob the SDK compiles
+       nothing here and the assembly comes out empty - which type-checks fine
+       until the first F# reference to `generated.*` fails to resolve. The glob
+       is deliberately a WILDCARD, not a hand-maintained list: generated/ is
+       machine-written by the README's flatc invocation. -->
+  <ItemGroup>
+    <Compile Include="generated/**/*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.FlatBuffers" Version="25.2.10" />
+  </ItemGroup>
+
+</Project>

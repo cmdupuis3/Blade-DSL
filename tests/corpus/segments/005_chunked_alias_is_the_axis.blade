@@ -1,0 +1,16 @@
+// TEST: A Chunked Alias Is The Axis It Segments
+// `Chunked<I, K>` adopts I's record (docs/plans/structural/07 §2.1): an
+// array over CI and an array over I are the same type, so they combine
+// elementwise, and `ungroup` under either name is the same value.
+type I = Idx<6>
+type CI = Chunked<I, 4>
+let a: Array<Float like I> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+let b: Array<Float like CI> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+let c = a + b
+// EXPECT: c = [11, 22, 33, 44, 55, 66]
+let seg = segments(CI)
+let gb = group_by(b, seg)
+let back: Array<Float like I> = ungroup(gb)
+// EXPECT: back = [10, 20, 30, 40, 50, 60]
+let sizes = extents(seg)
+// EXPECT: sizes = [4, 2]

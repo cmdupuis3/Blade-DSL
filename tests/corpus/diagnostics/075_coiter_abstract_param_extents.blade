@@ -1,0 +1,25 @@
+// TEST: Diag CoIter Abstract Param Extents (rejects)
+// The ABSTRACT-PARAMETER half of the zip agreement obligation 071/072 pin at
+// the zip itself.
+//
+// `zipHeadClash` refuses a mismatched zip literal-vs-literal, but a body over
+// `T^1` parameters has no extents to compare: `zip(a, b)` was accepted
+// unconditionally, and the co-iteration nest bounds EVERY level by operand 1
+// while every operand peels at every level (IRStorage's co-iteration arm). So
+// this program typechecked clean and walked q's 6 cells over p's 3-cell
+// allocation -- reading three doubles past the end of `p`:
+//   C++ : bad = 1.07938616957951e+98
+// The correct answer for agreeing operands is 66 (loops/195).
+//
+// The obligation travels on FuncCoIterGroups, derived from addup's body, and
+// is discharged HERE, at the first place both extents are concrete. Blamed on
+// argument 2 because the walk takes its bound from argument 1.
+// ERROR: BL3016
+// ERROR-CONTAINS: CO-ITERATES these two parameters
+function addup(a: T^1, b: T^1) -> T^0 =
+    reduce(method_for(zip(a, b)) <@> lambda(x, y) -> x + y, (+))
+type A = Idx<3>
+type Bx = Idx<6>
+let p: Array<Float like A> = [1.0, 2.0, 3.0]
+let q: Array<Float like Bx> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+let bad = addup(q, p)

@@ -1,0 +1,51 @@
+// TEST: Caret Rank-2 Reduce Peels One Axis
+// ============================================================================
+// docs/plans/plan-match-statements.md section 4, phase P2: a `T^k` parameter
+// must reach the array INTRINSICS at rank k, not at rank 1.
+//
+// `reduce(x, (+))` on a `T^2` parameter was refused with BL3999 "reduce()
+// requires an array as first argument" -- about a parameter whose caret says
+// it IS an array, and whose identical body over a concrete rank-2 array
+// compiled and ran. Two separate synthesis sites both assumed rank 1:
+//
+//   * `inferReduce`'s operand rank probe read only the RESOLVED type. A `T^k`
+//     var resolves to a bare `IRTInfer` -- the caret's rank lives in the
+//     substitution (`Subst.arityConstraints`, written by
+//     LookupOrCreateTypeVar), not in the type -- so the probe answered None,
+//     both rank-aware routes (leading-axis fold, partial fold) were skipped,
+//     and the tail arm minted a RANK-1 array whose unify against the `^2` pin
+//     failed. That failure is discarded (`|> ignore`), so the operand stayed
+//     unresolved and the last arm blamed the caller.
+//   * `requireArrayArgMinRank` (TypeCheckSupport), which every other array
+//     intrinsic goes through, minted rank-1 for the same reason -- see 049.
+//
+// Both now read `GetArityConstraint` (the exact pin) with `GetRankLowerBound`
+// as the fallback. With the rank known, `reduce` routes the fold through the
+// partial-fold rewrite it already had:
+//
+//     method_for(x) <@> lambda(row) -> reduce(row, (+)) |> compute
+//
+// which is the row-wise idiom the corpus writes by hand -- so this test also
+// pins that the abstract spelling and the hand-written one agree. No new IR
+// node, no new codegen: the caret just stopped being invisible to the router.
+//
+// The declared `-> T^1` is load-bearing evidence, not decoration: rank k in,
+// rank k-1 out is the default fold's contract, and it is what makes a
+// rank-RECURSIVE body writable at all (P3).
+// ============================================================================
+type Row = Idx<3>
+type Col = Idx<4>
+
+function rowsums(x: T^2) -> T^1 = reduce(x, (+))
+
+let a: Array<Float64 like Row, Col> = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]]
+
+let abstract_sums = rowsums(a)
+// EXPECT: abstract_sums = [10, 26, 42]
+
+// The hand-written row-wise spelling of the same fold, for agreement.
+let manual_sums = method_for(a) <@> lambda(row) -> reduce(row, (+)) |> compute
+// EXPECT: manual_sums = [10, 26, 42]
+
+let total = reduce(abstract_sums, (+))
+// EXPECT: total = 78

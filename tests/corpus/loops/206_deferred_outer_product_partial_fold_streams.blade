@@ -1,0 +1,65 @@
+// TEST: Deferred Outer Product Under The Default Partial Fold Streams
+// `reduce(method_for(A, B) <@> k, (+))` with the default `axes = 1` folds
+// the innermost axis of a product nobody else reads. The route used to force
+// the whole M x N pool and then fold its rows (docs/plans/structural/03,
+// section 1.3: two full passes over a pool the answer never needs). The
+// checker now rewrites it into the per-row shape of examples/10 -- an outer
+// apply over A whose row kernel is the FUSED fold over B with A's cell
+// captured -- and no rank-2 pool exists (tests/OptimizeTests.fs pins the
+// emission). Per row the fused fold is the same left fold in the same order
+// as the row mode, so the pins are exact differentials against the
+// materialized route: float and integer-valued data, non-power-of-two
+// extents, a (+) section, a (*) section, a seeded lambda kernel, and an
+// Int64 product. A rank-3 product keeps the materialized route (its row
+// kernel would be array-valued); it is pinned here so that stays true.
+type I = Idx<7>
+type J = Idx<11>
+type L = Idx<5>
+function score(a: Float64, b: Float64) -> Float64 = -(a - b) * (a - b) * 8.0
+let q = method_for(range<I>) <@> lambda(i) -> 0.3 * Float64(i) - 0.5 |> compute
+let k = method_for(range<J>) <@> lambda(j) -> 0.2 * Float64(j) - 0.4 |> compute
+let w = method_for(range<L>) <@> lambda(l) -> 1.0 + Float64(l) |> compute
+let ia: Array<Int64 like I> = [1, 2, 3, 5, 7, 11, 13]
+let ib: Array<Int64 like L> = [2, 3, 5, 7, 9]
+
+// (+) over float data: the softmax denominator without the score matrix.
+let z = reduce(method_for(q, k) <@> lambda(a, b) -> exp(score(a, b)), (+))
+let W = (method_for(q, k) <@> lambda(a, b) -> exp(score(a, b)) |> compute)
+let zr = reduce(W, (+))
+let dz = z - zr
+// EXPECT: dz = [0, 0, 0, 0, 0, 0, 0]
+
+// A seeded lambda kernel: the row maximum.
+let mx = reduce(method_for(q, k) <@> lambda(a, b) -> score(a, b),
+                lambda(x, y) -> if x > y then x else y, -1.0e300)
+let mxr = reduce(method_for(q, k) <@> lambda(a, b) -> score(a, b) |> compute,
+                 lambda(x, y) -> if x > y then x else y, -1.0e300)
+let dm = mx - mxr
+// EXPECT: dm = [0, 0, 0, 0, 0, 0, 0]
+
+// (*) over integer-valued float data.
+let p = reduce(method_for(q, w) <@> lambda(a, b) -> Float64(floor(a * 3.0)) + b, (*))
+let pr = reduce(method_for(q, w) <@> lambda(a, b) -> Float64(floor(a * 3.0)) + b |> compute, (*))
+let dp = p - pr
+// EXPECT: dp = [0, 0, 0, 0, 0, 0, 0]
+
+// Int64 cells.
+let s = reduce(method_for(ia, ib) <@> lambda(a, b) -> a * b + 1, (+))
+let sr = reduce(method_for(ia, ib) <@> lambda(a, b) -> a * b + 1 |> compute, (+))
+let ds = s - sr
+// EXPECT: ds = [0, 0, 0, 0, 0, 0, 0]
+
+// A rank-3 product folds its innermost axis into a rank-2 result -- on the
+// materialized route, the same as the forced spelling.
+let t = reduce(method_for(q, k, w) <@> lambda(a, b, c) -> a * b + c, (+))
+let tr = reduce(method_for(q, k, w) <@> lambda(a, b, c) -> a * b + c |> compute, (+))
+let dt = reduce(reduce(t - tr, (+)), (+))
+// EXPECT: dt = 0.0
+
+// The values themselves, for the interpreter differential.
+let z0 = z((0 : I))
+let s6 = s((6 : I))
+let t23 = t((2 : I))((3 : J))
+// EXPECT: z0 = 1.56664267164425
+// EXPECT: s6 = 343
+// EXPECT: t23 = 15.1

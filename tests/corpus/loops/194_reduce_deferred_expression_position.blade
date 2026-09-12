@@ -1,0 +1,33 @@
+// TEST: Reduce Over Deferred Computation In Expression Position
+// `reduce(A * B, (+))` lowers to IRReduceCompute -- scalar accumulators plus a
+// fused loop nest, statement-shaped, with no expression rendering anywhere. In
+// an ARRAY-LITERAL element or an `if` CONDITION it used to reach exprToCpp and
+// die BL7004 ("must be bound to a let") while the interpreter evaluated it
+// happily: a silent lane divergence that an interp-first notebook only met once
+// it finally compiled. IRLift now hoists it to its own let at both sites, which
+// is exactly what CodeGen's own IRReduceCompute arms already do for a body
+// `let` and for a function RETURN. Both lanes are pinned (the loops category is
+// in the interp differential slice).
+let a: Array<Float64 like Idx<5>> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let b: Array<Float64 like Idx<5>> = [2.0, 3.0, 4.0, 5.0, 6.0]
+
+// Element position: two folds in one literal (the `signal_ceiling` shape).
+let pair = [reduce(a * b, (+)), reduce(b * b, (+))]
+// EXPECT: pair = [70, 90]
+
+// Element position inside a NESTED literal -- the walker must still measure
+// rank 2, so only the scalar leaf is hoisted.
+let grid = [[reduce(a * b, (+)), 1.0], [2.0, 3.0]]
+// EXPECT: grid = [[70, 1], [2, 3]]
+
+// `if` CONDITION. Evaluated exactly once whatever the select does, so the
+// hoist is unconditional and changes no work.
+let picked = if reduce(a * b, (+)) > 80.0 then 1.0 else 2.0
+// EXPECT: picked = 2
+
+// The positions that always worked, kept here so a regression shows up beside
+// the new ones: binding RHS, and a fold inside larger inline arithmetic.
+let dot = reduce(a * b, (+))
+// EXPECT: dot = 70
+let scaled = reduce(a * b, (+)) / 5.0 + reduce(b * b, (+))
+// EXPECT: scaled = 104

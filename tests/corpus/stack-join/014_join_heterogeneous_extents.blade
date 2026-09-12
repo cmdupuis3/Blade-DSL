@@ -1,0 +1,44 @@
+// TEST: Join Heterogeneous Extents
+// ============================================================================
+// join concatenates along the named axis and the joined extents ADD --
+// including UNEQUAL operand extents, which every earlier join test left
+// unpinned (census: the notebooks' sgd_step assembly was the only exercise
+// in the tree). Four shapes, all previously probe-verified:
+//   1. rank-1 concatenation, 3+2+1 -> 6 (the "append 1D collections" case;
+//      stack would reject these extents with BL4004 -- join is the
+//      concatenator, formalism.md section 2.6);
+//   2. rank-2 along the LEADING axis (time-chunk assembly: a zarr store
+//      chunked along time reassembles by stacking time blocks);
+//   3. rank-2 along the TRAILING axis (one spatial chunk dim);
+//   4. a full 2-D BLOCK assembly by nesting joins (a store chunked along
+//      BOTH spatial dims: join rows of blocks along the trailing axis,
+//      then join the row strips along the leading axis).
+// ============================================================================
+let a = [1.0, 2.0, 3.0]
+let b = [4.0, 5.0]
+let c = [6.0]
+let flat = join(a, b, c, 0)
+let n = extents(flat)
+// EXPECT: flat = [1, 2, 3, 4, 5, 6]
+// EXPECT: n = 6
+
+type X = Idx<3>
+let t0: Array<Float like Idx<2>, X> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let t1: Array<Float like Idx<1>, X> = [[7.0, 8.0, 9.0]]
+let lead = join(t0, t1, 0)
+// EXPECT: lead = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+
+type T = Idx<2>
+let x0: Array<Float like T, Idx<2>> = [[1.0, 2.0], [5.0, 6.0]]
+let x1: Array<Float like T, Idx<1>> = [[3.0], [7.0]]
+let trail = join(x0, x1, 1)
+// EXPECT: trail = [[1, 2, 3], [5, 6, 7]]
+
+let b00: Array<Float like Idx<2>, Idx<2>> = [[1.0, 2.0], [5.0, 6.0]]
+let b01: Array<Float like Idx<2>, Idx<2>> = [[3.0, 4.0], [7.0, 8.0]]
+let b10: Array<Float like Idx<2>, Idx<2>> = [[9.0, 10.0], [13.0, 14.0]]
+let b11: Array<Float like Idx<2>, Idx<2>> = [[11.0, 12.0], [15.0, 16.0]]
+let top = join(b00, b01, 1)
+let bot = join(b10, b11, 1)
+let blocks = join(top, bot, 0)
+// EXPECT: blocks = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]

@@ -1,0 +1,5 @@
+// TEST: Segments Of A Plain Index Type Is Refused (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: not a `Chunked<..>` one
+type I = Idx<10>
+let seg = segments(I)

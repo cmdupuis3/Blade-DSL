@@ -1,0 +1,23 @@
+// TEST: Runtime condition inside the chosen arity arm
+// ============================================================================
+// The accepted spelling of what 052 refuses: the arm is selected statically
+// (unguarded `| 1` base arm), and the runtime condition moves INSIDE that
+// arm's body as an ordinary `if` -- exactly the steer BL3021's message gives.
+// The condition reads the pack itself (`A[0] > 0.0`): a base arm reading a
+// module-level binding instead currently trips the unrelated main-local
+// capture gap in pack specialization emission, so the pack-derived condition
+// is both the idiomatic and the portable form.
+//
+// Values pin that the branch is really taken at runtime, per element sign:
+// 1 + 2 + 3 + (-4 * 2) = -2.
+// ============================================================================
+function packsum(A: Poly<T^0>) -> T^0 = {
+    match arity(A) with
+    | 1 -> if A[0] > 0.0 then A[0] else A[0] * 2.0
+    | _ -> {
+        let head :: tail = A
+        head + packsum(tail)
+    }
+}
+let result = packsum(1.0, 2.0, 3.0, -4.0)
+// EXPECT: result = -2

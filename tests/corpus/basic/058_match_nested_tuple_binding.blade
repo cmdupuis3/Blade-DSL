@@ -1,0 +1,35 @@
+// TEST: Match Nested Tuple Binding
+// ============================================================================
+// A tuple pattern nested inside another one binds its leaves. The emitter
+// only ever looked ONE level down -- it collected top-level `IRPatVar`s and
+// nothing else -- so `((a, b), c)` bound only `c` and emitted the body
+// against dangling C++ identifiers for `a` and `b`. It typechecked cleanly
+// and died at g++; the interpreter had it right the whole time, so this was
+// also a twin divergence.
+//
+// HAND DERIVATION: a = 1, b = 2, c = 3, so a + b + c = 6 and (a - b) * c = -3.
+
+let t = ((1.0, 2.0), 3.0)
+let r = match t with
+    | ((a, b), c) -> a + b + c
+// EXPECT: r = 6
+
+// Nested on the RIGHT, and three deep -- the leaf must ride two projections.
+let u = (1.0, (2.0, (3.0, 4.0)))
+let s = match u with
+    | (a, (b, (c, d))) -> a + b * 10.0 + c * 100.0 + d * 1000.0
+// EXPECT: s = 4321
+
+// A nested LITERAL makes the outer pattern refutable: the test rides the
+// same recursion the binders do, so arm one must be skipped for arm two.
+// (Integers -- float patterns are not parser-reachable.)
+let ti = ((1, 2), 3)
+let v = match ti with
+    | ((9, b), c) -> b + c
+    | ((a, b), c) -> a * 100 + b * 10 + c
+// EXPECT: v = 123
+
+// A nested wildcard binds nothing and must not shift the slots beside it.
+let w = match u with
+    | (_, (b, (_, d))) -> b + d
+// EXPECT: w = 6

@@ -1,0 +1,146 @@
+// TEST: C2-Reverse -- Reverse Mode Through The Moment-Former Shape
+// The end-to-end target of plan-equivariant-nn-notebooks.md 5.2: a LEARNABLE
+// SCALAR upstream of a moment former, differentiated in reverse. This is
+// NB2 Phase B's shape.
+//
+// What the ppl pool path elaborates to (`PplElaborate.poolDecls`) is exactly
+// what is written below: row slices, ONE `method_for(zip(rows...))` loop
+// object, one product kernel per needed multiset, and additive folds of the
+// applications. Two deliberate differences, both recorded rather than hidden:
+//   * the former binds its rows as `A(i)` SLICES and joins its folds with
+//     `<&!>` into one traversal; a slice carries no static dims to this pass
+//     and `<&!>` is a combinator operator, so both stay refused. Unrolling
+//     the join into one `reduce` per moment is semantically identical (k
+//     traversals instead of one fused), and the rows arrive as parameters.
+//   * `ppl.moments`/`ppl.comoments` elaborate at MODULE level only
+//     (`PplElaborate.expand` matches `DeclLet`), so a former cannot appear
+//     inside a differentiated function at all -- the shape is what is
+//     reachable, and this test pins the shape.
+// The former's OTHER elaboration -- the unresolvable-extent fallback at
+// `PplElaborate.fs:462-464` -- is a rank-1 fiber kernel under `where comm`,
+// and 103 pins both of its refusals.
+//
+// Three chained lowerings compose here: the two scaling maps, then a zip map
+// over their RESULTS (so the lowered locals' dims must reach the next map's
+// operand classification), then additive folds of those results.
+//
+// NO `ad.jvp` LEG: forward mode's Tier-2 map rule takes named array
+// PARAMETERS and `halo`/`range` traversals as operands -- a `zip` is neither,
+// and neither is a local. It refuses this body outright, so on this shape the
+// lowering makes REVERSE mode strictly wider than forward and the
+// jvp-vs-grad residual is unavailable. Three independent gates stand in:
+// the plan-ad-combinators.md 6 combinator-vs-lane differential (the same
+// arithmetic through `expandRecArray`'s prefix-free lowering), central
+// differences on all three parameter kinds, and the 5. identity-pretransform
+// equality below.
+//
+//   r0 = [1, 2, 3, 4]   r1 = [2, 1, 4, 0.5]   N = 4
+//   S(r0^2) = 30   S(r0 r1) = 18   S(r1^2) = 21.25
+//   loss(b) = b^2/4 * (30 + 2*18 + 3*21.25) = b^2 * 32.4375
+//   at b = 1.5:  loss = 72.984375        dloss/db = 2b*32.4375 = 97.3125
+//     dr0(k) = b^2 (r0(k) + r1(k)) / 2      = 2.25 * [1.5, 1.5, 3.5, 2.25]
+//     dr1(k) = b^2 (r0(k) + 3 r1(k)) / 2    = 2.25 * [3.5, 2.5, 7.5, 2.75]
+//   Every value is dyadic, so the pins are the derivation verbatim.
+import ad as ad
+
+type S = Idx<4>
+
+// Phase B: a learnable scalar scaling the former's input upstream.
+function loss(r0: Array<Float like S>, r1: Array<Float like S>, beta: Float) -> Float = {
+    let s0 = method_for(r0) <@> lambda(t: Float) -> beta * t |> compute
+    let s1 = method_for(r1) <@> lambda(t: Float) -> beta * t |> compute
+    let L = method_for(zip(s0, s1))
+    let p00: Array<Float like S> = L <@> lambda(x0: Float, x1: Float) -> x0 * x0 |> compute
+    let p01: Array<Float like S> = L <@> lambda(x0: Float, x1: Float) -> x0 * x1 |> compute
+    let p11: Array<Float like S> = L <@> lambda(x0: Float, x1: Float) -> x1 * x1 |> compute
+    let m00 = reduce(p00, (+)) / 4.0
+    let m01 = reduce(p01, (+)) / 4.0
+    let m11 = reduce(p11, (+)) / 4.0
+    m00 + 2.0 * m01 + 3.0 * m11
+}
+
+// Phase A: the same former over a FIXED featurization -- no learnable
+// pre-transform at all. Byte-identical kernels; the scaling maps are gone.
+function loss_fixed(r0: Array<Float like S>, r1: Array<Float like S>) -> Float = {
+    let L = method_for(zip(r0, r1))
+    let p00: Array<Float like S> = L <@> lambda(x0: Float, x1: Float) -> x0 * x0 |> compute
+    let p01: Array<Float like S> = L <@> lambda(x0: Float, x1: Float) -> x0 * x1 |> compute
+    let p11: Array<Float like S> = L <@> lambda(x0: Float, x1: Float) -> x1 * x1 |> compute
+    let m00 = reduce(p00, (+)) / 4.0
+    let m01 = reduce(p01, (+)) / 4.0
+    let m11 = reduce(p11, (+)) / 4.0
+    m00 + 2.0 * m01 + 3.0 * m11
+}
+
+// The lane twin of Phase B: the scaling folded into each moment's slice, so
+// the arithmetic is identical and the LOWERING is not.
+function loss_rec(r0: Array<Float like S>, r1: Array<Float like S>, beta: Float) -> Float = {
+    let rec q00: Array<Float like Idx<4>> =
+        match q00 with
+        | zero -> zero
+        | prefix :: n -> prefix :: (beta * r0(n)) * (beta * r0(n))
+    let rec q01: Array<Float like Idx<4>> =
+        match q01 with
+        | zero -> zero
+        | prefix :: n -> prefix :: (beta * r0(n)) * (beta * r1(n))
+    let rec q11: Array<Float like Idx<4>> =
+        match q11 with
+        | zero -> zero
+        | prefix :: n -> prefix :: (beta * r1(n)) * (beta * r1(n))
+    reduce(q00, (+)) / 4.0 + 2.0 * (reduce(q01, (+)) / 4.0) + 3.0 * (reduce(q11, (+)) / 4.0)
+}
+
+// WARN: BL4003
+let r0 = [1.0, 2.0, 3.0, 4.0]
+let r1 = [2.0, 1.0, 4.0, 0.5]
+
+let mut d0 = [0.0, 0.0, 0.0, 0.0]
+let mut d1 = [0.0, 0.0, 0.0, 0.0]
+let (lv, dbeta) = ad.grad(loss)(r0, r1, 1.5, d0, d1)
+// EXPECT: lv = 72.984375
+// EXPECT: dbeta = 97.3125
+// EXPECT: d0 = [3.375, 3.375, 7.875, 5.0625]
+// EXPECT: d1 = [7.875, 5.625, 16.875, 6.1875]
+
+// The combinator-vs-lane differential: the same three moments through
+// `expandRecArray`'s prefix-free arm instead of the map lowering. Different
+// pre-pass, different emitted statements, same numbers -- value AND all
+// three gradients.
+let mut g0 = [0.0, 0.0, 0.0, 0.0]
+let mut g1 = [0.0, 0.0, 0.0, 0.0]
+let (rv, rdbeta) = ad.grad(loss_rec)(r0, r1, 1.5, g0, g1)
+let lane_vresid = rv - lv
+let lane_bresid = rdbeta - dbeta
+let lane_gresid = reduce(abs(g0 - d0), (+)) + reduce(abs(g1 - d1), (+))
+// EXPECT: lane_vresid = 0
+// EXPECT: lane_bresid = 0
+// EXPECT: lane_gresid = 0
+
+// The 5. stance: with the learnable pre-transform at the IDENTITY, the
+// gradient through the former must equal the Phase-A fixed-featurization
+// gradient. Not approximately -- the scaling maps collapse to copies, so
+// every partial is the same number.
+let mut e0 = [0.0, 0.0, 0.0, 0.0]
+let mut e1 = [0.0, 0.0, 0.0, 0.0]
+let (ident_v, ident_db) = ad.grad(loss)(r0, r1, 1.0, e0, e1)
+let mut f0 = [0.0, 0.0, 0.0, 0.0]
+let mut f1 = [0.0, 0.0, 0.0, 0.0]
+let fixed_v = ad.grad(loss_fixed)(r0, r1, f0, f1)
+let ident_vresid = ident_v - fixed_v
+let ident_gresid = reduce(abs(e0 - f0), (+)) + reduce(abs(e1 - f1), (+))
+// EXPECT: ident_v = 32.4375
+// EXPECT: ident_vresid = 0
+// EXPECT: ident_gresid = 0
+// EXPECT: ident_db = 64.875
+
+// Central differences on the primal: the independent route.
+let h = 0.000001
+let fdb = (loss(r0, r1, 1.5 + h) - loss(r0, r1, 1.5 - h)) / (2.0 * h)
+let fd0 = (loss([1.0, 2.0, 3.0 + h, 4.0], r1, 1.5) - loss([1.0, 2.0, 3.0 - h, 4.0], r1, 1.5)) / (2.0 * h)
+let fd1 = (loss(r0, [2.0, 1.0, 4.0, 0.5 + h], 1.5) - loss(r0, [2.0, 1.0, 4.0, 0.5 - h], 1.5)) / (2.0 * h)
+let fd_okb = abs(fdb - dbeta) < 0.000001 * (abs(dbeta) + 1.0)
+let fd_ok0 = abs(fd0 - d0(2)) < 0.000001 * (abs(d0(2)) + 1.0)
+let fd_ok1 = abs(fd1 - d1(3)) < 0.000001 * (abs(d1(3)) + 1.0)
+// EXPECT: fd_okb = true
+// EXPECT: fd_ok0 = true
+// EXPECT: fd_ok1 = true

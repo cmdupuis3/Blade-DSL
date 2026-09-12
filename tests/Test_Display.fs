@@ -110,10 +110,38 @@ add "a base64 frame quotes and escapes its payload" (fun () ->
     eq (F.Sentinel + "{\"v\":1,\"mime\":\"image/png\",\"encoding\":\"base64\",\"data\":\"iVBOR\",\"meta\":{\"id\":\"blade-1\"}}")
        (F.composeLine (F.headFor "image/png") true "iVBOR" "" 1))
 
+// `display.emit_id`: the SAME line with a runtime `meta.id` spliced where
+// `<SessionTag><ordinal>` goes. The whole point of pinning the bytes rather
+// than the difference is that "the same line" is a claim about every other
+// byte too -- head, payload, meta tail, both closing braces.
+
+add "an emit_id frame splices the RUNTIME id where the ordinal goes" (fun () ->
+    eq (F.Sentinel + "{\"v\":1,\"mime\":\"application/vnd.blade.plotstream.v1+json\",\"encoding\":\"json\","
+        + "\"data\":{\"channel\":\"train_loss\",\"epoch\":3,\"x\":[0,1],\"y\":[0.9,0.5]},"
+        + "\"meta\":{\"id\":\"train_loss\",\"stream\":true,\"backend\":\"plotly\"}}")
+       (F.composeLineId (F.headFor F.StreamMime) false
+            "{\"channel\":\"train_loss\",\"epoch\":3,\"x\":[0,1],\"y\":[0.9,0.5]}"
+            ",\"stream\":true,\"backend\":\"plotly\"" "train_loss"))
+
+add "an emit_id id is JSON-escaped like any other string value" (fun () ->
+    // A channel name is program data. Unescaped, a `"` in it would close the
+    // id and everything after would be read as sibling keys of `meta` -- the
+    // same class of bug `json_string` retired one level down.
+    // The SOH is spelled `char 1` rather than written into this literal: a raw
+    // control byte in a source file is invisible to every reader and to most
+    // editing tools.
+    eq (F.Sentinel + "{\"v\":1,\"mime\":\"image/png\",\"encoding\":\"base64\",\"data\":\"AA==\",\"meta\":{\"id\":\"a\\\"b\\\\c\\u0001d\"}}")
+       (F.composeLineId (F.headFor "image/png") true "AA==" "" ("a\"b\\c" + string (char 1) + "d")))
+
+add "the stream mime is a +json mime, so its payload rides inline" (fun () ->
+    // The frozen contract picks a `+json` mime precisely so the renderer gets
+    // an object, not a string it has to parse a second time.
+    eq "json" (F.encodingFor F.StreamMime))
+
 add "the IR node is marked IMPURE (a future CSE/hoist must not drop it)" (fun () ->
     let node =
         Blade.IR.IRDisplayEmit (F.headFor "image/png", true,
-                                Blade.IR.IRLit (Blade.IR.IRLitString "AA=="), "")
+                                Blade.IR.IRLit (Blade.IR.IRLitString "AA=="), "", None)
     let a = Blade.IRPrint.exprAttrs node
     (not a.IsPure) && (Blade.IRPrint.exprAttrs (Blade.IR.IRLit (Blade.IR.IRLitInt 1L))).IsPure,
     sprintf "IsPure = %b" a.IsPure)
@@ -640,6 +668,147 @@ add "plot: all five factories carry the backend slot, flat and chained" (fun () 
             if m = "\"meta\":{\"id\":\"blade-1\",\"backend\":\"plotly\",\"preferredBackend\":\"gr\"}"
             then "gr" else $"[{i} {m}]")
     eq "gr,gr,gr,gr,gr" (String.concat "," got))
+
+// ---- 7. plot.stream: the live-plot channel ----------------------------------
+//
+// `plot.stream(name, x, y[, slots])` is the other frame shape this module
+// emits -- one instalment of a chart a long-running cell keeps extending,
+// under its own mime and carrying a backend-neutral
+// {channel, epoch, x, y, labels} object instead of a plotly figure. The
+// corpus (display/012) pins the surface and the two-lane byte parity; what is
+// pinned here is the PAYLOAD's shape and the identity rule the panel merges
+// on, neither of which a `// EXPECT:` can see.
+
+let private streamSource =
+    "import plot\n\
+     let ok = plot.stream(\"train_loss\", [0.0, 1.0, 2.0], [0.9, 0.5, 0.3], \"mse\": ylabel, 3: epoch, \"batch\": xlabel, \"loss\": title)\n"
+
+add "plot.stream: the stream mime, inline-json encoding, and one frame" (fun () ->
+    match plotFrame streamSource with
+    | Error e -> false, e
+    | Ok doc ->
+        let r = doc.RootElement
+        ((r.GetProperty "mime").GetString() = F.StreamMime
+         && (r.GetProperty "encoding").GetString() = "json"
+         && (r.GetProperty "data").ValueKind = System.Text.Json.JsonValueKind.Object),
+        r.ToString())
+
+add "plot.stream: the payload carries channel, epoch, x, y and the labels" (fun () ->
+    // The slots are handed over OUT of declaration order above, so this also
+    // pins that `epoch` routes by nominal beside the three label slots.
+    match plotFrame streamSource with
+    | Error e -> false, e
+    | Ok doc ->
+        let d = doc.RootElement.GetProperty "data"
+        let nums (name: string) =
+            (d.GetProperty name).EnumerateArray() |> Seq.map (fun v -> string (v.GetDouble())) |> String.concat ","
+        eq "train_loss|3|0,1,2|0.9,0.5,0.3|loss|batch|mse"
+           ($"""{((d.GetProperty "channel").GetString())}|{((d.GetProperty "epoch").GetInt32())}|{(nums "x")}|{(nums "y")}|{((d.GetProperty "title").GetString())}|{((d.GetProperty "xlabel").GetString())}|{((d.GetProperty "ylabel").GetString())}"""))
+
+add "plot.stream: meta.id IS the channel name, and it carries the stream flag" (fun () ->
+    // Read as BYTES, like the backend-slot pins: key order and the absence of
+    // any other key are both contract. This is the frozen wire meta.
+    eq "\"meta\":{\"id\":\"train_loss\",\"stream\":true,\"backend\":\"plotly\"}"
+       (metaBytesOf streamSource))
+
+add "plot.stream: a bare call marks the epoch -1 and OMITS every label" (fun () ->
+    // "not given" and "given as blank" are the same request, and the shorter
+    // payload is the one a training loop repeats thousands of times.
+    let src = "import plot\nlet ok = plot.stream(\"c\", [0.0, 1.0], [2.0, 3.0])\n"
+    match plotFrame src with
+    | Error e -> false, e
+    | Ok doc ->
+        let d = doc.RootElement.GetProperty "data"
+        let has (k: string) =
+            let mutable v = Unchecked.defaultof<System.Text.Json.JsonElement>
+            d.TryGetProperty(k, &v)
+        ((d.GetProperty "epoch").GetInt32() = -1
+         && not (has "title") && not (has "xlabel") && not (has "ylabel")),
+        d.ToString())
+
+add "plot.stream: frames of one channel share an id, and spend NO ordinal" (fun () ->
+    // Two instalments of one chart merge because their ids are equal; the
+    // ordinary figure emitted after them is still `blade-1`, because
+    // `display.emit_id` deliberately leaves the run's ordinal counter alone.
+    // A stream that consumed ordinals would renumber -- and so detach -- every
+    // ordinary plot in a notebook the moment a training cell ran.
+    let src =
+        "import plot\n\
+         let a = plot.stream(\"loss\", [0.0], [1.0])\n\
+         let b = plot.stream(\"loss\", [1.0], [0.5])\n\
+         let c = plot.line([0.0, 1.0], [0.0, 1.0])\n"
+    match interpStdout src with
+    | Error e -> false, e
+    | Ok out ->
+        let ids =
+            out.Replace("\r\n", "\n").Split('\n')
+            |> Array.filter (fun l -> l.StartsWith F.Sentinel)
+            |> Array.map (fun l ->
+                let i = l.IndexOf "\"id\":\""
+                l.Substring(i + 6, l.IndexOf("\"", i + 6) - i - 6))
+            |> String.concat ","
+        eq "loss,loss,blade-1" ids)
+
+add "plot.stream: a channel name with a quote cannot escape meta.id" (fun () ->
+    // The id travels through Frame.escape; the SAME name also travels through
+    // d.json_string into the payload's `channel`. Both have to survive, and
+    // the frame has to still PARSE -- which plotFrame checks by construction.
+    let src = "import plot\nlet ok = plot.stream(\"a\\\" ,\\\"evil\\\":1\", [0.0], [1.0])\n"
+    match plotFrame src with
+    | Error e -> false, e
+    | Ok doc ->
+        let meta = doc.RootElement.GetProperty "meta"
+        let mutable leaked = Unchecked.defaultof<System.Text.Json.JsonElement>
+        let escaped = meta.TryGetProperty("evil", &leaked)
+        ((not escaped)
+         && (meta.GetProperty "id").GetString() = "a\" ,\"evil\":1"
+         && (doc.RootElement.GetProperty("data").GetProperty "channel").GetString() = "a\" ,\"evil\":1"),
+        meta.ToString())
+
+add "plot.stream: no sink installed means an ordinary buffered frame" (fun () ->
+    // The load-bearing default. Every lane but `ide serve` -- `blade run`,
+    // `blade repl`, the corpus, the interp/g++ differential gate -- leaves the
+    // sink unset, and a stream frame is then just another sentinel line at
+    // column 0 of stdout, ahead of the binding prints like any other frame.
+    let src = "import plot\nlet ok = plot.stream(\"loss\", [0.0], [1.0])\n"
+    match interpStdout src with
+    | Error e -> false, e
+    | Ok out ->
+        let lines = out.Replace("\r\n", "\n").Split('\n')
+        let frameAt = lines |> Array.tryFindIndex (fun l -> l.StartsWith F.Sentinel)
+        let bindAt = lines |> Array.tryFindIndex (fun l -> l.StartsWith "ok = ")
+        match frameAt, bindAt with
+        | Some f, Some b -> (f < b && F.sink.IsNone), $"frame at {f}, binding at {b}, sink set = {F.sink.IsSome}"
+        | _ -> false, sprintf "missing line(s) in %A" lines)
+
+add "the sink takes stream frames only, and leaves the buffer alone" (fun () ->
+    // The sink's whole contract in one check: install one, run a program that
+    // emits BOTH kinds, and the stream frame arrives live while the plotly
+    // frame still travels the buffered stdout path. Cleared in a `finally`
+    // exactly as IdeServe does, so a failure here cannot leak into the checks
+    // that follow.
+    let seen = ResizeArray<string>()
+    let src =
+        "import plot\n\
+         let s = plot.stream(\"loss\", [0.0], [1.0])\n\
+         let p = plot.line([0.0, 1.0], [0.0, 1.0])\n"
+    let out =
+        F.setSink (fun l -> seen.Add l)
+        try interpStdout src finally F.clearSink ()
+    match out with
+    | Error e -> false, e
+    | Ok text ->
+        let frames =
+            text.Replace("\r\n", "\n").Split('\n')
+            |> Array.filter (fun l -> l.StartsWith F.Sentinel)
+        let sunkIsStream =
+            seen.Count = 1 && seen.[0].StartsWith (F.Sentinel + F.headFor F.StreamMime)
+        // The stream frame is NOT also on stdout: section 3 of the spec
+        // forbids delivering one frame twice.
+        let stdoutIsPlotlyOnly =
+            frames.Length = 1 && frames.[0].Contains "application/vnd.plotly.v1+json"
+        (sunkIsStream && stdoutIsPlotlyOnly),
+        $"sunk={seen.Count} stdoutFrames={frames.Length}")
 
 // ---- Runner -----------------------------------------------------------------
 

@@ -6,8 +6,8 @@
 /// decide what a parity MEANS (placed before TypeCheck so it can invoke this internally).
 ///
 /// Transposing one ADJACENT parameter pair (pi, pj) gives each subtree a
-/// Parity: PInv (e[swap]=e), PNeg (e[swap]=-e), or PBottom -- the
-/// closed-world default: "no claim," dense storage, never compact-and-corrupt.
+/// Parity: PInv (e[swap]=e), PNeg (e[swap]=-e), PConj (e[swap]=conj e), or
+/// PBottom -- the closed-world default: "no claim," dense storage, never compact-and-corrupt.
 module Blade.Deduce
 
 open Blade.Ast
@@ -16,9 +16,19 @@ open Blade.IR
 open Blade.TypedAst
 
 /// Swap-parity of a kernel body under transposition of one adjacent parameter pair.
+///
+/// PConj is the Hermitian element: e[swap] = conj(e), the law of
+/// `x * conj(y)`. Over complex elements it is NOT invariance -- identity
+/// -mirror (comm) storage would answer mirrored reads un-conjugated and
+/// sign-mirror (anticomm) storage would answer them negated, both silent
+/// corruption -- so it exists to REFUTE those declarations, never to
+/// license storage (no compact class is user-writable for it yet). Over
+/// REAL elements conj is the identity and the same body IS invariant, so
+/// PConj's consumers must type-gate before treating it as a contradiction.
 type Parity =
     | PInv
     | PNeg
+    | PConj
     | PBottom
 
 /// SIGN-parity of a function body under NEGATING one parameter --
@@ -57,7 +67,13 @@ let rec private mirrorEq (pi: IRId) (pj: IRId) (l: TypedExpr) (r: TypedExpr) : b
     | TExprLit a, TExprLit b -> a = b
     | TExprSection a, TExprSection b -> a = b
     | TExprBinOp (mA, oA, lA, rA), TExprBinOp (mB, oB, lB, rB) ->
-        mA = mB && oA = oB && mirrorEq pi pj lA lB && mirrorEq pi pj rA rB
+        mA = mB && oA = oB
+        && ((mirrorEq pi pj lA lB && mirrorEq pi pj rA rB)
+            // A COMMUTATIVE op (opSwapClass PInv is exactly that set) also
+            // mirrors cross-matched: swap(l) = rB op lB equals lB op rB.
+            // What certifies `x*conj(y) + conj(x)*y` invariant -- the swap
+            // image of each addend is the OTHER one with its factors commuted.
+            || (opSwapClass oA = PInv && mirrorEq pi pj lA rB && mirrorEq pi pj rA lB))
     | TExprUnaryOp (oA, iA), TExprUnaryOp (oB, iB) ->
         oA = oB && mirrorEq pi pj iA iB
     | TExprApp (fA, aA), TExprApp (fB, aB) ->
@@ -95,24 +111,62 @@ and private kernelEq (a: TypedExpr) (b: TypedExpr) : bool =
     | TExprVar (_, ia, _), TExprVar (_, ib, _) -> ia = ib
     | _ -> false
 
+/// Conjugate-mirror: does transposing (pi pj) in `l` yield conj(r), node
+/// for node? Sound as a ONE-SIDED certificate because the swap is an
+/// involution: swap(l) = conj(r) semantically forces swap(r) = conj(l).
+/// conj peels through its own nodes (scalar OpConj and the array-level
+/// TExprArrayConjugate) and distributes over the field ops; everything
+/// else answers FALSE -- a bare var is never the conjugate of another,
+/// so failure lands on PBottom, never a wrong claim.
+let rec private conjMirrorEq (pi: IRId) (pj: IRId) (l: TypedExpr) (r: TypedExpr) : bool =
+    let peeled (e: TypedExpr) =
+        match e.Kind with
+        | TExprUnaryOp (OpConj, inner) | TExprArrayConjugate inner -> Some inner
+        | _ -> None
+    (match peeled r with
+     | Some r' -> mirrorEq pi pj l r'   // swap(l) = conj(conj r') = r'
+     | None -> false)
+    || (match peeled l with
+        | Some l' -> mirrorEq pi pj l' r   // swap(conj l') = conj(swap l') = conj(r) iff swap(l') = r
+        | None -> false)
+    || (match l.Kind, r.Kind with
+        // conj is a field automorphism: it distributes over + - * / and
+        // negation, so the certificate recurses per operand (cross-matched
+        // too when the op commutes -- the same license mirrorEq uses).
+        | TExprBinOp (mA, oA, lA, rA), TExprBinOp (mB, oB, lB, rB)
+            when mA = mB && oA = oB
+                 && (match oA with OpAdd | OpSub | OpMul | OpDiv -> true | _ -> false) ->
+            (conjMirrorEq pi pj lA lB && conjMirrorEq pi pj rA rB)
+            || (opSwapClass oA = PInv
+                && conjMirrorEq pi pj lA rB && conjMirrorEq pi pj rA lB)
+        | TExprUnaryOp (OpNeg, a), TExprUnaryOp (OpNeg, b)
+        | TExprArrayNegate a, TExprArrayNegate b -> conjMirrorEq pi pj a b
+        | _ -> false)
+
 /// Table 2: combine child parities through a binary op (the non-mirror
 /// case) -- the sign chain rule.
 let private combineBinOp (op: BinOp) (a: Parity) (b: Parity) : Parity =
     match op with
     | OpMul | OpDiv ->
         // Sign-multiplicative in each operand: (-x)*y = -(x*y), x/(-y) =
-        // -(x/y); PNeg*PNeg = PInv -- (a-b)*(a-b) is even.
+        // -(x/y); PNeg*PNeg = PInv -- (a-b)*(a-b) is even. conj is a field
+        // automorphism, so it is multiplicative too: conj(l)*conj(r) =
+        // conj(l*r) -- but ONLY jointly (PConj paired with PInv would need
+        // the invariant side provably real, which parities don't track).
         (match a, b with
          | PInv, PInv -> PInv
          | PInv, PNeg | PNeg, PInv -> PNeg
          | PNeg, PNeg -> PInv
+         | PConj, PConj -> PConj
          | _ -> PBottom)
     | OpAdd | OpSub ->
         // Jointly sign-linear: both operands must transform the same way
-        // ((-x)+(-y) = -(x+y); mixed parities certify nothing).
+        // ((-x)+(-y) = -(x+y); mixed parities certify nothing). conj
+        // distributes over both: conj(l) +/- conj(r) = conj(l +/- r).
         (match a, b with
          | PInv, PInv -> PInv
          | PNeg, PNeg -> PNeg
+         | PConj, PConj -> PConj
          | _ -> PBottom)
     | OpEq | OpNeq | OpAnd | OpOr | OpLt | OpLe | OpGt | OpGe ->
         // Boolean results absorb sign: only joint invariance survives.
@@ -189,6 +243,7 @@ let rec private exprSize (e: TypedExpr) : int =
     | TExprIndex (a, idxs, _) -> 1 + exprSize a + sum idxs
     | TExprTuple es | TExprSequence es | TExprStack es | TExprZip es -> 1 + sum es
     | TExprComplexLit (re, im) -> 1 + exprSize re + exprSize im
+    | TExprFma (a, b, c) -> 1 + exprSize a + exprSize b + exprSize c
     | TExprIf (c, t, f) -> 1 + exprSize c + exprSize t + exprSize f
     | TExprReduce (a, k, i) ->
         1 + exprSize a + exprSize k + (match i with Some x -> exprSize x | None -> 0)
@@ -208,13 +263,15 @@ let rec private countVar (v: IRId) (e: TypedExpr) : int =
     | TExprUnaryOp (_, i) -> c i
     | TExprExtents a | TExprArrayNegate a | TExprArrayConjugate a -> c a
     | TExprField (o, _, _) -> c o
-    | TExprConstraintCheck (cond, _) -> c cond
+    | TExprConstraintCheck (cond, _, _) -> c cond
+    | TExprBreakIf cond -> c cond
     | TExprApp (f, args) -> c f + sum args
     | TExprTupleIndex (t, i) -> c t + c i
     | TExprIndex (a, idxs, _) -> c a + sum idxs
     | TExprTuple es | TExprSequence es | TExprStack es | TExprZip es -> sum es
     | TExprArrayLit (es, _) -> sum es
     | TExprComplexLit (re, im) -> c re + c im
+    | TExprFma (x, y, z) -> c x + c y + c z
     | TExprIf (cond, t, f) -> c cond + c t + c f
     | TExprReduce (a, k, i) -> c a + c k + (match i with Some x -> c x | None -> 0)
     | TExprLet (_, _, value, body) -> c value + c body
@@ -252,8 +309,10 @@ let rec private substVar (v: IRId) (repl: TypedExpr) (e: TypedExpr) : TypedExpr 
     | TExprArrayNegate a -> sub a |> Option.bind (fun x -> ok (TExprArrayNegate x))
     | TExprArrayConjugate a -> sub a |> Option.bind (fun x -> ok (TExprArrayConjugate x))
     | TExprField (o, f, i) -> sub o |> Option.bind (fun x -> ok (TExprField (x, f, i)))
-    | TExprConstraintCheck (cond, msg) ->
-        sub cond |> Option.bind (fun x -> ok (TExprConstraintCheck (x, msg)))
+    | TExprConstraintCheck (cond, code, msg) ->
+        sub cond |> Option.bind (fun x -> ok (TExprConstraintCheck (x, code, msg)))
+    | TExprBreakIf cond ->
+        sub cond |> Option.bind (fun x -> ok (TExprBreakIf x))
     | TExprApp (f, args) ->
         (match sub f, subs args with
          | Some g, Some a -> ok (TExprApp (g, a))
@@ -274,6 +333,10 @@ let rec private substVar (v: IRId) (repl: TypedExpr) (e: TypedExpr) : TypedExpr 
     | TExprComplexLit (re, im) ->
         (match sub re, sub im with
          | Some a, Some b -> ok (TExprComplexLit (a, b))
+         | _ -> None)
+    | TExprFma (x, y, z) ->
+        (match sub x, sub y, sub z with
+         | Some a, Some b, Some c -> ok (TExprFma (a, b, c))
          | _ -> None)
     | TExprIf (cond, t, f) ->
         (match sub cond, sub t, sub f with
@@ -407,7 +470,8 @@ let rec private flattenBindings (e: TypedExpr) : TypedExpr =
         | TExprArrayNegate a -> k (TExprArrayNegate (f a))
         | TExprArrayConjugate a -> k (TExprArrayConjugate (f a))
         | TExprField (o, fl, i) -> k (TExprField (f o, fl, i))
-        | TExprConstraintCheck (c, msg) -> k (TExprConstraintCheck (f c, msg))
+        | TExprConstraintCheck (c, code, msg) -> k (TExprConstraintCheck (f c, code, msg))
+        | TExprBreakIf c -> k (TExprBreakIf (f c))
         | TExprApp (fn, args) -> k (TExprApp (f fn, fs args))
         | TExprTupleIndex (t, i) -> k (TExprTupleIndex (f t, f i))
         | TExprIndex (a, idxs, ident) -> k (TExprIndex (f a, fs idxs, ident))
@@ -417,6 +481,7 @@ let rec private flattenBindings (e: TypedExpr) : TypedExpr =
         | TExprZip es -> k (TExprZip (fs es))
         | TExprArrayLit (es, aty) -> k (TExprArrayLit (fs es, aty))
         | TExprComplexLit (re, im) -> k (TExprComplexLit (f re, f im))
+        | TExprFma (a, b, c) -> k (TExprFma (f a, f b, f c))
         | TExprIf (c, t, el) -> k (TExprIf (f c, f t, f el))
         | TExprReduce (a, kern, i) -> k (TExprReduce (f a, f kern, Option.map f i))
         | TExprLet (n, vid, value, body) -> k (TExprLet (n, vid, f value, f body))
@@ -645,11 +710,36 @@ let rec private parityOf (resolver: IRId -> SignParity list option)
     | TExprVar (_, id, _) -> if id = pi || id = pj then PBottom else PInv
     | TExprBinOp (_, op, l, r) ->
         if mirrorEq pi pj l r then opSwapClass op
-        else combineBinOp op (par l) (par r)
+        else
+            // A SIGN law proved from the children outranks the conjugate
+            // mirror below. The two can hold at once -- `x*y + conj(x)*conj(y)`
+            // is z + conj z with each side invariant, so e[swap] = e AND
+            // e[swap] = conj e, which only says the value is real -- and when
+            // they do, the sign law is the one storage reads: comm (identity
+            // mirror) is then exactly right, and PConj's refutation would be a
+            // false positive. PNeg with PConj likewise means purely imaginary,
+            // where anticomm is right. PConj only speaks when no sign law does.
+            let combined = combineBinOp op (par l) (par r)
+            if combined <> PBottom then combined
+            // The PConj birth site: swap(l) = conj(r) makes swap(l op r) =
+            // conj(r) op conj(l) = conj(r op l), which is conj(l op r) exactly
+            // when the op commutes AND conj distributes over it -- OpAdd/OpMul
+            // only (OpSub/OpDiv fail commutation; booleans absorb conj's law).
+            elif (match op with OpAdd | OpMul -> true | _ -> false)
+                 && conjMirrorEq pi pj l r then PConj
+            else PBottom
     | TExprUnaryOp (op, inner) ->
         (match op, par inner with
          | _, PInv -> PInv
-         | (OpNeg | OpReal | OpImag), PNeg -> PNeg   // R-linear: sign passes
+         // R-linear ops commute with sign (conj(-z) = -conj(z) included).
+         | (OpNeg | OpReal | OpImag | OpConj), PNeg -> PNeg
+         // The conjugate mirror composes: -conj(w) = conj(-w) and
+         // conj(conj(w)) re-conjugates on both sides, so PConj survives...
+         | (OpNeg | OpConj), PConj -> PConj
+         // ...collapses to invariance under real(): real(conj w) = real(w)...
+         | OpReal, PConj -> PInv
+         // ...and to ANTIsymmetry under imag(): imag(conj w) = -imag(w).
+         | OpImag, PConj -> PNeg
          | _ -> PBottom)
     | TExprApp (f, args) ->
         // Invariant when callee and every argument are invariant; else the
@@ -683,6 +773,8 @@ let rec private parityOf (resolver: IRId -> SignParity list option)
          | PInv, Some i -> (match par i with PInv -> PInv | _ -> PBottom)
          | PNeg, None when (match kernel.Kind with TExprSection OpAdd -> true | _ -> false) ->
              PNeg   // Sum(-x) = -Sum(x); reduce(*) and seeded folds certify nothing
+         | PConj, None when (match kernel.Kind with TExprSection OpAdd -> true | _ -> false) ->
+             PConj   // Sum(conj x) = conj(Sum x) -- the Hermitian dot product's law
          | _ -> PBottom)
     | TExprExtents arr ->
         (match par arr with PInv -> PInv | _ -> PBottom)
@@ -698,6 +790,7 @@ let rec private parityOf (resolver: IRId -> SignParity list option)
             (match par t, par f with
              | PInv, PInv -> PInv
              | PNeg, PNeg -> PNeg
+             | PConj, PConj -> PConj
              | _ -> PBottom)
     | TExprMatch (scrut, cases) when not (List.isEmpty cases) ->
         // The multi-way TExprIf. Also why PATTERN-BOUND vars need no
@@ -714,6 +807,7 @@ let rec private parityOf (resolver: IRId -> SignParity list option)
             let bodies = cases |> List.map (fun c -> par c.Body)
             if bodies |> List.forall ((=) PInv) then PInv
             elif bodies |> List.forall ((=) PNeg) then PNeg
+            elif bodies |> List.forall ((=) PConj) then PConj
             else PBottom
     | TExprField (o, _, _) ->
         (match par o with PInv -> PInv | _ -> PBottom)

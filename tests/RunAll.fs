@@ -24,6 +24,7 @@ open Blade.Tests.Guards
 open Blade.Tests.Combinators
 open Blade.Tests.Tuples
 open Blade.Tests.RecursiveArrays
+open Blade.Tests.Segments
 open Blade.Tests.StackJoin
 open Blade.Tests.Bracketed
 open Blade.Tests.IndexTypes
@@ -108,7 +109,7 @@ let private asRejectProbes (tests: (string * string) list) =
 /// All tests combined
 let allTests =
     basicTests @ intrinsicsTests @ castsTests @ adTests @ adJvpTests @ adJvpCombTests @ mlE2eTests @ mlOpsTests @ mlEquivTests @ loopTests @ symmetryTests @ reynoldsTests @ arityTests @ functionTests
-    @ structTests @ structAbortTests @ structMutualTests @ sumTypeTests @ interfaceTests @ moduleTests @ guardTests @ guardCombinatorTests @ zeroCombinatorTests @ sequenceCombinatorTests @ tupleViewTests @ tupleTests @ replicateTests @ anonRangeTests @ recursiveArrayTests @ bracketedTests
+    @ structTests @ structAbortTests @ structMutualTests @ sumTypeTests @ interfaceTests @ moduleTests @ guardTests @ guardCombinatorTests @ zeroCombinatorTests @ sequenceCombinatorTests @ tupleViewTests @ tupleTests @ replicateTests @ anonRangeTests @ recursiveArrayTests @ segmentsTests @ bracketedTests
     @ indexTypeTests @ treeTests @ mutabilityTests @ asRejectProbes mutabilityErrorTests @ staticTests @ pplTests @ mathTests @ randTests @ displayTests @ asRejectProbes displayErrorTests @ spectraTests @ fallbackTests @ stackJoinTests @ sgsTests @ unitTests @ asRejectProbes unitErrorTests
     @ foreignKeyTests @ maskTests @ setOpTests @ uniqueContainsTests @ semijoinTests @ groupByTests @ sortTests @ reduceTests @ extentsTests @ extentsMultiRankTests @ regressionTests @ sqlCombinedTests @ v24dProbes
     @ inferenceProbes
@@ -393,6 +394,31 @@ let runAllTestsFullWith (extraBlocks: (unit -> Blade.Tests.TestHarness.BlockResu
     // out-of-bounds loop bound. Pure codegen string checks, no toolchain.
     // (Also `blade test shapespec`.)
     let shapeSpec = Blade.Tests.ShapeSpecTests.runShapeSpecTests ()
+    // Flat-elementwise REACH: which index tags reach the flat path. Same
+    // silent-in-both-directions shape as the block above, and the same remedy —
+    // emission text, since the flat rewrite preserves values exactly. Chiefly
+    // PARITY pins between the anonymous range and `range<I>`: the `__anon` tag
+    // was refused for years by a blanket `__` prefix test that every other
+    // reserved tag was already refused by on IxKind grounds. Pure codegen
+    // string checks, no toolchain. (Also `blade test flat-path`.)
+    let flatPath = Blade.Tests.FlatPathTests.runFlatPathTests ()
+    // The optimization layer's emission pins (src/Optimize.fs): every pass
+    // there is value-preserving by charter, so the corpus cannot see one
+    // that silently stops firing -- or one that fires and smuggles in a
+    // contract (the freeze idiom must derive the break WITHOUT acquiring
+    // the `while` spelling's budget abort). Pure codegen string checks, no
+    // toolchain. (Also `blade test optimize`.)
+    let optimizeLayer = Blade.Tests.OptimizeTests.runOptimizeTests ()
+    // The RNG mirror's Philox4x32-10 generator against Random123's published
+    // known-answer vectors, plus the `_at` address identities on the
+    // generator alone (also `blade test rand-mirror`). No toolchain.
+    let randMirror = Blade.Tests.RandMirrorTests.runRandMirrorTests ()
+    // The halo access record and the reverse-mode halo ROUTE differential
+    // (docs/plans/structural/02): emission pins for which route fired, and
+    // the gather's output compared byte-for-byte with the scatter's on the
+    // same programs. The record and emission pins need no toolchain; the
+    // differential skips without g++. (Also `blade test access`.)
+    let accessLayer = Blade.Tests.AccessTests.runAccessTests ()
     // File-based module resolution (src/ModuleResolve.fs) + stdlib/units/SI.blade:
     // the search path, the transitive walk, cycle/duplicate/missing refusals,
     // and the two claims the corpus cannot make — that a file with NO imports
@@ -400,6 +426,19 @@ let runAllTestsFullWith (extraBlocks: (unit -> Blade.Tests.TestHarness.BlockResu
     // boundary still rejects a dimension mismatch. Front-end only apart from one
     // value case, which skips cleanly without g++. (Also `blade test module-resolve`.)
     let moduleResolve = Blade.Tests.ModuleResolveTests.runModuleResolveTests ()
+    // The icechunk `checkout` desugar (src/ProviderDesugar.fs): a raw-AST ->
+    // raw-AST rewrite that `TypeCheck.typeCheck` runs on EVERY program, whether
+    // or not it mentions a provider. No store, no registry, no g++, never
+    // skips — the same shape as the normalize/unify blocks — so it is
+    // unconditional here rather than reachable only through the standalone
+    // verb. (Also reachable standalone as `blade test provider-desugar`.)
+    let providerDesugar = Blade.Tests.ProviderDesugarTests.runProviderDesugarBlock ()
+    // Input manifests + run records (src/RunRecord.fs, blade_run_record.hpp):
+    // the manifest of a CSV-reading program, its baked emission, and -- with
+    // g++ -- the JSON a run writes to BLADE_RUN_RECORD, on the ok path and
+    // on a BL8007 abort. The e2e halves skip without g++. (Also `blade test
+    // run-record`.)
+    let runRecord = Blade.Tests.RunRecordTests.runRunRecordTests ()
     // OpenMP thread-coverage: verifies emitted pragmas form genuine parallel
     // regions when cores are available. Opt-in (see FullSuiteOptions).
     let omp =
@@ -487,7 +526,7 @@ let runAllTestsFullWith (extraBlocks: (unit -> Blade.Tests.TestHarness.BlockResu
         [ yield r1; yield r2; yield attrs; yield subst
           yield normalize; yield unify; yield validateArrow; yield displayFrames; yield grRender
           yield shape; yield oracles; yield orbRank; yield treeRank; yield wigner; yield symPower; yield polyOracle; yield lieTables; yield permSpec; yield permOracle; yield structIdxSpec; yield structIdxOracle; yield pointSpec; yield pgOracle; yield cartBridge; yield spans; yield diagCore; yield diagCorpus; yield certSuggest; yield repDiff; yield repCheck; yield repReject; yield alloc; yield orbWreath
-          yield ompPragma; yield linalgEmit; yield linalgProbe; yield blasTier; yield doctorBlock; yield setupBlock; yield factoryFlat; yield gatherElision; yield lapackEmit; yield shapeSpec; yield moduleResolve
+          yield ompPragma; yield linalgEmit; yield linalgProbe; yield blasTier; yield doctorBlock; yield setupBlock; yield factoryFlat; yield gatherElision; yield lapackEmit; yield shapeSpec; yield flatPath; yield optimizeLayer; yield randMirror; yield accessLayer; yield moduleResolve; yield providerDesugar; yield runRecord
           match omp with Some b -> yield b | None -> ()
           match ompReduce with Some b -> yield b | None -> ()
           yield bufType

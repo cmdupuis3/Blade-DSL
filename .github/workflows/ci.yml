@@ -76,7 +76,7 @@ on:
         description: 'Which test lanes to run'
         type: choice
         default: all
-        options: [all, none, cpp, providers, netcdf, zarr, csv, hybrid, llvm, llvm-suite]
+        options: [all, none, cpp, providers, netcdf, zarr, csv, icechunk, provider-desugar, hybrid, llvm, llvm-suite]
       include-interp:
         description: 'Also run the interpreter/codegen differential (slow)'
         type: boolean
@@ -181,17 +181,18 @@ jobs:
               # nightly carries it, and `lanes: cpp` still runs it on demand.
               nightlyOnly = $true
             }
-            # ONE LANE PER PROVIDER, not one lane running four verbs in
-            # sequence. Each lane is its own job on its own runner, so a verb
+            # ONE LANE PER PROVIDER, not one lane running the provider verbs
+            # in sequence. Each lane is its own job on its own runner, so a verb
             # that hangs -- and `test netcdf` has hung, on an HDF5 lock with no
             # timeout behind it -- costs its own lane and nothing else. As one
             # step they shared a fate: netcdf hung and zarr, csv and hybrid
             # never ran at all.
             #
             # The cost is per-lane fixed overhead (checkout, SDK, build,
-            # toolchain, doctor) paid four times instead of once. It buys
-            # failure isolation and four independent red/green signals, and the
-            # lanes run concurrently so wall-clock does not suffer.
+            # toolchain, doctor) paid once per lane instead of once in total. It
+            # buys failure isolation and one independent red/green signal per
+            # provider, and the lanes run concurrently so wall-clock does not
+            # suffer.
             netcdf = @{
               title       = 'Provider: NetCDF'
               timeout     = 45
@@ -208,6 +209,28 @@ jobs:
               title       = 'Provider: CSV'
               timeout     = 30
               verbs       = 'test csv'
+              nightlyOnly = $false
+            }
+            # Icechunk writes its own fixture repos on the fly (IcechunkWrite)
+            # and then compiles + runs several of them, so it is the most
+            # expensive of the provider lanes; the timeout matches zarr's
+            # rather than csv's for that reason.
+            icechunk = @{
+              title       = 'Provider: Icechunk'
+              timeout     = 45
+              verbs       = 'test icechunk'
+              nightlyOnly = $false
+            }
+            # The checkout desugar alone: a pure in-process AST rewrite, no
+            # store and no toolchain, ~1s. It also rides the DEFAULT suite
+            # (tests/RunAll.fs), but the default suite only reaches CI through
+            # the nightly-only `cpp` lane -- this entry is what lets a pull
+            # request see the pass every compilation goes through, for the cost
+            # of a build.
+            'provider-desugar' = @{
+              title       = 'Provider: icechunk checkout desugar'
+              timeout     = 15
+              verbs       = 'test provider-desugar'
               nightlyOnly = $false
             }
             hybrid = @{
@@ -244,8 +267,8 @@ jobs:
 
           # Named groups, so splitting a lane does not cost the shorthand that
           # named it. `lanes: providers` still selects the provider set; it just
-          # gets four jobs now instead of one.
-          $groups = @{ providers = @('netcdf', 'zarr', 'csv', 'hybrid') }
+          # gets one job per provider now instead of one job in total.
+          $groups = @{ providers = @('netcdf', 'zarr', 'csv', 'icechunk', 'provider-desugar', 'hybrid') }
 
           $selected = switch ($env:EVENT) {
             'schedule'          { $all }
@@ -435,7 +458,8 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: >-
           failure() && (matrix.lane == 'netcdf' || matrix.lane == 'zarr'
-          || matrix.lane == 'csv' || matrix.lane == 'hybrid')
+          || matrix.lane == 'csv' || matrix.lane == 'icechunk'
+          || matrix.lane == 'hybrid')
         with:
           name: generated-${{ matrix.lane }}
           path: |

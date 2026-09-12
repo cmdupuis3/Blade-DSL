@@ -1,0 +1,10 @@
+// TEST: Variant Pattern Of Another Type (rejects)
+// ERROR: BL3004
+// ============================================================================
+// `Three` is a constructor of `B`, and the scrutinee is an `A`. Nothing
+// related the constructor's parent type to the scrutinee's, and emission
+// compares constructor ORDINALS -- both zero here -- so this matched at
+// runtime and printed 10.
+type A = One | Two
+type B = Three | Four
+let x = match One with | Three -> 10 | _ -> 20

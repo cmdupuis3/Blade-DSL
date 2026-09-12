@@ -1,0 +1,12 @@
+// TEST: T^0 lift co-iterates several arrays and broadcasts the scalar
+// Three positions of one rank-0 variable: two arrays and a scalar. The two
+// array positions become a ZIP (co-iteration, one shared index space), and
+// the scalar rides the kernel body -- the same reading `method_for(zip(A, B))`
+// has everywhere else. Pins that the lift does not degrade to an OUTER
+// product when more than one array is present.
+function f3(a: T^0, b: T^0, c: T^0) -> T^0 = a + b * c
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let B: Array<Float like Idx<3>> = [10.0, 20.0, 30.0]
+let r = f3(A, B, 2.0)
+// EXPECT: r = [21.0, 42.0, 63.0]

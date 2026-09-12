@@ -75,6 +75,12 @@ type IRExpr =
     // is a scalar throughout the IR. Components are arbitrary float-typed
     // IRExpr, not just literals -- supports `complex(x, y)` for x, y: Float64.
     | IRComplex of re: IRExpr * im: IRExpr
+    /// Fused multiply-add a*b + c, ONE rounding (std::fma / Math.FusedMultiplyAdd
+    /// / llvm.fma.f64). Lowered from TExprFma; a scalar Float64 node. The
+    /// fusion is the meaning, which is why it is a node and not an IRBinOp
+    /// pair: it is bit-identical on every lane REGARDLESS of BLADE_FP_CONTRACT,
+    /// where a*b + c is not (see the header of Build.fs).
+    | IRFma of a: IRExpr * b: IRExpr * c: IRExpr
     | IRTupleProj of IRExpr * int * bool  // expr, index, isFlat (true=flat leaf index, false=structural type index)
     | IRTupleCons of head: IRExpr * tail: IRExpr
     | IRTupleDecons of tuple: IRExpr
@@ -122,7 +128,13 @@ type IRExpr =
     /// Both back ends share Blade.Display.Frame's byte format -- the
     /// interpreter buffers, the compiled binary writes std::cout, and the
     /// differential gate pins the two together.
-    | IRDisplayEmit of head: string * quoted: bool * data: IRExpr * metaTail: string
+    ///
+    /// `id` is None for `display.emit` (the frame's `meta.id` is the run's
+    /// `<SessionTag><ordinal>`) and Some for `display.emit_id`, whose id is
+    /// that runtime String. One node, one operand of difference: every walker,
+    /// both back ends and the interpreter would otherwise carry a second arm
+    /// that is a copy of the first.
+    | IRDisplayEmit of head: string * quoted: bool * data: IRExpr * metaTail: string * id: IRExpr option
     /// display.json_array(A): rank-1/rank-2 numeric array -> JSON text
     /// (String). Pure (unlike IRDisplayEmit). `rank` pinned at typecheck;
     /// formatting is the shared 15-significant-digit byte-parity rule.
@@ -134,6 +146,11 @@ type IRExpr =
     | IRGroupBy of values: IRExpr * grouping: IRExpr  // group_by(vals, gk) - apply grouping
     | IRGroupKeys of keys: IRExpr list               // group_keys(keys1, keys2, ...) - CSR grouping; multi-key => compound dispatch
     | IRGroupBucket of grouping: IRExpr              // group_bucket(gk) - row -> bucket over the source index space, -1 for dropped rows
+    | IRSegments of offsets: int64 list * labels: string list option  // segments(A): structural grouping, run boundaries [0; ..; N], identity permutation
+    | IRSegmentsGrid of bounds: int64 list list                        // segments(C0, C1): the product grouping of two slots, one group per tile, per-slot boundaries
+    | IRUngroupGrid of grouped: IRExpr * sources: IRIndexTypeG<IRExpr> list * bounds: int64 list list  // ungroup of a grid grouping: tiles back over the two axes
+    | IRUngroupRows of rows: IRExpr list * offsets: int64 list * source: IRIndexTypeG<IRExpr>  // ungroup([r1..rF], A): per-file arrays assembled over the tiled axis
+    | IRUngroup of grouped: IRExpr * source: IRIndexTypeG<IRExpr>  // ungroup(G): rows of a segment-grouped array reassembled over the source axis
     | IRGroupSizes of grouping: IRExpr               // extents(gk) - per-group sizes over the group axis; no gather
     | IRSort of array: IRExpr * key: IRExpr          // sort(arr, key) - stable ascending sort by key
     | IRReduce of array: IRExpr * kernel: IRExpr * init: IRExpr option  // reduce(arr, op[, init]) - fold innermost dim; init seeds the fold and defines the empty result
@@ -162,6 +179,7 @@ type IRExpr =
     | IRTranspose of array: IRExpr * dim1: int * dim2: int
     | IRDecompact of array: IRExpr * dim: int
     | IRGram of left: IRExpr * right: IRExpr * isSameArray: bool  // A * B^H contraction; symmetric/Hermitian when isSameArray
+    | IRGramApply of left: IRExpr * right: IRExpr * vec: IRExpr  // A * (B^H * x): the action of gram(A, B) on x; rank-1 result, no m x p matrix
     | IRMatmul of left: IRExpr * right: IRExpr  // A(m x k) * B(k x n) -> dense m x n; the math package's matmul, emitted through blade_linalg
     /// eigh(S): eigendecomposition of a rank-2 square operand -> the TUPLE
     /// (Q, LAM), emitted through `blade_lapack`. TUPLE-typed with TWO fresh
@@ -175,6 +193,12 @@ type IRExpr =
     /// nest (byte-pinned against `Interp/ArrayOps.solveArray`), and the LAPACK
     /// `dgesv` route only replaces those loops when the gate is on.
     | IRSolve of matrix: IRExpr * rhs: IRExpr
+    /// `m.lu(A)` -> (LU, piv): the factorization value (tuple of two pools),
+    /// the partial-pivoted LU `m.solve` computes, kept. Same pivot rule, same
+    /// arithmetic order, so `lu_solve(lu(A), b)` is bitwise `solve(A, b)`.
+    | IRLu of matrix: IRExpr
+    /// `lu_solve(LU, piv, b[, transposed])`: apply the stored factors.
+    | IRLuSolve of lu: IRExpr * piv: IRExpr * rhs: IRExpr * transposed: bool
     | IRArrayNegate of array: IRExpr     // whole-array elementwise negation (eager); type-preserving
     | IRArrayConjugate of array: IRExpr  // whole-array elementwise conjugation (eager); type-preserving
     | IRReverse of array: IRExpr * dim: int
@@ -184,7 +208,6 @@ type IRExpr =
     | IRSubset of array: IRExpr * dim: int * start: IRExpr * length: IRExpr
     | IRRange of IRIndexTypeG<IRExpr> list * offset: IRExpr option
     | IRVirtualReverse of IRIndexTypeG<IRExpr>
-    | IRBlocked of IRIndexTypeG<IRExpr> * blockSize: IRExpr
     // halo<CompoundIdx<m>> window read w(o): the COORDINATE of the present
     // cell at ordinal (window + offset). Renders via the peel-emitted local
     // alias `<w>_hcidx` of the materialized compound index (dense halo reads
@@ -263,13 +286,24 @@ type IRExpr =
     | IRAssign of target: IRExpr * value: IRExpr
     | IRForRange of varId: IRId * lo: IRExpr * hi: IRExpr * body: IRExpr
     /// Runtime constraint guard, statement-positioned:
-    /// `if (!(cond)) { blade_rt::panic("BL8001", message, file, line); }`.
-    /// Synthesized (mutual-group joint checks, struct constraint checks);
-    /// value type is unit. The span carries source provenance for runtime
-    /// traces; noSpan degrades the panic to a nullptr file / 0 line. Safe to
-    /// add here: IRConstraintCheck is statement-positioned and never hits
-    /// the structural `=` fast paths other IRExpr cases flow through.
-    | IRConstraintCheck of cond: IRExpr * message: string * span: Blade.Ast.Span
+    /// `if (!(cond)) { blade_rt::panic(code, message, file, line); }`.
+    /// Synthesized (mutual-group joint checks, struct constraint checks,
+    /// the rec-array while-guard budget abort); value type is unit. `code`
+    /// is the BLxxxx the panic renders (BL8001 for value-constraint guards,
+    /// BL8010 for the budget abort). The span carries source provenance for
+    /// runtime traces; noSpan degrades the panic to a nullptr file / 0 line.
+    /// Safe to add here: IRConstraintCheck is statement-positioned and never
+    /// hits the structural `=` fast paths other IRExpr cases flow through.
+    | IRConstraintCheck of cond: IRExpr * code: string * message: string * span: Blade.Ast.Span
+    /// Early exit from the ENCLOSING IRForRange when cond is true -- the
+    /// `while` guard on a recursive array's inductive arm (a C++ `break`).
+    /// Statement-positioned and unit-valued like IRConstraintCheck, and only
+    /// synthesized into rec-array recursion loops by inferRecArray; the
+    /// emitters refuse it anywhere a `break` could not stand. The C++ break
+    /// path must run the per-iteration frees accumulated so far FIRST
+    /// (genForRangeBinding's alloc scope) or each guarded loop leaks its
+    /// breaking iteration's slice materializations.
+    | IRBreakIf of cond: IRExpr
 
 /// Abstract callable in IR: the merged form of source-level functions and
 /// lambdas. Lives in the IRExpr mutual-recursion group because
@@ -320,6 +354,15 @@ and IRCallable = {
     IsMpiParallel: bool
     IsArityPoly: bool
     ArityParam: string option
+    // `where repro` (functions only): the emitted body must keep the
+    // interpreter's operation sequence. Codegen discharges it as the
+    // BLADE_REPRO_FN attribute (noinline + fp-contract off) on the emitted
+    // definition, a veto inside `foldReorderLicensed` (which also covers the
+    // BLADE_FP_REASSOC lanes and the LLVM lane's fast-math flags), and
+    // BLAS/LAPACK routing declined while this body emits. Grafted like
+    // AntisymGroups by the ONE construction site that has the clause
+    // (Lowering.lowerTypedFuncDecl); every other site leaves it false.
+    IsRepro: bool
     Captures: CaptureInfo list
     // Per-parameter SIGN parity of the body (KspOdd/KspEven/KspUnknown, in
     // declaration order), consumed by `deduceWreathTie`'s soundness gate.
@@ -328,6 +371,15 @@ and IRCallable = {
     // the interpreter see the same values. Empty for non-kernel callables --
     // missing entries read as KspUnknown.
     SignParities: KernelSignParity list
+    // Conservative effect summary of the body (Blade.Effects), computed
+    // from the TYPED body at checkFunctionDecl with callees resolved and
+    // grafted here by Lowering.lowerTypedFuncDecl -- the one legality fact
+    // every cost-only rewrite consults (fusion's splice, freeze
+    // recognition's callee test). `unknown` for every callable built
+    // anywhere else (lambdas, synthesized kernels, specialized clones of
+    // unmarked callables), which each consumer reads as "run your own
+    // analysis or decline" -- never as pure.
+    Effects: Blade.Effects.EffectSummary
 }
 
 /// Semantic-marker alias for IRCallable naming "top-level function in
@@ -421,6 +473,14 @@ and IRPattern =
     | IRPatTuple of IRPattern list
     | IRPatCons of IRPattern * IRPattern
     | IRPatVariant of name: string * tag: int * IRPattern option * isEnum: bool
+    /// Struct destructuring with its field NAMES kept. Lowering used to
+    /// collapse this to `IRPatTuple` in pattern order, which lost two
+    /// different things: the C++ lane then read a real struct with
+    /// `std::get<i>` (which does not compile), and a pattern listing fields
+    /// out of DECLARATION order -- `Point { y, x }` -- bound every field to
+    /// the wrong slot, silently, in both evaluators. The name is the only
+    /// thing that makes either decodable, so it rides the node.
+    | IRPatStruct of typeName: string * fields: (string * IRPattern) list
 
 and BoundaryMode =
     | BndShrink
@@ -440,6 +500,12 @@ and AlignSpec = {
 and SparseKeysSource =
     | SkStatic of entries: int64 list list
     | SkRuntime of keys: IRExpr
+    /// Enumerable constrained domain (docs/plans/structural/06): the keys are
+    /// the solutions of a static struct's linear constraints, enumerated in
+    /// closed form at RUN time (the C++ key builder) and at compile time
+    /// (the interpreter, the certificate) from one plan -- never a baked
+    /// table, so the domain is not box-capped.
+    | SkDomain of plan: DomainPlan
 
 
 // Concrete instantiations of the Types.fs generic family at IRExpr --
@@ -1383,7 +1449,9 @@ type ProviderReadSpec = {
     /// `alias.stream(var)`: not materialized at the binding -- consuming loop
     /// nests inline per-fiber reads at the S/T boundary. Only fiber-kernel
     /// method_for consumers are stream-eligible; other consumption is a
-    /// loud codegen error steering to `.read`.
+    /// loud codegen error steering to `.read` -- BL7004, raised wherever the
+    /// binding would render as a value (CodeGenState, "STREAMED VALUES NEVER
+    /// REACH C++"), never an undeclared name handed to g++.
     Streamed: bool
 }
 
@@ -1425,7 +1493,10 @@ type RandomFillSpec =
     | FillModulus of IRExpr              // fill_random(mod)
     // rand.<kind>(key, pars..[, weights]); kind = uniform | normal | exponential
     // | gamma | poisson | bernoulli | beta | categorical
-    | RandGen of kind: string * key: IRExpr * pars: IRExpr list * weights: (IRExpr * int) option
+    // `address` is the `_at` families' (stream, offset) channel, `Some` only
+    // for kinds ending in `_at`: two Int64 expressions evaluated once at the
+    // binding, emitted right after the key.
+    | RandGen of kind: string * key: IRExpr * pars: IRExpr list * weights: (IRExpr * int) option * address: (IRExpr * IRExpr) option
 
 type IRModule = {
     Name: string
@@ -1597,11 +1668,17 @@ let mkCallable
         IsMpiParallel = isMpiParallel
         IsArityPoly = opts.IsArityPoly
         ArityParam = opts.ArityParam
+        // Grafted by Lowering.lowerTypedFuncDecl (the one site with the
+        // clause), like AntisymGroups below.
+        IsRepro = false
         Captures = captures
         // Like AntisymGroups: grafted on by the one construction site that has
         // it (Lowering.lowerTypedLambda, from the typechecked kernel's
         // summary); every other callable-building site carries none.
         SignParities = []
+        // Grafted by Lowering.lowerTypedFuncDecl from the typed declaration;
+        // unknown everywhere else (see the field's comment).
+        Effects = Blade.Effects.unknown
     }
 
 /// Build a fresh IRCallable for an anonymous inline lambda: synthesized
@@ -1845,6 +1922,8 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRDecompact (e, d) -> [e], (function [e'] -> IRDecompact (e', d) | _ -> badChildren "IRDecompact")
     | IREigh e -> [e], (function [e'] -> IREigh e' | _ -> badChildren "IREigh")
     | IRSolve (a, b) -> [a; b], (function [a'; b'] -> IRSolve (a', b') | _ -> badChildren "IRSolve")
+    | IRLu a -> [a], (function [a'] -> IRLu a' | _ -> badChildren "IRLu")
+    | IRLuSolve (l, p, b, t) -> [l; p; b], (function [l'; p'; b'] -> IRLuSolve (l', p', b', t) | _ -> badChildren "IRLuSolve")
     | IRHaloUnhash (w, o) -> [w], (function [w'] -> IRHaloUnhash (w', o) | _ -> badChildren "IRHaloUnhash")
     | IRArrayNegate e -> [e], (function [e'] -> IRArrayNegate e' | _ -> badChildren "IRArrayNegate")
     | IRArrayConjugate e -> [e], (function [e'] -> IRArrayConjugate e' | _ -> badChildren "IRArrayConjugate")
@@ -1857,6 +1936,7 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRCompoundProject (e, plen) -> [e], (function [e'] -> IRCompoundProject (e', plen) | _ -> badChildren "IRCompoundProject")
     | IRSparseKeys (SkRuntime e) -> [e], (function [e'] -> IRSparseKeys (SkRuntime e') | _ -> badChildren "IRSparseKeys")
     | IRSparseKeys (SkStatic _) -> [], (function [] -> expr | _ -> badChildren "IRSparseKeys")   // baked entries: no child exprs
+    | IRSparseKeys (SkDomain _) -> [], (function [] -> expr | _ -> badChildren "IRSparseKeys")   // a plan: data, no child exprs
     // The level list is compile-time data, never an expression; the BASE extent
     // is an ordinary extent expression and is exposed as the one child, so
     // substitution / varref collection / folding reach it exactly as they reach
@@ -1864,7 +1944,6 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IROrbitClass (levels, n) ->
         [n], (function [n'] -> IROrbitClass (levels, n') | _ -> badChildren "IROrbitClass")
     | IRUnique e -> [e], (function [e'] -> IRUnique e' | _ -> badChildren "IRUnique")
-    | IRBlocked (idxTy, bs) -> [bs], (function [bs'] -> IRBlocked (idxTy, bs') | _ -> badChildren "IRBlocked")
 
     // -- Two children ---------------------------------------------------------
     | IRBinOp (mode, op, l, r) -> [l; r], (function [l'; r'] -> IRBinOp (mode, op, l', r') | _ -> badChildren "IRBinOp")
@@ -1886,12 +1965,23 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRIntersect (a, b) -> [a; b], (function [a'; b'] -> IRIntersect (a', b') | _ -> badChildren "IRIntersect")
     | IRUnion (a, b) -> [a; b], (function [a'; b'] -> IRUnion (a', b') | _ -> badChildren "IRUnion")
     | IRContains (a, v) -> [a; v], (function [a'; v'] -> IRContains (a', v') | _ -> badChildren "IRContains")
-    | IRDisplayEmit (h, q, d, m) -> [d], (function [d'] -> IRDisplayEmit (h, q, d', m) | _ -> badChildren "IRDisplayEmit")
+    // The id operand, when present, is a child like the payload: a walker that
+    // skipped it would rewrite the payload and leave a stale id expression.
+    | IRDisplayEmit (h, q, d, m, None) ->
+        [d], (function [d'] -> IRDisplayEmit (h, q, d', m, None) | _ -> badChildren "IRDisplayEmit")
+    | IRDisplayEmit (h, q, d, m, Some i) ->
+        [d; i], (function [d'; i'] -> IRDisplayEmit (h, q, d', m, Some i') | _ -> badChildren "IRDisplayEmit")
     | IRDisplayJson (r, d) -> [d], (function [d'] -> IRDisplayJson (r, d') | _ -> badChildren "IRDisplayJson")
     | IRDisplayNum d -> [d], (function [d'] -> IRDisplayNum d' | _ -> badChildren "IRDisplayNum")
     | IRDisplayStr d -> [d], (function [d'] -> IRDisplayStr d' | _ -> badChildren "IRDisplayStr")
     | IRGroupBy (v, k) -> [v; k], (function [v'; k'] -> IRGroupBy (v', k') | _ -> badChildren "IRGroupBy")
     | IRGroupBucket gk -> [gk], (function [gk'] -> IRGroupBucket gk' | _ -> badChildren "IRGroupBucket")
+    | IRSegments _ -> [], (fun _ -> expr)
+    | IRSegmentsGrid _ -> [], (fun _ -> expr)
+    | IRUngroupGrid (g, srcs, b) -> [g], (function [g'] -> IRUngroupGrid (g', srcs, b) | _ -> badChildren "IRUngroupGrid")
+    | IRUngroup (g, src) -> [g], (function [g'] -> IRUngroup (g', src) | _ -> badChildren "IRUngroup")
+    | IRUngroupRows (rows, offs, src) ->
+        rows, (fun rows' -> if rows'.Length = rows.Length then IRUngroupRows (rows', offs, src) else badChildren "IRUngroupRows")
     | IRGroupSizes gk -> [gk], (function [gk'] -> IRGroupSizes gk' | _ -> badChildren "IRGroupSizes")
     | IRSort (a, k) -> [a; k], (function [a'; k'] -> IRSort (a', k') | _ -> badChildren "IRSort")
     | IRReduce (a, k, None) -> [a; k], (function [a'; k'] -> IRReduce (a', k', None) | _ -> badChildren "IRReduce")
@@ -1901,14 +1991,17 @@ let (|ExprShape|) (expr: IRExpr) : IRExpr list * (IRExpr list -> IRExpr) =
     | IRPolyIndex (p, i) -> [p; i], (function [p'; i'] -> IRPolyIndex (p', i') | _ -> badChildren "IRPolyIndex")
     | IRPolyTail (p, drop) -> [p], (function [p'] -> IRPolyTail (p', drop) | _ -> badChildren "IRPolyTail")
     | IRAssign (t, v) -> [t; v], (function [t'; v'] -> IRAssign (t', v') | _ -> badChildren "IRAssign")
-    | IRConstraintCheck (c, msg, sp) -> [c], (function [c'] -> IRConstraintCheck (c', msg, sp) | _ -> badChildren "IRConstraintCheck")
+    | IRConstraintCheck (c, code, msg, sp) -> [c], (function [c'] -> IRConstraintCheck (c', code, msg, sp) | _ -> badChildren "IRConstraintCheck")
+    | IRBreakIf c -> [c], (function [c'] -> IRBreakIf c' | _ -> badChildren "IRBreakIf")
     | IRCurry (arr, idx, r) -> [arr; idx], (function [arr'; idx'] -> IRCurry (arr', idx', r) | _ -> badChildren "IRCurry")
     | IRGram (l, r, same) -> [l; r], (function [l'; r'] -> IRGram (l', r', same) | _ -> badChildren "IRGram")
+    | IRGramApply (l, r, x) -> [l; r; x], (function [l'; r'; x'] -> IRGramApply (l', r', x') | _ -> badChildren "IRGramApply")
     | IRMatmul (l, r) -> [l; r], (function [l'; r'] -> IRMatmul (l', r') | _ -> badChildren "IRMatmul")
     | IRLet (id, v, b) -> [v; b], (function [v'; b'] -> IRLet (id, v', b') | _ -> badChildren "IRLet")
 
     // -- Three children -------------------------------------------------------
     | IRIf (c, t, e) -> [c; t; e], (function [c'; t'; e'] -> IRIf (c', t', e') | _ -> badChildren "IRIf")
+    | IRFma (a, b, c) -> [a; b; c], (function [a'; b'; c'] -> IRFma (a', b', c') | _ -> badChildren "IRFma")
     | IRSlice (arr, d, s, e) -> [arr; s; e], (function [arr'; s'; e'] -> IRSlice (arr', d, s', e') | _ -> badChildren "IRSlice")
     | IRSubset (arr, d, s, len) -> [arr; s; len], (function [arr'; s'; len'] -> IRSubset (arr', d, s', len') | _ -> badChildren "IRSubset")
     | IRForRange (vid, lo, hi, body) -> [lo; hi; body], (function [lo'; hi'; b'] -> IRForRange (vid, lo', hi', b') | _ -> badChildren "IRForRange")
@@ -2032,6 +2125,8 @@ let rec patternBoundIds (pat: IRPattern) : Set<IRId> =
     | IRPatCons (h, t) -> Set.union (patternBoundIds h) (patternBoundIds t)
     | IRPatVariant (_, _, Some p, _) -> patternBoundIds p
     | IRPatVariant (_, _, None, _) -> Set.empty
+    | IRPatStruct (_, flds) ->
+        flds |> List.fold (fun acc (_, p) -> Set.union acc (patternBoundIds p)) Set.empty
 
 /// The variants that introduce variable scopes, factored out for
 /// binder-aware dispatchers (exprAttrs today; any future capture or escape
@@ -2300,6 +2395,22 @@ let declSpanOf (name: string) : Blade.Ast.Span =
     | Some s -> s
     | None -> Blade.Ast.noSpan
 
+/// A named struct's fields in DECLARATION order, out of the same per-module
+/// cache `tryLookupFieldType` reads. The order is what lets a name-erased
+/// POSITIONAL struct pattern be decoded at all; a named one (`IRPatStruct`)
+/// does not need to ask.
+let tryLookupStructFieldsByName (structName: string) : (string * IRType) list option =
+    let cache = getStructFieldsCache ()
+    match cache.TryGetValue(structName) with
+    | true, fields -> Some fields
+    | false, _ -> None
+
+/// The same lookup keyed by a scrutinee's type rather than a bare name.
+let tryLookupStructFields (objType: IRType) : (string * IRType) list option =
+    match objType with
+    | IRTNamed structName -> tryLookupStructFieldsByName structName
+    | _ -> None
+
 let tryLookupFieldType (objType: IRType) (fieldName: string) : IRType option =
     match objType with
     | IRTNamed structName ->
@@ -2504,6 +2615,7 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
          // A cast's type is its target, whatever the operand resolved to.
          | IRCast et -> IRTScalar et)
     | IRTuple exprs -> IRTTuple (exprs |> List.map typeOf)
+    | IRFma _ -> IRTScalar ETFloat64
     | IRComplex (re, _) ->
         // Complex type derived from component width: Float32 -> Complex64,
         // Float64 -> Complex128. Reports as a scalar (NOT a tuple) -- that's
@@ -2594,6 +2706,7 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
     | IRAssign _ -> IRTUnit
     | IRForRange _ -> IRTUnit
     | IRConstraintCheck _ -> IRTUnit
+    | IRBreakIf _ -> IRTUnit
     | IRFieldAccess (obj, field) ->
         // Resolved via the ONE struct-fields cache (structFieldsCacheStorage
         // above), populated both at liftInlineFormsModule entry and at
@@ -2656,6 +2769,27 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
              // that was previously satisfied stays satisfied.
              valsTy)
     | IRGroupKeys _ -> IRTUnit  // GroupKeys is an opaque structure, not a runtime value with a simple type
+    | IRSegments _ -> IRTUnit   // the structural grouping: same opaque sentinel as group_keys
+    | IRSegmentsGrid _ -> IRTUnit
+    | IRUngroupGrid (g, srcs, _) ->
+        (match typeOf g with
+         | IRTArrow (slots, res, x) when slots.Length >= 2 -> IRTArrow ((srcs |> List.map SIdx) @ List.skip 2 slots, res, x)
+         | other -> other)
+    | IRUngroupRows (rows, _, src) ->
+        // Each row is [file axis; rest...] over elem; the result is
+        // [source; rest...] over elem.
+        (match rows with
+         | r :: _ ->
+             (match typeOf r with
+              | IRTArrow (slots, res, x) when not slots.IsEmpty -> IRTArrow (SIdx src :: List.tail slots, res, x)
+              | other -> other)
+         | [] -> IRTUnit)
+    | IRUngroup (g, src) ->
+        // The grouped operand is [outer; member; rest...] over elem; the
+        // result is [source; rest...] over elem.
+        (match typeOf g with
+         | IRTArrow (slots, res, x) when slots.Length >= 2 -> IRTArrow (SIdx src :: List.skip 2 slots, res, x)
+         | other -> other)
     | IRGroupBucket gk ->
         // Rank-1 Int64 over the grouping's SOURCE index space -- the same slot
         // the key array was indexed by, so `bucket` co-iterates with the values
@@ -2774,6 +2908,32 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
                 let s1 = { pOuter with Rank = 1; Symmetry = SymNone }
                 mkArrayLike { la with ElemType = outElem; IndexTypes = [s0; s1] }
          | t, _ -> t)
+    | IRGramApply (l, r, x) ->
+        // gram_apply(A, B, x) = A * (B^H * x). A : m x n, B : p x n, x : p ->
+        // y : m, one plain axis with A's leading extent. Element type complex
+        // iff any operand is; units multiply through both contractions (twin
+        // of inferGramApply's join).
+        (match typeOf l, typeOf r, typeOf x with
+         | ArrayElem la, ArrayElem ra, ArrayElem xa when la.IndexTypes.Length >= 1 ->
+            let isComplexElem (t: IRType) =
+                match stripUnits t with IRTScalar (ETComplex64 | ETComplex128) -> true | _ -> false
+            let outBare =
+                [ la.ElemType; ra.ElemType; xa.ElemType ]
+                |> List.tryFind isComplexElem
+                |> Option.map stripUnits
+                |> Option.defaultValue (stripUnits la.ElemType)
+            let mulU a b =
+                match a, b with
+                | Some lu, Some ru -> Some (unitMul lu ru)
+                | Some u, None | None, Some u -> Some { u with Nominal = None }
+                | None, None -> None
+            let outElem =
+                match mulU (mulU (getUnits la.ElemType) (getUnits ra.ElemType)) (getUnits xa.ElemType) with
+                | Some u -> IRTUnitAnnotated (outBare, u)
+                | None -> outBare
+            let s0 = { la.IndexTypes.[0] with Rank = 1; Symmetry = SymNone }
+            mkArrayLike { la with ElemType = outElem; IndexTypes = [s0] }
+         | t, _, _ -> t)
     | IRMatmul (l, r) ->
         // matmul(A, B). A : m x k, B : k x n -> DENSE m x n (two plain axes,
         // SymNone). No conjugation and no symmetry claim: unlike gram, matmul
@@ -2823,6 +2983,24 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
         // decidable. The id is cosmetic -- the authoritative result type is the
         // one `inferSolve` built and lowering attached.
         (match typeOf matrix with
+         | ArrayElem aa when not aa.IndexTypes.IsEmpty ->
+            let axis = { aa.IndexTypes.Head with Rank = 1; Symmetry = SymNone; IxKind = IxKPlain; Dependencies = [] }
+            mkArrayLike { aa with IndexTypes = [axis] }
+         | t -> t)
+    | IRLu matrix ->
+        // lu(A) -> (LU : n x n dense Float64, piv : n dense Int64). Both
+        // extents are A's leading one; ids cosmetic (`inferLu` built the
+        // authoritative type).
+        (match typeOf matrix with
+         | ArrayElem aa when not aa.IndexTypes.IsEmpty ->
+            let axis = { aa.IndexTypes.Head with Rank = 1; Symmetry = SymNone; IxKind = IxKPlain; Dependencies = [] }
+            IRTTuple [ mkArrayLike { aa with IndexTypes = [axis; axis] }
+                       mkArrayLike { aa with ElemType = IRTScalar ETInt64; IndexTypes = [axis] } ]
+         | t -> t)
+    | IRLuSolve (lu, _, _, _) ->
+        // lu_solve(LU, piv, b) -> x : dense rank-1 of LU's leading extent,
+        // Float64 (the solve twin's rule, from the factor).
+        (match typeOf lu with
          | ArrayElem aa when not aa.IndexTypes.IsEmpty ->
             let axis = { aa.IndexTypes.Head with Rank = 1; Symmetry = SymNone; IxKind = IxKPlain; Dependencies = [] }
             mkArrayLike { aa with IndexTypes = [axis] }
@@ -2939,7 +3117,7 @@ and private typeOfReconstruct (expr: IRExpr) : IRType =
     | IRSlice _ | IRCurry _ | IRSubset _ | IRShift _ | IRReverse _ | IRDiag _
     | IRZip _ | IRAlign _ | IRStack [] | IRJoin ([], _)
     | IRTupleCons _ | IRTupleDecons _ | IRPolyIndex _ | IRPolyTail _ | IRReplicate _
-    | IRVirtualReverse _ | IRBlocked _ | IRZero ->
+    | IRVirtualReverse _ | IRZero ->
         IRTUnit
 
     // -- Coverage tail ---------------------------------------------------

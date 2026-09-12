@@ -1,0 +1,32 @@
+// TEST: Inlining Refuses To Capture A Kernel Binder (rejects)
+// The POSITIVE half of the capture check, re-homed from `ad/022` when the
+// C2-reverse lowering took its reverse-mode spelling away: the lowering
+// erases a map kernel's parameter binder before the inliner ever sees it, so
+// in GRAD mode there is no longer a binder here to capture (022 now pins the
+// value that fell out). Forward mode keeps the map as a loop object, the
+// lambda binder survives, and the check must still fire.
+//
+// Inlining binds a callee parameter by RENAMING it to the caller's variable:
+// `helper(y, arr)` renames `p` to `y`. helper's own kernel binds `y`, and the
+// renamed `p` inside that kernel would be captured by it. Refused rather than
+// silently read as the kernel's element.
+//
+// The refusal needs the occurrence test to be shadowing-aware in BOTH
+// directions: it must fire here, where `p` occurs free under the colliding
+// binder, and must NOT fire when the kernel merely reuses the name -- which
+// is 042.
+// ERROR: BL5501
+// ERROR-CONTAINS: inlining would rename 'p' to 'y'
+import ad as ad
+
+type I = Idx<3>
+
+function helper(p: Float, arr: Array<Float like I>) -> Float = {
+    let scaled = method_for(arr) <@> lambda(y: Float) -> y * p |> compute
+    reduce(scaled, (+))
+}
+
+function loss(y: Float, arr: Array<Float like I>) -> Float = helper(y, arr)
+
+let (lv, dly) = ad.jvp(loss)(2.0, [1.0, 2.0, 3.0], 1.0, [0.0, 0.0, 0.0])
+lv

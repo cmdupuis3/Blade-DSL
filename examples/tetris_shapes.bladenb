@@ -1,0 +1,750 @@
+// %% [markdown]
+// # Tetris in 3-D: what the compiler knows before the first gradient step
+//
+// Eight tetromino shapes, four points each, floating in space at arbitrary
+// orientations. Classify them. It is the [e3nn](https://e3nn.org) tutorial
+// task, and it is chosen because two of the eight — `chiral_shape_1` and
+// `chiral_shape_2` — are **mirror images**: no rotation carries one into the
+// other, and every quantity that is invariant under the *full* orthogonal
+// group O(3) takes the same value on both.
+//
+// That is not a modelling difficulty. It is a theorem, and in Blade it is a
+// theorem the type system states, checks, and refuses to let you violate. The
+// network below is built from four sanctioned moves — Clebsch-Gordan product,
+// gate, Schur-derived linear map, norms — under `where ml.equiv(O3)` and
+// `where ml.equiv(SO3)` clauses that the compiler *verifies*. Along the way
+// it refuses four plausible-looking layers, writes one missing clause for us,
+// and finally tells us, as a compile error, exactly why the chiral pair
+// cannot be separated by an O(3)-invariant readout.
+//
+// The data comes from `examples/data/tetris.zarr`, written by
+// `examples/tools/make_tetris_zarr.fsx` (the eight canonical shapes under
+// seeded rotations — 12 orientations per shape for training, 6 fresh ones per
+// shape for testing). Nothing here touches the network.
+
+// %%
+import ml as ml
+import ad as ad
+import zarr as z
+import rand as r
+import plot
+
+let store = z.load("examples/data/tetris.zarr")
+type Piece = store.index.piece
+type Pt = store.index.pt
+type Xyz = store.index.xyz
+type SampTr = store.index.samp_tr
+type SampTe = store.index.samp_te
+type Klass = store.index.klass
+
+// `__` marks an internal buffer: these are read with COMPUTED integer
+// subscripts (a flat weight vector has no index provenance to flow), which is
+// exactly what the `__` convention exempts from the BL4003 tag note.
+let __pieces: Array<Float like Piece, Pt, Xyz> = store.vars.pieces |> z.read
+let __pos_tr: Array<Float like SampTr, Pt, Xyz> = store.vars.pos_train |> z.read
+let __y_tr: Array<Float like SampTr, Klass> = store.vars.y_train |> z.read
+let __pos_te: Array<Float like SampTe, Pt, Xyz> = store.vars.pos_test |> z.read
+let __y_te: Array<Float like SampTe, Klass> = store.vars.y_test |> z.read
+
+// The mirror pair, centered, straight out of the store: shape 1 is shape 0
+// with y negated, point order preserved.
+let __p0 = __pieces(0)
+let __p1 = __pieces(1)
+let mirror_pair = [__p0(3, 0), __p0(3, 1), __p0(3, 2), __p1(3, 0), __p1(3, 1), __p1(3, 2)]
+mirror_pair
+// EXPECT: mirror_pair = [0.5, 0.75, -0.25, 0.5, -0.75, -0.25]
+
+// %% [markdown]
+// ## Representations, and how big a layer is allowed to be
+//
+// A feature is not an array of numbers, it is an array of numbers **with a
+// representation**: `IrrepsIdx<[(l, parity, multiplicity), ...]>`. `HSPEC`
+// below says "two invariant scalars, two odd vectors, two even rank-2
+// tensors" — the pooled spherical-harmonic expansion of a point cloud.
+//
+// Once the specs are fixed, the parameter counts are not hyperparameters.
+// They are Schur's lemma: `ml.hom_dim` counts the equivariant linear maps
+// between two representations, and `ml.tp_weight_dim` counts the admissible
+// Clebsch-Gordan paths. Print them and you are printing a dimension of a
+// Hom-space, not a design decision.
+
+// %%
+let static HSPEC = [(0, 0, 2), (1, 1, 2), (2, 0, 2)]     // pooled Y<=2, two radial channels
+let static MSPEC = [(0, 0, 3), (1, 1, 2), (2, 0, 1)]     // the certified block's output
+let static AVSPEC = [(1, 0, 2)]                          // l=1 EVEN: an axial vector
+let static PSSPEC = [(0, 1, 2)]                          // l=0 ODD: a pseudoscalar
+let static EVSPEC = [(0, 0, 12)]                          // the invariant readout channels
+let static OUTE = [(0, 0, 8)]                             // 8 even class scores
+let static OUTO = [(0, 1, 8)]                             // 8 odd class scores
+let static V = [(1, 1, 1)]                                // one true vector
+let static PS1 = [(0, 1, 1)]                              // one pseudoscalar
+let static CFG = (HSPEC, HSPEC, MSPEC)
+let static CFGA = (HSPEC, HSPEC, AVSPEC)
+let static CFGC = (AVSPEC, HSPEC, PSSPEC)
+
+let static WTP = ml.tp_weight_dim(CFG)
+let static WL = ml.linear_weight_dim(MSPEC, MSPEC)
+let static WA = ml.tp_weight_dim(CFGA)
+let static WC = ml.tp_weight_dim(CFGC)
+let static WHE = ml.hom_dim(EVSPEC, OUTE)
+let static WHO = ml.hom_dim(PSSPEC, OUTO)
+let static DH = ml.total_dim(HSPEC)
+let static DM = ml.total_dim(MSPEC)
+
+let sizes = [DH, DM, WTP, WL, WA, WC, WHE, WHO]
+sizes
+// EXPECT: sizes = [18, 14, 84, 14, 16, 8, 96, 16]
+
+// %% [markdown]
+// ## The deduction suite
+//
+// Before any of that is used, a run of cells whose entire payload is what
+// the compiler will and will not accept. **The next three cells fail on
+// purpose** — a failing cell never joins the notebook session, so nothing
+// downstream is disturbed.
+//
+// First: the elementwise product. Multiplying two representation-typed
+// features componentwise is basis-dependent — rotate the inputs and the
+// product is not the rotation of the output. The sanctioned bilinear
+// operation is the Clebsch-Gordan-typed `ml.tensor_product`, and the error
+// says so by name.
+
+// %%
+function hadamard(x: Array<Float like IrrepsIdx<HSPEC>>, y: Array<Float like IrrepsIdx<HSPEC>>)
+                  where ml.equiv(O3) -> Array<Float like IrrepsIdx<HSPEC>> =
+    x * y
+
+// %% [markdown]
+// Second: reading a component. Offsets 0 and 1 of `HSPEC` are the invariant
+// scalars and may be read freely; offset 2 is the first component of an
+// l = 1 block, and under a rotation it mixes with its two siblings. A bare
+// component read *is* a polynomial, so the compiler does not stop at "that
+// is basis-dependent" — it runs the generator check and reports which Lie
+// generator the identity `Df(x)(A x) = A f(x)` fails at, in which output
+// component, at which term.
+//
+// **This cell fails on purpose.**
+
+// %%
+function peek(x: Array<Float like IrrepsIdx<HSPEC>>) where ml.equiv(O3) -> Float =
+    x(2)
+
+// %% [markdown]
+// Third, and the sharpest one: the scalar triple product `u . (v x w)` of
+// three true vectors. It commutes with every generator of so(3) — it really
+// is rotation-invariant — and it still fails, because O(3) has a second
+// connected component and under the inversion `-I` three odd factors give
+// three sign flips. The honest theorem is that this quantity is a
+// *pseudoscalar*, and the message names both repairs.
+//
+// **This cell fails on purpose.**
+
+// %%
+function triple(u: Array<Float like IrrepsIdx<V>>, v: Array<Float like IrrepsIdx<V>>, w: Array<Float like IrrepsIdx<V>>)
+                where ml.equiv(O3) -> Float =
+    (u(0) * (v(1) * w(2) - v(2) * w(1))
+     + u(1) * (v(2) * w(0) - v(0) * w(2))
+     + u(2) * (v(0) * w(1) - v(1) * w(0)))
+
+// %% [markdown]
+// Take the first repair and the same body certifies — the declaration
+// changed, not the arithmetic. Take the second and it certifies too, because
+// SO(3) is connected and inversion is simply not part of that claim. The
+// three verdicts (`-> Float` under SO3, `-> IrrepsIdx<[(0,1,1)]>` under O3,
+// `-> Float` under O3) are the whole content of the parity rule.
+
+// %%
+function triple_o3(u: Array<Float like IrrepsIdx<V>>, v: Array<Float like IrrepsIdx<V>>, w: Array<Float like IrrepsIdx<V>>)
+                   where ml.equiv(O3) -> Array<Float like IrrepsIdx<PS1>> =
+    [u(0) * (v(1) * w(2) - v(2) * w(1))
+     + u(1) * (v(2) * w(0) - v(0) * w(2))
+     + u(2) * (v(0) * w(1) - v(1) * w(0))]
+
+function triple_so3(u: Array<Float like IrrepsIdx<V>>, v: Array<Float like IrrepsIdx<V>>, w: Array<Float like IrrepsIdx<V>>)
+                    where ml.equiv(SO3) -> Float =
+    (u(0) * (v(1) * w(2) - v(2) * w(1))
+     + u(1) * (v(2) * w(0) - v(0) * w(2))
+     + u(2) * (v(0) * w(1) - v(1) * w(0)))
+
+let handedness = triple_o3([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
+handedness
+// EXPECT: handedness = [1]
+
+// %% [markdown]
+// ## The compiler writes the clause
+//
+// The certificate channel runs in the other direction too. `invariants`
+// below carries **no** `where` clause — an uncertified function is not a
+// wrong function, only an unproved one. The compiler hypothesizes the
+// conjunct anyway, runs the same judgment it would have checked, and emits
+// BL4011 with the exact clause and the deduced signature. This cell compiles;
+// the warning *is* the output.
+
+// %%
+function invariants(h: Array<Float like IrrepsIdx<HSPEC>>, m: Array<Float like IrrepsIdx<MSPEC>>)
+                    -> Array<Float like Idx<12>> = {
+    let nh = ml.norms(HSPEC, h)
+    let nm = ml.norms(MSPEC, m)
+    [nh(0), nh(1), nh(2), nh(3), nh(4), nh(5),
+     nm(0), nm(1), nm(2), nm(3), nm(4), nm(5)]
+}
+
+// %% [markdown]
+// ## The featurization
+//
+// One uncertified step, and it is deliberately the *first* one: turning four
+// Cartesian points into a representation-typed feature is the one move whose
+// premise — "these three numbers really are the components of a vector" — no
+// signature can state. Everything after it is checked.
+//
+// `pooled` expands each point in real solid harmonics up to l = 2 with
+// `ml.y_to`, weights the four points by 1 and by r^2 (two radial channels),
+// and sums. Summing over points is what makes the result a function of the
+// point *set*, so nothing depends on how the four atoms were numbered.
+
+// %%
+let static NTR = 96
+let static NTE = 48
+let static NC = 8
+let static NTRH = NTR * DH
+let static NTEH = NTE * DH
+
+function pooled(x0: Float, y0: Float, z0: Float,
+                x1: Float, y1: Float, z1: Float,
+                x2: Float, y2: Float, z2: Float,
+                x3: Float, y3: Float, z3: Float) -> Array<Float like IrrepsIdx<HSPEC>> = {
+    let s0 = ml.y_to(2, x0, y0, z0)
+    let s1 = ml.y_to(2, x1, y1, z1)
+    let s2 = ml.y_to(2, x2, y2, z2)
+    let s3 = ml.y_to(2, x3, y3, z3)
+    let r0 = x0 * x0 + y0 * y0 + z0 * z0
+    let r1 = x1 * x1 + y1 * y1 + z1 * z1
+    let r2 = x2 * x2 + y2 * y2 + z2 * z2
+    let r3 = x3 * x3 + y3 * y3 + z3 * z3
+    let a = s0 + s1 + s2 + s3
+    let b = r0 * s0 + r1 * s1 + r2 * s2 + r3 * s3
+    [a(0), b(0),
+     a(1), a(2), a(3), b(1), b(2), b(3),
+     a(4), a(5), a(6), a(7), a(8), b(4), b(5), b(6), b(7), b(8)]
+}
+
+// The featurization depends on no weight, so it is computed ONCE, outside
+// every gradient: one flat buffer per split, laid out (sample, channel).
+function tr_slot(i: Int) -> Float = {
+    let smp = i / DH
+    let __row = __pos_tr(smp)
+    let __hv = pooled(__row(0, 0), __row(0, 1), __row(0, 2),
+                      __row(1, 0), __row(1, 1), __row(1, 2),
+                      __row(2, 0), __row(2, 1), __row(2, 2),
+                      __row(3, 0), __row(3, 1), __row(3, 2))
+    __hv(i - smp * DH)
+}
+let __h_tr = {
+    let rec h: Array<Float like Idx<NTRH>> =
+        match h with
+        | zero -> zero
+        | prefix :: i -> prefix :: tr_slot(i)
+    h
+}
+function te_slot(i: Int) -> Float = {
+    let smp = i / DH
+    let __row = __pos_te(smp)
+    let __hv = pooled(__row(0, 0), __row(0, 1), __row(0, 2),
+                      __row(1, 0), __row(1, 1), __row(1, 2),
+                      __row(2, 0), __row(2, 1), __row(2, 2),
+                      __row(3, 0), __row(3, 1), __row(3, 2))
+    __hv(i - smp * DH)
+}
+let __h_te = {
+    let rec h: Array<Float like Idx<NTEH>> =
+        match h with
+        | zero -> zero
+        | prefix :: i -> prefix :: te_slot(i)
+    h
+}
+function piece_feat(s: Int) -> Array<Float like IrrepsIdx<HSPEC>> = {
+    let __row = __pieces(s)
+    pooled(__row(0, 0), __row(0, 1), __row(0, 2),
+           __row(1, 0), __row(1, 1), __row(1, 2),
+           __row(2, 0), __row(2, 1), __row(2, 2),
+           __row(3, 0), __row(3, 1), __row(3, 2))
+}
+function h_tr_of(i: Int) -> Array<Float like IrrepsIdx<HSPEC>> = {
+    let b = i * DH
+    [__h_tr(b), __h_tr(b + 1), __h_tr(b + 2), __h_tr(b + 3), __h_tr(b + 4), __h_tr(b + 5),
+     __h_tr(b + 6), __h_tr(b + 7), __h_tr(b + 8), __h_tr(b + 9), __h_tr(b + 10), __h_tr(b + 11),
+     __h_tr(b + 12), __h_tr(b + 13), __h_tr(b + 14), __h_tr(b + 15), __h_tr(b + 16), __h_tr(b + 17)]
+}
+function h_te_of(i: Int) -> Array<Float like IrrepsIdx<HSPEC>> = {
+    let b = i * DH
+    [__h_te(b), __h_te(b + 1), __h_te(b + 2), __h_te(b + 3), __h_te(b + 4), __h_te(b + 5),
+     __h_te(b + 6), __h_te(b + 7), __h_te(b + 8), __h_te(b + 9), __h_te(b + 10), __h_te(b + 11),
+     __h_te(b + 12), __h_te(b + 13), __h_te(b + 14), __h_te(b + 15), __h_te(b + 16), __h_te(b + 17)]
+}
+
+// The l = 0 channel of the r^2 pooling is 0.28209 * sum r^2 -- one invariant
+// that already separates seven of the eight shapes, and takes the SAME value
+// on the mirror pair, as it must.
+let scale_channel = method_for(range<Idx<8>>) <@> lambda(s) -> ml.norms(HSPEC, piece_feat(s))(1) |> compute
+scale_channel
+// EXPECT: scale_channel = [0.705236979434695, 0.705236979434695, 0.564189583547756, 1.41047395886939, 0.634713281491226, 0.987331771208574, 0.775760677378165, 0.846284375321634]
+
+// %% [markdown]
+// ## The certified model
+//
+// Four functions, three clauses, no output — compile-time acceptance is the
+// payload.
+//
+// - `eq_block` is the classic equivariant block: Clebsch-Gordan product of
+//   the feature with itself, gate, Schur-derived linear mixing. `O3`.
+// - `chirality` is the interesting one. A pseudoscalar needs an odd number of
+//   odd factors and has to couple to l = 0, so it takes **three** vectors'
+//   worth of structure: first contract the feature with itself into an l = 1
+//   *even* block (an axial vector, `AVSPEC`), then contract that against the
+//   feature's l = 1 *odd* block. The compiler does the parity bookkeeping;
+//   both steps are ordinary tensor products, and the declared output is
+//   `(l = 0, odd)`. `O3`.
+// - `head_even` maps the invariant channels to eight class scores through
+//   `ml.derive_linear` — the compiler builds the Hom-space basis. `O3`.
+// - `head` adds the pseudoscalar channel. Under SO(3) a pseudoscalar *is* an
+//   invariant, so this certifies — under `SO3`, and only under `SO3`.
+
+// %%
+function eq_block(x: Array<Float like IrrepsIdx<HSPEC>>,
+                  wtp: Array<Float like Idx<WTP>>,
+                  wl: Array<Float like Idx<WL>>)
+                  where ml.equiv(O3) -> Array<Float like IrrepsIdx<MSPEC>> = {
+    let t = ml.tensor_product(CFG, x, x, wtp)
+    let g = ml.gated(MSPEC, t)
+    ml.linear(MSPEC, MSPEC, wl, g)
+}
+
+function chirality(x: Array<Float like IrrepsIdx<HSPEC>>,
+                   wa: Array<Float like Idx<WA>>,
+                   wc: Array<Float like Idx<WC>>)
+                   where ml.equiv(O3) -> Array<Float like IrrepsIdx<PSSPEC>> = {
+    let ax = ml.tensor_product(CFGA, x, x, wa)
+    ml.tensor_product(CFGC, ax, x, wc)
+}
+
+function head_even(ev: Array<Float like IrrepsIdx<EVSPEC>>, we: Array<Float like Idx<WHE>>)
+                   where ml.equiv(O3) -> Array<Float like Idx<NC>> =
+    ml.scalars(OUTE, ml.derive_linear(EVSPEC, OUTE, we, ev))
+
+function head(ev: Array<Float like IrrepsIdx<EVSPEC>>, od: Array<Float like IrrepsIdx<PSSPEC>>,
+              we: Array<Float like Idx<WHE>>, wo: Array<Float like Idx<WHO>>)
+              where ml.equiv(SO3) -> Array<Float like Idx<NC>> = {
+    let a = ml.derive_linear(EVSPEC, OUTE, we, ev)
+    let b = ml.derive_linear(PSSPEC, OUTO, wo, od)
+    [a(0) + b(0), a(1) + b(1), a(2) + b(2), a(3) + b(3),
+     a(4) + b(4), a(5) + b(5), a(6) + b(6), a(7) + b(7)]
+}
+
+// %% [markdown]
+// ## The chirality theorem, as a compile error
+//
+// `head` had to be `SO3`. Try to keep the pseudoscalar channel and claim
+// `O3` — that is the claim "these eight class scores are invariant under the
+// full orthogonal group", and it is exactly the claim that would let a
+// network tell the mirror pair apart while remaining O(3)-invariant. The
+// compiler refuses, naming the parity-odd read.
+//
+// This is the whole notebook in one diagnostic: **separating the chiral pair
+// is not O(3)-invariant, and no amount of training changes that.**
+//
+// **This cell fails on purpose.**
+
+// %%
+function head_o3(ev: Array<Float like IrrepsIdx<EVSPEC>>, od: Array<Float like IrrepsIdx<PSSPEC>>,
+                 we: Array<Float like Idx<WHE>>, wo: Array<Float like Idx<WHO>>)
+                 where ml.equiv(O3) -> Array<Float like Idx<NC>> = {
+    let a = ml.derive_linear(EVSPEC, OUTE, we, ev)
+    let b = ml.derive_linear(PSSPEC, OUTO, wo, od)
+    [a(0) + b(0), a(1) + b(1), a(2) + b(2), a(3) + b(3),
+     a(4) + b(4), a(5) + b(5), a(6) + b(6), a(7) + b(7)]
+}
+
+// %% [markdown]
+// ## Weights, and one calibration pass
+//
+// The certified stack is held fixed at a seeded random point: 122 weights
+// spread over 84 Clebsch-Gordan paths, 14 Schur multiplicities, and the two
+// chirality contractions. What is *learned* is the invariant readout —
+// `WHE + WHO = 112` weights — and because both readout maps are linear in
+// their weights, that loss is convex. Freezing a certified embedding is not a
+// shortcut: every channel it produces is provably the right kind of number,
+// which is the part a network normally has to discover.
+//
+// One pass over the training clouds fixes the numeric scale of each readout
+// channel (centre and spread for the even ones; root-mean-square only for the
+// pseudoscalars, since subtracting a constant from an odd quantity would stop
+// it being odd). The certified pipeline decides *what* the features are;
+// ordinary numerics still has to decide what they are measured in.
+
+// %%
+let static WB = WTP + WL + WA + WC
+let static BOFF_L = WTP
+let static BOFF_A = WTP + WL
+let static BOFF_C = WTP + WL + WA
+let static NEV = 12
+let static NB = 8
+let static STRIDE = 12
+
+function bpick(__b: Array<Float like Idx<WB>>, base: Int, k: Int) -> Float = __b(base + k)
+let __nb0 = r.normal(20260826, WB)
+let __wb = 0.3 * __nb0
+let __wtp = {
+    let rec o: Array<Float like Idx<84>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(__wb, 0, k)
+    o
+}
+let __wl = {
+    let rec o: Array<Float like Idx<14>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(__wb, BOFF_L, k)
+    o
+}
+let __wa = {
+    let rec o: Array<Float like Idx<16>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(__wb, BOFF_A, k)
+    o
+}
+let __wc = {
+    let rec o: Array<Float like Idx<8>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(__wb, BOFF_C, k)
+    o
+}
+
+function f0_slot(i: Int) -> Float = {
+    let smp = i / NEV
+    let __hh = h_tr_of(smp * STRIDE)
+    let __fv = invariants(__hh, eq_block(__hh, __wtp, __wl))
+    __fv(i - smp * NEV)
+}
+let __f0 = {
+    let rec f: Array<Float like Idx<96>> =
+        match f with
+        | zero -> zero
+        | prefix :: i -> prefix :: f0_slot(i)
+    f
+}
+function fmean(k: Int) -> Float = {
+    let rec a: Array<Float like Idx<NB>> =
+        match a with
+        | zero -> zero
+        | prefix :: i -> prefix :: __f0(i * NEV + k)
+    reduce(a, (+)) / 8.0
+}
+function fsd(k: Int) -> Float = {
+    let mu = fmean(k)
+    let rec a: Array<Float like Idx<NB>> =
+        match a with
+        | zero -> zero
+        | prefix :: i -> prefix :: (__f0(i * NEV + k) - mu) * (__f0(i * NEV + k) - mu)
+    sqrt(reduce(a, (+)) / 8.0)
+}
+let __fmu = {
+    let rec m: Array<Float like Idx<NEV>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: fmean(k)
+    m
+}
+// A channel with no spread carries no information; scale it to zero rather
+// than dividing by nothing. (Channel 0 is a constant and channel 2 is
+// identically zero -- the l = 1 block of the unweighted pooling is the sum of
+// the centered points.)
+let __fsc = {
+    let rec m: Array<Float like Idx<NEV>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if fsd(k) < 0.25 then 0.0 else 1.0 / fsd(k))
+    m
+}
+function chi_slot(i: Int) -> Float = {
+    let smp = i / 2
+    let __cv = chirality(h_tr_of(smp * STRIDE), __wa, __wc)
+    __cv(i - smp * 2)
+}
+let __c0 = {
+    let rec c: Array<Float like Idx<16>> =
+        match c with
+        | zero -> zero
+        | prefix :: i -> prefix :: chi_slot(i)
+    c
+}
+function chi_rms(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<NB>> =
+        match a with
+        | zero -> zero
+        | prefix :: i -> prefix :: __c0(i * 2 + j) * __c0(i * 2 + j)
+    sqrt(reduce(a, (+)) / 8.0)
+}
+let __osc = {
+    let rec m: Array<Float like Idx<2>> =
+        match m with
+        | zero -> zero
+        | prefix :: j -> prefix :: (if chi_rms(j) < 0.000000001 then 0.0 else 1.0 / chi_rms(j))
+    m
+}
+function scaled_inv(h: Array<Float like IrrepsIdx<HSPEC>>, m: Array<Float like IrrepsIdx<MSPEC>>) -> Array<Float like IrrepsIdx<EVSPEC>> = {
+    let f = invariants(h, m)
+    [(f(0) - __fmu(0)) * __fsc(0), (f(1) - __fmu(1)) * __fsc(1), (f(2) - __fmu(2)) * __fsc(2),
+     (f(3) - __fmu(3)) * __fsc(3), (f(4) - __fmu(4)) * __fsc(4), (f(5) - __fmu(5)) * __fsc(5),
+     (f(6) - __fmu(6)) * __fsc(6), (f(7) - __fmu(7)) * __fsc(7), (f(8) - __fmu(8)) * __fsc(8),
+     (f(9) - __fmu(9)) * __fsc(9), (f(10) - __fmu(10)) * __fsc(10), (f(11) - __fmu(11)) * __fsc(11)]
+}
+
+// The calibrated pseudoscalar, evaluated on the eight canonical shapes: zero
+// on the six achiral ones (five of them exactly, `corner` to 5e-18) and
+// equal-and-opposite on the mirror pair -- before a single gradient step, and
+// at every orientation.
+let chi_pieces = method_for(range<Idx<8>>) <@> lambda(s) -> __osc(0) * chirality(piece_feat(s), __wa, __wc)(0) |> compute
+chi_pieces
+// EXPECT: chi_pieces = [-2, 2, 0, 0, 5.65345647988733e-18, 0, 0, 0]
+
+// %% [markdown]
+// ## Training
+//
+// There are no loops in this language, so the optimizer is a **recursive
+// array**: one row per step, each row the previous row's state pushed one
+// step downhill. The state is a single flat `Array<Float like Idx<225>>`
+// holding 112 readout weights, 112 momentum slots, and one slot for the loss
+// measured on the way past; `sgd_step` zeroes a gradient buffer, calls
+// `ad.grad(loss)`, and reassembles the next row. Momentum is not a feature of
+// the optimizer — it is more slots in the same array.
+//
+// Eight training clouds, one orientation per shape. That is not a small
+// training set by accident: every readout channel is a certified invariant,
+// so the other 88 rotated copies in the store produce *the same eight
+// gradients*. Rotation augmentation is a no-op the type system already knew
+// about, which is why the 48 fresh test rotations below are a real test and
+// not a rehearsal.
+
+// %%
+let static NP = WHE + WHO
+let static NP2 = NP + NP
+let static SW = NP2 + 1
+let static LR = 0.02
+let static MU = 0.9
+let static NSTEP = 100
+let static NROW = NSTEP + 1
+
+function pick(__s: Array<Float like Idx<SW>>, base: Int, k: Int) -> Float = __s(base + k)
+function we_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<WHE>> = {
+    let rec o: Array<Float like Idx<96>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pick(__s, 0, k)
+    o
+}
+function wo_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<WHO>> = {
+    let rec o: Array<Float like Idx<16>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pick(__s, WHE, k)
+    o
+}
+function scores_of(h: Array<Float like IrrepsIdx<HSPEC>>, __s: Array<Float like Idx<SW>>) -> Array<Float like Idx<NC>> = {
+    let ch = chirality(h, __wa, __wc)
+    head(scaled_inv(h, eq_block(h, __wtp, __wl)), [ch(0) * __osc(0), ch(1) * __osc(1)], we_of(__s), wo_of(__s))
+}
+function scores_even_of(h: Array<Float like IrrepsIdx<HSPEC>>, __s: Array<Float like Idx<SW>>) -> Array<Float like Idx<NC>> =
+    head_even(scaled_inv(h, eq_block(h, __wtp, __wl)), we_of(__s))
+
+// One-vs-rest squared error against the one-hot table in the store: no
+// softmax and no branch, because reverse-mode differentiation wants
+// straight-line arithmetic.
+function sq_err(__s: Array<Float like Idx<SW>>, i: Int) -> Float = {
+    let sc = scores_of(h_tr_of(i * STRIDE), __s)
+    let __yr = __y_tr(i * STRIDE)
+    let e0 = sc(0) - __yr(0)
+    let e1 = sc(1) - __yr(1)
+    let e2 = sc(2) - __yr(2)
+    let e3 = sc(3) - __yr(3)
+    let e4 = sc(4) - __yr(4)
+    let e5 = sc(5) - __yr(5)
+    let e6 = sc(6) - __yr(6)
+    let e7 = sc(7) - __yr(7)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3 + e4 * e4 + e5 * e5 + e6 * e6 + e7 * e7
+}
+function loss(__s: Array<Float like Idx<SW>>) -> Float = {
+    let rec errs: Array<Float like Idx<8>> =
+        match errs with
+        | zero -> zero
+        | prefix :: i -> prefix :: sq_err(__s, i)
+    reduce(errs, (+)) / 8.0
+}
+
+function blk(__s: Array<Float like Idx<SW>>, base: Int) -> Array<Float like Idx<NP>> = {
+    let rec o: Array<Float like Idx<112>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pick(__s, base, k)
+    o
+}
+function cat_at(__wn: Array<Float like Idx<NP>>, __vn: Array<Float like Idx<NP>>, lv: Float, k: Int) -> Float =
+    if k < NP then __wn(k) else (if k < NP2 then __vn(k - NP) else lv)
+function sgd_step(s: Array<Float like Idx<SW>>) -> Array<Float like Idx<SW>> = {
+    let mut ds = replicate(SW, pure(0.0)) |> compute
+    let lv = ad.grad(loss)(s, ds)
+    let vn = MU * blk(s, NP) - LR * blk(ds, 0)
+    let wn = blk(s, 0) + vn
+    let rec o: Array<Float like Idx<SW>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: cat_at(wn, vn, lv, k)
+    o
+}
+
+// `rand.<family>` is legal only as a bare top-level binding value, so the
+// seed row is drawn first and scaled second.
+let __pmask = {
+    let rec m: Array<Float like Idx<SW>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NP then 1.0 else 0.0)
+    m
+}
+let __n0 = r.normal(31415926, SW)
+let __w0 = (0.1 * __n0) * __pmask
+
+let __traj = {
+    let rec t: Array<Float like Idx<NROW>, Idx<SW>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __w0
+        | prefix :: n -> prefix :: sgd_step(prefix(n - 1))
+    t
+}
+let final_row = __traj(NSTEP)
+function loss_at(n: Int) -> Float = __traj(n + 1)(NP2)
+let loss_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> loss_at(n) |> compute
+let final_loss = final_row(NP2)
+final_loss
+
+// %% [markdown]
+// The loss curve goes to the notebook's plot channel. It lives in its own
+// cell on purpose: a binding that emits a display frame is excluded from the
+// session memo and would re-run the whole descent every time a later cell is
+// evaluated.
+
+// %%
+let __step_axis = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> 1.0 * n |> compute
+let loss_plot = plot.stream("tetris_loss", __step_axis, loss_curve, 0: epoch,
+                            "one-vs-rest squared error": title, "step": xlabel, "loss": ylabel)
+loss_plot
+
+// %% [markdown]
+// ## Verification
+//
+// Forty-eight point clouds the network has never seen, at orientations drawn
+// from a different seed than the training set. Per class, six each.
+
+// %%
+function ind(a: Float, b: Float) -> Float = if a > b then 1.0 else 0.0
+function hit(sc: Array<Float like Idx<NC>>, __yr: Array<Float like Klass>) -> Float = {
+    let st = sc(0) * __yr(0) + sc(1) * __yr(1) + sc(2) * __yr(2) + sc(3) * __yr(3) + sc(4) * __yr(4) + sc(5) * __yr(5) + sc(6) * __yr(6) + sc(7) * __yr(7)
+    let ng = ind(sc(0), st) + ind(sc(1), st) + ind(sc(2), st) + ind(sc(3), st) + ind(sc(4), st) + ind(sc(5), st) + ind(sc(6), st) + ind(sc(7), st)
+    if ng < 0.5 then 1.0 else 0.0
+}
+function hit_te(i: Int) -> Float = hit(scores_of(h_te_of(i), final_row), __y_te(i))
+function cls_hits(c: Int) -> Float = {
+    let rec a: Array<Float like Idx<6>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: hit_te(c * 6 + k)
+    reduce(a, (+))
+}
+let per_class = method_for(range<Idx<8>>) <@> lambda(c) -> cls_hits(c) |> compute
+per_class
+// EXPECT: per_class = [6, 6, 6, 6, 6, 6, 6, 6]
+
+// %% [markdown]
+// ## The theorem, numerically
+//
+// `head_even` is the same readout with the pseudoscalar channel removed —
+// the O(3)-certified variant. Evaluate both models on the two canonical
+// chiral shapes. The even variant's two score vectors are not close, they are
+// **identical**: their squared distance is exactly zero, in binary, because
+// every number feeding them is an O(3) invariant and the two shapes differ by
+// an improper transformation. The full model's score vectors are two apart.
+//
+// A model that cannot see the difference cannot be trained into seeing it,
+// and the ablation says so: 12 chiral test clouds, 0 correct.
+
+// %%
+function hit_te_even(i: Int) -> Float = hit(scores_even_of(h_te_of(i), final_row), __y_te(i))
+function gap8(__a: Array<Float like Idx<NC>>, __b: Array<Float like Idx<NC>>) -> Float = {
+    let rec d: Array<Float like Idx<NC>> =
+        match d with
+        | zero -> zero
+        | prefix :: k -> prefix :: (__a(k) - __b(k)) * (__a(k) - __b(k))
+    reduce(d, (+))
+}
+let even_gap = gap8(scores_even_of(piece_feat(0), final_row), scores_even_of(piece_feat(1), final_row))
+let odd_gap = gap8(scores_of(piece_feat(0), final_row), scores_of(piece_feat(1), final_row))
+let n_hit_te = {
+    let rec a: Array<Float like Idx<NTE>> =
+        match a with
+        | zero -> zero
+        | prefix :: i -> prefix :: hit_te(i)
+    reduce(a, (+))
+}
+let n_hit_te_even = {
+    let rec a: Array<Float like Idx<NTE>> =
+        match a with
+        | zero -> zero
+        | prefix :: i -> prefix :: hit_te_even(i)
+    reduce(a, (+))
+}
+let n_hit_chiral = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: i -> prefix :: hit_te(i)
+    reduce(a, (+))
+}
+let n_hit_chiral_even = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: i -> prefix :: hit_te_even(i)
+    reduce(a, (+))
+}
+let theorem = [even_gap, n_hit_te, n_hit_te_even, n_hit_chiral, n_hit_chiral_even]
+theorem
+// EXPECT: theorem = [0, 48, 36, 12, 0]
+
+// %% [markdown]
+// ## What just happened
+//
+// Nothing in this notebook discovered that the tetrominoes are chiral. The
+// compiler stated it first, in three different registers:
+//
+// - as a **refusal** — `head_o3`, the eight class scores that would have been
+//   O(3)-invariant and still told the mirror twins apart;
+// - as a **deduction** — BL4011 writing `where ml.equiv(O3)` on `invariants`
+//   for us, and the parity rule certifying `u . (v x w)` the moment it was
+//   declared odd;
+// - as a **number** — the pseudoscalar channel, exactly zero on six shapes
+//   and exactly opposite on the seventh and eighth, computed from random
+//   weights before any training happened at all.
+//
+// The training run then fitted 112 readout weights and the fresh-rotation
+// accuracy came out at 48 of 48. That is the least interesting fact here. The
+// interesting one is that the hypothesis space the optimizer searched was
+// carved out at compile time, and every layer that could have left it was a
+// program that does not exist.
+//
+// To poke at the data, regenerate it with
+// `dotnet fsi examples/tools/make_tetris_zarr.fsx` and read the chirality
+// verdict it prints per shape; to poke at the model, widen `MSPEC` and watch
+// `WTP` and `WHE` change on their own.

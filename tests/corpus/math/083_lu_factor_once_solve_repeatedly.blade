@@ -1,0 +1,45 @@
+// TEST: Math lu: factor once, solve repeatedly, transpose solve
+// `m.lu(A)` keeps the partial-pivoted LU as a VALUE -- an ordinary tuple
+// (LU, piv): the packed L\U factor and the pivot rows -- and `m.lu_solve` /
+// `m.lu_solve_t` apply it to any right-hand side without refactoring
+// (plan-fortran-killer-2 section 6.2). The factorization is the one
+// `m.solve` computes, kept: same working copy, same strict-`>` pivot rule,
+// same fused elimination order, so `lu_solve(lu(A), b)` is BITWISE
+// `solve(A, b)` (d1 = 0 below is that identity, not a tolerance). The
+// matrix is math/070's exact-in-binary one, so every pin is an exact value:
+//
+//   A = [[1,1,1],[2,4,1],[1,0,2]]: step 0 pivots on row 1 (|2|), step 1 on
+//   row 2 (|-2| > |-1|), so piv = [1, 2, 2] and
+//   LU = [[2,4,1],[0.5,-2,1.5],[0.5,0.5,-0.25]] (multipliers below the
+//   diagonal, U on and above).
+//
+// The transpose solve: A^T x = b is U^T (L^T (P x)) = b -- U^T forward, L^T
+// backward, the pivot swaps undone in reverse step order. With
+// b = A^T [1,2,3] = [8, 9, 9] every intermediate is dyadic and x comes back
+// as the integers it should be.
+import math as m
+let A: Array<Float64 like Idx<3>, Idx<3>> = [[1.0, 1.0, 1.0], [2.0, 4.0, 1.0], [1.0, 0.0, 2.0]]
+let b1: Array<Float64 like Idx<3>> = [6.0, 13.0, 7.0]
+let f = m.lu(A)
+let (LU, piv) = m.lu(A)
+// EXPECT: LU = [[2, 4, 1], [0.5, -2, 1.5], [0.5, 0.5, -0.25]]
+// EXPECT: piv = [1, 2, 2]
+let x1 = m.lu_solve(f, b1)
+// EXPECT: x1 = [1, 2, 3]
+let x1s = m.solve(A, b1)
+let d1 = reduce(x1 - x1s, (+))
+// EXPECT: d1 = 0
+// A second right-hand side against the SAME factorization: A [1,1,1] = [3,7,3].
+let b2: Array<Float64 like Idx<3>> = [3.0, 7.0, 3.0]
+let x2 = m.lu_solve(f, b2)
+// EXPECT: x2 = [1, 1, 1]
+// The two-halves spelling.
+let x3 = m.lu_solve(LU, piv, b1)
+// EXPECT: x3 = [1, 2, 3]
+// The transpose solve, against the same factors.
+let bt: Array<Float64 like Idx<3>> = [8.0, 9.0, 9.0]
+let xt = m.lu_solve_t(f, bt)
+// EXPECT: xt = [1, 2, 3]
+let At: Array<Float64 like Idx<3>, Idx<3>> = transpose(A, [0, 1])
+let xt_ref = m.solve(At, bt)
+// EXPECT: xt_ref = [1, 2, 3]

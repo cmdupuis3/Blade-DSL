@@ -342,22 +342,286 @@ let (|HaloWinTag|_|) (tag: string) : (bool * string * int list) option =
             else None
         | _ -> None
 
-/// The center's first valid ordinal for a halo slot: max(0, -min(offsets union {0})).
-/// The loop over the SHRUNK slot starts at 0; adding this to the loop index
-/// yields the true center ordinal in the inner index's space.
-let haloStartOffsetOfTag (tag: string) : int64 option =
+/// The halo ACCESS DESCRIPTION (docs/plans/structural/02, section 2.1): which
+/// input ordinals one output ordinal's window may read. Parsed ONCE from the
+/// slot tag (or built from the surface literals by the AD lane), and read by
+/// every consumer -- the checker's offset and extent guards, the codegen and
+/// interpreter BL8009 guards, the halo carousel, the reverse-mode gather --
+/// rather than re-derived from the tag at each. The tag stays the CARRIER:
+/// it already survives every index-record rewrite.
+///
+/// Reach = Offsets union {0}: the centre is always readable. `Start` is the
+/// centre's first valid ordinal in the inner space (the shrunk loop begins at
+/// 0), `Shrink` the interior lost to the reach on both sides; the output
+/// extent M of a slot over an inner extent N is N - Shrink.
+type HaloAccess = {
+    /// The wrapped index alias ("" when anonymous or surface-built).
+    Inner: string
+    /// The DECLARED offset set, as written.
+    Offsets: int list
+    /// max 0 (-(min 0 (min Offsets)))
+    Start: int64
+    /// (-(min 0 (min Offsets))) + max 0 (max Offsets)
+    Shrink: int64
+    /// A "c:" tag: ordinals walk the PRESENT cells of a compound inner.
+    IsCompound: bool
+}
+
+let haloAccessOf (inner: string) (offsets: int list) (isCompound: bool) : HaloAccess =
+    let lo = min 0 (List.min offsets)
+    let hi = max 0 (List.max offsets)
+    { Inner = inner; Offsets = offsets
+      Start = int64 (-lo); Shrink = int64 (hi - lo); IsCompound = isCompound }
+
+/// Parse a slot tag into its access record. Total: None for a non-halo tag.
+let haloAccessOfTag (tag: string) : HaloAccess option =
     match tag with
-    | HaloWinTag (_, _, offs) -> Some (int64 (max 0 (- (min 0 (List.min offs)))))
+    | HaloWinTag (isC, inner, offs) -> Some (haloAccessOf inner offs isC)
     | _ -> None
 
-/// Interior loss of a halo slot: (-min(offsets union {0})) + max(offsets union {0}).
-/// Dense slots fold this into the extent at typecheck; compound slots (whose
-/// extent is the runtime mask cardinality) subtract it at the loop bound.
+/// The reach, sorted: the declared offsets and 0.
+let haloReach (h: HaloAccess) : int list = (0 :: h.Offsets) |> List.distinct |> List.sort
+
+/// Is a literal offset inside the reach the interior was shrunk for?
+let haloOffsetInReach (h: HaloAccess) (o: int) : bool =
+    let r = haloReach h
+    o >= List.min r && o <= List.max r
+
+/// FORWARD DEMAND: the input window [lo', hi') an output tile [lo, hi) reads.
+/// Over the whole output [0, M) this is [0, M + Shrink) = [0, N): the extent
+/// guards' "declared inner extent" is `snd (haloDemand h (0, M))`.
+let haloDemand (h: HaloAccess) (lo: int64, hi: int64) : int64 * int64 =
+    let r = haloReach h
+    (lo + h.Start + int64 (List.min r), hi - 1L + h.Start + int64 (List.max r) + 1L)
+
+/// TRANSPOSE: the (offset, output ordinal) pairs that read input ordinal `j`
+/// -- the boundary is ZeroOutside (an output ordinal outside [0, M) does not
+/// exist, so it contributes nothing). Every j in [0, N) has at least one
+/// contributor because 0 is in the reach.
+let haloContributors (h: HaloAccess) (outExtent: int64) (j: int64) : (int * int64) list =
+    haloReach h
+    |> List.map (fun o -> (o, j - h.Start - int64 o))
+    |> List.filter (fun (_, i) -> 0L <= i && i < outExtent)
+
+/// The run boundaries of every `Chunked` alias registered in the current
+/// compilation, by alias (docs/plans/structural/07): what the stencil
+/// emitter reads to drive a halo map over a streamed segmented source one
+/// run at a time (§2.3). The checker records it beside its own
+/// Segmentations table; AsyncLocal, like the provider registries, so
+/// parallel test compilations do not see each other.
+module SegmentTable =
+    open System.Threading
+    let private table = new AsyncLocal<Map<string, int64 list>>()
+    let private entries () = match box table.Value with null -> Map.empty | _ -> table.Value
+    let record (alias: string) (offsets: int64 list) = table.Value <- Map.add alias offsets (entries ())
+    let tryFind (alias: string) : int64 list option = Map.tryFind alias (entries ())
+    let reset () = table.Value <- Map.empty
+
+/// SCRATCH REUSE ACROSS BARRIERS (plan-fortran-killer-2 section 4, gate 2):
+/// the plan `Blade.Optimize.planPoolReuse` computes per function body and
+/// codegen consumes. A let whose fresh dense pool has the same element type
+/// and literal extents as an earlier, DEAD, unaliased pool in the same body
+/// takes that pool instead of allocating -- `Donors` maps the reuser's let id
+/// to the ROOT let whose `allocate<>` it inherits; `ReturnDonors` does the
+/// same for a body's return position, keyed by the callable's id;
+/// `CurrentReturnDonor` is the one for the body codegen is emitting.
+/// Codegen applies the plan by rewriting the reuser's emitted declaration
+/// (`CodeGenLoopNest.rewritePoolAlias`) and sparing the right scope free.
+/// AsyncLocal like SegmentTable; reset once per program, in
+/// `lowerTypedProgram`, because let ids restart per compile.
+module PoolReuseTable =
+    open System.Threading
+    type State =
+        { Donors: Map<IRId, IRId>
+          ReturnDonors: Map<IRId, IRId>
+          CurrentReturnDonor: IRId option }
+    let private empty =
+        { Donors = Map.empty; ReturnDonors = Map.empty; CurrentReturnDonor = None }
+    let private cell = new AsyncLocal<State>()
+    let private get () = match box cell.Value with null -> empty | _ -> cell.Value
+    let reset () = cell.Value <- empty
+    let record (reuser: IRId) (donor: IRId) = cell.Value <- { get () with Donors = Map.add reuser donor (get ()).Donors }
+    let tryDonor (reuser: IRId) : IRId option = Map.tryFind reuser (get ()).Donors
+    let donors () : Map<IRId, IRId> = (get ()).Donors
+    let recordReturn (func: IRId) (donor: IRId) = cell.Value <- { get () with ReturnDonors = Map.add func donor (get ()).ReturnDonors }
+    let tryReturnDonor (func: IRId) : IRId option = Map.tryFind func (get ()).ReturnDonors
+    let setCurrentReturnDonor (d: IRId option) = cell.Value <- { get () with CurrentReturnDonor = d }
+    let currentReturnDonor () : IRId option = (get ()).CurrentReturnDonor
+
+/// The center's first valid ordinal for a halo slot (a projection of the
+/// record; kept for its call sites).
+let haloStartOffsetOfTag (tag: string) : int64 option =
+    haloAccessOfTag tag |> Option.map (fun h -> h.Start)
+
+/// Interior loss of a halo slot (a projection of the record; kept for its
+/// call sites). Dense slots fold this into the extent at typecheck; compound
+/// slots (whose extent is the runtime mask cardinality) subtract it at the
+/// loop bound.
 let haloShrinkOfTag (tag: string) : int64 option =
-    match tag with
-    | HaloWinTag (_, _, offs) ->
-        Some (int64 ((- (min 0 (List.min offs))) + (max 0 (List.max offs))))
-    | _ -> None
+    haloAccessOfTag tag |> Option.map (fun h -> h.Shrink)
+
+// Provider PACKED-POOL provenance tags (icechunk plan section 5.3).
+//
+// A dense provider axis carries its provenance in a "__icaxis|" Tag, which is
+// what makes cross-repo/diverged-axis arithmetic refuse: co-iteration decides
+// axis agreement from the Tag alone. A PACKED variable's pool axis is not a
+// dimension -- its extent is a derived cardinality, so it never joins the
+// module's shared dim universe and never reached that tag -- and an untagged
+// axis is "some axis of this cardinality", which two different repos' pools
+// silently share. These prefixes give a pool axis the same provenance the
+// dense axes have.
+//
+// TWO prefixes because the Tag doubles as the KIND sentinel and a pool comes
+// in two kinds: a depth-1 simplex pool (SymIdx/AntisymIdx storage) is IxKPlain,
+// an iterated-wreath pool (OrbIdx) is IxKOrbit and would otherwise carry the
+// "__orbidx" sentinel. `ixKindOfTag` below maps each spelling back, which is
+// what IRValidate's Tag/IxKind agreement check requires. Both start with
+// `providerPoolTagStem`, so one predicate recognises the family, and both start
+// with `__` so the seams that read a Tag as a user-written NAME
+// (`checkArrayIndexTags`, `elemTypeForIterationIndex`, `Ide.indexNamesOf`)
+// leave them alone -- exactly as for "__icaxis|". `unify` is the one seam that
+// USED to be on that list and is not: see `isProviderAxisTag` below.
+let providerPoolTagStem = "__icpool"
+/// Depth-1 simplex pool (SymIdx/AntisymIdx/Hermitian storage): IxKPlain.
+let providerPoolTagPrefix = "__icpool|"
+/// Iterated-wreath pool (OrbIdx, depth >= 2): IxKOrbit.
+let providerOrbPoolTagPrefix = "__icpoolorb|"
+
+/// Does this Tag carry packed-pool provenance (either kind)?
+let isProviderPoolTag (tag: string) : bool = tag.StartsWith providerPoolTagStem
+
+/// A DENSE provider dimension's provenance prefix. The tag's SHAPE and the
+/// reasoning behind it live at `IcechunkProvider.axisTag`, which re-exports
+/// this binding as `axisTagPrefix`; the literal sits here because the two
+/// predicates that read it (`Unify.indexPairIncompatible`,
+/// `TypeLower.indexNamesCoIterable`) compile before the provider does.
+let providerAxisTagPrefix = "__icaxis|"
+
+/// Does this Tag carry PROVIDER provenance of any flavour -- a dense axis, a
+/// simplex pool, or a wreath pool?
+///
+/// The family exists because these three tags are `__`-prefixed for one
+/// narrow reason (the four seams above must not read them as user-written
+/// names) and are otherwise NOT synthetic at all: a synthetic tag is a KIND
+/// sentinel, structural and shared by every record of that kind, while a
+/// provider tag is an IDENTITY -- which repo, which version of the dim -- and
+/// two different ones are two different axes. Every seam that decides axis
+/// AGREEMENT therefore has to treat them nominatively, which is what this
+/// predicate marks. `__orbidx`, `__sparseidx`, `__anon` and friends stay
+/// exempt; they are sentinels, and comparing them would refuse sound code.
+let isProviderAxisTag (tag: string) : bool =
+    tag.StartsWith providerAxisTagPrefix || isProviderPoolTag tag
+
+// ---------------------------------------------------------------------------
+// Provider seams that the DIAGNOSTIC layer needs (icechunk review pass)
+// ---------------------------------------------------------------------------
+
+/// Raised by a provider whose STORE RESOLUTION failed: the repo does not
+/// exist, the ref does not resolve (typo'd, ambiguous, a deleted-tag
+/// tombstone), the header is not spec 2, the status is Offline, the snapshot
+/// carries a virtual chunk ref or a nested group -- every refusal that makes
+/// the store's dims and variables untypeable.
+///
+/// WHY A TYPE AND NOT `failwith`. `TypeCheck.checkDecl`'s catch-all used to
+/// swallow every icechunk store-resolution refusal and fall back to opaque
+/// types, so `blade check` and the editor reported NOTHING and the error only
+/// surfaced under `emit`/`run` once lowering re-opened the store. A named
+/// type lets that arm re-raise as a spanned diagnostic while leaving every
+/// other provider's silent fallback untouched: zarr/netcdf/csv do not raise
+/// this.
+///
+/// WHY A CLASS AND NOT `exception ProviderResolutionError of string`. The
+/// message has to survive as `.Message` -- `Lowering.lower` and
+/// `lowerCheckedProgram` surface an escaping provider failure through exactly
+/// that property, and an F# exception DECLARATION leaves `Message` at the
+/// default "Exception of type ... was thrown", blanking every lowering-phase
+/// refusal text in one stroke.
+type ProviderResolutionError(message: string) =
+    inherit System.Exception(message)
+
+/// Extension point: the provider layer registers the decoder that turns one of
+/// its axis Tags into the DISPLAY NAME a user would recognise
+/// (`__icaxis|lat@wx:9f3a1c...` -> `lat`, and a split identity -> `lat#2`);
+/// see `ProviderStatics.install`.
+///
+/// Behind a hook because the refusal sites that print tags -- `TypeLower`'s two
+/// co-iteration messages and `TypeEnv.formatTypeError` -- must not depend on a
+/// provider module, and because leaving it UNREGISTERED has to reproduce
+/// today's behaviour exactly (the raw tag, verbatim). That is what keeps a
+/// standalone `#load` of the front-end files honest, and what makes the
+/// decoder's absence a display regression rather than a crash.
+let mutable private providerAxisTagDecoder : (string -> string option) option = None
+
+let registerProviderAxisTagDecoder (f: string -> string option) : unit =
+    providerAxisTagDecoder <- Some f
+
+/// The decoded display name of a Tag: `None` when no decoder is installed, or
+/// when the tag is not one the installed decoder recognises. Never throws --
+/// a diagnostic must not die while rendering itself.
+let tryDecodeAxisTag (tag: string) : string option =
+    match providerAxisTagDecoder with
+    | Some f -> (try f tag with _ -> None)
+    | None -> None
+
+/// A Tag as it should APPEAR in a diagnostic: the decoded provider name when
+/// there is one, the raw tag otherwise. The raw case covers every user-written
+/// name (which is already its own display form), every kind sentinel, and every
+/// tag at all before `ProviderStatics.install` has run.
+let displayTagName (tag: string) : string =
+    match tryDecodeAxisTag tag with
+    | Some n -> n
+    | None -> tag
+
+/// Extension point: WHY a provider axis identity differs from the one it split
+/// from ("coordinate content differs", "extent 5 -> 10", ...), keyed on the
+/// tag that identity carries. The provider records this at mint time and,
+/// until now, nothing ever printed it -- so a diverged-checkout refusal told
+/// the user THAT two axes disagree and never WHICH FACT about the store made
+/// them disagree, which is the one thing they cannot recover by reading the
+/// program.
+let mutable private providerAxisSplitReason : (string -> string option) option = None
+
+let registerProviderAxisSplitReason (f: string -> string option) : unit =
+    providerAxisSplitReason <- Some f
+
+let tryAxisSplitReason (tag: string) : string option =
+    match providerAxisSplitReason with
+    | Some f -> (try f tag with _ -> None)
+    | None -> None
+
+/// The ONE clause a refusal between two DIFFERENT provider identities of the
+/// SAME axis earns, or `None` when the pair is not that.
+///
+/// The case exists because the display name deliberately drops everything that
+/// discriminates two identities except the split ordinal: two checkouts of one
+/// repo print as 'lat' and 'lat#2' (informative but unexplained), and two
+/// REPOS' `lat` print identically (uninformative). Both read as "these are the
+/// same axis, why the refusal?" -- so the clause says which of the two it is,
+/// and, when the mint table remembers, the store fact behind it.
+///
+/// One line, appended: every existing pin on the sentence in front of it keeps
+/// matching.
+let providerSplitClause (tagA: string) (tagB: string) : string option =
+    if tagA = tagB || not (isProviderAxisTag tagA) || not (isProviderAxisTag tagB) then None
+    else
+        match tryDecodeAxisTag tagA, tryDecodeAxisTag tagB with
+        | Some a, Some b when a = b ->
+            // Same DISPLAY name and different tags: nothing on the line above
+            // distinguishes them, so this clause is the whole diagnosis.
+            match tryAxisSplitReason tagB |> Option.orElse (tryAxisSplitReason tagA) with
+            | Some reason -> Some $"(these are two identities of axis '{a}': {reason})"
+            | None ->
+                Some $"(two different axes both print as '{a}' here: they carry different store provenance -- a diverged checkout, or a different repo)"
+        | Some a, Some b ->
+            // Different display names. When they share a base dim name the
+            // ordinal already says "two identities"; the reason says why.
+            let baseOf (n: string) = match n.IndexOf '#' with | i when i > 0 -> n.Substring(0, i) | _ -> n
+            if baseOf a = baseOf b then
+                match tryAxisSplitReason tagB |> Option.orElse (tryAxisSplitReason tagA) with
+                | Some reason -> Some $"(these are two identities of axis '{(baseOf a)}': {reason})"
+                | None -> None
+            else None
+        | _ -> None
 
 /// Derive the kind from a (possibly user-supplied) Tag value: sentinel strings
 /// map to their kind, anything else (user names, "__anon", None) is IxKPlain.
@@ -384,6 +648,12 @@ let ixKindOfTag (tag: string option) : IxKind =
     | Some t when t.StartsWith irrepsTagPrefix -> IxKIrreps
     | Some t when t.StartsWith pgIrrepsTagPrefix -> IxKPgIrreps
     | Some t when t.StartsWith treeTagPrefix -> IxKTree
+    // A provider pool tag REPLACES the record's kind sentinel, so it has to
+    // decode back to the kind the record actually carries. The wreath spelling
+    // stands in for "__orbidx"; the depth-1 spelling falls through to IxKPlain
+    // below, which is what a simplex pool record carries (its symmetry, not its
+    // IxKind, is what makes it compact).
+    | Some t when t.StartsWith providerOrbPoolTagPrefix -> IxKOrbit
     // A compound-inner halo slot keeps IxKCompound: the compound machinery
     // (cidx materialization, cardinality bound) must still engage. Dense
     // halo slots fall through to IxKPlain like any other "__" placeholder.
@@ -974,3 +1244,86 @@ let (|TreeIdxLike|_|) (ix: IRIndexTypeG<'Ext>) : string option =
             // Kind says tree but the tag is missing/unparseable -- a state
             // validateIR rejects; render a placeholder rather than crash.
             Some "TreeIdx<?>"
+
+// ---------------------------------------------------------------------------
+// Enumerable constrained domains (docs/plans/structural/06)
+//
+// A `static struct R { ... } where ...` whose conjuncts are linear
+// inequalities on the fields enumerates in CLOSED FORM: level k (declaration
+// order, first field outermost) runs over an interval whose ends are affine
+// in the earlier levels. Difference constraints (`x_a - x_b <= c`, bounds)
+// are Fourier-Motzkin-projected at planning time so no prefix is dead; a
+// general affine bound on a level (`l3 <= l1 + l2`, `m_out == m1 + m2`) is
+// admitted unprojected -- a prefix may then meet an empty interval, which
+// costs the empty loop and nothing else. Every consumer (the compiler's
+// certificate, the C++ key builder, the interpreter) reads THIS record;
+// there is one enumeration order, lex ascending, and the position in it is
+// the storage offset.
+// ---------------------------------------------------------------------------
+
+/// `Const + Σ coef * x_level` over EARLIER levels.
+type DomainAffine = { Const: int64; Coefs: (int * int64) list }
+
+/// One end of a level's interval: a lower bound is the MAX of its forms, an
+/// upper the MIN (a level always has at least its box bound).
+type DomainBound = DomainAffine list
+
+type DomainLevel = { Field: string; Lo: DomainBound; Hi: DomainBound }
+
+type DomainPlan = {
+    Name: string
+    /// Declaration order = nesting order.
+    Levels: DomainLevel list
+    /// The solution count, walked at planning time.
+    Card: int64
+}
+
+let domainAffineValue (f: DomainAffine) (prefix: int64[]) : int64 =
+    f.Coefs |> List.fold (fun acc (j, a) -> acc + a * prefix.[j]) f.Const
+
+let domainLower (b: DomainBound) (prefix: int64[]) : int64 =
+    b |> List.map (fun f -> domainAffineValue f prefix) |> List.fold max System.Int64.MinValue
+
+let domainUpper (b: DomainBound) (prefix: int64[]) : int64 =
+    b |> List.map (fun f -> domainAffineValue f prefix) |> List.fold min System.Int64.MaxValue
+
+/// Every solution of the plan, lex ascending in declaration order.
+let enumerateDomain (plan: DomainPlan) : int64[] list =
+    let levels = Array.ofList plan.Levels
+    let r = levels.Length
+    let out = ResizeArray<int64[]>()
+    let prefix = Array.zeroCreate<int64> r
+    let rec go (k: int) =
+        if k = r then out.Add (Array.copy prefix)
+        else
+            let lo = domainLower levels.[k].Lo prefix
+            let hi = domainUpper levels.[k].Hi prefix
+            let mutable v = lo
+            while v <= hi do
+                prefix.[k] <- v
+                go (k + 1)
+                v <- v + 1L
+    if r > 0 then go 0
+    List.ofSeq out
+
+/// The solution count without materializing the solutions: the innermost
+/// level contributes its interval's length per prefix.
+let domainCardOf (levels: DomainLevel list) : int64 =
+    let levels = Array.ofList levels
+    let r = levels.Length
+    if r = 0 then 0L
+    else
+    let prefix = Array.zeroCreate<int64> r
+    let rec go (k: int) : int64 =
+        let lo = domainLower levels.[k].Lo prefix
+        let hi = domainUpper levels.[k].Hi prefix
+        if k = r - 1 then (if hi < lo then 0L else hi - lo + 1L)
+        else
+            let mutable total = 0L
+            let mutable v = lo
+            while v <= hi do
+                prefix.[k] <- v
+                total <- total + go (k + 1)
+                v <- v + 1L
+            total
+    go 0

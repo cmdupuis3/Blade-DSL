@@ -1,0 +1,11 @@
+// TEST: Anticomm contradicts conjugating kernel (rejects)
+// ERROR: BL4013
+// The signed twin of symmetry/039: `anticomm` on the same conjugating body.
+// Strict-triangular storage recovers mirrored cells by NEGATION, but the
+// true mirror of `x * conj(y)` is the CONJUGATE -- negation flips the real
+// part that conjugation preserves (only the imaginary half happens to
+// agree). Same PConj deduction, same refusal; the anticommutative claim
+// the user may have meant is `imag(x * conj(y))`, which symmetry/045 pins
+// as accepted.
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let bad = method_for(A, A) <@> lambda(x, y) where anticomm(x, y) -> x * conj(y) |> compute

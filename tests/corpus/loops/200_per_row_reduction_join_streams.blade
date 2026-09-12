@@ -1,0 +1,39 @@
+// TEST: Per-Row Reduction Join Streams The Pairwise Normalization
+// ============================================================================
+// The softmax-normalized weighted sum y(i) = sum_j exp(s(i,j)) v(j) /
+// sum_j exp(s(i,j)) WITHOUT the M x N intermediate (docs/plans/structural/03,
+// section 2.1): a per-row kernel whose body is a reduction join over a
+// DEFERRED producer. Naming `e` is the sharing declaration; `object_for(<&!>)`
+// folds both legs in one traversal of j, so the only allocation is `y`.
+// Pass 1 is the row maximum (the fused terminal with a lambda kernel needs
+// the 3-argument seed); pass 2 subtracts it before exponentiating. The
+// reference is the same sum written the naive way, cell by cell, so the pins
+// are a differential, not a magic number.
+// ============================================================================
+type I = Idx<7>
+type J = Idx<11>
+function score(a: Float64, b: Float64) -> Float64 = -(a - b) * (a - b) * 8.0
+let q = method_for(range<I>) <@> lambda(i) -> 0.3 * Float64(i) - 0.5 |> compute
+let k = method_for(range<J>) <@> lambda(j) -> 0.2 * Float64(j) - 0.4 |> compute
+let v = method_for(range<J>) <@> lambda(j) -> 1.0 + 0.1 * Float64(j) |> compute
+
+let y = (method_for(range<I>) <@> lambda(i) -> {
+    let qi = q(i)
+    let m = reduce(method_for(k) <@> lambda(b) -> score(qi, b),
+                   lambda(a, b) -> if a > b then a else b, -1.0e300)
+    let e = method_for(k) <@> lambda(b) -> exp(score(qi, b) - m)
+    let z, u = object_for(<&!>) <@> (reduce(e, (+)), prodsum(e, v))
+    u / z
+}) |> compute
+
+// The naive reference: materialize the M x N weights and fold twice.
+let W = (method_for(q, k) <@> lambda(a, b) -> exp(score(a, b)) |> compute)
+let zr = reduce(W, (+))
+let ur = method_for(range<I>) <@> lambda(i) -> prodsum(W(i), v) |> compute
+let yr = ur / zr
+let dev = method_for(zip(y, yr)) <@> lambda(a, b) -> abs(a - b) |> compute
+let maxdev = reduce(dev, lambda(a, b) -> if a > b then a else b, 0.0)
+let agrees = maxdev < 1.0e-12
+// EXPECT: agrees = true
+let y0 = y((0 : I))
+let y6 = y((6 : I))

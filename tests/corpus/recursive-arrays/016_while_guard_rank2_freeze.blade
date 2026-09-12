@@ -1,0 +1,22 @@
+// TEST: While Guard Rank2 Field Freezes
+// ============================================================================
+// A rank-2 guarded recurrence: each sweep halves the field; the guard reads
+// one scalar cell of the previous slice. Exercises the per-iteration
+// machinery the break must respect -- the rank >= 2 slice materialization
+// and the hoisted lag-row reads are per-iteration, so the early exit runs
+// the iteration's frees before breaking (a naive break leaks). Slices after
+// the stop repeat the last written field.
+// ============================================================================
+type Sweep = Idx<6>
+type Row = Idx<2>
+type Col = Idx<2>
+let rec f: Array<Float like Sweep, Row, Col> =
+    match f with
+    | zero -> zero
+    | zero :: s -> zero :: [[8.0, 4.0], [2.0, 1.0]]
+    | prefix :: n while prefix(n - 1, 0, 0) > 1.0 -> prefix :: [[prefix(n - 1, 0, 0) * 0.5, prefix(n - 1, 0, 1) * 0.5], [prefix(n - 1, 1, 0) * 0.5, prefix(n - 1, 1, 1) * 0.5]]
+// EXPECT: f = [8, 4, 2, 1, 4, 2, 1, 0.5, 2, 1, 0.5, 0.25, 1, 0.5, 0.25, 0.125, 1, 0.5, 0.25, 0.125, 1, 0.5, 0.25, 0.125]
+let probe = f((5 : Sweep), (0 : Row), (0 : Col))
+// EXPECT: probe = 1
+let corner = f((5 : Sweep), (1 : Row), (1 : Col))
+// EXPECT: corner = 0.125

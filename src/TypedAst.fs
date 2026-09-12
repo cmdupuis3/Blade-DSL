@@ -172,6 +172,14 @@ and TypedExprKind =
     // scalar nature: runtime layout is two floats (std::complex<double>),
     // typed as scalar IRTScalar ETComplex64/128. Lowering routes to IRLitComplex.
     | TExprComplexLit of re: TypedExpr * im: TypedExpr
+
+    // Fused multiply-add `fma(a, b, c)` = a*b + c with ONE rounding. A
+    // dedicated node rather than a binop chain because the fusion is the
+    // semantics: an IR pass that saw `a*b` and `+ c` as separate nodes could
+    // legally split them, and a split fma is not an fma (TwoProd's error
+    // term would come out exactly 0). All three operands Float64; lowers to
+    // IRFma, rendered std::fma / Math.FusedMultiplyAdd / llvm.fma.f64.
+    | TExprFma of a: TypedExpr * b: TypedExpr * c: TypedExpr
     
     // Array literal
     | TExprArrayLit of elems: TypedExpr list * arrayType: IRArrayType
@@ -199,7 +207,6 @@ and TypedExprKind =
     | TExprRange of indexTypes: IRIndexType list
     | TExprDotDot of lo: TypedExpr * hi: TypedExpr
     | TExprReverse of indexType: IRIndexType
-    | TExprBlocked of indexType: IRIndexType * blockSize: TypedExpr
     // halo<Inner, [offsets]> has no typed node -- it typechecks to a
     // TExprRange over a "__halowin|"-tagged slot (TypeCheck.haloSlotOf); the
     // per-slot center offset is re-derived from the tag at loop building.
@@ -241,7 +248,7 @@ and TypedExprKind =
     // checker off the argument's own type. It rides along rather than being
     // re-read from the TypedExpr's type downstream so that the "is this extent
     // static?" question is asked (and refused) in exactly one place.
-    | TExprRandGen of kind: string * key: TypedExpr * pars: TypedExpr list * weights: (TypedExpr * int) option * dims: int list
+    | TExprRandGen of kind: string * key: TypedExpr * pars: TypedExpr list * weights: (TypedExpr * int) option * address: (TypedExpr * TypedExpr) option * dims: int list
     | TExprGuard of cond: TypedExpr * body: TypedExpr
     | TExprZero
     | TExprReynolds of kernel: TypedExpr * isAntisymmetric: bool
@@ -264,7 +271,14 @@ and TypedExprKind =
     /// including `"data":`, `quoted` says whether the payload goes out as a
     /// quoted JSON string or an inline JSON value, `metaTail` is the user
     /// `meta` object minus its braces. Byte format: Blade.Display.Frame.
-    | TExprDisplayEmit of head: string * quoted: bool * data: TypedExpr * metaTail: string
+    ///
+    /// `id` is `None` for `display.emit` -- the frame's `meta.id` is then the
+    /// run's `<SessionTag><ordinal>` -- and `Some e` for `display.emit_id`,
+    /// whose id is that runtime String instead. One node rather than two
+    /// because the two spellings differ in exactly this operand: everything
+    /// downstream (typing, lowering, both back ends) would otherwise be
+    /// duplicated verbatim.
+    | TExprDisplayEmit of head: string * quoted: bool * data: TypedExpr * metaTail: string * id: TypedExpr option
     /// `display.json_array(A)`: render a rank-1 or rank-2 numeric array as
     /// JSON text (String). `rank` is pinned at typecheck so both back ends
     /// pick the 1-D/2-D serializer without re-resolving the type. Number
@@ -281,12 +295,38 @@ and TypedExprKind =
     | TExprGroupKeys of keys: TypedExpr list
     /// group_bucket(gk): row -> bucket over the grouping's source index space.
     | TExprGroupBucket of grouping: TypedExpr
+    /// segments(A): the STRUCTURAL grouping of a `Chunked` axis
+    /// (docs/plans/structural/07 §2.2) -- a GroupKeys whose partition is
+    /// the segment table: `offsets` are the run boundaries `[0; ..; N]`,
+    /// `labels` the file labels of a file-segmented axis. No key array,
+    /// no CSR: the permutation is the identity.
+    | TExprSegments of alias: string * offsets: int64 list * labels: string list option
+    /// segments(C0, C1): the PRODUCT grouping of two segmented slots of a
+    /// rank-2 array (docs/plans/structural/07 §4.1b): one group per tile
+    /// (g0, g1) in slot order, the member the tile's cells row-major.
+    /// `bounds` are the per-slot run boundaries `[0; ..; N_d]`.
+    | TExprSegmentsGrid of aliases: string list * bounds: int64 list list
+    /// ungroup(G) of a grid grouping: the tiles written back over the two
+    /// source axes.
+    | TExprUngroupGrid of grouped: TypedExpr * sources: IRIndexType list * bounds: int64 list list
+    /// ungroup(G): the inverse of `group_by(_, segments(A))` -- G's rows
+    /// reassembled over the SOURCE axis `source` (§2.3, §3.3).
+    | TExprUngroup of grouped: TypedExpr * source: IRIndexType
+    /// ungroup([r1, .., rF], A): the per-file arrays of a file-segmented axis
+    /// assembled over the axis (§2.7: the inverse of `files(A)` applied to
+    /// explicit rows -- how a variable that lives in several stores is
+    /// named over the tiled axis). Rows are bare names; `offsets` are the
+    /// file boundaries.
+    | TExprUngroupRows of rows: TypedExpr list * offsets: int64 list * source: IRIndexType
     | TExprSort of array: TypedExpr * key: TypedExpr
     | TExprReduce of array: TypedExpr * kernel: TypedExpr * init: TypedExpr option
     | TExprProdSum of args: TypedExpr list  // prodsum(x1..xk): fused sum_t prod_l x_l(t) over rank-1 arrays
     | TExprTranspose of array: TypedExpr * dim1: int * dim2: int
     | TExprDecompact of array: TypedExpr * dim: int
     | TExprGram of left: TypedExpr * right: TypedExpr * isSameArray: bool
+    /// gram_apply(A, B, x) = A * (B^H * x): the action of gram(A, B) on x
+    /// (rank-1 result over A's leading axis); no m x p matrix is formed.
+    | TExprGramApply of left: TypedExpr * right: TypedExpr * vec: TypedExpr
     /// matmul(A, B): A(m x k) * B(k x n) -> dense m x n, routed through
     /// blade_linalg rather than synthesized as a Blade triple loop.
     | TExprMatmul of left: TypedExpr * right: TypedExpr
@@ -303,6 +343,14 @@ and TypedExprKind =
     /// The LAPACK `dgesv` route is an availability-gated replacement for those
     /// loops, not a precondition for the node existing.
     | TExprSolve of matrix: TypedExpr * rhs: TypedExpr
+    /// `m.lu(A)` -> (LU, piv): the FACTORIZATION VALUE of plan-fortran-killer-2
+    /// section 6.2 -- an ordinary tuple of two fresh arrays (the packed L\U
+    /// factor, n x n Float64; the pivot rows, n Int64), immutable by
+    /// construction (A was copied), consumed by the solve actions below.
+    | TExprLu of matrix: TypedExpr
+    /// `m.lu_solve(LU, piv, b)` / `m.lu_solve_t(LU, piv, b)`: x with A x = b
+    /// (or A^T x = b) from a stored factorization, no refactoring.
+    | TExprLuSolve of lu: TypedExpr * piv: TypedExpr * rhs: TypedExpr * transposed: bool
     | TExprArrayNegate of array: TypedExpr
     | TExprArrayConjugate of array: TypedExpr
     | TExprExtents of array: TypedExpr
@@ -334,10 +382,19 @@ and TypedExprKind =
     // Partial application of operator (e.g., (+ 3) or (3 +))
     | TExprPartialApp of op: BinOp * arg: TypedExpr * isLeft: bool
 
-    // Runtime constraint guard: emits `if (!(cond)) { cerr << message; abort(); }`.
-    // Synthesized by the checker for mutual-group joint bindings (and, in later
-    // phases, struct constraint checks); not expressible in surface syntax.
-    | TExprConstraintCheck of cond: TypedExpr * message: string
+    // Runtime constraint guard: emits `if (!(cond)) { panic(code, message); }`.
+    // Synthesized by the checker for mutual-group joint bindings, struct
+    // constraint checks, and the rec-array budget abort; not expressible in
+    // surface syntax. `code` is the BLxxxx the panic renders (BL8001 for
+    // value-constraint guards, BL8010 for the while-guard budget abort).
+    | TExprConstraintCheck of cond: TypedExpr * code: string * message: string
+
+    // Early exit from the ENCLOSING for-in loop when cond is true. Synthesized
+    // ONLY by inferRecArray for the `while` guard on a recursive array's
+    // inductive arm -- never parser-reachable, and only legal in for-in
+    // statement position (the emitters refuse it anywhere a C++ `break`
+    // could not stand).
+    | TExprBreakIf of cond: TypedExpr
 
 and TypedMatchCase = {
     Pattern: TypedPattern
@@ -418,6 +475,10 @@ and TypedFunctionDecl = {
     IsStatic: bool
     /// Source span of the function's NAME TOKEN (see Ast.FunctionDecl.NameSpan).
     NameSpan: Span
+    /// Conservative effect summary of `Body` (Blade.Effects), computed by
+    /// checkFunctionDecl with callees resolved through TypeEnv.FuncEffects;
+    /// Lowering grafts it onto the IR callable.
+    Effects: Blade.Effects.EffectSummary
 }
 
 // Typed type definitions, resolved from raw TypeDecl.

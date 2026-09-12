@@ -1,0 +1,12 @@
+// TEST: Fused Chain Under Reduce
+// ============================================================================
+// A binop chain consumed directly by a fold. Fusion collapses the chain to
+// one deferred co-iteration, so the fold traverses once with no materialized
+// intermediate (previously the inner product materialized before the fold).
+
+type I = Idx<5>
+let a = method_for(range<I>) <@> lambda(i) -> Float64(i) |> compute
+let b = method_for(range<I>) <@> lambda(i) -> Float64(i) + 1.0 |> compute
+
+let s = reduce(a * b + a, (+))
+// EXPECT: s = 50

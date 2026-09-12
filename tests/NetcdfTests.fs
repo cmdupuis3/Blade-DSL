@@ -858,6 +858,55 @@ let runNetcdfTests () =
              && writeCode |> List.exists (fun s -> s.Contains "\"time\"")) ""
     | _ -> ()
 
+    // Dimension NAMES as `tryProviderWrite` derives them (the other half of
+    // the genWriteVar check above, which is handed its names ready-made).
+    // A named index type used to arrive here as "dim0": the derivation looked
+    // the slot up by `IRIndexType.Id` against the module's IRTDIndexType
+    // defs, and `lowerIndexType` stamps a FRESH Id per use, so the match never
+    // fired and every user-declared axis name was dropped on the floor.
+    // Lowering-level (not codegen): no libnetcdf, no sample.nc.
+    printfn "\n--- write dimension names (lowering) ---"
+    let writeSpecDimNames (source: string) : Result<string list, string> =
+        lower source
+        |> Result.bind (fun ir ->
+            match ir.Modules.[0].ProviderWrites |> Map.toList with
+            | [ (_, spec) ] -> Ok spec.DimNames
+            | specs -> Error $"expected exactly one write spec, got {specs.Length}")
+    let namedAxisWrite = """
+import netcdf as nc
+type LatIdx = Idx<2>
+type LonIdx = Idx<3>
+let A: Array<Float64 like LatIdx, LonIdx> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let _ = nc.write("out.nc", A)
+"""
+    (let name = "write dims: named index types reach the store's dimension names"
+     match writeSpecDimNames namedAxisWrite with
+     | Ok names -> check name (names = ["LatIdx"; "LonIdx"]) (sprintf "got %A" names)
+     | Error e -> check name false e)
+    // Anonymous axes have no name to carry: dim<i> stands, as before.
+    let anonAxisWrite = """
+import netcdf as nc
+let A: Array<Float64 like Idx<2>, Idx<3>> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let _ = nc.write("out.nc", A)
+"""
+    (let name = "write dims: anonymous axes still synthesize dim<i>"
+     match writeSpecDimNames anonAxisWrite with
+     | Ok names -> check name (names = ["dim0"; "dim1"]) (sprintf "got %A" names)
+     | Error e -> check name false e)
+    // One index type in TWO slots is one dimension used twice, but the writers
+    // emit one definition per slot -- `nc_def_dim` would fail NC_ENAMEINUSE on
+    // the repeat. A repeated tag therefore names no slot.
+    let repeatedAxisWrite = """
+import netcdf as nc
+type SqIdx = Idx<2>
+let A: Array<Float64 like SqIdx, SqIdx> = [[1.0, 2.0], [3.0, 4.0]]
+let _ = nc.write("out.nc", A)
+"""
+    (let name = "write dims: a repeated index type falls back rather than colliding"
+     match writeSpecDimNames repeatedAxisWrite with
+     | Ok names -> check name (names = ["dim0"; "dim1"]) (sprintf "got %A" names)
+     | Error e -> check name false e)
+
     // genReadCompoundVar: load_compound's materializer. Reads the dense var and
     // the integer mask, converts nonzero -> bool, builds compound_index_t, and
     // scatters into a compact buffer (verified against the real cpp/ runtime).
@@ -1303,6 +1352,218 @@ let out = method_for(A) <@> lambda(x) -> x + x |> compute
         | Error e ->
             check "dense read: lowers (plain provider var read)" false ($"lower error: {e}")
     with ex -> unexpected "dense read" ex
+
+    // ---------------------------------------------------------------
+    // Shape guard (BL8012): the dense reader's baked extents vs the file at
+    // RUN time. Lowering bakes A as xdim x ydim x zdim = 20 x 30 x 50 from
+    // sample.nc; the exe must refuse -- before nc_get_var writes anything --
+    // when the file it opens at run time declares different dimensions, and
+    // must still run clean against the unchanged fixture (no false positive).
+    // The mismatched files are generated with ncgen, from the same install
+    // as libnetcdf (NETCDF_DIR\bin, else PATH); without ncgen the negative
+    // halves SKIP. Two mismatches: a longer leading dimension (the overrun
+    // case) and a lower rank (the garbage-read case).
+    // ---------------------------------------------------------------
+    printfn "\n--- shape guard: dense read refuses a file whose dimensions changed (BL8012) ---"
+    let shapeGuardSource = """
+import netcdf as NetCDF
+
+let sample = NetCDF.load("tests/fixtures/sample.nc")
+let A = sample.vars.A |> NetCDF.read
+let out = method_for(A) <@> lambda(x) -> x + x |> compute
+"""
+    /// Run ncgen on a CDL text, producing `outNc`. None = ncgen unavailable
+    /// (SKIP); Some (Error e) = ncgen ran and failed (FAIL: the CDL is ours).
+    let tryNcgen (cdl: string) (outNc: string) : Result<unit, string> option =
+        let candidates =
+            [ match Environment.GetEnvironmentVariable "NETCDF_DIR" with
+              | null | "" -> ()
+              | d -> yield Path.Combine(d, "bin", "ncgen.exe")
+              yield "ncgen" ]
+        let cdlPath = Path.ChangeExtension(outNc, ".cdl")
+        File.WriteAllText(cdlPath, cdl)
+        let tryOne (exe: string) : Result<unit, string> option =
+            try
+                let psi = ProcessStartInfo(exe, $"-o \"{outNc}\" \"{cdlPath}\"")
+                psi.RedirectStandardOutput <- true
+                psi.RedirectStandardError <- true
+                psi.UseShellExecute <- false
+                psi.CreateNoWindow <- true
+                use p = Process.Start(psi)
+                let err = p.StandardError.ReadToEnd()
+                p.WaitForExit()
+                if p.ExitCode = 0 && File.Exists outNc then Some (Ok ())
+                else Some (Error $"ncgen exit {p.ExitCode}: {err}")
+            with
+            | :? System.ComponentModel.Win32Exception -> None   // not found: try the next
+            | ex -> Some (Error ex.Message)
+        candidates |> List.tryPick tryOne
+    try
+        match lower shapeGuardSource with
+        | Ok ir ->
+            let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "shape_guard_e2e"
+            let iRank = cppCode.IndexOf "nc_inq_varndims"
+            let iRead = cppCode.IndexOf "nc_get_var_float"
+            check "shape guard: codegen queries rank + dimension lengths BEFORE nc_get_var (BL8012)"
+                (iRank >= 0 && iRead > iRank && cppCode.Contains "nc_inq_dimlen" && cppCode.Contains "BL8012")
+                ($"varndims at {iRank}, get_var at {iRead}")
+            let sgOutDir = "./generated_cpp_tests"
+            if not (Directory.Exists sgOutDir) then Directory.CreateDirectory sgOutDir |> ignore
+            CodeGen.deployRuntimeHeaders sgOutDir
+            let sgCppFile = Path.Combine(sgOutDir, "shape_guard_e2e.cpp")
+            File.WriteAllText(sgCppFile, cppCode)
+            (match compileCpp sgCppFile sgOutDir with
+             | Ok exePath ->
+                 check "shape guard e2e: compiles and links libnetcdf" true ""
+                 Directory.CreateDirectory(Path.Combine(sgOutDir, "tests", "fixtures")) |> ignore
+                 File.Copy("tests/fixtures/sample.nc", Path.Combine(sgOutDir, "tests", "fixtures", "sample.nc"), true)
+                 (match runExecutable exePath with
+                  | Ok (0, _) -> check "shape guard e2e: the unchanged fixture still reads (exit 0, no false positive)" true ""
+                  | Ok (code, runOut) ->
+                      check "shape guard e2e: the unchanged fixture still reads (exit 0, no false positive)" false
+                          ($"exit {code}: {(runOut.Substring(0, min 300 runOut.Length))}")
+                  | Error e -> check "shape guard e2e: the unchanged fixture still reads (exit 0, no false positive)" false e)
+                 // Negative halves: the same exe against a regenerated sample.nc.
+                 let negative (label: string) (cdl: string) (wantSubstring: string) =
+                     let badDir = Path.Combine(Path.GetTempPath(), "blade_nc_shape_" + Guid.NewGuid().ToString("N"))
+                     Directory.CreateDirectory(Path.Combine(badDir, "tests", "fixtures")) |> ignore
+                     try
+                         let badNc = Path.Combine(badDir, "tests", "fixtures", "sample.nc")
+                         match tryNcgen cdl badNc with
+                         | None -> printfn "  SKIP shape guard e2e (%s): ncgen not found (NETCDF_DIR\\bin or PATH)" label
+                         | Some (Error e) -> check $"shape guard e2e ({label}): ncgen builds the mismatched fixture" false e
+                         | Some (Ok ()) ->
+                             let exeCopy = Path.Combine(badDir, Path.GetFileName exePath)
+                             File.Copy(exePath, exeCopy, true)
+                             (match runExecutable exeCopy with
+                              | Ok (code, badOut) ->
+                                  let name = $"shape guard e2e ({label}): aborts with BL8012 before reading, prints no data"
+                                  check name
+                                      (code <> 0
+                                       && badOut.Contains "error[BL8012]"
+                                       && badOut.Contains "provider shape mismatch"
+                                       && badOut.Contains wantSubstring
+                                       && not (badOut.Contains "out = "))
+                                      ($"exit {code}: {(badOut.Substring(0, min 400 badOut.Length))}")
+                              | Error e -> check $"shape guard e2e ({label}): aborts with BL8012 before reading, prints no data" false e)
+                     finally
+                         try Directory.Delete(badDir, true) with _ -> ()
+                 // xdim 20 -> 21: A grows by 1500 floats past the baked buffer.
+                 negative "longer leading dim"
+                     "netcdf sample {\ndimensions:\n zdim = 50 ;\n ydim = 30 ;\n xdim = 21 ;\nvariables:\n float A(xdim, ydim, zdim) ;\n}\n"
+                     "dimension 0 of length 21"
+                 // A loses its trailing axis: rank 2 against a rank-3 type.
+                 negative "lower rank"
+                     "netcdf sample {\ndimensions:\n ydim = 30 ;\n xdim = 20 ;\nvariables:\n float A(xdim, ydim) ;\n}\n"
+                     "has rank 2"
+             | Error e ->
+                 if isSkipError e then printfn "  SKIP shape guard e2e (compile skipped): %s" e
+                 else check "shape guard e2e: compiles and links libnetcdf" false e)
+        | Error e when nativeLibUnavailable e ->
+            printfn "  SKIP shape guard: %s" e
+        | Error e ->
+            check "shape guard: lowers (plain provider var read)" false ($"lower error: {e}")
+    with ex -> unexpected "shape guard" ex
+
+    // ---------------------------------------------------------------
+    // Shape guard, INTERPRETER lane: Run.materializeProviderRead is the twin
+    // of CppNetcdf.ncShapeGuard and must raise BL8012 on the same
+    // disagreement. The interpreter opens the file named in the IR at run
+    // time, so the block lowers against a PRIVATE copy of sample.nc, checks
+    // the copy still interprets, regenerates the copy with ncgen (a longer
+    // leading dim), and interprets the same IR again. No g++ involved.
+    // ---------------------------------------------------------------
+    printfn "\n--- shape guard, interpreter lane: BL8012 from materializeProviderRead ---"
+    let itDir = Path.Combine(Path.GetTempPath(), "blade_nc_shape_interp_" + Guid.NewGuid().ToString("N"))
+    try
+        try
+            Directory.CreateDirectory itDir |> ignore
+            let itNc = Path.Combine(itDir, "sample.nc")
+            File.Copy("tests/fixtures/sample.nc", itNc, true)
+            let itSource =
+                "import netcdf as NetCDF\n\n"
+                + "let sample = NetCDF.load(\"" + itNc.Replace('\\', '/') + "\")\n"
+                + "let A = sample.vars.A |> NetCDF.read\n"
+                + "let out = method_for(A) <@> lambda(x) -> x + x |> compute\n"
+            match lower itSource with
+            | Ok ir ->
+                let run () = Blade.Interp.Run.runProgram ir "shape_guard_interp" Blade.Interp.Value.defaultLimits
+                let good = run ()
+                check "shape guard interp: the unchanged copy interprets (exit 0, no false positive)"
+                    (good.ExitCode = 0 && good.Stdout.Contains "out = ")
+                    ($"exit {good.ExitCode}: {(good.Stderr.Substring(0, min 300 good.Stderr.Length))}")
+                (match tryNcgen
+                        "netcdf sample {\ndimensions:\n zdim = 50 ;\n ydim = 30 ;\n xdim = 21 ;\nvariables:\n float A(xdim, ydim, zdim) ;\n}\n"
+                        itNc with
+                 | None -> printfn "  SKIP shape guard interp (negative): ncgen not found (NETCDF_DIR\\bin or PATH)"
+                 | Some (Error e) -> check "shape guard interp: ncgen rebuilds the private copy" false e
+                 | Some (Ok ()) ->
+                     let bad = run ()
+                     check "shape guard interp: the regenerated copy (longer leading dim) raises BL8012, prints no data"
+                         (bad.ExitCode <> 0
+                          && bad.Stderr.Contains "BL8012"
+                          && bad.Stderr.Contains "length 21"
+                          && not (bad.Stdout.Contains "out = "))
+                         ($"exit {bad.ExitCode}: {(bad.Stderr.Substring(0, min 400 bad.Stderr.Length))}"))
+            | Error e when nativeLibUnavailable e -> printfn "  SKIP shape guard interp: %s" e
+            | Error e -> check "shape guard interp: lowers (plain provider var read)" false ($"lower error: {e}")
+        with ex -> unexpected "shape guard interp" ex
+    finally
+        try Directory.Delete(itDir, true) with _ -> ()
+
+    // ---------------------------------------------------------------
+    // Destination passing (plan-fortran-killer-2.md section 4, gate 1): a
+    // dense provider write hands libnetcdf the array's own pool instead of
+    // flattening into a fresh buffer. Emission pin: the write prologue
+    // aliases `pool_base(...)` and allocates/frees no `_flat` buffer.
+    // End to end: write a 2 x 3 literal, read it back through the F#
+    // binding, compare every value -- the aliasing is only right if DFS pool
+    // order really is the store's row-major order.
+    // ---------------------------------------------------------------
+    printfn "\n--- destination passing: nc.write hands the pool to libnetcdf (no flatten copy) ---"
+    let dpSource = """
+import netcdf as nc
+type RowIdx = Idx<2>
+type ColIdx = Idx<3>
+let A: Array<Float64 like RowIdx, ColIdx> = [[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]]
+let _ = nc.write("dp_out.nc", A)
+"""
+    try
+        match lower dpSource with
+        | Ok ir ->
+            let (cppCode, _) = CodeGen.genSelfContainedProgramFromIR ir "dest_passing_write"
+            check "destination passing: the dense write aliases pool_base and allocates no flat copy"
+                (cppCode.Contains "_flat = pool_base(" && not (cppCode.Contains "_flat = new "))
+                (if cppCode.Contains "_flat = new " then "a `_flat = new` allocation survives" else "no pool_base alias emitted")
+            let dpOutDir = "./generated_cpp_tests"
+            if not (Directory.Exists dpOutDir) then Directory.CreateDirectory dpOutDir |> ignore
+            CodeGen.deployRuntimeHeaders dpOutDir
+            let dpCppFile = Path.Combine(dpOutDir, "dest_passing_write.cpp")
+            File.WriteAllText(dpCppFile, cppCode)
+            (match compileCpp dpCppFile dpOutDir with
+             | Ok exePath ->
+                 check "destination passing e2e: compiles and links libnetcdf" true ""
+                 let outNc = Path.Combine(Path.GetDirectoryName exePath, "dp_out.nc")
+                 (try File.Delete outNc with _ -> ())
+                 (match runExecutable exePath with
+                  | Ok (0, _) ->
+                      check "destination passing e2e: the write runs to completion (exit 0)" true ""
+                      (match NetcdfProvider.readVarData outNc "A" with
+                       | Ok { DimLengths = dims; Payload = NetcdfProvider.NcFloats got } ->
+                           let want = [| 1.5; 2.5; 3.5; 4.5; 5.5; 6.5 |]
+                           check "destination passing e2e: the file holds the array in row-major order, every value intact"
+                               (dims = [2; 3] && got = want)
+                               (sprintf "dims %A, values %A" dims got)
+                       | Ok other -> check "destination passing e2e: the file holds the array in row-major order, every value intact" false (sprintf "unexpected payload %A" other.DimLengths)
+                       | Error e -> check "destination passing e2e: the file holds the array in row-major order, every value intact" false e)
+                  | Ok (code, runOut) -> check "destination passing e2e: the write runs to completion (exit 0)" false ($"exit {code}: {(runOut.Substring(0, min 300 runOut.Length))}")
+                  | Error e -> check "destination passing e2e: the write runs to completion (exit 0)" false e)
+             | Error e ->
+                 if isSkipError e then printfn "  SKIP destination passing e2e (compile skipped): %s" e
+                 else check "destination passing e2e: compiles and links libnetcdf" false e)
+        | Error e when nativeLibUnavailable e -> printfn "  SKIP destination passing: %s" e
+        | Error e -> check "destination passing: lowers (nc.write of a dense literal)" false ($"lower error: {e}")
+    with ex -> unexpected "destination passing" ex
 
     // ---------------------------------------------------------------
     // fill_random builtin (general codegen, hermetic -- no NetCDF): a random-fill

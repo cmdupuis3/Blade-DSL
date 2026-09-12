@@ -1,0 +1,9 @@
+// TEST: Anon Range Reduce
+// reduce over a bare range: the operand is hoisted and materialized.
+let s = reduce(0..5, (+))
+let p = reduce(1..5, (*))
+type W = Idx<6>
+let sw = reduce(range<W>, (+))
+// EXPECT: s = 10
+// EXPECT: p = 24
+// EXPECT: sw = 15

@@ -37,6 +37,15 @@ let Version = 1
 /// can never re-open a frame, and no escaping scheme is needed on top.
 let Sentinel = "\u0001blade-display\u0001"
 
+/// The LIVE-PLOT STREAM mime. A frame carrying exactly this mime is the one
+/// kind an `ide serve` eval forwards WHILE the program runs (the `sink` below)
+/// instead of buffering it to end-of-run; every other mime keeps the buffered
+/// path unchanged. Frozen by docs/plans/plan-equivariant-nn-notebooks.md
+/// section 4 and implemented verbatim on both sides of the wire, so it is a
+/// literal here rather than a caller's spelling.
+[<Literal>]
+let StreamMime = "application/vnd.blade.plotstream.v1+json"
+
 /// Prefix for generated `meta.id`s. Frames with equal ids are alternate
 /// renders of the SAME plot, so the panel merges rather than appends -- which
 /// is what makes the REPL's re-run-the-whole-session model harmless: replaying
@@ -64,24 +73,91 @@ let tagForSession (key: string) : string =
 // compiled lane's counterpart is a `static int` in the generated C++.
 let private buffer = ResizeArray<string>()
 let mutable private ordinal = 0
+let mutable private sunk = 0
+
+/// Every frame this run has delivered, in order: the line, whether it went to
+/// the live sink rather than the buffer, and whether it consumed a run
+/// ordinal. Interp/Run.fs brackets each top-level binding with `producedCount`
+/// to learn which frames that binding emitted, so a session memo can REPLAY
+/// them instead of re-running the binding that computed them.
+let private produced = ResizeArray<string * bool * bool>()
+
+/// The LIVE FRAME SINK, installed by `IdeServe`'s eval handler for the length
+/// of one evaluation and by nothing else. When it is set, a frame whose mime is
+/// exactly `StreamMime` is handed to it AS IT IS PRODUCED and is NOT buffered
+/// -- which is what turns a training loop's per-batch plot into something the
+/// editor can paint while the loop is still running.
+///
+/// Scope is deliberately narrow, because the alternative breaks the format's
+/// central pin: with no sink (`blade run`, `blade repl`, the corpus, the
+/// interpreter/g++ differential gate) EVERY frame stays an ordinary buffered
+/// sentinel line, byte-identical between the two lanes. The compiled lane has
+/// no sink at all and needs none -- its frames already reach stdout as the
+/// program runs.
+///
+/// A plain mutable is enough: one interpreter run at a time on one worker
+/// thread, and `ide serve` handles one request at a time (IdeServe.serveLoop).
+let mutable sink : (string -> unit) option = None
+
+/// Install the live frame sink. Always paired with `clearSink` in a `finally`.
+let setSink (f: string -> unit) = sink <- Some f
+
+/// Remove the live frame sink; frames go back to the buffer.
+let clearSink () = sink <- None
 
 /// Clear the per-run state. Called at the top of every interpreter run so the
-/// n-th emission of a program is always id `<tag><n>`, run after run.
+/// n-th emission of a program is always id `<tag><n>`, run after run. The sink
+/// is NOT touched: it belongs to the caller that installed it (one eval may
+/// drive more than one run), and only that caller clears it.
 let resetRun () =
     buffer.Clear()
+    produced.Clear()
     ordinal <- 0
+    sunk <- 0
 
 /// How many frames this run has emitted so far. Interp/Run.fs brackets each
 /// top-level binding with it to find the frame EMITTERS: a session memo must
 /// never adopt one, because a binding that does not re-run cannot re-emit, and
 /// the editor keys its plot panel on the frames of the run it is showing.
-let emitted () = buffer.Count
+/// Frames handed to the sink count too -- they were emitted, they just did not
+/// travel by way of stdout, and a streaming binding is exactly the one that
+/// must keep re-running.
+let emitted () = buffer.Count + sunk
 
 /// Take the frames this run produced, in emission order.
 let drain () : string list =
     let xs = List.ofSeq buffer
     buffer.Clear()
     xs
+
+/// How many frames this run has delivered. The bracket Interp/Run.fs takes
+/// around each top-level binding; `producedSince` reads the window back.
+let producedCount () = produced.Count
+
+/// The frames delivered since `n`, in emission order.
+let producedSince (n: int) : (string * bool * bool) list =
+    [ for i in n .. produced.Count - 1 -> produced.[i] ]
+
+/// Re-deliver frames a binding produced on an EARLIER run of the same session,
+/// without re-running the binding that computed them.
+///
+/// Sound for the same reason caching the binding's value is: the session memo
+/// may only be offered to a run whose prefix is unchanged (see SessionMemo in
+/// Interp/Run.fs), so a binding eligible for adoption had the same inputs, and
+/// the frames it would emit now are the frames it emitted then. Each frame
+/// goes back to the channel it originally took, and one that consumed a run
+/// ordinal consumes one again -- so the ids of the frames AROUND it are
+/// unchanged, and a replayed run is indistinguishable, frame for frame, from
+/// the run that computed it.
+let replay (frames: (string * bool * bool) list) : unit =
+    for (line, sank, usedOrdinal) in frames do
+        if usedOrdinal then ordinal <- ordinal + 1
+        match sink with
+        | Some f when sank ->
+            sunk <- sunk + 1
+            f line
+        | _ -> buffer.Add line
+        produced.Add(line, sank, usedOrdinal)
 
 /// `encoding` implied by a mime type (spec section 1): JSON-shaped mimes carry
 /// an inline JSON value, `text/*` carries a string, everything else is binary
@@ -134,7 +210,7 @@ let jsonString (s: string) : string = "\"" + escape s + "\""
 /// no NaN/Infinity literal -- plotly's own encoder writes `null` for both -- so
 /// every element the numeric serializers emit goes through this guard rather
 /// than straight out as `nan`/`inf`/`-inf`, which are bare identifiers to a
-/// parser. `rendered` is the caller's 15-significant-digit rendering: this
+/// parser. `rendered` is the caller's shortest round-trip rendering: this
 /// module compiles before Interp.CppFormat and cannot name it. Mirrored by the
 /// `std::isfinite` branch in `blade_display::jsonval`.
 let jsonNumber (rendered: string) (x: float) : string =
@@ -158,12 +234,58 @@ let metaTailOf (metaJson: string) : string option =
         Some (if inner = "" then "" else "," + inner)
     else None
 
+/// One frame line, without its terminating newline, with the `meta.id` text
+/// already decided. The two public composers differ in that ONE substring and
+/// in nothing else, which is the property the byte pins are here to keep.
+let private composeWith (head: string) (quoted: bool) (data: string) (metaTail: string) (idText: string) : string =
+    let payload = if quoted then "\"" + escape data + "\"" else data
+    Sentinel + head + payload + ",\"meta\":{\"id\":\"" + idText + "\"" + metaTail + "}}"
+
 /// One frame line, without its terminating newline. `head` and `metaTail` are
 /// the elaboration-time constants; `data` is the runtime payload; `ord` is this
 /// run's 1-based emission ordinal.
 let composeLine (head: string) (quoted: bool) (data: string) (metaTail: string) (ord: int) : string =
-    let payload = if quoted then "\"" + escape data + "\"" else data
-    Sentinel + head + payload + ",\"meta\":{\"id\":\"" + SessionTag + string ord + "\"" + metaTail + "}}"
+    composeWith head quoted data metaTail (SessionTag + string ord)
+
+/// `composeLine`'s twin for `display.emit_id`: the `meta.id` is a RUNTIME
+/// string rather than `<SessionTag><ordinal>`, escaped exactly like any other
+/// JSON string value (a channel name with a quote in it must not be able to
+/// open a key of its own). Everything else about the line -- head, payload
+/// quoting, meta tail, the closing braces -- is the same bytes `composeLine`
+/// produces, because it is the same code.
+let composeLineId (head: string) (quoted: bool) (data: string) (metaTail: string) (id: string) : string =
+    composeWith head quoted data metaTail (escape id)
+
+/// The head of a stream frame. Head equality IS mime equality: `headFor`
+/// embeds the mime verbatim, so comparing the whole head is the exact test
+/// "this frame's mime is `StreamMime`" without re-parsing the head.
+let private streamHead = headFor StreamMime
+
+/// Route one composed line: to the live sink when one is installed AND this
+/// frame is LIVE, otherwise to the run buffer. Live means the frame carries a
+/// stable identity: a stream chunk, or any `display.emit_id` frame (`hasId`,
+/// set by emitId below) -- a stable-id figure is re-emittable and a viewer
+/// merges it by `meta.id`, so forwarding it the moment it is produced is what
+/// lets a long cell ANIMATE a plot (a continuous zoom dive, a per-step field)
+/// and lets a recomputed view repaint before its eval settles. Ordinal
+/// (`blade-N`) frames stay buffered: their ids are per-run bookkeeping, and
+/// they are results, not installments. The no-sink path is the ONLY path a
+/// `blade run` / corpus / differential-gate program can take, and it is the
+/// pre-sink code verbatim.
+let private deliver (hasId: bool) (head: string) (line: string) : bool =
+    let sank =
+        match sink with
+        | Some f when hasId || head = streamHead ->
+            sunk <- sunk + 1
+            f line
+            true
+        | _ ->
+            buffer.Add line
+            false
+    // `emit` consumes an ordinal and `emitId` does not, which is exactly
+    // `hasId` -- recorded so a replay reproduces the same id sequence.
+    produced.Add(line, sank, not hasId)
+    true
 
 /// Interpreter-lane emission: buffer one frame and answer `true` (the value
 /// `display.emit` evaluates to). Buffered rather than written because the
@@ -173,8 +295,18 @@ let composeLine (head: string) (quoted: bool) (data: string) (metaTail: string) 
 /// body, before the timing line and the print block).
 let emit (head: string) (quoted: bool) (data: string) (metaTail: string) : bool =
     ordinal <- ordinal + 1
-    buffer.Add(composeLine head quoted data metaTail ordinal)
-    true
+    deliver false head (composeLine head quoted data metaTail ordinal)
+
+/// Interpreter-lane emission with a CALLER-CHOSEN `meta.id` (`display.emit_id`).
+///
+/// The run ordinal is deliberately NOT consumed: an explicit id is already
+/// stable across calls and across a session replay, and leaving the counter
+/// alone means adding a streaming plot to a notebook cannot renumber the
+/// `blade-N` ids of the ordinary `display.emit` frames around it. The generated
+/// C++ (`blade_display::emit_id`) leaves its own counter alone for the same
+/// reason, which is what keeps the two lanes byte-identical.
+let emitId (head: string) (quoted: bool) (data: string) (metaTail: string) (id: string) : bool =
+    deliver true head (composeLineId head quoted data metaTail id)
 
 /// Split a program's raw stdout into the text a terminal should show and the
 /// frame JSON strings it carried. Frame lines are always whole lines at column
@@ -206,6 +338,10 @@ let extract (stdout: string) : string * string list =
 let cppRuntime () : string list =
     [ "#include <sstream>  // blade_display::json1/json2/jsonnum"
       "#include <cmath>    // blade_display::jsonval (non-finite -> null)"
+      "#include <charconv> // blade_display::jsonfloat (shortest round-trip)"
+      "#include <cstdlib>"
+      "#include <string>"
+      "#include <type_traits>"
       "namespace blade_display {"
       "// Display frames (docs/display-frames.md). Mirrors Blade.Display.Frame."
       "static int __blade_display_ord = 0;"
@@ -235,8 +371,10 @@ let cppRuntime () : string list =
       "    return \"\\\"\" + __blade_display_esc(s) + \"\\\"\";"
       "}"
       "// JSON serialization of numeric arrays / scalars (display.json_array /"
-      "// display.json_num). setprecision(15) is the print block's own float"
-      "// rule; Blade.Interp.CppFormat.formatFloat15 is its byte-exact mirror,"
+      "// display.json_num). A floating element goes out as its SHORTEST"
+      "// round-trip rendering (jsonfloat below) -- exact, where the print"
+      "// block's setprecision(15) would quantize a Float64 to 15 digits;"
+      "// Blade.Interp.CppFormat.formatFloatShortest is the byte-exact mirror,"
       "// so the differential gate pins the two lanes together."
       "//"
       "// jsonval is the per-element guard: JSON has no NaN/Infinity literal, so"
@@ -247,19 +385,55 @@ let cppRuntime () : string list =
       "// of a non-finite is implementation-defined (`nan`, `-nan`, `NaN`,"
       "// `1.#QNAN` across the standard libraries). isfinite is the portable"
       "// predicate; matching the formatter's output would not be."
+      "// Shortest round-trip rendering of a double, laid out like \"%.17g\": the"
+      "// fewest significant digits that parse back to the same double, fixed"
+      "// notation for decimal exponents in [-4, 17), scientific otherwise."
+      "// Mirrors CppFormat.formatFloatShortest / assembleShortest byte for byte."
+      "static inline std::string jsonfloat(double v) {"
+      "    char buf[64];"
+      "    auto r = std::to_chars(buf, buf + sizeof buf, v, std::chars_format::scientific);"
+      "    std::string s(buf, r.ptr);                     // [-]d[.ddd]e[+-]dd"
+      "    std::string sign; size_t p = 0;"
+      "    if (s[0] == '-') { sign = \"-\"; p = 1; }"
+      "    size_t e = s.find('e');"
+      "    std::string digits;"
+      "    for (size_t i = p; i < e; ++i) if (s[i] != '.') digits += s[i];"
+      "    while (digits.size() > 1 && digits.back() == '0') digits.pop_back();"
+      "    if (digits == \"0\") return sign + \"0\";"
+      "    int x = std::atoi(s.c_str() + e + 1);"
+      "    std::string out = sign;"
+      "    if (x < -4 || x >= 17) {"
+      "        out += digits[0];"
+      "        if (digits.size() > 1) { out += '.'; out += digits.substr(1); }"
+      "        out += 'e'; out += (x < 0 ? '-' : '+');"
+      "        int a = x < 0 ? -x : x;"
+      "        if (a < 10) out += '0';"
+      "        out += std::to_string(a);"
+      "    } else if (x >= 0) {"
+      "        size_t intLen = (size_t)x + 1;"
+      "        std::string padded = digits;"
+      "        if (padded.size() < intLen) padded.append(intLen - padded.size(), '0');"
+      "        out += padded.substr(0, intLen);"
+      "        if (padded.size() > intLen) { out += '.'; out += padded.substr(intLen); }"
+      "    } else {"
+      "        out += \"0.\"; out.append((size_t)(-x) - 1, '0'); out += digits;"
+      "    }"
+      "    return out;"
+      "}"
       "template <typename T>"
       "static inline void jsonval(std::ostringstream& o, const T& x) {"
-      "    if (std::isfinite((double)x)) o << x; else o << \"null\";"
+      "    if (!std::isfinite((double)x)) { o << \"null\"; return; }"
+      "    if constexpr (std::is_floating_point_v<T>) o << jsonfloat((double)x); else o << x;"
       "}"
       "template <typename A>"
       "static inline std::string json1(const A& a) {"
-      "    std::ostringstream o; o << std::setprecision(15) << '[';"
+      "    std::ostringstream o; o << '[';"
       "    for (size_t i = 0; i < a.extents[0]; ++i) { if (i) o << ','; jsonval(o, a[i]); }"
       "    o << ']'; return o.str();"
       "}"
       "template <typename A>"
       "static inline std::string json2(const A& a) {"
-      "    std::ostringstream o; o << std::setprecision(15) << '[';"
+      "    std::ostringstream o; o << '[';"
       "    for (size_t i = 0; i < a.extents[0]; ++i) {"
       "        if (i) o << ','; o << '[';"
       "        for (size_t j = 0; j < a.extents[1]; ++j) { if (j) o << ','; jsonval(o, a[i][j]); }"
@@ -269,7 +443,7 @@ let cppRuntime () : string list =
       "}"
       "template <typename T>"
       "static inline std::string jsonnum(T x) {"
-      "    std::ostringstream o; o << std::setprecision(15); jsonval(o, x); return o.str();"
+      "    std::ostringstream o; jsonval(o, x); return o.str();"
       "}"
       "static inline bool emit(const char* head, bool quoted, const std::string& data,"
       "                        const char* metaTail, const char* tag) {"
@@ -277,6 +451,20 @@ let cppRuntime () : string list =
       "    if (quoted) std::cout << '\"' << __blade_display_esc(data) << '\"';"
       "    else std::cout << data;"
       "    std::cout << \",\\\"meta\\\":{\\\"id\\\":\\\"\" << tag << ++__blade_display_ord"
+      "              << \"\\\"\" << metaTail << \"}}\" << \"\\n\";"
+      "    return true;"
+      "}"
+      "// display.emit_id: the same line with a RUNTIME meta.id in place of"
+      "// <tag><ordinal>, escaped like any other JSON string value. The ordinal"
+      "// counter is deliberately untouched -- Blade.Display.Frame.emitId does"
+      "// not consume one either, so an emit_id call never renumbers the plain"
+      "// emit frames around it in EITHER lane."
+      "static inline bool emit_id(const char* head, bool quoted, const std::string& data,"
+      "                           const char* metaTail, const std::string& id) {"
+      "    std::cout << \"\\x01\" \"blade-display\" \"\\x01\" << head;"
+      "    if (quoted) std::cout << '\"' << __blade_display_esc(data) << '\"';"
+      "    else std::cout << data;"
+      "    std::cout << \",\\\"meta\\\":{\\\"id\\\":\\\"\" << __blade_display_esc(id)"
       "              << \"\\\"\" << metaTail << \"}}\" << \"\\n\";"
       "    return true;"
       "}"

@@ -1,0 +1,15 @@
+// TEST: Gram Float32 Cancellation Width
+// ============================================================================
+// Float32 gram accumulates in Float32 on BOTH lanes. The compiled loop
+// rounds after every product and every add (`float __gacc += float *
+// float`); the interpreter seeded its accumulator with a double zero and the
+// promotion rule kept the whole fold in Float64, answering 1 where the
+// compiled lane answers 0. Small exact integers never show this; the
+// cancellation below does. (Run under `blade test interp index-types` for
+// the interpreter half.)
+let A: Array<Float32 like Idx<1>, Idx<3>> = [[16777216.0, 1.0, -16777216.0]]
+let B: Array<Float32 like Idx<1>, Idx<3>> = [[1.0, 1.0, 1.0]]
+let G = gram(A, B)
+// EXPECT: A = [[16777216, 1, -16777216]]
+// EXPECT: B = [[1, 1, 1]]
+// EXPECT: G = [[0]]

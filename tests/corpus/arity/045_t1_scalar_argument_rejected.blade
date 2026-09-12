@@ -1,0 +1,23 @@
+// TEST: T^1 parameter fed a scalar (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: is an ARRAY by declaration
+// ============================================================================
+// The caret is a rank CLAIM (see 030): a `T^1` parameter is an array by
+// declaration, so a scalar in that position is the wrong shape -- not a
+// broadcast. Lifting would have to invent an axis, so the lift declines and
+// the conflict is reported.
+//
+// The escape this closes is the same one the `T^0` cases had, and it reached
+// g++ the same way: `T` took argument 1's `Array<double,1>`, argument 2's
+// teaching was discarded, and the emitted call handed a bare double to an
+// array parameter. Note what makes it invisible to the ordinary rank check --
+// a `T^k` parameter is still an OPEN inference variable at the call site
+// (that is what keeps HM alive here), so `concreteRankOf` declines it and
+// every rank comparison stands down.
+// ============================================================================
+function rs(a: T^1, b: T^1) -> T^1 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let s = 5.0
+
+let r = rs(A, s)

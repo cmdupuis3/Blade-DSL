@@ -38,9 +38,66 @@ let internal panicSpanArgs (span: Blade.Ast.Span) : string =
 // Code Generation Context
 
 /// Tracks information needed during code generation
+/// Revision reuse (docs/plans/structural/04, v1): one tiled binding's plan,
+/// built by CodeGenTiles.planTiles and consumed at three seams -- the
+/// need-masked provider read (CodeGenBinding), the tile run loop around the
+/// nest (CodeGenCuda.genApplyCombinator), and the remainder read after it.
+type TileInputPlan = {
+    /// The provider-read binding this input is.
+    ReadId: IRId
+    CppName: string
+    Spec: ProviderReadSpec
+    /// Chunks in the variable's grid (row-major flat), and the product of
+    /// the trailing grid dims -- tile t's chunks are [t*G, (t+1)*G).
+    ChunkCount: int
+    TrailingGrid: int64
+    /// Whether anything OTHER than the tiled binding observes this input: a
+    /// later consumer, a function body, or the print pass (which prints every
+    /// top-level binding unless `--print` selects; docs/plans/structural/04,
+    /// 3.5). False means the remainder read has no reader, so the chunks the
+    /// compute phase did not need are never fetched at all -- the total-bytes
+    /// saving the plan says appears exactly when the input is not printed.
+    Observed: bool
+    /// The need-masked read emitted at the binding, the remainder read (every
+    /// chunk the compute phase did not need) emitted after the tiled binding,
+    /// and the buffer release alone -- what an UNOBSERVED input emits in
+    /// place of the remainder, so nothing leaks. All unindented.
+    Phase1: string list
+    Phase2: string list
+    Release: string list
+}
+and TilePlan = {
+    /// The tiled binding's C++ name (genApplyCombinator's `name`).
+    Output: string
+    BindingId: IRId
+    Inputs: TileInputPlan list
+    /// Tiles = leading-axis chunks; LeadBounds has Tiles + 1 entries.
+    Tiles: int
+    LeadBounds: int64 list
+    /// Cells per leading-axis row (the product of the trailing extents).
+    Trailing: int64
+    ElemCpp: string
+    /// One SHA-256 hex key per tile.
+    Keys: string list
+    /// The probe runs at the inputs' reads (read avoidance) when nothing
+    /// between the read and the tiled binding observes the input; otherwise
+    /// the tile loop probes by loading (recompute avoidance only).
+    Hoisted: bool
+}
+
 type CodeGenContext = {
     /// Map from IR variable IDs to C++ variable names
     VarNames: Map<IRId, string>
+    /// The VarIds of the PARAMETERS of the function body being emitted
+    /// (empty at module level). A parameter's array type may carry a LITERAL
+    /// extent that is not a statement about the runtime array: shape
+    /// monomorphization pins a `T^k` parameter from one argument, and a
+    /// co-iterating body unifies the parameters' records, so a curried or
+    /// let-bound partial application leaves a second parameter typed at the
+    /// first one's extent. The co-iteration extent guard (BL8011) therefore
+    /// compares runtime extents whenever a parameter is involved, and trusts
+    /// equal literals only between non-parameter (allocated) arrays.
+    ParamIds: Set<IRId>
     /// Current indentation level
     Indent: int
     /// Generated static declarations (symmetry vectors, extents)
@@ -64,6 +121,14 @@ type CodeGenContext = {
     /// Streamed provider reads whose prologue is already emitted, keyed by cpp name:
     /// a hit means inline a fiber read at the S/T boundary instead of peeling.
     StreamedArrays: Map<string, ProviderReadSpec>
+    /// Groupings emitted by genSegmentsBinding (structural: static offsets,
+    /// identity accessor), by cpp name. A group_by over a STREAMED rank-1
+    /// variable and one of these reads per run (docs/plans/structural/07 §3.4).
+    StructuralGroupings: Set<string>
+    /// Grid (tile) groupings emitted by genSegmentsGridBinding, by cpp name:
+    /// the per-slot run boundaries. group_by gathers tiles from a rank-2
+    /// value through these; `__at` is not used for them.
+    GridGroupings: Map<string, int64 list list>
     /// Deferred random-fill constructors keyed by binding id (from IRModule.RandomInits);
     /// genBinding emits allocate<> + a pool fill from the RandomFillSpec.
     RandomInits: Map<IRId, RandomFillSpec>
@@ -80,6 +145,11 @@ type CodeGenContext = {
     /// deep-copies storage (fresh alloc + pool copy) instead of aliasing the Array wrapper by
     /// value, so mutation can't corrupt the source array.
     MutableArrayLets: Set<IRId>
+    /// Revision reuse (docs/plans/structural/04): tile plans by the tiled
+    /// binding's C++ name, and the hoisted probes by the provider-read
+    /// binding they attach to. Empty unless BLADE_TILE_CACHE is set.
+    TilePlans: Map<string, TilePlan>
+    TileReads: Map<IRId, TilePlan>
     /// Accumulated code generation warnings (unsupported IR nodes, fallbacks, etc.)
     Warnings: string list ref
 }
@@ -679,6 +749,125 @@ let ompSuppressedBlockMarker (requested: bool) (reason: string) : string =
 /// picks cblas or the native fallback at C++ compile time. The include line
 /// below is what keeps codegen and build in lockstep; Build.fs keys its
 /// -D/-I/link flags off it.
+/// Revision reuse: set when a tiled binding or a hoisted probe was emitted
+/// this assembly, so the assemblers include `blade_tilecache.hpp` (and
+/// Build.fs keys `-DBLADE_TOOLCHAIN_ID` off the include line). Same shape
+/// as linalgUsedCell.
+/// `blade run --print <names>` / `BLADE_PRINT`: WHICH top-level bindings the
+/// emitted program prints. `None` (unset, or empty) is the default and prints
+/// every printable binding, which is what every corpus pin reads.
+///
+/// The CLI prints every top-level binding, so a program's own output can
+/// dominate its cost -- a 4000 x 4000 map prints 231 MB before it does
+/// anything else, which is why revision reuse's saved chunk reads were
+/// invisible end to end (docs/plans/structural/04, 3.5 and the scale run).
+/// Selecting the bindings is the honest fix: it changes WHAT THE PROGRAM
+/// PRINTS, visibly and by request, rather than making printing lazy behind
+/// the user's back.
+///
+/// Read per call like every other env gate (a harness pins it mid-process),
+/// and read by BOTH lanes -- codegen's print pass and the interpreter's --
+/// so a differential run compares like with like. Names are separated by
+/// commas, spaces or semicolons. A name that is not a top-level binding at
+/// all is a loud refusal (genPrintStatements); a name that IS one but never
+/// prints (a deferred loop value, a streamed read) prints nothing, exactly
+/// as it does without the flag.
+let printSelection () : Set<string> option =
+    match System.Environment.GetEnvironmentVariable "BLADE_PRINT" with
+    | null -> None
+    | v ->
+        let names =
+            v.Split([| ','; ' '; ';' |], System.StringSplitOptions.RemoveEmptyEntries)
+            |> Array.map (fun s -> s.Trim())
+            |> Array.filter (fun s -> s <> "")
+        if names.Length = 0 then None else Some (Set.ofArray names)
+
+let internal tilesUsedStorage =
+    System.Threading.AsyncLocal<bool ref>()
+
+let tilesUsedCell () : bool ref =
+    let v = tilesUsedStorage.Value
+    if isNull (box v) then
+        let fresh = ref false
+        tilesUsedStorage.Value <- fresh
+        fresh
+    else v
+
+/// The probe emitted at the FIRST input read of a hoisted tile plan: every
+/// input's need/done masks, the tile hit table, and the need of each unhit
+/// tile's chunks. Emitted before the phase-1 read of that input (unindented).
+let tileProbeLines (plan: TilePlan) : string list =
+    let f = plan.Output
+    let keys = plan.Keys |> List.map (fun k -> $"\"{k}\"") |> String.concat ", "
+    let lo = plan.LeadBounds |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+    [ $"// revision reuse (docs/plans/structural/04): probe the tile store for {f} before its inputs are read,"
+      $"// so a chunk only a stored tile depends on is not read for the compute phase"
+      $"static const char* {f}__tkeys[{plan.Tiles}] = {{ {keys} }};"
+      $"static const size_t {f}__tlo[{plan.Tiles + 1}] = {{ {lo} }};"
+      $"bool {f}__hit[{plan.Tiles}];" ]
+    @ (plan.Inputs |> List.collect (fun i ->
+        [ $"bool {i.CppName}__need[{i.ChunkCount}]; bool {i.CppName}__done[{i.ChunkCount}];"
+          $"for (size_t __c = 0; __c < {i.ChunkCount}UL; __c++) {{ {i.CppName}__need[__c] = false; {i.CppName}__done[__c] = false; }}" ]))
+    @ [ $"for (size_t __tt = 0; __tt < {plan.Tiles}UL; __tt++) {{"
+        $"    {f}__hit[__tt] = blade_tiles::probe({f}__tkeys[__tt], (std::uint64_t)({f}__tlo[__tt + 1] - {f}__tlo[__tt]) * {plan.Trailing}UL * sizeof({plan.ElemCpp}));" ]
+    @ (plan.Inputs |> List.map (fun i ->
+        $"    for (size_t __j = 0; __j < {i.TrailingGrid}UL; __j++) {i.CppName}__need[__tt * {i.TrailingGrid}UL + __j] = !{f}__hit[__tt];"))
+    @ [ "}" ]
+
+/// The tile run loop around the (outer-level-bounded) nest `loopCode`, then
+/// the remainder reads and the verbose census. `ind` is the binding's indent.
+let tileLoopLines (ind: string) (plan: TilePlan) (loopCode: string list) : string list =
+    let f = plan.Output
+    let keysDecl =
+        if plan.Hoisted then []
+        else
+            let keys = plan.Keys |> List.map (fun k -> $"\"{k}\"") |> String.concat ", "
+            let lo = plan.LeadBounds |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+            [ $"{ind}static const char* {f}__tkeys[{plan.Tiles}] = {{ {keys} }};"
+              $"{ind}static const size_t {f}__tlo[{plan.Tiles + 1}] = {{ {lo} }};" ]
+    let hitTest =
+        if plan.Hoisted then $"{f}__hit[__tt]"
+        else $"blade_tiles::probe({f}__tkeys[__tt], __tbytes)"
+    [ $"{ind}// revision reuse (docs/plans/structural/04): {f} is computed one leading-axis tile at a time;"
+      $"{ind}// a tile whose key (task text + output geometry + the content identities of the chunks it reads)"
+      $"{ind}// is in the tile store is loaded instead of recomputed. Values only: what prints is unchanged." ]
+    @ keysDecl
+    @ [ $"{ind}size_t {f}__computed = 0, {f}__loaded = 0;"
+        $"{ind}for (size_t __tt = 0; __tt < {plan.Tiles}UL; __tt++) {{"
+        $"{ind}    size_t __blade_mpi_lo_{f} = {f}__tlo[__tt];"
+        $"{ind}    size_t __blade_mpi_hi_{f} = {f}__tlo[__tt + 1];"
+        $"{ind}    {plan.ElemCpp}* __tbase = pool_base({f}.data) + __blade_mpi_lo_{f} * {plan.Trailing}UL;"
+        $"{ind}    std::uint64_t __tbytes = (std::uint64_t)(__blade_mpi_hi_{f} - __blade_mpi_lo_{f}) * {plan.Trailing}UL * sizeof({plan.ElemCpp});"
+        $"{ind}    if ({hitTest}) {{"
+        $"{ind}        if (!blade_tiles::load({f}__tkeys[__tt], __tbase, __tbytes)) {{ std::cerr << \"Blade tile cache error: tile \" << __tt << \" of '{f}' was present at the probe and is gone at the load\" << std::endl; std::exit(1); }}"
+        $"{ind}        {f}__loaded++;"
+        $"{ind}    }} else {{" ]
+    @ (loopCode |> List.map (fun s -> "        " + s))
+    @ [ $"{ind}        blade_tiles::store({f}__tkeys[__tt], __tbase, __tbytes);"
+        $"{ind}        {f}__computed++;"
+        $"{ind}    }}"
+        $"{ind}}}" ]
+    @ (if plan.Hoisted then
+           plan.Inputs |> List.collect (fun i ->
+               if i.Observed then
+                   [ $"{ind}// the remainder of {i.CppName}: every chunk the compute phase did not need, for the consumers that read it whole (the print pass, a later binding)" ]
+                   @ (i.Phase2 |> List.map (fun s -> ind + s))
+               else
+                   // Nothing reads this input but the tiled nest, so the
+                   // chunks its hit tiles would have needed are never
+                   // fetched: the buffers are released and the remainder
+                   // read is not emitted at all.
+                   [ $"{ind}// {i.CppName} has no reader but the tiled nest above, so its unneeded chunks are never read" ]
+                   @ (i.Release |> List.map (fun s -> ind + s)))
+       else [])
+    @ [ $"{ind}if (blade_tiles::verbose()) {{"
+        $"{ind}    std::fprintf(stderr, \"[tiles] {f}: computed %%zu/{plan.Tiles}, hit %%zu/{plan.Tiles}\\n\", {f}__computed, {f}__loaded);" ]
+    @ (if plan.Hoisted then
+           plan.Inputs |> List.map (fun i ->
+               $"{ind}    std::fprintf(stderr, \"[chunks] {i.CppName}: read %%zu/{i.ChunkCount} (compute %%zu, remainder %%zu)\\n\", {i.CppName}__read1 + {i.CppName}__read2, {i.CppName}__read1, {i.CppName}__read2);")
+       else [])
+    @ [ $"{ind}}}" ]
+
 let internal linalgUsedStorage =
     System.Threading.AsyncLocal<bool ref>()
 
@@ -1038,6 +1227,121 @@ let takeCodegenRefusalDiagnostics (cppCode: string) : Blade.Diagnostics.Diagnost
             Blade.Diagnostics.Codes.backendRefusal (IR.declSpanOf declName)
                 ($"{msg}{where}"))
 
+// STREAMED VALUES NEVER REACH C++.
+//
+// A variable bound with `.stream` is never materialized: its binding emits a
+// reader over the store (`A_zm`, `A_fillv`, ...) and NOTHING named `A`. The
+// stream-eligible consumers -- the top-level fold (structural/07 D6), a
+// group_by over a structural grouping, fiber-kernel method_for and the
+// segment-run elementwise/stencil nests -- find it by name in
+// ctx.StreamedArrays and read the store themselves. Every OTHER use needs the
+// values as an array, and used to render the bare name, so g++ said "'A' was
+// not declared in this scope" (a fold inside a kernel body inlined into
+// main(), the same fold inside a named function's closure, a capture argument
+// at a call site). ProviderReadSpec.Streamed has always promised a loud
+// codegen error there instead; this is it.
+//
+// The renderers see only a name map, not the context, and `A` IS legitimately
+// declared in two scopes: a lifted free function receives a capture as a
+// parameter named `A`, and a segment run declares a window alias named `A`.
+// So the check is by the BINDING's id and emitted name, and those two scopes
+// mask the name while they emit (`maskStreamedNames`, restored on Dispose --
+// bind it with `use`).
+//
+// The refusal is DEFERRED: a render returns a sentinel identifier and queues
+// the message, and `settleStreamedValueLeaks` turns it into a BL7004 refusal
+// (plus the `#error` the corpus harness reads) only if that sentinel reached
+// the translation unit. Renders that are made and then discarded -- a
+// consumer that renders an operand before deciding it takes the streamed
+// route -- therefore cost nothing, which is the lazy-rendering trap
+// `exprError` cannot avoid.
+let internal streamedBindingsStorage = System.Threading.AsyncLocal<Map<IRId, string> ref>()
+let internal streamedMaskStorage = System.Threading.AsyncLocal<Set<string> ref>()
+let internal streamedLeaksStorage = System.Threading.AsyncLocal<(string * string * string) list ref>()
+
+let private asyncCell (storage: System.Threading.AsyncLocal<'T ref>) (empty: 'T) : 'T ref =
+    let v = storage.Value
+    if isNull (box v) then
+        let fresh = ref empty
+        storage.Value <- fresh
+        fresh
+    else v
+
+let private streamedBindingsCell () = asyncCell streamedBindingsStorage Map.empty
+let private streamedMaskCell () = asyncCell streamedMaskStorage Set.empty
+let private streamedLeaksCell () = asyncCell streamedLeaksStorage []
+
+/// Per-program reset, beside the other codegen channels.
+let resetStreamedValueState () : unit =
+    (streamedBindingsCell ()).Value <- Map.empty
+    (streamedMaskCell ()).Value <- Set.empty
+    (streamedLeaksCell ()).Value <- []
+
+/// A `.stream` binding was emitted under C++ name `name`: from here on, a
+/// render of that binding as a value is a leak unless a scope masks it.
+let noteStreamedBinding (id: IRId) (name: string) : unit =
+    let cell = streamedBindingsCell ()
+    cell.Value <- Map.add id name cell.Value
+
+/// The emitted name of a streamed binding, if `id` is one.
+let streamedBindingName (id: IRId) : string option =
+    Map.tryFind id (streamedBindingsCell ()).Value
+
+/// Treat `names` as materialized until the returned handle is disposed: the
+/// scope declares an array under that name (a lifted function's capture
+/// parameter, a segment run's window alias).
+let maskStreamedNames (names: string list) : System.IDisposable =
+    let cell = streamedMaskCell ()
+    let saved = cell.Value
+    cell.Value <- Set.union saved (Set.ofList names)
+    { new System.IDisposable with member _.Dispose () = cell.Value <- saved }
+
+/// The sentinel to render instead of `resolved` when `id` is a streamed
+/// binding that is not materialized in the current scope; None otherwise.
+/// `resolved` must equal the binding's emitted name: a name map that sends
+/// the id elsewhere (an alias) is already a materialized array.
+let streamedValueSentinel (id: IRId) (resolved: string) : string option =
+    match streamedBindingName id with
+    | Some emitted when emitted = resolved && not (Set.contains emitted (streamedMaskCell ()).Value) ->
+        let token =
+            "BLADE_CODEGEN_ERROR_STREAMED_VALUE_"
+            + System.String(emitted |> Seq.map (fun c -> if System.Char.IsLetterOrDigit c || c = '_' then c else '_') |> Array.ofSeq)
+        let msg =
+            $"'{emitted}' is bound with `.stream`, so it is never materialized -- no array named "
+            + $"'{emitted}' exists, only a reader over its store -- and this use needs its values as an "
+            + "array (a fold or read inside a kernel or function body, an index, an argument). A "
+            + "streamed variable is read only by top-level consumers: fold it (`let t = reduce(x, (+))`), "
+            + "group it by a structural grouping (`let g = group_by(x, segments(...))`), or map or "
+            + "stencil it at top level, and use that result -- or bind it with `.read` to load it"
+        let entry = (token, msg, (currentDeclCell ()).Value)
+        let cell = streamedLeaksCell ()
+        if not (List.contains entry cell.Value) then cell.Value <- cell.Value @ [entry]
+        Some token
+    | _ -> None
+
+/// Settle the deferred leaks against the finished translation unit: each whose
+/// sentinel actually appears becomes a BL7004 refusal (spanned at the
+/// declaration that rendered it) and an `#error` appended to the unit.
+/// Discarded renders are dropped. The queue is drained either way.
+let settleStreamedValueLeaks (code: string) : string =
+    let cell = streamedLeaksCell ()
+    let pending = cell.Value
+    cell.Value <- []
+    let hits =
+        pending |> List.filter (fun (token, _, _) ->
+            System.Text.RegularExpressions.Regex.IsMatch(code, $@"\b{token}\b"))
+    if hits.IsEmpty then code
+    else
+        let refusals = codegenRefusalsCell ()
+        for (_, msg, decl) in hits do
+            if not (List.contains (msg, decl) refusals.Value) then
+                refusals.Value <- refusals.Value @ [(msg, decl)]
+        let directives =
+            hits
+            |> List.map (fun (_, msg, _) -> "#error \"Blade codegen: " + msg.Replace("\"", "'") + "\"")
+            |> List.distinct
+        code + "\n" + (directives |> String.concat "\n") + "\n"
+
 /// Record an expression-level warning and return a C++ expression that causes a compile error.
 /// The identifier is the in-place marker; the companion `#error` directive is
 /// appended to the translation unit by `genSelfContainedProgramFromIR` (an
@@ -1092,6 +1396,7 @@ let isUnitExpr (expr: IRExpr) : bool =
 
 let emptyContext () = {
     VarNames = Map.empty
+    ParamIds = Set.empty
     Indent = 0
     StaticDecls = []
     TupleChildren = Map.empty
@@ -1100,11 +1405,15 @@ let emptyContext () = {
     ProviderReads = Map.empty
     ProviderWrites = Map.empty
     StreamedArrays = Map.empty
+    StructuralGroupings = Set.empty
+    GridGroupings = Map.empty
     RandomInits = Map.empty
     CompoundInits = Map.empty
     SparseInits = Map.empty
     GroupedArrays = Map.empty
     MutableArrayLets = Set.empty
+    TilePlans = Map.empty
+    TileReads = Map.empty
     Warnings = ref []
 }
 

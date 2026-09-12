@@ -1,0 +1,13 @@
+// TEST: Math lu: a singular matrix aborts at factor time (aborts)
+// ABORT: error[BL8007]
+// ABORT: lu(A): the matrix is SINGULAR
+// The singularity test is `m.solve`'s: an EXACT `== 0.0` on the chosen
+// pivot, never an epsilon, so both lanes decide it identically. It fires
+// when the factor is taken, not when it is applied -- a factorization that
+// cannot exist is refused before any right-hand side reads it. Row 1 is
+// exactly twice row 0.
+import math as m
+let A: Array<Float64 like Idx<3>, Idx<3>> = [[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [1.0, 0.0, 1.0]]
+let f = m.lu(A)
+let b: Array<Float64 like Idx<3>> = [1.0, 2.0, 3.0]
+let x = m.lu_solve(f, b)

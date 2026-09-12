@@ -1,0 +1,19 @@
+// TEST: Caret Rank-0 Reduce Rejected (rejects)
+// ERROR: BL3001
+// ERROR-CONTAINS: rank mismatch
+// ============================================================================
+// The boundary of 047. Teaching the array synthesis to read the caret must NOT
+// teach it to invent a rank where none was claimed: `T^0` (equivalently a bare
+// `T`) records NO arity constraint -- `LookupOrCreateTypeVar` only writes one
+// for `arity > 0` -- so `reduce` keeps its rank-1 default for it, exactly as
+// before.
+//
+// The consequence is visible at the CALL, and that is the point: the parameter
+// is a rank-1 array demand, so passing a scalar is refused with the rank
+// mismatch, instead of a rank-0 fold being silently invented for a value that
+// has no axis to fold. A call site neither broadcasts nor reduces rank
+// (arity/042's rule); reading the caret adds no exception for folds.
+// ============================================================================
+function total(x: T^0) -> Float64 = reduce(x, (+))
+
+let s = total(3.0)

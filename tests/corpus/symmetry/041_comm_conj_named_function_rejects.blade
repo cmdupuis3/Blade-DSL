@@ -1,0 +1,10 @@
+// TEST: Comm contradicts conjugating named function (rejects)
+// ERROR: BL4013
+// The named-function twin of symmetry/039: `where comm` on a declaration
+// whose body deduces PConj rejects AT THE DECL, the same seam
+// functions/030 pins for the PNeg case. The refusal is gated on the
+// body's element type being provably complex at the declaration --
+// annotated params make it so here; a generic declaration stays trusted
+// at the decl (conj is the identity over reals), which is why the
+// annotations below are load-bearing.
+function hprod(a: Complex128, b: Complex128) where comm(a, b) = a * conj(b)

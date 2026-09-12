@@ -107,6 +107,7 @@ let inferInlineElemTypeStr (opName: string) (form: IRExpr) : string =
         // derives BOTH element types itself, since Q's and LAM's can differ),
         // so this arm exists purely to keep the diagnostic honest.
         | IREigh a -> a
+        | IRLu a -> a
         | _ -> form
     match inferExprType arrExpr with
     | ArrayElem a -> elemTypeToCpp a.ElemType
@@ -328,6 +329,8 @@ let rec exprToCppSimple (names: Map<IRId, string>) (expr: IRExpr) : string =
         | IRCaret -> $"pow({lStr}, {rStr})"
         | IRMath2 name -> renderMath2 name lStr rStr
         | _ -> emitBinOpWithComplexCoercion op l r lStr rStr inferExprType binOpToCpp
+    | IRFma (a, b, c) ->
+        $"std::fma({(exprToCppSimple names a)}, {(exprToCppSimple names b)}, {(exprToCppSimple names c)})"
     | IRUnaryOp (IRConj, e) ->
         let inner = exprToCppSimple names e
         if isComplexType (inferExprType e) then $"""{(complexFnName "conj")}({inner})"""
@@ -450,6 +453,34 @@ let genSparseIndexFromKeys (source: SparseKeysSource) (keysName: string option) 
             |> String.concat ", "
         [ $$"""std::vector<std::array<size_t, {{rank}}>> {{idxName}}_keys = { {{rows}} };"""
           $"sparse_index_t<{rank}>* {idxName} = new sparse_index_t<{rank}>(\"{idxName}\", std::move({idxName}_keys));" ]
+    | SkDomain plan ->
+        // Closed-form enumeration (docs/plans/structural/06): nested loops,
+        // level k over [lo_k, hi_k] with the ends affine in the earlier
+        // levels, pushing each solution in lex order -- the same order the
+        // interpreter and the compile-time certificate produce. Exactly the
+        // solutions are visited (plus an empty inner loop at a dead prefix
+        // of an unprojected general bound); the box is never scanned.
+        let r = plan.Levels.Length
+        let var k = $"__d{k}"
+        let affine (f: DomainAffine) =
+            f.Coefs |> List.fold (fun acc (j, a) -> $"{acc} + {a}LL * {var j}") $"({f.Const}LL)"
+        let boundExpr (isLower: bool) (b: DomainBound) =
+            let fn = if isLower then "std::max<int64_t>" else "std::min<int64_t>"
+            match b |> List.map affine with
+            | [] -> if isLower then "INT64_MIN" else "INT64_MAX"
+            | first :: rest -> rest |> List.fold (fun acc t -> $"{fn}({acc}, {t})") first
+        let opens =
+            plan.Levels |> List.mapi (fun k lvl ->
+                let ind = String.replicate k "    "
+                $"{ind}for (int64_t {var k} = {boundExpr true lvl.Lo}; {var k} <= {boundExpr false lvl.Hi}; ++{var k}) {{")
+        let push =
+            let comps = [ for k in 0 .. r - 1 -> $"(size_t){var k}" ] |> String.concat ", "
+            $"""{String.replicate r "    "}{idxName}_keys.push_back({{ {comps} }});"""
+        let closes = [ for k in r - 1 .. -1 .. 0 -> String.replicate k "    " + "}" ]
+        [ $"// enumerable domain {plan.Name}: {plan.Card} solution(s) in closed form, lex order (docs/plans/structural/06)"
+          $"std::vector<std::array<size_t, {rank}>> {idxName}_keys; {idxName}_keys.reserve({plan.Card});" ]
+        @ opens @ [ push ] @ closes
+        @ [ $"sparse_index_t<{rank}>* {idxName} = new sparse_index_t<{rank}>(\"{idxName}\", std::move({idxName}_keys));" ]
     | SkRuntime _ ->
         match keysName with
         | Some kn ->
@@ -547,7 +578,14 @@ let gkSidecarParams (caps: CaptureInfo list) : string list =
 /// through the active name map, then the gk side-state pairs in the same
 /// order the signature declares them.
 let captureForwardArgs (names: Map<IRId, string>) (caps: CaptureInfo list) : string list =
-    (caps |> List.map (captureForwardName names))
+    // A `.stream` capture forwarded from a scope that does not materialize it
+    // names an array no C++ declaration carries: forward the deferred refusal
+    // sentinel instead (CodeGenState, "STREAMED VALUES NEVER REACH C++").
+    (caps |> List.map (fun c ->
+        let n = captureForwardName names c
+        match streamedValueSentinel c.Id n with
+        | Some sentinel -> sentinel
+        | None -> n))
     @ (groupedCaptureGks caps
        |> List.collect (fun gkId ->
            let stem = gkSidecarStem names gkId
@@ -1133,13 +1171,33 @@ let foldKernelBuiltinOp (callable: IRCallable) : IRBinOp option =
          | _ -> None)
     | _ -> None
 
+/// Does this fold kernel demand REPRODUCIBLE evaluation? True when the
+/// callable itself is a `where repro` function, or when it is the
+/// eta-expanded wrapper around one (`lambda(a, b) -> f(a, b)` -- the shape a
+/// named function takes in kernel position; the wrapper carries no clause of
+/// its own, so the demand is read off the callee). A repro demand VETOES the
+/// reorder licence below even when `comm` grants it: comm says reordering is
+/// mathematically sound, repro says the operation sequence is the contract.
+let foldKernelReproVetoed (callable: IRCallable) : bool =
+    callable.IsRepro
+    || (match callable.Body with
+        | IRApp ((IRVar _) as f, _, _) ->
+            (match resolveCallable f with
+             | Some callee -> callee.IsRepro
+             | None -> false)
+        | _ -> false)
+
 /// May a fold through `callable` be reordered/reassociated across threads?
 /// Answers only the LICENCE question -- whether omp was requested is separate
 /// (callable.IsOmpParallel), so the two can be reported independently.
+/// `where repro` vetoes unconditionally: this one predicate gates the OpenMP
+/// fold paths, every BLADE_FP_REASSOC lane, and the LLVM lane's fast-math
+/// flags, so the veto lands on all of them at once.
 let foldReorderLicensed (callable: IRCallable) : bool =
-    callable.IsCommutative
-    || not (List.isEmpty callable.CommGroups)
-    || (foldKernelBuiltinOp callable).IsSome
+    not (foldKernelReproVetoed callable)
+    && (callable.IsCommutative
+        || not (List.isEmpty callable.CommGroups)
+        || (foldKernelBuiltinOp callable).IsSome)
 
 /// An operand's extent along `dim`, as a C++ expression: the LITERAL when the
 /// operand's own index record carries one, else the runtime `.extents[dim]`

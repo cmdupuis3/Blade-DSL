@@ -165,3 +165,30 @@
     #define BLADE_OMP_SIMD_REDUCTION(spec)
   #endif
 #endif
+
+// ---------------------------------------------------------------------------
+// BLADE_REPRO_FN -- the `where repro` discharge on an emitted function
+// definition: the body's floating-point operation sequence is the source's
+// (no FMA contraction), and the function is never re-inlined into a caller
+// compiled under the contraction licence (`-ffp-contract=fast` on the
+// shipping flag line), where the caller's licence would re-fuse it.
+//
+// GCC carries per-function optimization overrides through the `optimize`
+// attribute; measured on ucrt64 g++ at -O3 -march=native -ffp-contract=fast:
+// the attributed twin of `a + b * c` emits mul+add where the bare one emits
+// vfmadd. Clang ignores `optimize` (noinline still holds; the memcheck
+// profile compiles Debug, where contraction is off anyway) and MSVC gets
+// `__declspec(noinline)` (the MSVC lane exists for CUDA hosts; repro x cuda
+// is refused upstream). The emission site is genFuncDef/genForwardDecls; the
+// licence-side vetoes (fold reorder, BLAS routing) are the compiler's.
+#ifndef BLADE_REPRO_FN
+  #if defined(__clang__)
+    #define BLADE_REPRO_FN __attribute__((noinline))
+  #elif defined(__GNUC__)
+    #define BLADE_REPRO_FN __attribute__((noinline, optimize("-ffp-contract=off")))
+  #elif defined(_MSC_VER)
+    #define BLADE_REPRO_FN __declspec(noinline)
+  #else
+    #define BLADE_REPRO_FN
+  #endif
+#endif

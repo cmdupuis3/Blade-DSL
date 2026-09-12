@@ -90,9 +90,21 @@ export interface Binding {
   /** Doc comment. Absent when empty. On a function, the parameter lines are
    *  stripped out (they travel on `params[]`). */
   doc?: string;
-  /** Provenance for a top-level provider read
-   *  (`let x = store.vars.v |> alias.read`). */
+  /** Provenance for a top-level provider READ
+   *  (`let x = store.vars.v |> alias.read`; also `alias.stream`,
+   *  `alias.read_window`, `alias.load_compound`): the store member this
+   *  binding reads. */
   providerRead?: { store: string; member: string };
+  /** Provenance for a top-level provider WRITE
+   *  (`let saved = alias.write("out.csv", x)`): the store member the array it
+   *  persists ORIGINALLY came from, chased through `x`, and present only when
+   *  `x` itself recorded a provenance in the same module.
+   *
+   *  A separate field from `providerRead` because it is the opposite
+   *  direction — a write binding reads nothing — and the two never appear on
+   *  one binding. Clients that render `providerRead` as "reads …" must not
+   *  render this one the same way. */
+  providerWrite?: { store: string; member: string };
   /** Functions only. */
   params?: Param[];
   /** Functions only — the return type. Its presence is what marks this

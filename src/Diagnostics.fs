@@ -175,6 +175,25 @@ module Codes =
             // from the cause. Missing/unreadable STORES keep their lowering
             // diagnostics; this fires only for the library itself.
             "BL2007", "provider native library unavailable"
+            // BL2008: the STORE named at a provider load/checkout site cannot be
+            // resolved -- missing repo, bad/ambiguous ref, deleted-tag tombstone,
+            // unsupported spec byte, Offline status, or a snapshot the reader
+            // refuses by name. Sibling of BL2007 (there the LIBRARY is unusable,
+            // here the STORE) -- both are name resolution failing, not a type
+            // judgment.
+            //
+            // Providers opt in by raising Types.ProviderResolutionError; one
+            // that doesn't keeps the historical silent fallback at check and
+            // its own diagnostics at lowering.
+            "BL2008", "provider cannot resolve the store"
+            // BL2009: a second top-level `function` declaration reusing a name
+            // the same module scope already declared. Previously the later
+            // declaration silently shadowed the earlier one and calls matching
+            // the first signature died blaming the caller. Same-scope only --
+            // nested `function`s desugar to block lets and may still shadow an
+            // outer name. Refused until same-name clause dispatch exists
+            // (plan-match-statements.md §5 R1).
+            "BL2009", "duplicate function declaration"
             // BL3xxx: types
             "BL3001", "type mismatch"
             "BL3002", "arity mismatch"
@@ -255,6 +274,16 @@ module Codes =
             // NON-literal operand is converted, and names the explicit cast
             // that says it out loud.
             "BL3020", "implicit numeric conversion"
+            // BL3021: a `match` on a specialization index (`arity(p)` over a
+            // pack param, `rank(p)` over an abstract/caret param) carries an
+            // arm the specializer cannot decide statically -- a guarded arm,
+            // a non-integer pattern, or a second catch-all. Arm selection
+            // happens when the specialization is cloned; a guard reads
+            // runtime values, so a guarded matching arm would bail the
+            // constant-match fold and (for a recursive pack) let
+            // specialization shrink past the base arm. The condition belongs
+            // INSIDE the chosen arm's body.
+            "BL3021", "undecidable specialization-index match arm"
             "BL3999", "type error"
             // BL4xxx: constraints / static
             "BL4001", "constraint violation"
@@ -313,12 +342,20 @@ module Codes =
             // nesting and reads the annotation's lens nowhere, so both cases
             // used to be accepted and then ignored.
             "BL4018", "ragged lens contradicts the literal"
-            // BL4019 and BL4020 are RESERVED, not free: BL4019 is the planned
-            // "tree read of indeterminate depth" refusal (P5, when partial-path
-            // views land) and BL4020 is unallocated. Registering BL4021 out of
-            // order is deliberate -- the plan named it, the docs cite it, and
-            // renumbering later would break every pin.
-            //
+            // BL4019: a window read `A(w(o))` whose literal offset lies
+            // outside the halo's declared offset set. The interior shrink
+            // covers the declared reach only, so the read lands past the
+            // pool at the boundary -- silently compiled, a panic
+            // interpreted. Judged for literal offsets at the apply seam
+            // (haloExtentClash's site walk); computed offsets stay fail-open.
+            "BL4019", "halo offset outside the declared set"
+            // BL4020: `range<R>` over a `static struct` whose constraints
+            // are not linear inequalities on the fields AND whose box is over
+            // the cap for enumerating the solutions by table
+            // (docs/plans/structural/06). A linear domain enumerates in
+            // closed form and is not capped; a small non-linear one is
+            // tabled with a BL4010 advisory.
+            "BL4020", "constrained domain not enumerable"
             // BL4021: a `TreeIdx<shape>` whose shape is not a well-formed
             // preorder degree sequence. TWO mistakes under one code (BL4018's
             // shape one entry up): the shape does not statically evaluate at all
@@ -389,6 +426,35 @@ module Codes =
             // before the nest by genApplyCombinator's haloExtentGuards, and
             // mirrored by the interpreter's halo loop.
             "BL8009", "halo extent mismatch"
+            // A recursive array's `while` guard was still true at the end of
+            // the recursion budget (the declared leading extent): the
+            // recurrence did not converge, and freezing the last slice would
+            // silently pretend it did. Emitted by inferRecArray's budget
+            // check (an IRConstraintCheck after the recursion loop) and
+            // mirrored by the interpreter through the same node.
+            "BL8010", "recursion budget exhausted"
+            // Two operands co-iterated in one loop nest (`a + b`, `zip(a, b)`,
+            // gram's contracted axis) disagree on the RUNTIME extent of a
+            // shared axis. The compile-time twin is BL3016 / coIterClash,
+            // which sees literal extents only; inside a function over `T^k`
+            // parameters the extents are the caller's, and a curried or
+            // let-bound partial application never reaches the call-site
+            // check at all. Emitted once before the nest by
+            // genApplyCombinator (and by materializeGramForm for the
+            // contracted axis), mirrored by the interpreter's materializeApply
+            // and gramArray.
+            "BL8011", "co-iteration extent mismatch"
+            // A provider variable's RUNTIME shape disagrees with the extents
+            // lowering baked from the file present at compile time: a
+            // different rank, or a dimension of a different length. The dense
+            // readers hand libnetcdf a buffer sized from the baked extents and
+            // `nc_get_var_*` writes the variable's whole current extent into
+            // it, so a grown file overran the buffer and a shrunk or reordered
+            // one read garbage into indexed cells, both silently. Emitted by
+            // CppNetcdf.ncShapeGuard between `nc_inq_varid` and the read
+            // (dense, compound + mask, stream open), and mirrored by the
+            // interpreter's materializeProviderRead.
+            "BL8012", "provider shape mismatch"
             // BL9xxx: internal compiler errors
             "BL9001", "internal compiler error"
             "BL9002", "internal codegen invariant violated"

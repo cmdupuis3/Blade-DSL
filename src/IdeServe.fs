@@ -25,11 +25,30 @@
 // the bytes they had before.
 //   -> {"id":N,"cmd":"resetSession","session":"<key>"}   <- {"id":N,"ok":true}
 //
+// ...and the RENDER FAST PATH, which recomputes an evaluated session under a
+// new camera without re-running it (see the block above serveLoop):
+//
+//   -> {"id":N,"cmd":"render","session":"<key>","bindings":["cam_cx",..],
+//       "values":[-0.74,..],"cwd":"<dir>"?}
+//   <- {"event":"display","id":N,"frame":{...}}   (one per CHANGED frame, live)
+//   <- {"id":N,"ok":B,"cached":B,"frames":F,"unchanged":U,"elapsedMs":M,
+//       "exitCode":E,"stderr":"..."}
+//
+// `cached:true` means the executable was reused -- the steady state, and the
+// whole reason the lane exists. An older compiler answers `unknown cmd
+// 'render'`, which is how a client probes for it.
+//
+// Only frames whose BYTES MOVED since this session's last render are sent;
+// `unchanged` counts the rest. A camera change can only alter the plots that
+// read the camera, but the program emits every plot it has, so re-sending all
+// of them replays the whole notebook into the panel -- a fixed tour under a
+// stable id animates its entire descent again on every zoom.
+//
 // ...and the LANGUAGE SURFACE, the one command that reads no program at all:
 //
 //   -> {"id":N,"cmd":"surface"}
 //   <- {"id":N,"version":1,"compilerVersion":"..","keywords":[{"word","token"}],
-//       "operators":[..],"mathIntrinsics":{"unary","binary","complex"},
+//       "operators":[..],"mathIntrinsics":{"unary","binary","ternary","complex"},
 //       "builtins":[..],"scalarTypes":[..],"builtinCalls":[..],
 //       "diagnostics":[{"code","title","phase"}]}
 //
@@ -156,6 +175,19 @@ let private tryStrList (root: JsonElement) (name: string) : string list option =
             let items = [ for e in v.EnumerateArray() -> e ]
             if items |> List.forall (fun e -> e.ValueKind = JsonValueKind.String)
             then Some (items |> List.map _.GetString())
+            else None)
+
+/// A JSON array of numbers, all-or-nothing for the same reason `tryStrList`
+/// is: a camera with one unreadable slot is not a camera, and rendering from
+/// a partial one would put the lens somewhere the caller never asked for.
+let private tryNumList (root: JsonElement) (name: string) : float list option =
+    tryProp root name
+    |> Option.bind (fun v ->
+        if v.ValueKind <> JsonValueKind.Array then None
+        else
+            let items = [ for e in v.EnumerateArray() -> e ]
+            if items |> List.forall (fun e -> e.ValueKind = JsonValueKind.Number)
+            then Some (items |> List.map _.GetDouble())
             else None)
 
 /// The RAW JSON TEXT of an object-valued property; None when it is absent or
@@ -294,6 +326,120 @@ let renderPlotResponse (id: int) (format: string) (plotId: string option) (data:
 /// to keep the rule.) Factored over
 /// TextReader/TextWriter so the test suite can drive a whole conversation
 /// in-process without spawning anything.
+// ---------------------------------------------------------------------------
+// THE RENDER FAST PATH
+// ---------------------------------------------------------------------------
+//
+// A zoom gesture changes three numbers and nothing else, but seeing them costs
+// a whole session evaluation: the camera cell is PART OF THE PROGRAM, so every
+// gesture is a fresh compile -- or, in the interpreter, a fresh escape-time
+// computation of every plot below the camera.
+//
+// `render` keeps the camera IN THE CELL. The client rewrites the cell text
+// exactly as it does today, so the notebook stays truthful about where the lens
+// points; what this lane COMPILES is a program the camera has been ERASED from,
+// its named bindings reading their values out of a CSV at run time instead of
+// carrying literals. That source is the same bytes for every camera, so the
+// executable is built ONCE and re-run per gesture with only three numbers
+// travelling. Measured on examples/mandelbrot.bladenb, one gesture:
+//
+//   interpreter, re-running the session      5480 ms
+//   this lane, first call (builds)          ~5400 ms
+//   this lane, every call after              423 ms
+//
+// The erasure is value-exact -- the notebook EXPECT pins reproduce bit for bit
+// through the CSV -- and it is also the only thing that puts the executable
+// cache (Build.fs) within reach: that cache is keyed on the emitted .cpp text,
+// which a baked-in camera would change on every single gesture.
+
+/// (srcPath) -> the built executable. Injected by Cli.fs, which owns
+/// compileToExe: IdeServe.fs compiles before Build.fs, the same ordering that
+/// makes ReplSession take its g++ fallback lane by injection.
+type RenderCompile = string -> Result<string, string>
+
+/// (cwd, exePath) -> exit code, stdout, stderr.
+type RenderRun = string -> string -> Result<int * string * string, string>
+
+let mutable private renderCompile : RenderCompile option = None
+let mutable private renderRun : RenderRun option = None
+
+/// Hand the render lane its toolchain driver. Called once, by Cli.fs.
+let installRenderLane (compile: RenderCompile) (run: RenderRun) =
+    renderCompile <- Some compile
+    renderRun <- Some run
+
+/// One row, one column per camera slot. "R" round-trips a Float64 exactly, so
+/// the value the client chose is the value the picture is computed from.
+let cameraCsvText (values: float list) : string =
+    (values
+     |> List.map (fun v -> v.ToString("R", Globalization.CultureInfo.InvariantCulture))
+     |> String.concat ",") + "\n"
+
+/// Rewrite `source` so each binding in `names` reads its value out of the CSV at
+/// `csvPath` rather than carrying a literal, and hand back the whole program.
+///
+/// Refuses rather than guesses. A camera name bound zero times, or more than
+/// once, would otherwise render from a camera the caller never set -- and the
+/// picture would look perfectly plausible, which is the worst way to be wrong.
+let cameraErasedSource (source: string) (names: string list) (csvPath: string)
+                       : Result<string, string> =
+    if List.isEmpty names then Error "no camera bindings were named" else
+    // Forward slashes: this path lands inside a Blade string literal, where a
+    // Windows separator would read as an escape.
+    let path = csvPath.Replace("\\", "/")
+    let located =
+        names |> List.mapi (fun slot n ->
+            let re =
+                Text.RegularExpressions.Regex(
+                    "(?m)^[ \t]*let[ \t]+"
+                    + Text.RegularExpressions.Regex.Escape n + "[ \t]*=.*$")
+            let ms = re.Matches source
+            if ms.Count = 1 then Ok (slot, n, ms.[0])
+            else
+                Error (sprintf
+                        "camera binding %s is bound %d times at top level (expected exactly once)"
+                        n ms.Count))
+    match located |> List.tryPick (function Error e -> Some e | Ok _ -> None) with
+    | Some e -> Error e
+    | None ->
+        let hits = located |> List.choose (function Ok x -> Some x | Error _ -> None)
+        // Rewrite from the LAST binding backwards, so the earlier offsets this
+        // loop has yet to use are not disturbed by its own edits.
+        let mutable out = source
+        for (slot, n, m) in hits |> List.sortByDescending (fun (_, _, m) -> m.Index) do
+            out <- out.Substring(0, m.Index)
+                   + sprintf "let %s = __blade_cam_slots(0, %d)" n slot
+                   + out.Substring(m.Index + m.Length)
+        // The reader goes immediately above the EARLIEST camera binding: that
+        // precedes every use of the camera without moving anything else in a
+        // session whose declaration order belongs to the user.
+        let firstIdx = hits |> List.map (fun (_, _, m) -> m.Index) |> List.min
+        let preamble =
+            sprintf "let __blade_cam_store = __blade_cam_csv.load(\"%s\")\n" path
+            + "let __blade_cam_slots = __blade_cam_store.vars.data |> __blade_cam_csv.read\n"
+        out <- out.Substring(0, firstIdx) + preamble + out.Substring firstIdx
+        Ok ("import csv as __blade_cam_csv\n\n" + out)
+
+/// Which frames of a render to actually send, as indices into this run's
+/// `digests`, given the digests of what the session's LAST render showed.
+///
+/// A camera change can only alter the plots that read the camera, but the
+/// program emits every plot it has -- so sending all of them replays the whole
+/// notebook into the panel. The failure mode to guard is the other direction:
+/// holding back a frame that DID move leaves a stale picture on screen, so
+/// anything past the end of `previous` counts as changed.
+let changedFrameIndices (previous: string[]) (digests: string[]) : int[] =
+    [| for i in 0 .. digests.Length - 1 do
+         if i >= previous.Length || previous.[i] <> digests.[i] then yield i |]
+
+/// SHA256 of the erased source, hex -- the render cache key. Same bytes means
+/// the executable already on disk still computes this program.
+let private sourceDigest (s: string) : string =
+    use sha = Security.Cryptography.SHA256.Create()
+    sha.ComputeHash(Encoding.UTF8.GetBytes s)
+    |> Array.map (fun b -> b.ToString "x2")
+    |> String.concat ""
+
 let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
     // Exactly one \n-terminated line per response, flushed before the next
     // read: the client frames on newlines and correlates by id. WriteLine is
@@ -318,13 +464,15 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
         with _ -> ()
     let runCheck (id: int) (tier: string) (file: string) (source: string) =
         setCwdFor file
-        // typeCheck resets its own AsyncLocal side-channels; these two it does
-        // not touch. IdeStores would otherwise carry a PREVIOUS file's provider
-        // stores into this payload, and `provenance` is an append-only fold log
-        // that would grow without bound in a process that never exits. The
-        // mtime-keyed caches beside it are left alone -- they were built for
+        // typeCheck resets its own AsyncLocal side-channels; these three it
+        // does not touch. IdeStores would otherwise carry a PREVIOUS file's
+        // provider stores into this payload, the icechunk axis mint table its
+        // axis identities, and `provenance` is an append-only fold log that
+        // would grow without bound in a process that never exits. The
+        // mtime-keyed caches beside them are left alone -- they were built for
         // exactly this daemon shape.
         Blade.ProviderRegistry.IdeStores.reset ()
+        Blade.IcechunkProvider.resetAxisMint ()
         Blade.ProviderStatics.provenance.Clear ()
         let env : Blade.Ide.Envelope = { Id = Some id; Tier = Some tier; Windows = None }
         let upgrade = if tier = "full" then Some fullTierUpgrade else None
@@ -341,6 +489,7 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
         setCwdFor file
         // The same per-request hygiene `runCheck` applies, for the same reasons.
         Blade.ProviderRegistry.IdeStores.reset ()
+        Blade.IcechunkProvider.resetAxisMint ()
         Blade.ProviderStatics.provenance.Clear ()
         let (source, windows) = Blade.ReplSession.assembleCells cells
         let env : Blade.Ide.Envelope = { Id = Some id; Tier = Some tier; Windows = Some windows }
@@ -362,9 +511,10 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
             (try Directory.SetCurrentDirectory dir with _ -> ())
         | _ -> ()
         // The same per-request hygiene the check handler applies: a PREVIOUS
-        // request's provider stores must not follow this evaluation, and
-        // `provenance` would otherwise grow without bound.
+        // request's provider stores and axis identities must not follow this
+        // evaluation, and `provenance` would otherwise grow without bound.
         Blade.ProviderRegistry.IdeStores.reset ()
+        Blade.IcechunkProvider.resetAxisMint ()
         Blade.ProviderStatics.provenance.Clear ()
         let session =
             match sessions.TryGetValue key with
@@ -384,7 +534,166 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
         // process serves every open notebook; requests are handled strictly one
         // at a time (see the loop's doc comment), so this cannot interleave.
         Blade.Display.Frame.SessionTag <- Blade.Display.Frame.tagForSession key
-        respond (evalResponse id (session.EvalOnce source))
+        // STREAMED FRAMES (docs/display-frames.md section 3). A submission that
+        // runs for minutes -- a training loop -- wants its plot refreshed while
+        // it runs, not once at the end. The interpreter hands every
+        // stream-mime frame to this sink AS IT IS PRODUCED (Frame.sink), and
+        // each one goes out immediately as the out-of-band event line the
+        // client already parses:
+        //
+        //   {"event":"display","id":<this request's id>,"frame":{...}}
+        //
+        // The composed line still carries its sentinel prefix (it is the same
+        // bytes the buffered path would have put on stdout); the remainder IS
+        // the frame object, spliced in raw for the same reason `display[]`
+        // splices raw -- escaping it would hand the reader a string.
+        //
+        // A sunk frame is NOT buffered, so it never reaches stdout and never
+        // appears in this response's `display` array: section 3 forbids
+        // delivering one frame twice. The exception is a fall-back to the g++
+        // lane, which re-runs the whole submission in a process with no sink
+        // and therefore re-emits every frame into `display[]`; the panel merges
+        // on `meta.id`, which for a stream frame is the stable channel name.
+        //
+        // Installed per request and cleared in a `finally`: serveLoop handles
+        // one request at a time (see its doc comment), and EvalOnce is
+        // synchronous, so a single mutable sink cannot interleave. Every other
+        // lane -- `blade run`, `blade repl`, the corpus, the interp/g++
+        // differential gate -- installs no sink and is untouched.
+        let sentinel = Blade.Display.Frame.Sentinel
+        Blade.Display.Frame.setSink (fun line ->
+            let frame = if line.StartsWith sentinel then line.Substring sentinel.Length else line
+            respond $"{{\"event\":\"display\",\"id\":{id},\"frame\":{frame}}}")
+        let result =
+            try session.EvalOnce source
+            finally Blade.Display.Frame.clearSink ()
+        respond (evalResponse id result)
+
+    // session key -> (digest of the erased source, executable, camera CSV).
+    // The point of the lane in one line: a gesture that changes only the
+    // camera leaves the digest alone, so nothing recompiles and nothing is
+    // even re-typechecked -- the front end is most of what is left once the
+    // executable cache has turned g++ into a file copy.
+    let renderCache = Collections.Generic.Dictionary<string, string * string * string>()
+    // What the last render of this session PUT ON SCREEN: one digest per frame,
+    // in program order. The same executable emits the same sequence every run,
+    // so position identifies a plot across renders without parsing one.
+    let renderFrames = Collections.Generic.Dictionary<string, string[]>()
+
+    /// One camera change, rendered from an already-built executable.
+    let runRender (id: int) (key: string) (names: string list) (values: float list)
+                  (cwd: string option) =
+        (match cwd with
+         | Some dir when Directory.Exists dir ->
+             (try Directory.SetCurrentDirectory dir with _ -> ())
+         | _ -> ())
+        let watch = Diagnostics.Stopwatch.StartNew()
+        // Frame ids are `<tag><ordinal>` and CodeGen BAKES the tag into the
+        // generated C++, so it has to be this session's before anything
+        // compiles: the panel merges what this lane emits onto the entries the
+        // eval lane already put there, and it merges them BY ID.
+        Blade.Display.Frame.SessionTag <- Blade.Display.Frame.tagForSession key
+        let outcome =
+            match renderCompile, renderRun with
+            | Some compile, Some run ->
+                if names.Length <> values.Length then
+                    Error (sprintf "\"render\" got %d bindings and %d values"
+                               names.Length values.Length)
+                else
+                    match sessions.TryGetValue key with
+                    | false, _ ->
+                        Error (sprintf "session %s has evaluated nothing to render" key)
+                    | true, session ->
+                        let slug =
+                            key |> String.map (fun c ->
+                                if Array.contains c (Path.GetInvalidFileNameChars()) then '_' else c)
+                        let dir = Path.Combine(Path.GetTempPath(), "blade-render", slug)
+                        Directory.CreateDirectory dir |> ignore
+                        let csvPath = Path.Combine(dir, "camera.csv")
+                        let srcPath = Path.Combine(dir, "render.blade")
+                        let source = String.concat "\n\n" session.Snippets + "\n"
+                        match cameraErasedSource source names csvPath with
+                        | Error e -> Error e
+                        | Ok erased ->
+                            // The CSV must exist BEFORE the compile: the
+                            // provider reads its shape at compile time and
+                            // bakes it, then re-validates at run time. Writing
+                            // it first also means the very first render shows
+                            // the camera the caller actually asked for.
+                            File.WriteAllText(csvPath, cameraCsvText values)
+                            let digest = sourceDigest erased
+                            let hit =
+                                match renderCache.TryGetValue key with
+                                | true, (d, exe, _) when d = digest && File.Exists exe -> Some exe
+                                | _ -> None
+                            let built =
+                                match hit with
+                                | Some exe -> Ok (exe, true)
+                                | None ->
+                                    File.WriteAllText(srcPath, erased)
+                                    // Same per-request hygiene the eval and
+                                    // check handlers apply: this compiles a
+                                    // program, and a previous request's stores
+                                    // must not follow it in.
+                                    Blade.ProviderRegistry.IdeStores.reset ()
+                                    Blade.IcechunkProvider.resetAxisMint ()
+                                    Blade.ProviderStatics.provenance.Clear ()
+                                    match compile srcPath with
+                                    | Error e -> Error e
+                                    | Ok exe ->
+                                        renderCache.[key] <- (digest, exe, csvPath)
+                                        // A different program may emit a
+                                        // different sequence, so position no
+                                        // longer identifies anything: start the
+                                        // comparison over.
+                                        renderFrames.Remove key |> ignore
+                                        Ok (exe, false)
+                            match built with
+                            | Error e -> Error e
+                            | Ok (exe, wasCached) ->
+                                match run (Directory.GetCurrentDirectory()) exe with
+                                | Error e -> Error e
+                                | Ok (code, out, err) -> Ok (out, err, code, wasCached)
+            | _ -> Error "the render lane has no toolchain driver in this process"
+        match outcome with
+        | Error e -> errorResponse (Some id) e
+        | Ok (out, err, code, wasCached) ->
+            watch.Stop()
+            // Frames go out as the live event lines the panel already consumes
+            // for a stable-id plot, and NOT also in a `display` array: one
+            // frame, one delivery (docs/display-frames.md section 3).
+            let sentinel = Blade.Display.Frame.Sentinel
+            let produced =
+                out.Replace("\r\n", "\n").Split('\n')
+                |> Array.filter (fun l -> l.StartsWith sentinel)
+                |> Array.map (fun l -> l.Substring sentinel.Length)
+            // A gesture moves the camera, and only the plots that READ the
+            // camera can have changed by it -- but the program emits every plot
+            // it has. Re-sending all of them replays the whole notebook into the
+            // panel: a fixed tour under a stable id animates its entire descent
+            // again on every zoom, and lands back where it started. So send the
+            // frames whose bytes actually moved.
+            //
+            // Suppression is safe because the panel keeps history: an unchanged
+            // frame would merge onto an entry already holding exactly those
+            // bytes. The first render after a build sends everything -- there is
+            // nothing to compare against, and that is the run whose output the
+            // panel has not seen from this executable.
+            let previous =
+                match renderFrames.TryGetValue key with
+                | true, ds -> ds
+                | _ -> Array.empty
+            let digests = produced |> Array.map sourceDigest
+            let send = changedFrameIndices previous digests
+            for i in send do
+                respond (sprintf "{\"event\":\"display\",\"id\":%d,\"frame\":%s}" id produced.[i])
+            let frames = send.Length
+            renderFrames.[key] <- digests
+            respond (sprintf
+                        "{\"id\":%d,\"ok\":%b,\"cached\":%b,\"frames\":%d,\"unchanged\":%d,\"elapsedMs\":%d,\"exitCode\":%d,\"stderr\":\"%s\"}"
+                        id (code = 0) wasCached frames (produced.Length - frames)
+                        (int watch.ElapsedMilliseconds)
+                        code (Blade.Ide.jsonEscape err))
     /// Handle one line; false means "stop the loop".
     let handle (line: string) : bool =
         use doc = JsonDocument.Parse line
@@ -435,6 +744,19 @@ let serveLoop (version: string) (input: TextReader) (output: TextWriter) : int =
                  | Some i, None, _ -> errorResponse (Some i) "\"eval\" requires a \"session\" key"
                  | Some i, _, None -> errorResponse (Some i) "\"eval\" requires a \"source\" string"
                  | Some i, Some key, Some source -> runEval i key source (tryStr root "cwd"))
+                true
+            | Some "render" ->
+                (match id, tryStr root "session", tryStrList root "bindings",
+                       tryNumList root "values" with
+                 | None, _, _, _ -> errorResponse None "\"render\" requires an integer \"id\""
+                 | Some i, None, _, _ ->
+                     errorResponse (Some i) "\"render\" requires a \"session\" key"
+                 | Some i, _, None, _ ->
+                     errorResponse (Some i) "\"render\" requires a \"bindings\" array of strings"
+                 | Some i, _, _, None ->
+                     errorResponse (Some i) "\"render\" requires a \"values\" array of numbers"
+                 | Some i, Some key, Some names, Some values ->
+                     runRender i key names values (tryStr root "cwd"))
                 true
             | Some "resetSession" ->
                 // Idempotent by design: "restart kernel" fires before the

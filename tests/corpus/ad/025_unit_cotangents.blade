@@ -1,0 +1,60 @@
+// TEST: AD Unit-Carrying Cotangents
+// Reverse mode over unit-carrying parameters and a unit-carrying loss
+// (plan-fortran-killer-2.md section 6.1). The gradient ABI declares each
+// cotangent as <loss>/<parameter>: for dist(t, v) = v * t in meters with t
+// in seconds and v in meters/second, d(dist)/dt is meters/second and
+// d(dist)/dv is seconds. The ascriptions `chk_*` are the pins that matter --
+// they typecheck only if the synthesized types resolve to those units (same
+// dimensions; the nominal spelling may differ). The array case pins the
+// mutable cotangent buffer's type: a squared-meter loss over a meter-valued
+// array yields a meter-valued gradient (m2/meters).
+import ad as ad
+
+Unit meters
+Unit seconds
+Unit mps = meters / seconds
+Unit m2 = meters * meters
+
+function dist(t: Float<seconds>, v: Float<mps>) -> Float<meters> = v * t
+let (d, dd_dt, dd_dv) = ad.grad(dist)(2.0, 3.0)
+let chk_t: Float<mps> = dd_dt
+let chk_v: Float<seconds> = dd_dv
+// EXPECT: d = 6
+// EXPECT: dd_dt = 3
+// EXPECT: dd_dv = 2
+// EXPECT: chk_t = 3
+// EXPECT: chk_v = 2
+
+function energy(x: Array<Float<meters> like Idx<3>>) -> Float<m2> =
+    reduce([x(0) * x(0), x(1) * x(1), x(2) * x(2)], (+))
+let x0: Array<Float<meters> like Idx<3>> = [1.0, 2.0, 3.0]
+let mut dx: Array<Float<meters> like Idx<3>> = [0.0, 0.0, 0.0]
+let e = ad.grad(energy)(x0, dx)
+// EXPECT: e = 14
+// EXPECT: dx = [2, 4, 6]
+
+// A two-level chain whose intermediate carries a unit DIFFERENT from the
+// loss's: y = x*x (m2), loss = y*y (m4). The intermediate cotangent must be
+// declared m4/m2 for the last hop into dx (m4/meters) to typecheck; that is
+// what the symbolic unit walk over the normalized body provides.
+// d(x^4)/dx = 4 x^3 = 32 at x = 2.
+Unit m4 = m2 * m2
+function quart(x: Float<meters>) -> Float<m4> = {
+    let y = x * x
+    y * y
+}
+let (q, dq) = ad.grad(quart)(2.0)
+let chk_q: Float<meters * meters * meters> = dq
+// EXPECT: q = 16
+// EXPECT: dq = 32
+// EXPECT: chk_q = 32
+
+// A dimensionless loss over unit-carrying parameters: each cotangent is
+// 1/<parameter>. d(a/b)/da = 1/b, d(a/b)/db = -a/b^2, at (3, 2).
+function ratio(a: Float<meters>, b: Float<meters>) -> Float = a / b
+let (r, dr_da, dr_db) = ad.grad(ratio)(3.0, 2.0)
+let chk_a: Float<1/meters> = dr_da
+// EXPECT: r = 1.5
+// EXPECT: dr_da = 0.5
+// EXPECT: dr_db = -0.75
+// EXPECT: chk_a = 0.5

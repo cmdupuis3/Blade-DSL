@@ -253,6 +253,14 @@ type TypeExpr =
     | TyOrbIdx of levels: (int * bool) list * baseIdx: SymIdxBase
     | TyBoundedIdx of lower: Expr * upper: Expr
     | TyCompoundIdx of mask: Expr
+    // Chunked<I, spec>: I's own axis, SEGMENTED (docs/plans/structural/07).
+    // `spec` is a literal edge (a regular chunk grid over I), `store` (the
+    // provider's grid for a provider axis), or `[[s1, f1], [s2, f2], ..]`
+    // (stores tiling I in order, each with its own chunking). The alias IS
+    // still I -- same record, same identity; the segmentation lives beside
+    // the type definition (TypeEnv.Segmentations) and is read by
+    // `segments(Alias)`.
+    | TyChunked of inner: TypeExpr * spec: Expr
     // SparseIdx<keys>: explicit valid-tuple enumeration (formalism 3.5).
     // `keys` is a rank-1 array of Nat tuples (edge lists, CG triples); rank
     // is implicit from the tuple arity. Keys keep their given order (never
@@ -401,6 +409,17 @@ and WhereClause = {
     // different dims) would relax that rule rather than change this type,
     // since the list already represents multiple per-dim assignments.
     Parallel: ParallelStrategy list       // [] => serial; today 0 or 1 element
+    // `where repro`: the function demands REPRODUCIBLE floating-point
+    // evaluation -- the same operation sequence the interpreter performs.
+    // Codegen discharges it as: no FMA contraction in the emitted body
+    // (BLADE_REPRO_FN), never re-inlined into a contraction-licensed caller
+    // (noinline), no BLAS/LAPACK routing inside the body, and a veto on
+    // every fold-reorder licence (comm-licensed omp folds and
+    // BLADE_FP_REASSOC lanes run serial with a marker). Functions only:
+    // a lambda kernel is textually inlined into its call sites, where the
+    // annotation cannot travel, so the parser accepts it anywhere but the
+    // checker refuses it off a named function declaration.
+    Repro: bool
     TDims: TDimSpec list
     // Open constraint conjuncts: `where <name>(<idents>)` for any name the
     // parser doesn't recognize as a built-in clause keyword. The parser
@@ -475,7 +494,6 @@ and ExprKind =
     | ExprRange of TypeExpr list           // range<I> or range<I1, ..., In> (multi-index)
     | ExprDotDot of lo: Expr * hi: Expr  // a..b: anonymous range sugar
     | ExprReverse of TypeExpr              // reverse<I>
-    | ExprBlocked of TypeExpr * Expr       // blocked<I, K>
     | ExprHalo of inner: TypeExpr * offsets: Expr  // halo<I, [o..]>: stencil traversal transformer over I (signed ordinal offsets, center = 0)
     // Zip and align
     | ExprZip of Expr list
@@ -524,6 +542,7 @@ and ExprKind =
     | ExprReduce of array: Expr * kernel: Expr * init: Expr option * axes: Expr option
     | ExprTranspose of array: Expr * dim1: int * dim2: int  // transpose(A, [d1, d2]) - swap two arity-1 SymNone axes (hard; allocates)
     | ExprDecompact of array: Expr * dim: int  // decompact(A, d) - pull the compact component at dim d out as a free Idx (hard; allocates dense)
+    | ExprGramApply of left: Expr * right: Expr * vec: Expr  // gram_apply(A, B, x) = A * (B^H * x): the action of gram(A, B) on x, y[i] = sum_k A[i][k] * sum_j conj(B[j][k]) x[j]; rank-1 result over A's leading axis, no m x p matrix.
     | ExprGram of left: Expr * right: Expr  // gram(A, B) = A * B^H: result[i][j] = sum_k A[i][k]*conj(B[j][k]). Square+Hermitian/symmetric when A,B same array; dense otherwise.
     | ExprExtents of array: Expr                   // extents(A) - innermost dim extent (rank-1 only for now)
     // Struct construction
@@ -571,6 +590,13 @@ and RecArrayDef = {
     PrefixVar: Ident
     StepVar: Ident
     SliceExpr: Expr
+    /// `| prefix :: n while GUARD -> prefix :: SLICE` -- the convergence
+    /// guard on the inductive arm (plan-match-statements.md 3). The array is
+    /// defined up to the first n where the guard is false, FROZEN (last
+    /// written slice repeats) after it, and a guard still true at the end of
+    /// the budget is a runtime abort (BL8010). Scopes like SliceExpr: reads
+    /// prefix/StepVar under the same binders. Illegal on the seed arm.
+    Guard: Expr option
 }
 
 /// Every pattern carries its source span. Construct via mkPat.

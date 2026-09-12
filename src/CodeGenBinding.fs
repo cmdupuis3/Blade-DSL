@@ -46,8 +46,20 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genUnionBinding ctx binding builder aExpr bExpr
     | IRUnique arrExpr ->
         genUniqueBinding ctx binding builder arrExpr
+    | IRRange _ ->
+        genRangeBinding ctx binding
     | IRGroupKeys keys ->
         genGroupKeysBinding ctx binding builder keys
+    | IRSegments (offsets, _) ->
+        genSegmentsBinding ctx binding offsets
+    | IRSegmentsGrid bounds ->
+        genSegmentsGridBinding ctx binding bounds
+    | IRUngroupGrid (g, srcs, bounds) ->
+        genUngroupGridBinding ctx binding g srcs bounds
+    | IRUngroup (g, src) ->
+        genUngroupBinding ctx binding g src
+    | IRUngroupRows (rows, offsets, src) ->
+        genUngroupRowsBinding ctx binding rows offsets src
     | IRGroupBy (vals, gk) ->
         genGroupByBinding ctx binding builder vals gk
     | IRGroupBucket gk ->
@@ -68,12 +80,18 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genArrayNegateConjugateBinding ctx binding builder arrExpr
     | IRGram (_, _, _) ->
         genGramBinding ctx binding builder
+    | IRGramApply (_, _, _) ->
+        genGramApplyBinding ctx binding builder
     | IRMatmul (_, _) ->
         genMatmulBinding ctx binding builder
     | IREigh _ ->
         genEighBinding ctx binding builder
     | IRSolve (_, _) ->
         genSolveBinding ctx binding builder
+    | IRLu _ ->
+        genLuBinding ctx binding builder
+    | IRLuSolve _ ->
+        genLuSolveBinding ctx binding builder
     | IRReduce (arrExpr, kernelExpr, initExpr) ->
         genReduceBinding ctx binding builder arrExpr kernelExpr initExpr
     | IRReduceCompute (compExpr, kernelExpr, seedExpr) ->
@@ -155,6 +173,13 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
     // genComputeBinding's scalar fall-through and dies on the unsupported-node
     // sentinel -- exactly the BL7001 this arm was added to stop). Both
     // subtrahends are predicates in IR.fs beside `isStatementShaped` itself.
+    | IRCompute (IRRange _ as inner) ->
+        // `0..n |> compute`: compute IS the forcing request, and the range's
+        // own binding arm is the materializer -- re-dispatch on the unwrapped
+        // range. (Not statement-shaped, so the subtraction arm below never
+        // catches it, and genComputeBinding's fall-through would treat it as
+        // a scalar and die on the unsupported-node sentinel.)
+        genBinding ctx { binding with Value = inner } builder
     | IRCompute eager when
         isStatementShaped eager && not (isDeferringForm eager) && not (isGroupTableForm eager) ->
         genBinding ctx { binding with Value = eager } builder
@@ -201,7 +226,7 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         genVarAliasBinding ctx binding builder srcId
     | IRBind (comp, cont) ->
         genBindChainBinding ctx binding builder comp cont
-    | IRTuple _ | IRComplex _ | IRFieldAccess _ | IRLit _ | IRBinOp _ | IRUnaryOp _ | IRIf _ | IRApp _ | IRParam _ | IRMatch _
+    | IRTuple _ | IRComplex _ | IRFma _ | IRFieldAccess _ | IRLit _ | IRBinOp _ | IRUnaryOp _ | IRIf _ | IRApp _ | IRParam _ | IRMatch _
     // display.emit is a Bool-valued scalar like the rest of this group -- the
     // frame write is a side effect of evaluating it, and it lands in main()'s
     // BODY, ahead of the timing line and the print block. That position is what
@@ -241,12 +266,27 @@ let rec genBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
         let ctx' = addVarName binding.Id name ctx
         (code, ctx')
 
-    | IRConstraintCheck (cond, message, span) ->
+    | IRConstraintCheck (cond, blCode, message, span) ->
         // Runtime constraint guard -- the loud-failure idiom (cerr + abort).
         let code =
             [ $$"""{{ind}}if (!({{(exprToCppCtx ctx cond)}})) {"""
-              $"{ind}    blade_rt::panic(\"BL8001\", \"{message}\", {(panicSpanArgs span)});"
+              $"{ind}    blade_rt::panic(\"{blCode}\", \"{message}\", {(panicSpanArgs span)});"
               $"{ind}}}" ]
+        let ctx' = addVarName binding.Id name ctx
+        (code, ctx')
+
+    | IRBreakIf cond ->
+        // Early exit from the enclosing for-range (the rec-array `while`
+        // guard). The per-iteration frees accumulated SO FAR must run before
+        // the break -- a naive `break` skips the bottom-of-body frees and
+        // leaks whatever this iteration already materialized. Peek, don't
+        // pop: the frame stays live for the non-breaking path.
+        let frees = peekAllocScopeFrees (ind + "    ")
+        let code =
+            [ $$"""{{ind}}if ({{(exprToCppCtx ctx cond)}}) {""" ]
+            @ frees
+            @ [ $"{ind}    break;"
+                $"{ind}}}" ]
         let ctx' = addVarName binding.Id name ctx
         (code, ctx')
 
@@ -415,6 +455,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
                       $"{ind}}}"
                       $"{ind}size_t {name}__nsrc = {keysBound}; // source rows (>= offsets[ngroups]; negative keys drop)"
                       $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+                      $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
                       $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm" ]
                 ]
                 let ctx' = addVarName binding.Id name ctx
@@ -443,6 +484,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
                       $"{ind}}}"
                       $"{ind}size_t {name}__nsrc = {keysBound}; // source rows (>= offsets[ngroups]; negative keys drop)"
                       $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+                      $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
                       $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm" ]
                 ]
                 let ctx' = addVarName binding.Id name ctx
@@ -497,6 +539,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
                     $"{ind}}}"
                     $"{ind}size_t {name}__nsrc = {keysBound}; // source rows (EnumIdx keys never drop, so == offsets[ngroups])"
                     $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+                    $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
                     $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm"
                 ]
                 let ctx' = addVarName binding.Id name ctx
@@ -580,6 +623,7 @@ and genGroupKeysBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRB
               $"{ind}}}"
               $"{ind}size_t {name}__nsrc = {outerExtent}; // source rows (>= offsets[ngroups]; negative components drop)"
               $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+              $"{ind}auto {name}__at = [&](size_t __p) {{ return {name}__perm[__p]; }};"
               $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__perm (compound)" ]
         ]
         let ctx' = addVarName binding.Id name ctx
@@ -675,6 +719,7 @@ and genComputeBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                         | IRIndex (a, idxs, ty) -> IRIndex (subst a, idxs |> List.map subst, ty)
                         | IRTuple es -> IRTuple (es |> List.map subst)
                         | IRComplex (re, im) -> IRComplex (subst re, subst im)
+                        | IRFma (a, b, c) -> IRFma (subst a, subst b, subst c)
                         | IRTupleProj (e, i, flat) -> IRTupleProj (subst e, i, flat)
                         | IRFieldAccess (e, f) -> IRFieldAccess (subst e, f)
                         | IRLet (id, v, b) -> IRLet (id, subst v, subst b)
@@ -1327,13 +1372,28 @@ and genProviderReadBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: 
         // per-fiber reads via ctx.StreamedArrays; nothing named `name`
         // exists as an array, so any non-nest consumer fails to compile --
         // and the eligible-shape checks in the nest fail loudly first.
-        match pspec.GenStreamOpen with
+        // A RANK-1 stream has no fiber to read by site: it streams per
+        // SEGMENT under a structural grouping (docs/plans/structural/07
+        // §3.4), through the provider's rows prologue.
+        let rank1 = spec.VarType.IndexTypes.Length = 1
+        let opener =
+            if rank1 then
+                match pspec.GenStreamRowsOpen with
+                | Some g -> Some g
+                | None -> None
+            else pspec.GenStreamOpen
+        match opener with
         | None ->
-            raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"provider '{spec.Provider}' does not support streamed reads (variable '{spec.VarName}' -- bind with .read)")))
+            raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan (
+                if rank1 then $"provider '{spec.Provider}' does not support per-segment streamed reads of a rank-1 variable ('{spec.VarName}' -- bind with .read)"
+                else $"provider '{spec.Provider}' does not support streamed reads (variable '{spec.VarName}' -- bind with .read)")))
         | Some gen ->
             let code = gen spec.FilePath spec.VarName name spec.VarType
             let ctx' = addVarName binding.Id name ctx
             let ctx' = { ctx' with StreamedArrays = Map.add name spec ctx'.StreamedArrays }
+            // Nothing named `name` exists: a render of this binding as a
+            // value from here on is refused, not handed to g++.
+            noteStreamedBinding binding.Id name
             (code |> List.map (fun s -> ind + s), ctx')
     else
     // A wreath group passes the `Symmetry <> SymNone && Rank >= 2` packed test
@@ -1434,6 +1494,19 @@ and genProviderReadBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: 
                   addVarName binding.Id name ctx)
              | _ -> raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.iceCodegen ($"packed provider read '{spec.VarName}': binding is not array-typed"))))
     else
+    match Map.tryFind binding.Id ctx.TileReads with
+    | Some plan ->
+        // Revision reuse (docs/plans/structural/04, 3.4): this read feeds a
+        // tiled binding whose probe is hoisted here. The FIRST of the plan's
+        // inputs (by emission order) carries the probe; each input's phase-1
+        // read assembles only the chunks the unhit tiles need. The remainder
+        // is read after the tiled binding (tileLoopLines).
+        (tilesUsedCell ()).Value <- true
+        let ip = plan.Inputs |> List.find (fun i -> i.ReadId = binding.Id)
+        let first = plan.Inputs |> List.minBy (fun i -> i.ReadId)
+        let lines = (if first.ReadId = binding.Id then tileProbeLines plan else []) @ ip.Phase1
+        (lines |> List.map (fun s -> ind + s), addVarName binding.Id name ctx)
+    | None ->
     let readCode =
         (match spec.MaskName, spec.MaskType with
          | Some maskName, Some maskType ->
@@ -1523,6 +1596,26 @@ and genProviderWriteBinding (ctx: CodeGenContext) (binding: IRBinding) (builder:
         let cleanup = [ $"delete[] {baseName}_flat;" ]
         (guardProviderWrite ind (flatten @ writeCode @ cleanup), ctx)
     else
+    // DESTINATION PASSING, gate 1 (plan-fortran-killer-2.md section 4): a
+    // plain dense source already IS the flat buffer the writer wants.
+    // allocate<> places every scalar of a nested Array in ONE contiguous pool
+    // in DFS order -- row-major, which is exactly the Horner index the copy
+    // loop below used to compute -- so `<base>_flat` aliases
+    // pool_base(src.data): no allocation, no copy, no delete, one full-array
+    // temporary fewer at the pipeline's terminal. The copy stays for every
+    // storage pool_base is not defined on (compound / sparse tabulated
+    // records, ragged rows, group records) and for the packed and wreath
+    // arms above, whose pool order is not the store's dense order.
+    let plainDense =
+        rank > 0
+        && arrTy.IndexTypes |> List.forall (fun ix -> ix.IxKind = IxKPlain && ix.Symmetry = SymNone)
+    if plainDense then
+        let alias =
+            [ $"// Write {spec.VarName} to {spec.FilePath} (destination passing: the pool is the row-major buffer)"
+              $"{elemCpp}* {baseName}_flat = pool_base({srcCpp}.data);" ]
+        let writeCode = pspec.GenWriteVar spec.FilePath spec.VarName baseName arrTy spec.DimNames
+        (guardProviderWrite ind (alias @ writeCode), ctx)
+    else
     let extentNames = extentTerms |> List.mapi (fun i _ -> $"{baseName}_ext{i}")
     let extentDecls =
         List.zip extentNames extentTerms
@@ -1574,10 +1667,10 @@ and genProviderWriteBinding (ctx: CodeGenContext) (binding: IRBinding) (builder:
 and genRandGenBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
     let ind = indentStr ctx
     let name = bindingCppName binding
-    let kind, keyExpr, parExprs, weightsExpr =
+    let kind, keyExpr, parExprs, weightsExpr, addressExpr =
         match ctx.RandomInits.[binding.Id] with
-        | RandGen (k, key, pars, weights) -> k, key, pars, weights
-        | FillModulus _ -> "uniform", IRLit (IRLitInt 0L), [], None  // unreachable: dispatch guards this
+        | RandGen (k, key, pars, weights, address) -> k, key, pars, weights, address
+        | FillModulus _ -> "uniform", IRLit (IRLitInt 0L), [], None, None  // unreachable: dispatch guards this
     match binding.Type with
     | ArrayElem arrTy ->
         let elemCpp = elemTypeToCpp arrTy.ElemType
@@ -1604,9 +1697,34 @@ and genRandGenBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                 parExprs
                 |> List.map (fun p -> $", (double)({(exprToCpp ctx.VarNames p)})")
                 |> String.concat ""
+            // The `_at` address channel sits right after the key: the stream
+            // key and the sample offset, both int64, before the weights/pars.
+            // Bound to locals and RANGE-CHECKED HERE, in the emitted text --
+            // the stream key occupies one 32-bit counter word, the offset is
+            // an unsigned sample id -- because a runtime header must never
+            // reach blade_rt::panic on its own (codegen elides the shadow
+            // frame of a body whose text cannot panic; Test_Diagnostics pins
+            // that rule). The interpreter mirror carries the same two guards.
+            let addressLines, addressArgs =
+                match addressExpr with
+                | None -> [], ""
+                | Some (sExpr, oExpr) ->
+                    let sName = $"{name}__stream"
+                    let oName = $"{name}__offset"
+                    ([ $"{ind}const int64_t {sName} = (int64_t)({(exprToCpp ctx.VarNames sExpr)});"
+                       $"{ind}const int64_t {oName} = (int64_t)({(exprToCpp ctx.VarNames oExpr)});"
+                       $$"""{{ind}}if ({{sName}} < 0 || (((uint64_t){{sName}}) >> 32) != 0) {"""
+                       $"{ind}    std::cerr << \"Blade runtime: rand: the stream key of an _at family must be in [0, 2^32) (got \" << {sName} << \")\" << std::endl;"
+                       $"{ind}    blade_rt::panic(\"BL8001\", \"rand stream key out of range\", nullptr, 0);"
+                       $"{ind}}}"
+                       $$"""{{ind}}if ({{oName}} < 0) {"""
+                       $"{ind}    std::cerr << \"Blade runtime: rand: the sample offset of an _at family must be non-negative (got \" << {oName} << \")\" << std::endl;"
+                       $"{ind}    blade_rt::panic(\"BL8001\", \"rand sample offset negative\", nullptr, 0);"
+                       $"{ind}}}" ],
+                     $", {sName}, {oName}")
             let fillLine =
-                $"{ind}blade_rand::{kind}(nested_array_utilities::pool_base({name}.data), (size_t){card}LL, (int64_t)({(exprToCpp ctx.VarNames keyExpr)}){weightsArgs}{parArgs});"
-            ([extentsArr; allocLine; fillLine], addVarName binding.Id name ctx)
+                $"{ind}blade_rand::{kind}(nested_array_utilities::pool_base({name}.data), (size_t){card}LL, (int64_t)({(exprToCpp ctx.VarNames keyExpr)}){addressArgs}{weightsArgs}{parArgs});"
+            ([extentsArr; allocLine] @ addressLines @ [fillLine], addVarName binding.Id name ctx)
     | _ ->
         ([refusalErrorLine ind ($"rand binding '{name}' is not an array type")], addVarName binding.Id name ctx)
 
@@ -1808,7 +1926,7 @@ and genSparseInitBinding (ctx: CodeGenContext) (binding: IRBinding) : string lis
          let idxName = $"{name}_idx"
          let idxLines =
              match sparseIx.Extent with
-             | IRSparseKeys (SkStatic _ as src) -> genSparseIndexFromKeys src None leadRank idxName
+             | IRSparseKeys ((SkStatic _ | SkDomain _) as src) -> genSparseIndexFromKeys src None leadRank idxName
              | IRSparseKeys (SkRuntime (IRVar (kid, _)) as src) ->
                  genSparseIndexFromKeys src (Map.tryFind kid ctx.VarNames) leadRank idxName
              | _ -> [ refusalErrorLine "" ($"sparse() binding '{name}': keys source is not a SparseIdx extent") ]
@@ -1983,6 +2101,27 @@ and genUniqueBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuil
 
 
 
+and genRangeBinding (ctx: CodeGenContext) (binding: IRBinding) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    // A BARE range in binding position (`let xs = 0..n`, `let r = range<I>`,
+    // or either behind `|> compute`) materializes the iota it denotes. Inside
+    // a combinator a range never reaches this arm -- the nest peels it as
+    // induction values, which is the whole point of a virtual array. Only the
+    // single-slot plain dense form has a standalone value meaning; compound/
+    // sparse/halo slots enumerate coordinate sets and a multi-slot range only
+    // means anything to a loop nest, so those keep a refusal.
+    let matStmts =
+        match materializeInlineForm emptySubst ctx.VarNames name (lazy "int64_t") binding.Value with
+        | Some (s, allocs) -> registerMaterializedAllocs allocs; s
+        | None ->
+            codegenError ctx ind "a compound/sparse/halo or multi-slot range has no standalone value form; iterate it via method_for(range<...>)"
+    let code = [$"{ind}// range: materialized iota"] @ (matStmts |> List.map (fun s -> ind + s))
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+
+
 and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) (vals: IRExpr) (gk: IRExpr) : string list * CodeGenContext =
     let ind = indentStr ctx
     let name = bindingCppName binding
@@ -2001,9 +2140,129 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
     // pointer for downstream peeling. Print's inner-loop bound of 0
     // means no values printed, matching prior behavior.
     //
+    // PER-SEGMENT STREAM (docs/plans/structural/07 §3.4): the values are a
+    // rank-1 variable bound with `.stream` (no array named after it exists)
+    // and the grouping is structural (static run boundaries), so each row
+    // is read from the store directly into its slot of the pool -- the
+    // whole variable is never materialized. Any other consumer of a
+    // streamed variable, and a key grouping over one, keep the standing
+    // refusals.
+    let streamedVals =
+        match vals with
+        | IRVar (vid, _) ->
+            (match Map.tryFind vid ctx.VarNames with
+             | Some vn -> Map.tryFind vn ctx.StreamedArrays |> Option.map (fun s -> (vn, s))
+             | None -> None)
+        | _ -> None
+    match streamedVals with
+    | Some (valsName, spec) ->
+        let gkName = exprToCppCtx ctx gk
+        if not (Set.contains gkName ctx.StructuralGroupings) then
+            let ctx' = addVarName binding.Id name ctx
+            (codegenError ctx ind $"group_by over the streamed variable '{spec.VarName}' needs a structural grouping (`segments(..)` / `files(..)`), which reads one run at a time; a key grouping needs the whole variable -- bind it with .read", ctx')
+        else
+        let pspec = (Blade.ProviderRegistry.tryFind spec.Provider).Value
+        match Map.tryFind gkName ctx.GridGroupings, pspec.GenStreamWindow with
+        | Some bounds, Some genWindow when spec.VarType.IndexTypes.Length = 2 ->
+            // TILE GATHER over a streamed rank-2 source (§4.1b + §3.4): each
+            // tile is one rectangular window read straight into its slot of
+            // the pool, row-major -- the member layout the grid grouping
+            // defines. With inherited edges a tile is exactly one chunk file.
+            let elemStr = elemTypeToCpp spec.VarType.ElemType
+            let g1 = bounds.[1].Length - 1
+            let extentsDecl =
+                fst (emitExtentsTable ind (name + "_extents") 2
+                         [($"{gkName}__ngroups", false); ("0 /* inner extent is ragged */", false)])
+            let tileRead =
+                genWindow spec.FilePath spec.VarName valsName ($"{name}__pool + {gkName}__offsets[__t]")
+                          [ ($"{gkName}__b0[__t0]", $"{gkName}__b0[__t0 + 1]"); ($"{gkName}__b1[__t1]", $"{gkName}__b1[__t1 + 1]") ]
+                          spec.VarType
+                |> List.map (fun s -> ind + "    " + s)
+            let code =
+                [ $"{ind}// group_by: per-tile STREAMED windows of '{spec.VarName}' -- each tile read from the store into its slot; no whole-array buffer" ]
+                @ extentsDecl
+                @ [ $$"""{{ind}}Array<{{elemStr}}*, 1> {{name}} = { new {{elemStr}}*[{{gkName}}__ngroups], {{name}}_extents };"""
+                    $"{ind}{elemStr}* {name}__pool = new {elemStr}[{gkName}__offsets[{gkName}__ngroups]];"
+                    $$"""{{ind}}for (size_t __t = 0; __t < {{gkName}}__ngroups; __t++) {"""
+                    $"{ind}    size_t __t0 = __t / {g1}, __t1 = __t %% {g1};"
+                    $"{ind}    {name}[__t] = {name}__pool + {gkName}__offsets[__t];" ]
+                @ tileRead
+                @ [ $"{ind}}}" ]
+            registerShapedAlloc name "deallocate_ragged_storage" ($"{name}.data, {name}__pool")
+            let ctx' = addVarName binding.Id name ctx
+            let ctx' = { ctx' with GroupedArrays = Map.add name gkName ctx'.GroupedArrays }
+            (code, ctx')
+        | _ when spec.VarType.IndexTypes.Length <> 1 ->
+            let ctx' = addVarName binding.Id name ctx
+            (codegenError ctx ind $"group_by over the streamed rank-{spec.VarType.IndexTypes.Length} variable '{spec.VarName}' needs its tile grouping (`segments(C0, C1)`); bind it with .read for anything else", ctx')
+        | _, _ ->
+        match pspec.GenStreamRows with
+        | None ->
+            let ctx' = addVarName binding.Id name ctx
+            (codegenError ctx ind $"provider '{spec.Provider}' does not support per-segment streamed reads ('{spec.VarName}' -- bind with .read)", ctx')
+        | Some genRows ->
+            let elemStr = elemTypeToCpp spec.VarType.ElemType
+            let extentsDecl =
+                fst (emitExtentsTable ind (name + "_extents") 2
+                         [($"{gkName}__ngroups", false); ("0 /* inner extent is ragged */", false)])
+            let rowRead =
+                genRows spec.FilePath spec.VarName valsName ($"{name}__pool + __off") $"{gkName}__offsets[__g]" $"{gkName}__offsets[__g + 1]" spec.VarType
+                |> List.map (fun s -> ind + "    " + s)
+            let code =
+                [ $"{ind}// group_by: per-segment STREAMED rows of '{spec.VarName}' -- each run read from the store into its slot; no whole-array buffer" ]
+                @ extentsDecl
+                @ [ $$"""{{ind}}Array<{{elemStr}}*, 1> {{name}} = { new {{elemStr}}*[{{gkName}}__ngroups], {{name}}_extents };"""
+                    $"{ind}{elemStr}* {name}__pool = new {elemStr}[{gkName}__offsets[{gkName}__ngroups]];"
+                    $$"""{{ind}}for (size_t __g = 0; __g < {{gkName}}__ngroups; __g++) {"""
+                    $"{ind}    size_t __off = {gkName}__offsets[__g];"
+                    $"{ind}    {name}[__g] = {name}__pool + __off;" ]
+                @ rowRead
+                @ [ $"{ind}}}" ]
+            // The same layout as the per-tile branch above: a row table whose
+            // rows are slices of ONE pool, so the table and the pool are freed
+            // together (and no row individually).
+            registerShapedAlloc name "deallocate_ragged_storage" ($"{name}.data, {name}__pool")
+            let ctx' = addVarName binding.Id name ctx
+            let ctx' = { ctx' with GroupedArrays = Map.add name gkName ctx'.GroupedArrays }
+            (code, ctx')
+    | None ->
     // group_by's copy loop indexes vals by name, so it needs a MATERIALIZED
     // input; the shared helper forces a still-deferred or inline vals first.
     let (forceCode, ctx, vals) = forceDeferredArrayInput ctx builder ($"{name}__vals") vals
+    let gridGk =
+        let gkName = exprToCppCtx ctx gk
+        Map.tryFind gkName ctx.GridGroupings |> Option.map (fun b -> (gkName, b))
+    match gridGk with
+    | Some (gkName, bounds) ->
+        // TILE GATHER (docs/plans/structural/07 §4.1b): the values are rank 2,
+        // addressed by coordinates; tile t = (t / G1, t % G1) copies its
+        // window row-major into its slot of the pool.
+        let valsName = exprToCppCtx ctx vals
+        let (elemType, elemErrCode) = inferElemTypeStrict ctx ind vals "group_by"
+        let elemStr = elemTypeToCpp elemType
+        let g1 = bounds.[1].Length - 1
+        let extentsDecl =
+            fst (emitExtentsTable ind (name + "_extents") 2
+                     [($"{gkName}__ngroups", false); ("0 /* inner extent is ragged */", false)])
+        let code =
+            elemErrCode
+            @ [ $"{ind}// group_by: tile gather over a rank-2 value (grid grouping {gkName})" ]
+            @ extentsDecl
+            @ [ $$"""{{ind}}Array<{{elemStr}}*, 1> {{name}} = { new {{elemStr}}*[{{gkName}}__ngroups], {{name}}_extents };"""
+                $"{ind}{elemStr}* {name}__pool = new {elemStr}[{gkName}__offsets[{gkName}__ngroups]];"
+                $$"""{{ind}}for (size_t __t = 0; __t < {{gkName}}__ngroups; __t++) {"""
+                $"{ind}    size_t __t0 = __t / {g1}, __t1 = __t %% {g1};"
+                $"{ind}    size_t __lo0 = {gkName}__b0[__t0], __hi0 = {gkName}__b0[__t0 + 1];"
+                $"{ind}    size_t __lo1 = {gkName}__b1[__t1], __hi1 = {gkName}__b1[__t1 + 1];"
+                $"{ind}    size_t __w = __hi1 - __lo1;"
+                $"{ind}    {name}[__t] = {name}__pool + {gkName}__offsets[__t];"
+                $$"""{{ind}}    for (size_t __i = __lo0; __i < __hi0; __i++) for (size_t __j = __lo1; __j < __hi1; __j++) {{name}}[__t][(__i - __lo0) * __w + (__j - __lo1)] = {{valsName}}[__i][__j];"""
+                $"{ind}}}" ]
+        registerShapedAlloc name "deallocate_ragged_storage" ($"{name}.data, {name}__pool")
+        let ctx' = addVarName binding.Id name ctx
+        let ctx' = { ctx' with GroupedArrays = Map.add name gkName ctx'.GroupedArrays }
+        (forceCode @ code, ctx')
+    | None ->
     let valsName = exprToCppCtx ctx vals
     let gkName = exprToCppCtx ctx gk
     let (elemType, elemErrCode) = inferElemTypeStrict ctx ind vals "group_by"
@@ -2060,7 +2319,7 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                $"{ind}    size_t __sz = {gkName}__offsets[__g + 1] - __off;"
                $"{ind}    {name}[__g] = {name}__pool + __off;"
                $$"""{{ind}}    for (size_t __k = 0; __k < __sz; __k++) {"""
-               $"""{ind}        {name}[__g][__k] = {(valsAt (sprintf "%s__perm[__off + __k]" gkName))};"""
+               $"""{ind}        {name}[__g][__k] = {(valsAt (sprintf "%s__at(__off + __k)" gkName))};"""
                $$"""{{ind}}    }"""
                $"{ind}}}" ])
     // Owns the row table AND every per-group row (each a separate new[]).
@@ -2085,6 +2344,161 @@ and genGroupByBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
     (forceCode @ code, ctx')
 
 
+
+/// segments(A): the STRUCTURAL grouping (docs/plans/structural/07 §2.2, §3.2).
+/// Same name-suffix ABI as group_keys -- `__ngroups`, `__offsets`, `__nsrc`,
+/// `__at` -- but NO permutation is built: the offsets are the static run
+/// boundaries and `__at` is the identity, so a grouped read is a direct
+/// read. `__perm` is not declared at all; every consumer goes through
+/// `__at`, which is what makes the two regimes interchangeable downstream.
+and genSegmentsBinding (ctx: CodeGenContext) (binding: IRBinding) (offsets: int64 list) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let ngroups = offsets.Length - 1
+    let n = List.last offsets
+    let table = offsets |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+    let code =
+        [ $"{ind}// segments: {ngroups} runs over {n} cells, structural (static boundaries, identity permutation)"
+          $"{ind}size_t {name}__ngroups = {ngroups};"
+          $"{ind}const size_t {name}__offsets[{ngroups + 1}] = {{ {table} }};"
+          $"{ind}size_t {name}__nsrc = {n};"
+          $"{ind}auto {name}__at = [](size_t __p) {{ return __p; }};"
+          $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+          $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets (structural: no __perm)" ]
+    let ctx' = addVarName binding.Id name ctx
+    let ctx' = { ctx' with StructuralGroupings = Set.add name ctx'.StructuralGroupings }
+    (code, ctx')
+
+/// segments(C0, C1): the tile grouping of two segmented slots (docs/plans/
+/// structural/07 §4.1b). Same name-suffix ABI; the offsets are the
+/// cumulative tile sizes, tile t = (t / G1, t % G1); the per-slot boundary
+/// tables are emitted for the gather and the scatter. `__at` is the
+/// identity over the tile-major member order (used by nothing today; the
+/// grid gather addresses the rank-2 value by coordinates).
+and genSegmentsGridBinding (ctx: CodeGenContext) (binding: IRBinding) (bounds: int64 list list) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let b0, b1 = bounds.[0], bounds.[1]
+    let g0, g1 = b0.Length - 1, b1.Length - 1
+    let sizes =
+        [ for i in 0 .. g0 - 1 do
+            for j in 0 .. g1 - 1 ->
+                (b0.[i + 1] - b0.[i]) * (b1.[j + 1] - b1.[j]) ]
+    let offsets = sizes |> List.scan (+) 0L
+    let table (xs: int64 list) = xs |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+    let code =
+        [ $"{ind}// segments grid: {g0} x {g1} tiles over {List.last b0} x {List.last b1} cells, structural"
+          $"{ind}size_t {name}__ngroups = {g0 * g1};"
+          $"{ind}const size_t {name}__offsets[{g0 * g1 + 1}] = {{ {table offsets} }};"
+          $"{ind}const size_t {name}__b0[{g0 + 1}] = {{ {table b0} }};"
+          $"{ind}const size_t {name}__b1[{g1 + 1}] = {{ {table b1} }};"
+          $"{ind}size_t {name}__nsrc = {List.last offsets};"
+          $"{ind}auto {name}__at = [](size_t __p) {{ return __p; }};"
+          $"{ind}size_t {name}_extents[1] = {{{name}__ngroups}};"
+          $"{ind}void* {name} = nullptr; // gk: state in {name}__ngroups, {name}__offsets, {name}__b0/__b1 (grid)" ]
+    let ctx' = addVarName binding.Id name ctx
+    let ctx' = { ctx' with StructuralGroupings = Set.add name ctx'.StructuralGroupings
+                           GridGroupings = Map.add name bounds ctx'.GridGroupings }
+    (code, ctx')
+
+/// ungroup(G) of a tile grouping: the tiles written back over the two
+/// source axes into one dense rank-2 array.
+and genUngroupGridBinding (ctx: CodeGenContext) (binding: IRBinding) (g: IRExpr) (srcs: IRIndexType list) (bounds: int64 list list) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let gName = exprToCppCtx ctx g
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> elemTypeToCpp at.ElemType
+        | _ -> "double"
+    match Map.tryFind gName ctx.GroupedArrays with
+    | None ->
+        let ctx' = addVarName binding.Id name ctx
+        (codegenError ctx ind $"ungroup: '{gName}' is not a group_by result this emitter can trace to its grouping (bind `let G = group_by(A, segments(X, Y))` and ungroup that name)", ctx')
+    | Some gkName ->
+        let b0, b1 = bounds.[0], bounds.[1]
+        let n0, n1 = List.last b0, List.last b1
+        let g1 = b1.Length - 1
+        let (extentsDecl, ownedExtents) =
+            emitExtentsTable ind (name + "_extents") 2 [($"{n0}UL", false); ($"{n1}UL", false)]
+        let code =
+            [ $"{ind}// ungroup: tiles of {gName} written back over the two axes ({n0} x {n1})" ]
+            @ extentsDecl
+            @ [ $$"""{{ind}}Array<{{elemStr}}, 2> {{name}} = { allocate<promote<{{elemStr}}, 2>::type>({{name}}_extents), {{name}}_extents };"""
+                $$"""{{ind}}for (size_t __t = 0; __t < {{gkName}}__ngroups; __t++) {"""
+                $"{ind}    size_t __t0 = __t / {g1}, __t1 = __t %% {g1};"
+                $"{ind}    size_t __lo0 = {gkName}__b0[__t0], __hi0 = {gkName}__b0[__t0 + 1];"
+                $"{ind}    size_t __lo1 = {gkName}__b1[__t1], __hi1 = {gkName}__b1[__t1 + 1];"
+                $"{ind}    size_t __w = __hi1 - __lo1;"
+                $$"""{{ind}}    for (size_t __i = __lo0; __i < __hi0; __i++) for (size_t __j = __lo1; __j < __hi1; __j++) {{name}}[__i][__j] = {{gName}}[__t][(__i - __lo0) * __w + (__j - __lo1)];"""
+                $"{ind}}}" ]
+        registerPoolAlloc AllocDense elemStr 2 "nullptr" (name + "_extents") name ownedExtents
+        let ctx' = addVarName binding.Id name ctx
+        (code, ctx')
+
+/// ungroup(G): the rows of a segment-grouped array written back over the
+/// source axis (§3.3). G's grouping is recovered from GroupedArrays (the
+/// same registration the grouped peel uses), so the offsets are the
+/// grouping's own; the destination is one dense buffer of the source
+/// extent, and each row lands at its run.
+and genUngroupBinding (ctx: CodeGenContext) (binding: IRBinding) (g: IRExpr) (src: IRIndexType) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let gName = exprToCppCtx ctx g
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> elemTypeToCpp at.ElemType
+        | _ -> "double"
+    match Map.tryFind gName ctx.GroupedArrays with
+    | None ->
+        let ctx' = addVarName binding.Id name ctx
+        (codegenError ctx ind $"ungroup: '{gName}' is not a group_by result this emitter can trace to its grouping (bind `let G = group_by(A, segments(X))` and ungroup that name)", ctx')
+    | Some gkName ->
+        let total =
+            match src.Extent with
+            | IRLit (IRLitInt n) -> $"{n}UL"
+            | _ -> $"{gkName}__offsets[{gkName}__ngroups]"
+        let (extentsDecl, ownedExtents) =
+            emitExtentsTable ind (name + "_extents") 1 [(total, false)]
+        let code =
+            [ $"{ind}// ungroup: rows of {gName} written back over the source axis ({total} cells)" ]
+            @ extentsDecl
+            @ [ $$"""{{ind}}Array<{{elemStr}}, 1> {{name}} = { allocate<promote<{{elemStr}}, 1>::type>({{name}}_extents), {{name}}_extents };"""
+                $$"""{{ind}}for (size_t __g = 0; __g < {{gkName}}__ngroups; __g++) {"""
+                $"{ind}    size_t __off = {gkName}__offsets[__g];"
+                $"{ind}    size_t __sz = {gkName}__offsets[__g + 1] - __off;"
+                $$"""{{ind}}    for (size_t __k = 0; __k < __sz; __k++) {{name}}[{{gkName}}__at(__off + __k)] = {{gName}}[__g][__k];"""
+                $"{ind}}}" ]
+        registerPoolAlloc AllocDense elemStr 1 "nullptr" (name + "_extents") name ownedExtents
+        let ctx' = addVarName binding.Id name ctx
+        (code, ctx')
+
+/// ungroup([r1, .., rF], A): per-file arrays copied at their file offsets
+/// into one buffer over the tiled axis (§2.7). Rows are bare names by
+/// construction (inferUngroupRows) and the offsets are static.
+and genUngroupRowsBinding (ctx: CodeGenContext) (binding: IRBinding) (rows: IRExpr list) (offsets: int64 list) (src: IRIndexType) : string list * CodeGenContext =
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> elemTypeToCpp at.ElemType
+        | _ -> "double"
+    let total = List.last offsets
+    let (extentsDecl, ownedExtents) =
+        emitExtentsTable ind (name + "_extents") 1 [($"{total}UL", false)]
+    let copies =
+        List.zip rows (List.pairwise offsets)
+        |> List.collect (fun (r, (lo, hi)) ->
+            let rName = exprToCppCtx ctx r
+            [ $$"""{{ind}}for (size_t __k = 0; __k < {{hi - lo}}UL; __k++) {{name}}[{{lo}}UL + __k] = {{rName}}[__k];""" ])
+    let code =
+        [ $"{ind}// ungroup: {rows.Length} per-file array(s) assembled over the tiled axis ({total} cells)" ]
+        @ extentsDecl
+        @ [ $$"""{{ind}}Array<{{elemStr}}, 1> {{name}} = { allocate<promote<{{elemStr}}, 1>::type>({{name}}_extents), {{name}}_extents };""" ]
+        @ copies
+    registerPoolAlloc AllocDense elemStr 1 "nullptr" (name + "_extents") name ownedExtents
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
 
 and genGroupBucketBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) (gk: IRExpr) : string list * CodeGenContext =
     let ind = indentStr ctx
@@ -2115,7 +2529,7 @@ and genGroupBucketBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: I
             $"{ind}for (size_t __i = 0; __i < {gkName}__nsrc; __i++) {name}[__i] = -1;"
             $$"""{{ind}}for (size_t __g = 0; __g < {{gkName}}__ngroups; __g++) {"""
             $$"""{{ind}}    for (size_t __p = {{gkName}}__offsets[__g]; __p < {{gkName}}__offsets[__g + 1]; __p++) {"""
-            $"{ind}        {name}[{gkName}__perm[__p]] = ({elemStr})__g;"
+            $"{ind}        {name}[{gkName}__at(__p)] = ({elemStr})__g;"
             $$"""{{ind}}    }"""
             $"{ind}}}" ]
     registerPoolAlloc AllocDense elemStr 1 "nullptr" (name + "_extents") name ownedExtents
@@ -2301,6 +2715,25 @@ and genGramBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
     (code, ctx')
 
 
+and genGramApplyBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
+    // gram_apply(A, B, x) = A * (B^H * x): the action of gram(A, B) on x,
+    // materialized as two rank-1 pools (B^H x, then A times it) and never the
+    // m x p matrix. The shared helper emits the statement form.
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> irTypeToCpp at.ElemType
+        | _ -> "double"
+    let matStmts =
+        match materializeInlineForm emptySubst ctx.VarNames name (lazy elemStr) binding.Value with
+        | Some (s, allocs) -> registerMaterializedAllocs allocs; s
+        | None -> []
+    let code = [$"{ind}// gram_apply: A * (B^H * x) (Gram action, no m x p pool)"] @ (matStmts |> List.map (fun s -> ind + s))
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+
 and genMatmulBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
     // matmul(A, B) = A * B. Dense m x n result. Same shape as genGramBinding:
     // the shared materialize helper emits the statement form (allocation plus
@@ -2336,6 +2769,40 @@ and genEighBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilde
     let code =
         [$"{ind}// eigh: symmetric/Hermitian eigendecomposition -> (Q, LAM)"]
         @ (matStmts |> List.map (fun s -> ind + s))
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+
+and genLuBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
+    // lu(A) -> (LU, piv): a TUPLE value like eigh's, two pools under derived
+    // names bound to one make_tuple; the shared helper derives both element
+    // types itself.
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let matStmts =
+        match materializeInlineForm emptySubst ctx.VarNames name (lazy "") binding.Value with
+        | Some (s, allocs) -> registerMaterializedAllocs allocs; s
+        | None -> []
+    let code =
+        [$"{ind}// lu: partial-pivoted LU factorization -> (LU, piv), kept for repeated solves"]
+        @ (matStmts |> List.map (fun s -> ind + s))
+    let ctx' = addVarName binding.Id name ctx
+    (code, ctx')
+
+
+and genLuSolveBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuilder) : string list * CodeGenContext =
+    // lu_solve(LU, piv, b) -> x: one array result, genSolveBinding's shape.
+    let ind = indentStr ctx
+    let name = bindingCppName binding
+    let elemStr =
+        match binding.Type with
+        | ArrayElem at -> irTypeToCpp at.ElemType
+        | _ -> "double"
+    let matStmts =
+        match materializeInlineForm emptySubst ctx.VarNames name (lazy elemStr) binding.Value with
+        | Some (s, allocs) -> registerMaterializedAllocs allocs; s
+        | None -> []
+    let code = [$"{ind}// lu_solve: apply a stored LU factorization (no refactoring)"] @ (matStmts |> List.map (fun s -> ind + s))
     let ctx' = addVarName binding.Id name ctx
     (code, ctx')
 
@@ -2497,7 +2964,88 @@ and genReduceBinding (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBuil
     let pathBSuppressedNote =
         if parallelFold.IsSome && not ompThreadsOn
         then [ $"{ind}// [omp] requested but emitted serial: {(ompThreadsSuppressedReason ())}" ]
-        else []
+        else
+        // The `where repro` veto: the kernel (or the named function its eta
+        // wrapper calls) demands the serial operation sequence, so
+        // foldReorderLicensed said no and the fold lands on the serial arms
+        // below -- which say nothing about omp on their own. Same
+        // silence-prevention as the knob note above; without it a
+        // comm-licensed `omp, repro` fold would drop its omp request with no
+        // trace in the emitted text.
+        match resolveCallable kernelExpr with
+        | Some c when c.Params.Length = 2 && c.IsOmpParallel && foldKernelReproVetoed c ->
+            [ $"{ind}// [omp] requested but emitted serial: fold kernel is `where repro` (the operation order is the contract; reorder licence vetoed)" ]
+        | _ -> []
+    // STREAMED FOLD (docs/plans/structural/07, decision D6 as read: a fold over
+    // a segmented axis is the plain flat fold at the API). The operand is a
+    // rank-1 variable bound with `.stream`: no array exists, so the fold walks
+    // the store one block at a time -- the block is the store's own chunk
+    // edge -- and folds the cells in STORAGE ORDER. That is the same operation
+    // sequence as the flat fold over a materialized copy, so the two agree
+    // bitwise; nothing is reassociated and no reorder licence is asked
+    // (`omp` on the kernel is noted and ignored: the store is read serially).
+    // Keyed by the binding's NAME, not by `arrName`: a streamed operand
+    // RENDERS as the refusal sentinel (it is not materialized), which is
+    // exactly right for every non-streamed path below and never matches here.
+    let streamedKey =
+        match arrExpr with
+        | IRVar (vid, _) -> Map.tryFind vid ctx.VarNames |> Option.defaultValue arrName
+        | _ -> arrName
+    let streamedFold =
+        match Map.tryFind streamedKey ctx.StreamedArrays with
+        | Some spec when spec.VarType.IndexTypes.Length = 1 ->
+            let pspec = (Blade.ProviderRegistry.tryFind spec.Provider).Value
+            match pspec.GenStreamRows, pspec.StreamRowsBlock with
+            | Some genRows, Some blockOf ->
+                let n =
+                    match spec.VarType.IndexTypes.[0].Extent with
+                    | IRLit (IRLitInt n) -> n
+                    | _ -> raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"streamed fold over '{spec.VarName}' needs a static extent")))
+                let block = max 1L (blockOf spec.FilePath spec.VarName)
+                let blk = $"{name}__blk"
+                let stepOf (acc: string) (cell: string) : string * string list =
+                    match resolveCallable kernelExpr with
+                    | Some callable when callable.Params.Length = 2 ->
+                        (match pathAOp with
+                         | Some (op, _) -> ($"{acc} {(binOpToCpp op)} {cell}", [])
+                         | None ->
+                             let (wrapperCode, wname) = genCallableWrapper ctx.VarNames name callable
+                             ($"{wname}({acc}, {cell})", wrapperCode |> List.map (fun s -> ind + s)))
+                    | _ -> raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"streamed fold over '{spec.VarName}': the kernel must be a two-argument fold kernel")))
+                let (stepExpr, wrapperLines) = stepOf name $"{blk}[__q]"
+                let seedLines, firstGuard =
+                    match initExpr with
+                    | Some initE -> ([ $"{ind}{elemStr} {name} = {(exprToCppCtx ctx initE)};" ], "")
+                    | None ->
+                        if n <= 0L then
+                            raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan ($"streamed fold over '{spec.VarName}': the variable is empty and the fold has no seed")))
+                        ([ $"{ind}{elemStr} {name} = ({elemStr})0;"; $"{ind}bool {name}__first = true;" ],
+                         $"if ({name}__first) {{ {name} = {blk}[__q]; {name}__first = false; }} else ")
+                let ompNote =
+                    match resolveCallable kernelExpr with
+                    | Some c when c.IsOmpParallel -> [ $"{ind}// [omp] requested but emitted serial: the operand is streamed from the store in storage order" ]
+                    | _ -> []
+                let rowRead =
+                    genRows spec.FilePath spec.VarName streamedKey blk "__lo" "__hi" spec.VarType
+                    |> List.map (fun s -> ind + "    " + s)
+                Some (
+                    elemErrCode @ ompNote @ wrapperLines
+                    @ [ $"{ind}// reduce: STREAMED fold over '{spec.VarName}' in storage order, {block} cells per block (bitwise the flat fold)"
+                        $"{ind}{elemStr}* {blk} = new {elemStr}[{block}];" ]
+                    @ seedLines
+                    @ [ $$"""{{ind}}for (size_t __lo = 0; __lo < {{n}}UL; __lo += {{block}}UL) {"""
+                        $"{ind}    size_t __hi = __lo + {block}UL; if (__hi > {n}UL) __hi = {n}UL;" ]
+                    @ rowRead
+                    @ [ $"{ind}    for (size_t __q = 0; __q < __hi - __lo; __q++) {firstGuard}{name} = {stepExpr};"
+                        $"{ind}}}"
+                        $"{ind}delete[] {blk};" ])
+            | _ ->
+                let ctx' = addVarName binding.Id name ctx
+                Some (codegenError ctx ind $"provider '{spec.Provider}' does not support per-block streamed folds ('{spec.VarName}' -- bind with .read)")
+        | _ -> None
+    match streamedFold with
+    | Some code -> (code, addVarName binding.Id name ctx)
+    | None ->
     let code =
         match resolveCallable kernelExpr with
         | Some callable when callable.Params.Length = 2 ->
@@ -2776,9 +3324,12 @@ and genReduceComputeBindingCore (ctx: CodeGenContext) (binding: IRBinding) (buil
                 info.ArrayTypes |> List.exists (fun at ->
                     at.IndexTypes |> List.exists (fun ix ->
                         isRaggedFamilyKind ix.IxKind || ix.IxKind = IxKDepInner
-                        || ix.IxKind = IxKGroupOuter || ix.IxKind = IxKCompound)))
+                        || ix.IxKind = IxKGroupOuter || ix.IxKind = IxKCompound
+                        // a sparse/domain range's driver index is declared by
+                        // genApplyCombinator only; this path never builds one
+                        || ix.IxKind = IxKSparse)))
         if unsupportedInput then
-            (codegenError ctx ind "reduce over a deferred computation is not supported for ragged/grouped/compound inputs yet -- force with |> compute and reduce the array", ctx')
+            (codegenError ctx ind "reduce over a deferred computation is not supported for ragged/grouped/compound/sparse inputs yet -- bind the map with |> compute and reduce the array", ctx')
         else
             match resolveCallable kernelExpr with
             | Some callable when callable.Params.Length = 2 ->
@@ -2797,7 +3348,6 @@ and genReduceComputeBindingCore (ctx: CodeGenContext) (binding: IRBinding) (buil
                         | IRVar (id, _) -> Map.tryFind id ctx.VarNames |> Option.defaultValue ($"arr{i}")
                         | IRRange _ -> $"__range{i}"
                         | IRVirtualReverse _ -> $"__rev{i}"
-                        | IRBlocked _ -> $"__blk{i}"
                         | _ -> $"arr{i}")
                 let foldCg (info: ApplyInfo) (accName: string) =
                     // S2 routing, same rule as the single-kernel site.
@@ -3205,11 +3755,22 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
              | Some d -> resolveDeferred d
              | None -> e)
         | _ -> e
+    // A leaf that is a NAMED deferred map keeps its id beside the resolved
+    // apply: `reduce(e, (+))` next to `prodsum(e, v)` is the sharing
+    // declaration read from the leg's side (docs/plans/structural/03, D2),
+    // and the id is what ties this leg to the share leaf the slot declares.
     let rec collectLeaves e =
-        match resolveDeferred e with
+        match e with
+        | IRVar (id, _) when Map.containsKey id ctx.DeferredComputations ->
+            (match resolveDeferred e with
+             | IRFusion _ as f -> collectLeaves f
+             | IRApplyCombinator _ as a -> [(a, Some id)]
+             | other -> [(other, None)])
         | IRFusion (l, r) -> collectLeaves l @ collectLeaves r
-        | other -> [other]
-    let leaves = collectLeaves compExpr
+        | other -> [(other, None)]
+    let leafPairs = collectLeaves compExpr
+    let leaves = leafPairs |> List.map fst
+    let leafVarIds = leafPairs |> List.map snd
     let infos = leaves |> List.choose (function IRApplyCombinator i -> Some i | _ -> None)
     let ctx' = addVarName binding.Id name ctx
     if infos.Length <> leaves.Length || infos.Length <> kernelExprs.Length then
@@ -3249,9 +3810,29 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
              | Some (IRApplyCombinator dinfo) -> Some (id, dinfo)
              | _ -> None)
         | _ -> None
+    // Per leg, in traversal order: the leg's own leaf when it is a named map
+    // (collectLeaves), then its operand slots. A slot operand is always a
+    // share (that is how a deferred slot gets a C++ definition at all); a
+    // leaf name is a share only when the join spells it at least twice -- as
+    // a leaf again or as a slot -- so a leg that merely folds a named map on
+    // its own keeps today's inlined nest.
+    let leafDeferred (v: IRId option) : (IRId * ApplyInfo) option =
+        v |> Option.bind (fun id ->
+            match Map.tryFind id ctx.DeferredComputations with
+            | Some (IRApplyCombinator di) -> Some (id, di)
+            | _ -> None)
+    let leafShares = leafVarIds |> List.choose leafDeferred
+    let slotShares = infos |> List.collect (fun info -> info.Arrays |> List.choose deferredOperand)
+    let spelled (id: IRId) =
+        (leafShares |> List.filter (fun (i, _) -> i = id) |> List.length)
+        + (slotShares |> List.filter (fun (i, _) -> i = id) |> List.length)
     let sharedIds =
-        infos
-        |> List.collect (fun info -> info.Arrays |> List.choose deferredOperand)
+        List.zip leafVarIds infos
+        |> List.collect (fun (lv, info) ->
+            (match leafDeferred lv with
+             | Some (id, di) when spelled id >= 2 -> [(id, di)]
+             | _ -> [])
+            @ (info.Arrays |> List.choose deferredOperand))
         |> List.fold (fun acc (id, di) -> if acc |> List.exists (fun (i, _) -> i = id) then acc else acc @ [(id, di)]) []
     let badShare =
         sharedIds |> List.tryPick (fun (id, di) ->
@@ -3282,7 +3863,6 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
                  | None -> Map.tryFind id ctx.VarNames |> Option.defaultValue ($"arr{i}"))
             | IRRange _ -> $"__range{i}"
             | IRVirtualReverse _ -> $"__rev{i}"
-            | IRBlocked _ -> $"__blk{i}"
             | _ -> $"arr{i}")
     /// Repoint every deferred operand slot at the deferred map's own leading
     /// source array, so the level's bound and peel name exist in C++ (and
@@ -3337,6 +3917,17 @@ and genReduceJoinCore (ctx: CodeGenContext) (binding: IRBinding) (builder: IRBui
     let leafNames = infos |> List.mapi (fun i _ -> $"{name}_{i}")
     let leafCgs =
         List.mapi (fun i (info: ApplyInfo) ->
+            match leafVarIds.[i] |> Option.bind (fun sid -> sharedIds |> List.tryFind (fun (s, _) -> s = sid)) with
+            | Some (sid, di) ->
+                // This leg's traversal IS the shared map: the same nest as the
+                // share leaf (its peels dedup with the share's), whose per-cell
+                // value is the share local itself -- `acc = wrap(acc, <share>)`,
+                // never a second spelling of the producer.
+                let cg0 = routeKernelBodyThroughCall di (buildLoopNestCodeGen di (arrayNamesOf di) leafNames.[i] builder)
+                { cg0 with KernelExpr = IRVar (sid, sharedElemTy sid)
+                           OutputType = callables.[i].RetType
+                           FoldWrapper = Some wnames.[i] }
+            | None ->
             let (info', moved) = repoint info
             let cg0 = routeKernelBodyThroughCall info' (buildLoopNestCodeGen info' (arrayNamesOf info') leafNames.[i] builder)
             // Every param bound by a repointed slot now reads the SHARED local

@@ -13,6 +13,5 @@ function mean_cast(xs: Array<Float like I>) -> Float = {
     reduce(xs, (+)) / Float64(extents(xs))
 }
 let (v, t) = ad.jvp(mean_cast)([1.0, 2.0, 3.0, 4.0], [1.0, 0.0, 0.0, 0.0])
-// WARN: BL4003
 // EXPECT: v = 2.5
 // EXPECT: t = 0.25

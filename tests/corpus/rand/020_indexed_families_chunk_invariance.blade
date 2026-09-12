@@ -1,0 +1,53 @@
+// TEST: Rand Indexed Families: every transform is addressed per sample
+// The `_at` families share one copy of each transform with the sequenced
+// ones; what changes is the raw source -- a per-sample Philox stream whose
+// draw counter advances per block. That is what makes a REJECTION sampler
+// chunk-invariant: gamma's Marsaglia-Tsang loop and poisson's PTRS loop draw
+// a data-dependent number of uniforms per sample, and in a sequenced fill a
+// rejection at sample 3 shifts every later sample. Here each sample owns its
+// own counter, so the second chunk of a gamma fill is the same bits whether
+// or not the first chunk existed. normal_at (two uniforms per draw, one
+// block), bernoulli_at, exponential_at, beta_at and categorical_at follow.
+import rand as r
+let g_whole = r.gamma_at(99, 3, 0, 2.5, 1.0, 10)
+// EXPECT: g_whole = [1.39988304874556, 2.30024667543487, 1.94919065829231, 0.393132239354666, 2.46683548920222, 0.449332013520143, 2.18607085332204, 2.43055577990809, 2.30272072570226, 4.20255080868927]
+let g_tail = r.gamma_at(99, 3, 6, 2.5, 1.0, 4)
+let dg = g_tail(0) - g_whole(6) + g_tail(3) - g_whole(9)
+// EXPECT: dg = 0.0
+let p_whole = r.poisson_at(99, 3, 0, 40.0, 10)
+// EXPECT: p_whole = [47, 43, 40, 31, 41, 33, 53, 54, 52, 32]
+let p_tail = r.poisson_at(99, 3, 7, 40.0, 3)
+let dp = p_tail(0) - p_whole(7) + p_tail(2) - p_whole(9)
+// EXPECT: dp = 0.0
+let n_whole = r.normal_at(99, 3, 0, 8)
+// EXPECT: n_whole = [-0.598338144814407, 0.0889461341519247, -0.152984681902948, -1.91592178474339, 0.195171365895755, -1.80206013856032, 0.0131433902588162, 0.172454747056817]
+let n_tail = r.normal_at(99, 3, 5, 3)
+let dn = n_tail(0) - n_whole(5) + n_tail(2) - n_whole(7)
+// EXPECT: dn = 0.0
+let b_whole = r.bernoulli_at(99, 3, 0, 0.3, 8)
+// EXPECT: b_whole = [0, 0, 0, 1, 0, 1, 0, 0]
+let b_tail = r.bernoulli_at(99, 3, 4, 0.3, 4)
+let db = b_tail(0) - b_whole(4) + b_tail(3) - b_whole(7)
+// EXPECT: db = 0.0
+let e_whole = r.exponential_at(99, 3, 0, 2.0, 6)
+// EXPECT: e_whole = [0.89971988592071, 0.565642611235124, 1.81855564507849, 0.0641127090423009, 0.38266736137816, 0.0901799417964986]
+let e_tail = r.exponential_at(99, 3, 4, 2.0, 2)
+let de = e_tail(0) - e_whole(4) + e_tail(1) - e_whole(5)
+// EXPECT: de = 0.0
+let bt_whole = r.beta_at(99, 3, 0, 2.0, 3.0, 6)
+// EXPECT: bt_whole = [0.366429300127224, 0.231737478116762, 0.557472653663885, 0.0561663380351393, 0.337965359821715, 0.0886357531525608]
+let bt_tail = r.beta_at(99, 3, 3, 2.0, 3.0, 3)
+let dbt = bt_tail(0) - bt_whole(3) + bt_tail(2) - bt_whole(5)
+// EXPECT: dbt = 0.0
+let w = [1.0, 2.0, 3.0, 4.0]
+let c_whole = r.categorical_at(99, 3, 0, w, 8)
+// EXPECT: c_whole = [3, 3, 3, 1, 2, 1, 3, 3]
+let c_tail = r.categorical_at(99, 3, 5, w, 3)
+let dc = c_tail(0) - c_whole(5) + c_tail(2) - c_whole(7)
+// EXPECT: dc = 0
+// Sanity on the transforms through the new source: the gamma mean is near
+// shape/rate = 2.5 and every poisson count is a non-negative integer.
+let g_mean = reduce(g_whole, (+)) / 10.0
+// EXPECT: g_mean = 2.00805182921714
+let p_int = reduce(method_for(p_whole) <@> lambda(k) -> if k >= 0.0 && k == Float64(floor(k)) then 1.0 else 0.0 |> compute, (+))
+// EXPECT: p_int = 10

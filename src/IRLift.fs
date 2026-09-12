@@ -21,8 +21,8 @@ open Blade.IR
 let isInlineForm (e: IRExpr) : bool =
     match e with
     | IRMask _ | IRSort _ | IRIntersect _ | IRUnion _ | IRUnique _
-    | IRGroupBy _ | IRGroupKeys _ | IRGroupBucket _ | IRGroupSizes _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _
-    | IRReduceCompute _ | IRMatmul _ | IREigh _ | IRSolve _ -> true
+    | IRGroupBy _ | IRGroupKeys _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRSegmentsGrid _ | IRUngroup _ | IRUngroupRows _ | IRUngroupGrid _ | IRTranspose _ | IRDecompact _ | IRArrayNegate _ | IRArrayConjugate _
+    | IRReduceCompute _ | IRMatmul _ | IRGramApply _ | IREigh _ | IRSolve _ | IRLu _ | IRLuSolve _ -> true
     | IRCompute (IRApplyCombinator _) -> true
     | _ -> false
 
@@ -57,12 +57,12 @@ let isStatementShaped (e: IRExpr) : bool =
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _ -> true
     // Shape-changing / contraction forms.
     | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _
-    | IRGram _ | IRMatmul _ | IREigh _ | IRSolve _ -> true
+    | IRGram _ | IRGramApply _ | IRMatmul _ | IREigh _ | IRSolve _ | IRLu _ | IRLuSolve _ -> true
     // Whole-array eager unary forms.
     | IRArrayNegate _ | IRArrayConjugate _ -> true
     // Grouping: the `group_keys` CSR tables and the two accessors that read
     // them back out. All four hang a name-suffix ABI off the binding's name.
-    | IRGroupKeys _ | IRGroupBy _ | IRGroupBucket _ | IRGroupSizes _ -> true
+    | IRGroupKeys _ | IRGroupBy _ | IRGroupBucket _ | IRGroupSizes _ | IRSegments _ | IRSegmentsGrid _ | IRUngroup _ | IRUngroupRows _ | IRUngroupGrid _ -> true
     // Array literals: extents table + allocate + per-element init.
     | IRArrayLit _ -> true
     // The DEFERRING family. `genBinding` answers these with a comment and a
@@ -116,7 +116,7 @@ let forceDeferringForm (e: IRExpr) : IRExpr =
 /// here. They materialize an ordinary array and peel like any other eager form.
 let isGroupTableForm (e: IRExpr) : bool =
     match e with
-    | IRGroupKeys _ | IRGroupBy _ -> true
+    | IRGroupKeys _ | IRGroupBy _ | IRSegments _ | IRSegmentsGrid _ -> true
     | _ -> false
 
 /// `isStatementShaped` through an explicit `|> compute`. The user's own force
@@ -206,6 +206,12 @@ let internal isNestedLoopComputeArg (e: IRExpr) : bool =
     // declared. IRGram allocates one fresh pool with its own extents table, so
     // it hoists exactly like IRMatmul beside it.
     | IRGram _ -> true
+    // `gram_apply(A, B, x)` is array-typed (rank 1) and allocates its own
+    // pools, so it hoists like the two above.
+    | IRGramApply _ -> true
+    // `lu_solve(...)` likewise (array-typed rank 1); `lu` is tuple-typed and
+    // absent for IREigh's reason.
+    | IRLuSolve _ -> true
     // IREigh is deliberately ABSENT, and its absence is a decision rather than
     // an omission: an eigh node is TUPLE-typed, and a loop form's `Arrays` slot
     // holds arrays. There is no surface spelling that puts a tuple where the
@@ -390,6 +396,20 @@ let liftChildIncludingLoopApp (builder: IRBuilder) (child: IRExpr) : (IRId * IRT
         let id = builder.FreshId()
         let ty = typeOf inner
         (peeled @ [(id, ty, inner)], IRVar (id, ty))
+    // A BARE range in a by-name operand slot (`reduce(0..n, (+))`, prodsum,
+    // whole-array negate): hoist it to its own let-RHS so the consumer
+    // subscripts a materialized binding (genRangeBinding) -- exactly what
+    // writing the intermediate `let` by hand does. Ranges are deliberately
+    // NOT `isInlineForm`: a method_for/nest operand slot must keep them
+    // virtual so the nest peels them as induction values, and those slots
+    // never route through this helper. The type is spelled here rather than
+    // taken from `typeOf` -- IRRange sits in typeOf's IntValued tier (its
+    // ELEMENT under peeling), which would type the hoisted binding as a
+    // scalar and starve the fold of its extents.
+    | IRRange (ixs, _) ->
+        let id = builder.FreshId()
+        let ty = mkArrayLike { ElemType = IRTScalar ETInt64; IndexTypes = ixs; IsVirtual = false; Identity = None }
+        (peeled @ [(id, ty, inner)], IRVar (id, ty))
     | _ ->
         let (b, e) = liftChild builder inner
         (peeled @ b, e)
@@ -544,6 +564,11 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
         wrapLets binds (IRUnique aFinal)
     | IRGroupBy (v, k) -> IRGroupBy (liftExpr builder v, liftExpr builder k)
     | IRGroupKeys ks -> IRGroupKeys (List.map (liftExpr builder) ks)
+    | IRSegments _ -> expr
+    | IRUngroup (g, src) -> IRUngroup (liftExpr builder g, src)
+    | IRUngroupRows (rows, offs, src) -> IRUngroupRows (List.map (liftExpr builder) rows, offs, src)
+    | IRSegmentsGrid _ -> expr
+    | IRUngroupGrid (g, srcs, b) -> IRUngroupGrid (liftExpr builder g, srcs, b)
     // The gk operand is a bare name by construction (inferGroupBucket refuses
     // anything else), so there is nothing to lift out of it.
     | IRGroupBucket gk -> IRGroupBucket (liftExpr builder gk)
@@ -560,7 +585,8 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
     // display.emit's payload is a plain String scalar -- nothing to lift, but
     // the child still recurses so an inline form INSIDE the payload
     // expression is handled like anywhere else.
-    | IRDisplayEmit (h, q, data, m) -> IRDisplayEmit (h, q, liftExpr builder data, m)
+    | IRDisplayEmit (h, q, data, m, idOpt) ->
+        IRDisplayEmit (h, q, liftExpr builder data, m, Option.map (liftExpr builder) idOpt)
 
     // display.json_array consumes an ARRAY: recurse, then hoist an inline
     // form in the data slot into a let, exactly like IRReduce's array slot.
@@ -648,12 +674,32 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
         let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
         let (bindsR, rFinal) = liftChildEvaluatedOnce builder r'
         wrapLets (bindsL @ bindsR) (IRGram (lFinal, rFinal, s))
+    | IRGramApply (l, r, x) ->
+        let l' = liftExpr builder l
+        let r' = liftExpr builder r
+        let x' = liftExpr builder x
+        let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
+        let (bindsR, rFinal) = liftChildEvaluatedOnce builder r'
+        let (bindsX, xFinal) = liftChildEvaluatedOnce builder x'
+        wrapLets (bindsL @ bindsR @ bindsX) (IRGramApply (lFinal, rFinal, xFinal))
     | IRMatmul (l, r) ->
         let l' = liftExpr builder l
         let r' = liftExpr builder r
         let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
         let (bindsR, rFinal) = liftChildEvaluatedOnce builder r'
         wrapLets (bindsL @ bindsR) (IRMatmul (lFinal, rFinal))
+    | IRLu matrix ->
+        let m' = liftExpr builder matrix
+        let (binds, mFinal) = liftChildEvaluatedOnce builder m'
+        wrapLets binds (IRLu mFinal)
+    | IRLuSolve (l, p, b, t) ->
+        let l' = liftExpr builder l
+        let p' = liftExpr builder p
+        let b' = liftExpr builder b
+        let (bindsL, lFinal) = liftChildEvaluatedOnce builder l'
+        let (bindsP, pFinal) = liftChildEvaluatedOnce builder p'
+        let (bindsB, bFinal) = liftChildEvaluatedOnce builder b'
+        wrapLets (bindsL @ bindsP @ bindsB) (IRLuSolve (lFinal, pFinal, bFinal, t))
     | IREigh operand ->
         // Same evaluate-once lift, same reason: `materializeEighForm` spells
         // the operand THREE times (`.extents[0]`, and `.data` twice, bare and
@@ -756,18 +802,41 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
         match esFinal with
         | [reF; imF] -> wrapLets binds (IRComplex (reF, imF))
         | _ -> wrapLets binds (IRComplex (re', im'))  // unreachable; defensive
+    | IRFma (a, b, c) ->
+        let a' = liftExpr builder a
+        let b' = liftExpr builder b
+        let c' = liftExpr builder c
+        let (binds, esFinal) = liftChildren builder [a'; b'; c']
+        match esFinal with
+        | [aF; bF; cF] -> wrapLets binds (IRFma (aF, bF, cF))
+        | _ -> wrapLets binds (IRFma (a', b', c'))  // unreachable; defensive
     | IRArrayLit (es, ty) ->
         // Peel any IRLet chains from element results
-        // (descendant lifts) and re-wrap them at THIS level. Don't lift the
-        // peeled inner expressions further -- IRArrayLit elements must
-        // remain as the genArrayLiteral walker expects (nested IRArrayLit
-        // for multi-dim, scalar leaves at the bottom). Replacing an inner
-        // IRArrayLit with an IRVar would shorten computeArrayDims to just
-        // this level and break extents/print/walker.
+        // (descendant lifts) and re-wrap them at THIS level. Don't lift an
+        // ARRAY-TYPED peeled element further -- those are the structure the
+        // genArrayLiteral walker measures (nested IRArrayLit for multi-dim,
+        // row values for the rank-raising row map). Replacing one with an
+        // IRVar would shorten computeArrayDims to just this level and break
+        // extents/print/walker.
+        //
+        // A SCALAR LEAF that is an inline form is the opposite case, and must
+        // be lifted. `[reduce(A * B, (+)), reduce(C * D, (+))]` puts an
+        // IRReduceCompute -- accumulators plus a fused loop nest, with no
+        // expression rendering anywhere -- in a leaf slot, where exprToCppCore
+        // answers it with the BL7004 "must be bound to a let" refusal while the
+        // interpreter evaluates it happily: a silent lane divergence that an
+        // interp-first notebook only meets when it finally compiles. Hoisting
+        // it is exactly what writing the intermediate `let` by hand does, and
+        // exactly what CodeGen's own IRReduceCompute arms already do for the
+        // body-let and RETURN positions.
         let es' = es |> List.map (liftExpr builder)
         let (binds, esPeeled) = es' |> List.fold (fun (accB, accE) e ->
             let (b, e') = peelLetChain e
-            (accB @ b, accE @ [e'])) ([], [])
+            if isInlineForm e' && (match typeOf e' with ArrayElem _ -> false | _ -> true) then
+                let id = builder.FreshId()
+                let ty = typeOf e'
+                (accB @ b @ [(id, ty, e')], accE @ [IRVar (id, ty)])
+            else (accB @ b, accE @ [e'])) ([], [])
         wrapLets binds (IRArrayLit (esPeeled, ty))
 
     // BinOps: array-typed binops can have inline forms on either side.
@@ -803,7 +872,19 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
                 let (b, fe') = liftChildIncludingArrayLit builder fe
                 (accBinds @ b, accFlds @ [(fn, fe')])) ([], [])
         wrapLets binds (IRStructLit (n, fldsLifted))
-    | IRIf (c, t, e) -> IRIf (liftExpr builder c, liftExpr builder t, liftExpr builder e)
+    | IRIf (c, t, e) ->
+        // The CONDITION's lifts hoist ABOVE the select; the BRANCHES' stay put.
+        // A condition is evaluated exactly once whatever the select does, so a
+        // statement-shaped operand inside it (`if reduce(A * B, (+)) > 0.0 ...`,
+        // whose IRBinOp arm mints the let that then had nowhere to live but the
+        // condition slot, where codegen renders it inline and hits the BL7004
+        // reduce refusal) belongs at the enclosing drain point. A BRANCH is
+        // not: hoisting out of an untaken arm would compute it unconditionally
+        // -- a cost change at best, and a panic the interpreter never raises at
+        // worst. Statement-shaped values in conditional arms stay refused (the
+        // whole family: an IRArrayLit there is the same BL7001 today).
+        let (binds, cFinal) = peelLetChain (liftExpr builder c)
+        wrapLets binds (IRIf (cFinal, liftExpr builder t, liftExpr builder e))
     | IRMatch (scr, cases) ->
         IRMatch (liftExpr builder scr, cases |> List.map (fun c ->
             { c with Guard = c.Guard |> Option.map (liftExpr builder)
@@ -839,14 +920,14 @@ let rec liftExpr (builder: IRBuilder) (expr: IRExpr) : IRExpr =
     | IRCompoundMask mk -> IRCompoundMask (liftExpr builder mk)
     | IRCompoundProject (parent, plen) -> IRCompoundProject (liftExpr builder parent, plen)
     | IRSparseKeys (SkRuntime keys) -> IRSparseKeys (SkRuntime (liftExpr builder keys))
-    | IRSparseKeys (SkStatic _) -> expr
+    | IRSparseKeys (SkStatic _) | IRSparseKeys (SkDomain _) -> expr
     // Only the base extent can hold a liftable inline form; the level list is data.
     | IROrbitClass (levels, n) -> IROrbitClass (levels, liftExpr builder n)
     | IRAssign (t, v) -> IRAssign (t, liftExpr builder v)
-    | IRConstraintCheck (c, msg, sp) -> IRConstraintCheck (liftExpr builder c, msg, sp)
+    | IRConstraintCheck (c, code, msg, sp) -> IRConstraintCheck (liftExpr builder c, code, msg, sp)
+    | IRBreakIf c -> IRBreakIf (liftExpr builder c)
     | IRForRange (vid, lo, hi, body) ->
         IRForRange (vid, liftExpr builder lo, liftExpr builder hi, liftExpr builder body)
-    | IRBlocked (it, bs) -> IRBlocked (it, liftExpr builder bs)
 
     // Loop forms: their auto-materialize handles top-level Arrays for
     // inline forms. We still descend into the kernels and any nested

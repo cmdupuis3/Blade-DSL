@@ -1,0 +1,38 @@
+// TEST: Caret Rank-3 Double Peel
+// ============================================================================
+// The rank pin at 047 is read at EVERY rank, not special-cased at two: a `T^3`
+// parameter peels its innermost axis to rank 2, and feeding that into a `T^2`
+// peel gives rank 1. This is the shape a rank-recursive `flatten_sum` unrolls
+// into (plan-match-statements.md section 4, P3), written out by hand at the two
+// ranks the worklist would generate.
+//
+// The intermediate is ASCRIBED deliberately. Chaining two abstract-RANK calls
+// with the intermediate left open (`peel2(peel3(c))`) does not work yet: the
+// callee's output extents are the synthesized `__..._inferred_n` params, and
+// shape monomorphization has no rank worklist to close them over, so the
+// binding fails IR validation with BL6001 (or, unused, is pruned). That is
+// P3's job. Pinning the ascribed form here keeps the two RANKS honest without
+// claiming the composition works.
+//
+// Cross-check: `reduce(peel3(c), (+))` -- the same second peel spelled as an
+// intrinsic instead of a call -- must produce the identical rank-1 result, so
+// a regression that quietly folds the wrong axis cannot hide behind one
+// spelling.
+// ============================================================================
+type Sheet = Idx<2>
+type Row = Idx<3>
+type Col = Idx<4>
+
+function peel3(x: T^3) -> T^2 = reduce(x, (+))
+function peel2(y: T^2) -> T^1 = reduce(y, (+))
+
+let c: Array<Float64 like Sheet, Row, Col> = [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]], [[13.0, 14.0, 15.0, 16.0], [17.0, 18.0, 19.0, 20.0], [21.0, 22.0, 23.0, 24.0]]]
+
+let once: Array<Float64 like Sheet, Row> = peel3(c)
+// EXPECT: once = [[10, 26, 42], [58, 74, 90]]
+
+let twice = peel2(once)
+// EXPECT: twice = [78, 222]
+
+let direct = reduce(peel3(c), (+))
+// EXPECT: direct = [78, 222]

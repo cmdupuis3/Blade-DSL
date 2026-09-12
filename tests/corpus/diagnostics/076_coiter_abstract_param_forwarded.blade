@@ -1,0 +1,23 @@
+// TEST: Diag CoIter Abstract Param Forwarded (rejects)
+// The same obligation one hop up a FORWARDING chain: `outer` never mentions
+// zip, it just passes its own two abstract parameters straight into `addup`,
+// which co-iterates them. If the obligation stopped at the function that
+// spells the zip, moving the call behind one wrapper would restore the silent
+// out-of-bounds that 075 pins.
+//
+// coIterParamGroups' second source handles it: a call to an ALREADY-obligated
+// callee passing this body's own parameters into its obligated positions
+// re-records the group against THIS function's positions. One forward pass is
+// enough -- a body sees only names bound before it, and mutual recursion is
+// rejected (BL2001) -- so `addup` is always in the table before `outer` reads
+// it. The blame names 'outer', the function this call actually invokes.
+// ERROR: BL3016
+// ERROR-CONTAINS: the body of 'outer' CO-ITERATES
+function addup(a: T^1, b: T^1) -> T^0 =
+    reduce(method_for(zip(a, b)) <@> lambda(x, y) -> x + y, (+))
+function outer(x: T^1, y: T^1) -> T^0 = addup(x, y)
+type A = Idx<3>
+type Bx = Idx<6>
+let p: Array<Float like A> = [1.0, 2.0, 3.0]
+let q: Array<Float like Bx> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+let bad = outer(q, p)

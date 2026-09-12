@@ -1,0 +1,9 @@
+// TEST: Group Bucket Of A Segmentation Is The Run Ordinal
+// `group_bucket` over a structural grouping answers position -> run with no
+// permutation to invert: it is `i / K` spelled through the same accessor the
+// CSR groupings use (sql.md §7a).
+type I = Idx<10>
+type CI = Chunked<I, 4>
+let seg = segments(CI)
+let which = group_bucket(seg)
+// EXPECT: which = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2]

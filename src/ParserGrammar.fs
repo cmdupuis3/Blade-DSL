@@ -721,6 +721,19 @@ and parsePrimary (tokens: Token list) : ParseResult<Expr> =
         expect TokRParen afterRight >>= fun _ remaining ->
         success (mkE tokens remaining (ExprGram (left, right))) remaining
 
+    // gram_apply(A, B, x) = A * (B^H * x): the ACTION of gram(A, B) on the
+    // vector x without forming the m x p matrix. A is m x n, B is p x n, x
+    // has p cells, the result has m cells (docs/plans/structural/05, 3.2).
+    | Some (TokKeyword KwGramApply) ->
+        advance tokens |> expect TokLParen >>= fun _ afterLParen ->
+        parseExprImpl afterLParen >>= fun left afterLeft ->
+        expect TokComma afterLeft >>= fun _ afterComma ->
+        parseExprImpl afterComma >>= fun right afterRight ->
+        expect TokComma afterRight >>= fun _ afterComma2 ->
+        parseExprImpl afterComma2 >>= fun vec afterVec ->
+        expect TokRParen afterVec >>= fun _ remaining ->
+        success (mkE tokens remaining (ExprGramApply (left, right, vec))) remaining
+
     | Some (TokKeyword KwDecompact) ->
         advance tokens |> expect TokLParen >>= fun _ afterLParen ->
         parseExprImpl afterLParen >>= fun array afterArr ->
@@ -1050,8 +1063,26 @@ and parseIf (tokens: Token list) : ParseResult<Expr> =
 and parseMatch (tokens: Token list) : ParseResult<Expr> =
     parseExprImpl tokens >>= fun scrutinee afterScrutinee ->
     expect (TokKeyword KwWith) afterScrutinee >>= fun _ afterWith ->
-    many parseMatchCase (skipNL afterWith) >>= fun cases remaining ->
+    manyMatchCases (skipNL afterWith) >>= fun cases remaining ->
     success (mkE tokens remaining (ExprMatch (scrutinee, cases))) remaining
+
+/// `many parseMatchCase`, except that an `isHardParseError` code PROPAGATES
+/// instead of ending the arm list. Plain `many` treats every failure as "the
+/// list stops here", so a curated steer raised inside an arm (the `while`-on-
+/// an-ordinary-arm message, the removed-`for` steer in an arm body) was
+/// discarded and the caller re-reported the far-away, useless "Expected
+/// declaration but got '|'" at the NEXT arm -- which is why every
+/// pattern-level parse failure in a match looked identical. Same rule and
+/// same justification `sepBy` and `parseLetAnnotation` already apply: a hard
+/// code is raised only after the parse has committed, so propagating it cuts
+/// off no legitimate backtrack.
+and manyMatchCases (tokens: Token list) : ParseResult<MatchCase list> =
+    let rec loop acc toks =
+        match parseMatchCase toks with
+        | Ok (v, rest) -> loop (v :: acc) rest
+        | Error e when isHardParseError e -> Error e
+        | Error _ -> Ok (List.rev acc, toks)
+    loop [] tokens
 
 // Guard-parse errors propagate rather than being swallowed.
 and parseMatchCase (tokens: Token list) : ParseResult<MatchCase> =
@@ -1067,6 +1098,19 @@ and parseMatchCase (tokens: Token list) : ParseResult<MatchCase> =
             // bodies (e.g. nested match) require braces.
             parseBody afterArrow >>= fun body remaining ->
             success { Pattern = pat; Guard = Some guard; Body = body } remaining
+        // `while` belongs to the RECURSIVE-ARRAY arm and only there: it
+        // declares when the induction stops (and freezes), which is a
+        // statement about the recursion, not about this cell. An ordinary
+        // match arm has nothing to stop -- its guard falls through to the
+        // next arm -- so the two are not interchangeable in either
+        // direction, and `parseConsArm` steers the mirror case (`if` on a
+        // rec-array arm) back here. Without this the misuse died as a bare
+        // "Expected '->'".
+        | Some (TokIdent "while") ->
+            let line, col = currentPos afterPat
+            errorC "BL1003"
+                "`while` guards a RECURSIVE-ARRAY arm (`let rec x = match x with | prefix :: n while <cond> -> ...`), where it declares when the induction stops and the array freezes. An ordinary match arm has no induction to stop: its guard is `if`, and a failing `if` falls through to the next arm."
+                line col
         | _ ->
             expect (TokOp "->") afterPat >>= fun _ afterArrow ->
             parseBody afterArrow >>= fun body remaining ->
@@ -1467,8 +1511,8 @@ and parseRecArrayBinding (tokens: Token list) : ParseResult<Binding> =
             // --- arm 2 (optional seed) / arm 3 (required inductive):
             //     | zero :: n -> zero :: SEED
             //     | prefix :: n -> prefix :: SLICE
-            let parseConsArm (toks: Token list) : ParseResult<bool * Ident * Ident * Expr> =
-                // returns (isSeedArm, prefixOrZeroName, stepVar, sliceExpr)
+            let parseConsArm (toks: Token list) : ParseResult<bool * Ident * Ident * Expr * Expr option> =
+                // returns (isSeedArm, prefixOrZeroName, stepVar, sliceExpr, guard)
                 expect TokPipe (skipNL toks) >>= fun _ t1 ->
                 let isSeed, pfxName, t2res =
                     match peek t1 with
@@ -1480,6 +1524,21 @@ and parseRecArrayBinding (tokens: Token list) : ParseResult<Binding> =
                 | Ok t2 ->
                 expect TokColonColon t2 >>= fun _ t3 ->
                 expectIdent t3 >>= fun stepVar t4 ->
+                // Optional `while GUARD` between the step var and `->`. A bare
+                // TokIdent, NOT a keyword (the `repro` where-conjunct
+                // precedent) -- a program binding `while` elsewhere still
+                // parses. Only the inductive arm may carry it: the seed slice
+                // is unconditional by construction.
+                (match peek t4 with
+                 | Some (TokIdent "while") when not isSeed ->
+                     advance t4 |> parseGuardExpr >>= fun g afterG ->
+                     success (Some g) afterG
+                 | Some (TokIdent "while") ->
+                     errHere t4 $"recursive array '{name}': a `while` guard is only legal on the inductive arm (`| prefix :: n while <cond> -> ...`), not on the seed arm"
+                 | Some (TokKeyword KwIf) ->
+                     errHere t4 $"recursive array '{name}': a recursive-array arm takes a `while` guard, not `if` -- `| prefix :: n while <cond> -> ...` (defined until the guard goes false, frozen after)"
+                 | _ -> success None t4)
+                >>= fun guard t4 ->
                 expect (TokOp "->") t4 >>= fun _ t5 ->
                 // Body must open with the SAME constructor head: `zero ::` /
                 // `prefix ::` -- this is the productivity check.
@@ -1496,11 +1555,11 @@ and parseRecArrayBinding (tokens: Token list) : ParseResult<Binding> =
                 let _ = headOk
                 expect TokColonColon t6 >>= fun _ t7 ->
                 suppressingStructLiterals (fun () -> parseExprImpl t7) >>= fun slice t8 ->
-                success (isSeed, pfxName, stepVar, slice) t8
-            parseConsArm afterBase >>= fun (isSeed1, pfx1, step1, slice1) afterArm2 ->
+                success (isSeed, pfxName, stepVar, slice, guard) t8
+            parseConsArm afterBase >>= fun (isSeed1, pfx1, step1, slice1, guard1) afterArm2 ->
             if isSeed1 then
                 // seed arm present; inductive arm must follow
-                parseConsArm afterArm2 >>= fun (isSeed2, pfx2, step2, slice2) afterArm3 ->
+                parseConsArm afterArm2 >>= fun (isSeed2, pfx2, step2, slice2, guard2) afterArm3 ->
                 if isSeed2 then
                     errHere afterArm2 $"recursive array '{name}': only one seed arm (`zero :: n`) is allowed; expected the inductive arm `prefix :: n -> prefix :: <slice>`"
                 else
@@ -1514,7 +1573,8 @@ and parseRecArrayBinding (tokens: Token list) : ParseResult<Binding> =
                         Type = Some ty
                         Value = mkExpr sp (ExprRecArray {
                             Name = name; SeedArm = Some (step1, slice1)
-                            PrefixVar = pfx2; StepVar = step2; SliceExpr = slice2 })
+                            PrefixVar = pfx2; StepVar = step2; SliceExpr = slice2
+                            Guard = guard2 })
                     } afterArm3
             else
                 let sp = rangeSpan tokens afterArm2
@@ -1524,7 +1584,8 @@ and parseRecArrayBinding (tokens: Token list) : ParseResult<Binding> =
                     Type = Some ty
                     Value = mkExpr sp (ExprRecArray {
                         Name = name; SeedArm = None
-                        PrefixVar = pfx1; StepVar = step1; SliceExpr = slice1 })
+                        PrefixVar = pfx1; StepVar = step1; SliceExpr = slice1
+                        Guard = guard1 })
                 } afterArm2
         | _ ->
             errHere afterEq $"recursive array '{name}': the body must be `match {name} with | zero -> zero | prefix :: n -> prefix :: <slice>`"

@@ -75,10 +75,12 @@ let staticEnvOf (env: TypeEnv) : StaticEval.StaticEnv =
             staticFuncProjCache <- Some (box src, p)
             p
     { Values = env.StaticValues
+      Globals = env.StaticValues
       Functions = projected
       CalledFunctions = ref Set.empty
       ProviderRoots = Map.empty
-      Structs = Map.empty }
+      Segments = Map.empty
+      Structs = env.StructStatics }
 
 let evalStaticIntExpr (env: TypeEnv) (expr: Expr) : int option =
     match evalConstExpr env expr with
@@ -702,6 +704,10 @@ let rec lowerTypeExpr (env: TypeEnv) (ty: TypeExpr) : IRType =
 
     | TyBoundedIdx _ -> IRTScalar ETInt64
 
+    // Chunked<I, _> IS I (docs/plans/structural/07 §2.1): every position
+    // lowers the inner axis; the segmentation is registered beside the
+    // alias by registerTypeDecl and read only by `segments(Alias)`.
+    | TyChunked (inner, _) -> lowerTypeExpr env inner
     | TyCompoundIdx _mask ->
         let idx = { Id = env.Builder.FreshId(); Rank = 1; Extent = IRParam ("compound", 0, IRTNat None)
                     Symmetry = SymNone; Tag = None; IxKind = IxKPlain; Kind = SDimension; Dependencies = [] }
@@ -1111,9 +1117,33 @@ and lowerIndexType env (_position: int) (ty: TypeExpr) : IRIndexType =
         match lookupTypeDef name env with
         | Some (TDIIndexType (_, idx, _)) -> { idx with Id = id }
         | Some (TDIEnumIdx (_, idx, _, _)) -> { idx with Id = id }
+        // A `static struct` name stands where an index type stands
+        // (docs/plans/structural/06): its solution set is the key
+        // enumeration of a SparseIdx-shaped slot -- closed-form (SkDomain)
+        // when the constraints are linear, a certified baked table otherwise.
+        // Refusals surface at the range<> seam (TypeCheckInfer) with their
+        // own code; this arm's failwith is the annotation-only backstop.
+        | Some (TDIStruct _) when (match Map.tryFind name (staticEnvOf env).Structs with
+                                  | Some si -> si.IsStatic
+                                  | None -> false) ->
+            (match Blade.StructIdxSpec.domainRoute (staticEnvOf env) name with
+             | Ok (Blade.StructIdxSpec.DomainClosedForm plan) ->
+                 { Id = id; Rank = plan.Levels.Length; Extent = IRSparseKeys (SkDomain plan)
+                   Symmetry = SymNone; Tag = Some "__sparseidx"; IxKind = IxKSparse
+                   Kind = SDimension; Dependencies = [] }
+             | Ok (Blade.StructIdxSpec.DomainTable (entries, _, _)) ->
+                 let rank =
+                     match entries with
+                     | e :: _ -> e.Length
+                     | [] -> (match Map.tryFind name (staticEnvOf env).Structs with Some si -> si.FieldDecls.Length | None -> 1)
+                 { Id = id; Rank = rank; Extent = IRSparseKeys (SkStatic entries)
+                   Symmetry = SymNone; Tag = Some "__sparseidx"; IxKind = IxKSparse
+                   Kind = SDimension; Dependencies = [] }
+             | Error msg -> failwith msg)
         | _ ->
             { Id = id; Rank = 1; Extent = IRParam (name, 0, IRTNat None); Symmetry = SymNone
               Tag = Some name; IxKind = ixKindOfTag (Some name); Kind = SDimension; Dependencies = [] }
+    | TyChunked (inner, _) -> lowerIndexType env _position inner
     | TyCompoundIdx maskExpr ->
         // CompoundIdx<mask> -- masked product space (formalism 4.5). Rank = the
         // RANK of the mask array (its number of dimensions). The mask is a runtime
@@ -1450,11 +1480,96 @@ let indexPackingCoIterable (a: IRIndexType) (b: IRIndexType) : bool =
 /// (`__group_outer`, `__raggedidx`, the irreps payloads). For anything but a
 /// plain record the tag is not a name and comparing it would mean the
 /// packing/provenance conflation `indexPackingCoIterable` deliberately avoids.
+///
+/// THE ONE EXCEPTION is a PROVIDER PROVENANCE tag (`isProviderAxisTag`: the
+/// dense `__icaxis|` spelling and both pool spellings), which is provenance,
+/// not a kind sentinel -- a pool's kind is recovered from the tag's spelling
+/// instead (`ixKindOfTag`). Two provider-tagged records must therefore agree
+/// whatever their `IxKind` says, which is what makes a cross-repo
+/// `ca.vars.cov - cb.vars.cov` refuse for a WREATH pool (IxKOrbit) as well as a
+/// simplex one -- a dense `__icaxis|` record is `IxKPlain` and would reach the
+/// same verdict through the fallthrough, but naming the whole family here
+/// keeps the rule one rule. A provider tag against anything else stays
+/// permissive, the same anonymous-side rule as above: a checkout's packed
+/// variable beside a locally-declared `Array<Float64 like SymIdx<2, 4>>` is
+/// not a provenance clash, nor is one beside a plain Zarr store's untagged
+/// pool.
+///
+/// A provider axis reaching this predicate under an ALIAS still carries its
+/// own tag, not the alias name (`registerTypeDecl`'s provider carve-out), so
+/// `type L = ck.index.lat; let w: Array<Float64 like L> = lats; w * lats`
+/// co-iterates (same axis, same tag), while the same shape across two
+/// diverged checkouts does not.
 let indexNamesCoIterable (a: IRIndexType) (b: IRIndexType) : bool =
-    a.IxKind <> IxKPlain || b.IxKind <> IxKPlain
-    || (match a.Tag, b.Tag with
-        | Some x, Some y -> x = y
-        | _ -> true)
+    match a.Tag, b.Tag with
+    | Some x, Some y when isProviderAxisTag x && isProviderAxisTag y -> x = y
+    | _ ->
+        a.IxKind <> IxKPlain || b.IxKind <> IxKPlain
+        || (match a.Tag, b.Tag with
+            | Some x, Some y -> x = y
+            | _ -> true)
+
+/// The provider-split clause for a pair of records, ready to append (a leading
+/// space, or nothing). See `Types.providerSplitClause` for what it says and
+/// when: the short version is that two identities of one provider axis print
+/// as 'lat' and 'lat#2' -- or, across two repos, identically -- and neither
+/// spelling explains itself.
+let private axisSplitSuffix (a: IRIndexType) (b: IRIndexType) : string =
+    match a.Tag, b.Tag with
+    | Some ta, Some tb ->
+        (match providerSplitClause ta tb with
+         | Some c -> " " + c
+         | None -> "")
+    | _ -> ""
+
+/// WHICH record of two multi-axis shapes disagrees, ready to append to a
+/// shape-clash refusal (a leading ": ", or "" when nothing structural is to
+/// blame -- e.g. the operands are shape-equal and were refused for PACKING).
+///
+/// Every multi-axis co-iteration refusal in the front end used to end at
+/// "... must have identical index shapes (same records: tags, extents,
+/// symmetry)", naming no operand, no axis and no disagreement. On a provider
+/// program -- two checkouts of one store, exactly one of five axes moved --
+/// that is the difference between a one-line fix and re-reading the store.
+/// Shared by the two sites that say it (`zipSharedRecords` here and the
+/// elementwise-operator arm in TypeCheckInfer) so the two cannot drift; the
+/// labels are the caller's because the two word their operands differently.
+let indexShapeClashDetail (labelA: string) (labelB: string)
+                          (a: IRIndexType list) (b: IRIndexType list) : string =
+    let nameOf (ix: IRIndexType) =
+        match ix.Tag with
+        | Some t -> displayTagName t
+        | None -> "<unnamed>"
+    if a.Length <> b.Length then
+        $": {labelA} has {a.Length} index records and {labelB} has {b.Length}"
+    else
+        List.zip a b
+        |> List.mapi (fun d (x, y) -> (d + 1, x, y))
+        |> List.tryPick (fun (axis, x, y) ->
+            if indexRecordsAgree x y then None
+            else
+                let extents =
+                    match tryEvalIntIR x.Extent, tryEvalIntIR y.Extent with
+                    | Some p, Some q when p <> q -> $", extents {p} vs {q}"
+                    | _ -> ""
+                Some (sprintf ": they first differ at index record %d of %d -- %s has '%s' and %s has '%s'%s.%s"
+                          axis a.Length labelA (nameOf x) labelB (nameOf y) extents (axisSplitSuffix x y)))
+        |> Option.defaultValue ""
+
+/// The rank->=2 co-iteration refusal, with the FIRST disagreeing record of the
+/// FIRST disagreeing operand named -- the same "first offender, 1-based"
+/// contract `zipHeadClash` follows.
+let private multiAxisShapeClash (shape0: IRIndexType list) (rest: IRArrayType list) : string =
+    let head =
+        "co-iteration over multi-axis arrays requires all operands to have identical index shapes (same records: tags, extents, symmetry)"
+    let detail =
+        rest
+        |> List.mapi (fun i at -> (i + 2, at.IndexTypes))
+        |> List.tryPick (fun (pos, ixs) ->
+            match indexShapeClashDetail "operand 1" $"operand {pos}" shape0 ixs with
+            | "" -> None
+            | d -> Some d)
+    head + defaultArg detail ""
 
 /// The shared-axis disagreement in a single-record co-iteration, if any --
 /// every operand's HEAD record against the FIRST operand's, which is the
@@ -1495,9 +1610,21 @@ let private zipHeadClash (arrayTypes: IRArrayType list) : TypeError option =
                         | Some e0, Some e when e0 <> e -> Some (ZipExtentMismatch (pos, e0, e))
                         | _ ->
                             if not (indexNamesCoIterable h0 h) then
+                                // Names, not raw Tags. A provider axis tag is a
+                                // provenance IDENTITY ("__icaxis|lat@wx:9f3a1c
+                                // 2b4d5e6f70#2"), and printing it verbatim
+                                // handed the user a 40-character internal token
+                                // where the store says `lat`. `displayTagName`
+                                // decodes it through the hook the provider
+                                // registers; every other tag (user names,
+                                // sentinels) comes back unchanged, so this is
+                                // the old text for everything that is not a
+                                // provider axis.
                                 Some (Other (sprintf
-                                        "co-iteration operands are over DIFFERENT index types: operand 1 is indexed by '%s' and operand %d by '%s'. A named index type carries provenance, so two of them do not interoperate merely by having the same extent (%s) -- that is what makes a subscript bounds-safe by construction. Index one of them through the other's space, or drop the annotation on one operand if they really are the same axis (an UNNAMED index co-iterates with either)."
-                                        (defaultArg h0.Tag "?") pos (defaultArg h.Tag "?") (ppExtentOf h0.Extent)))
+                                        "co-iteration operands are over DIFFERENT index types: operand 1 is indexed by '%s' and operand %d by '%s'. A named index type carries provenance, so two of them do not interoperate merely by having the same extent (%s) -- that is what makes a subscript bounds-safe by construction. Index one of them through the other's space, or drop the annotation on one operand if they really are the same axis (an UNNAMED index co-iterates with either).%s"
+                                        (displayTagName (defaultArg h0.Tag "?")) pos
+                                        (displayTagName (defaultArg h.Tag "?")) (ppExtentOf h0.Extent)
+                                        (axisSplitSuffix h0 h)))
                             else None)
 
 /// Shared iteration records for a zip co-iteration, from the operands' array
@@ -1524,7 +1651,7 @@ let zipSharedRecords (arrayTypes: IRArrayType list) : Result<IRIndexType list, T
             | Some e when minRank > 0 -> Error e
             | _ -> Ok (if minRank > 0 then [shape0.Head] else [])
         elif not (rest |> List.forall (fun at -> indexShapesAgree at.IndexTypes shape0)) then
-            Error (Other "co-iteration over multi-axis arrays requires all operands to have identical index shapes (same records: tags, extents, symmetry)")
+            Error (Other (multiAxisShapeClash shape0 rest))
         elif isGroupedRaggedShape shape0 then
             // All operands grouped: the ragged member axis is NOT a product
             // axis, so this is not the plain-dense product rule -- the rows
@@ -1585,10 +1712,17 @@ let haloSlotsOf (env: TypeEnv) (innerTy: TypeExpr) (offsetsExpr: Expr) : TypeRes
                 match inner.Extent with
                 | IRLit (IRLitInt n) -> IRLit (IRLitInt (n - shrink))
                 | e -> IRBinOp (IRElementwise, IRSub, e, IRLit (IRLitInt shrink))
+            // A `Chunked` alias adopts its inner axis's record (so it IS the
+            // axis), which for a store axis carries no name: the halo was
+            // declared over the ALIAS, and that is the name the segment-run
+            // emitter looks the runs up by (docs/plans/structural/07 §2.3).
             let innerName =
-                match inner.Tag with
-                | Some n when not (n.StartsWith("__")) -> n
-                | _ -> ""
+                match innerTy with
+                | TyNamed (n, []) when Map.containsKey n env.Segmentations -> n
+                | _ ->
+                    match inner.Tag with
+                    | Some n when not (n.StartsWith("__")) -> n
+                    | _ -> ""
             Ok { inner with
                     Id = env.Builder.FreshId()
                     Extent = shrunkExtent

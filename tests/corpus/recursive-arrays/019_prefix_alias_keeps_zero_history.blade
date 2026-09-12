@@ -1,0 +1,17 @@
+// TEST: Prefix Alias Keeps Zero History
+// ============================================================================
+// `let history = prefix` followed by `history(n - 2)` is a prefix READ. The
+// rewrite recognizes reads by the callee's spelling, so through the alias
+// the read fell to the raw buffer with no bounds discipline: at n = 1 it
+// read cell -1 (an uninitialized double where the zero-history rule says
+// 0). Aliases of the prefix are inlined before the rewrite.
+type Step = Idx<3>
+let rec x: Array<Float like Step> =
+    match x with
+    | zero -> zero
+    | zero :: s -> zero :: 7.0
+    | prefix :: n -> prefix :: {
+        let history = prefix
+        history(n - 2)
+    }
+// EXPECT: x = [7, 0, 7]

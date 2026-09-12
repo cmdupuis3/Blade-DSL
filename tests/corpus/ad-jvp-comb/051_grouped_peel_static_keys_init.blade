@@ -33,7 +33,6 @@ let pL = reduce(pm, (+))
 // EXPECT: pm = [67, 7, 47]
 // EXPECT: pL = 121
 
-// WARN: BL4003
 let mut dv = [0.0, 0.0, 0.0, 0.0]
 let gv = ad.grad(loss)(vv, sk, dv)
 // 100 of data + 3 groups x 7.0 of init, matching the peel exactly

@@ -8,7 +8,7 @@ open System.IO
 open Blade.Build
 open Blade.Lowering
 
-let compilerVersion = "0.20.0"
+let compilerVersion = Blade.RunRecord.bladeVersion
 
 let printUsage () =
     printfn "Blade Compiler v%s" compilerVersion
@@ -25,6 +25,9 @@ let printUsage () =
     printfn "                                    at exit (Windows: needs a vcvars64 environment;"
     printfn "                                    equivalently set BLADE_MEMCHECK=1)"
     printfn "  check <file.edgi>                 Type-check only (no code generation)"
+    printfn "  plan <file.edgi> [--json]         Type-check and lower, then list every optimization"
+    printfn "                                    decision the cost-only layer took (rule, subject,"
+    printfn "                                    applied/declined with reason, evidence)"
     printfn "  doctor [--json]                   Report native-toolchain health: g++/OpenMP core"
     printfn "                                    (real compile+run), BLAS/LAPACK tier, NetCDF, MPI,"
     printfn "                                    CUDA, setup tools; exit 0 iff the g++ core works"
@@ -71,6 +74,7 @@ let printUsage () =
     printfn "  test multifile                    Run the cross-module (multi-file) corpus standalone"
     printfn "  test module-resolve               Run the file-based module resolver + units.SI block"
     printfn "  test shapespec                    Run the shape-specialization reach block standalone"
+    printfn "  test flat-path                    Run the flat-elementwise reach block standalone"
     printfn "  test cuda                         Run the CUDA kernel block standalone"
     printfn "  test mpi                          Run the MPI decomposition block standalone"
     printfn "  test netcdf                       Run the NetCDF provider block (needs libnetcdf + sample.nc)"
@@ -490,8 +494,8 @@ let private runExeIn (cwd: string) (exeFile: string) : Result<int * string * str
         psi.CreateNoWindow <- true
         psi.WorkingDirectory <- cwd
         use proc = System.Diagnostics.Process.Start(psi)
-        let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-        let stderrTask = proc.StandardError.ReadToEndAsync()
+        let stdoutTask = Blade.Runtime.readToEndOffPool proc.StandardOutput
+        let stderrTask = Blade.Runtime.readToEndOffPool proc.StandardError
         if proc.WaitForExit(60000) then
             Ok (proc.ExitCode, stdoutTask.Result, stderrTask.Result)
         else
@@ -512,6 +516,16 @@ module ReplTypes = Blade.ReplSession.ReplTypes
 /// top of Build.fs and is unreachable from a file that compiles this early.
 /// The two failure messages are composed exactly as the REPL has always
 /// printed them, so the caller only has to add `[snippet not kept]`.
+/// The RENDER lane's two halves (IdeServe's `render` command): build a source
+/// into an executable and hand back its PATH, and run an executable already
+/// built. Split apart because the whole point of that lane is to do the second
+/// WITHOUT the first -- a camera change re-runs a binary it compiled once.
+let internal renderCompileLane (srcPath: string) : Result<string, string> =
+    compileToExe srcPath None false false
+
+let internal renderRunLane (cwd: string) (exeFile: string) : Result<int * string * string, string> =
+    runExeIn cwd exeFile
+
 let internal compiledReplLane (srcPath: string) (cwd: string) : Result<int * string * string, string> =
     match compileToExe srcPath None false false with
     | Error e -> Error e
@@ -711,6 +725,43 @@ let replLoop () : int =
 /// End-to-end CLI smoke test: compile and run a one-line .edgi from a FRESH
 /// temp directory -- the only block exercising the user-facing path from a
 /// bare directory (other runners pre-deploy runtime headers, masking a compileToExe that forgets to).
+
+/// `blade plan <file>`: the optimization DECISION RECORD (plan-fortran-
+/// killer-2.md section 3 step 5). Installs a Blade.Effects.Decisions
+/// collector, runs the same parse -> typecheck -> lower pipeline `emit`
+/// runs (every cost-only pass fires during lowering), and prints one line
+/// per decision: rule and version, subject, source position when the pass
+/// had one, applied or declined with the first reason, and the evidence
+/// the pass discharged. Diagnostic data only -- nothing here is a licence
+/// to branch on an optimizer outcome from Blade source.
+let planFile (filePath: string) (json: bool) : int =
+    if not (File.Exists filePath) then
+        reportFailure $"File not found: {filePath}"
+    else
+        let source = File.ReadAllText(filePath)
+        let useColor = not Console.IsErrorRedirected
+        Blade.Effects.Decisions.start ()
+        match Blade.Lowering.lowerFileDiag filePath source with
+        | Error ds, sm ->
+            Blade.Effects.Decisions.drain () |> ignore
+            reportFailure (Blade.Diagnostics.Render.renderAll useColor (Some sm) ds)
+        | Ok (program, _), _ ->
+            let ds = Blade.Effects.Decisions.drain ()
+            // The input manifest (docs/plans/plan-fortran-killer-2.md section 7):
+            // runtime provider reads plus the inputs this compilation folded.
+            let inputs = Blade.RunRecord.manifestOf program.Modules (Blade.ProviderStatics.drainFoldLog ())
+            if json then
+                let js = Blade.Effects.Decisions.renderJson filePath ds
+                // `{"file":..,"decisions":[..]}` -> add the manifest as a sibling.
+                printfn "%s" (js.Substring(0, js.Length - 1) + ",\"inputs\":" + Blade.RunRecord.renderJson inputs + "}")
+            else
+                printfn "plan: %s -- %d optimization decision(s)" filePath ds.Length
+                for d in ds do
+                    printfn "  %s" (Blade.Effects.Decisions.render d)
+                printfn "inputs: %d (identity policy: `content` = folded at compile time, hashed; `version` = read at run time, size + mtime observed -- BLADE_RUN_RECORD=<path> writes the run record)" inputs.Length
+                for e in inputs do
+                    printfn "  %s" (Blade.RunRecord.renderEntry e)
+            0
 
 let checkFile (filePath: string) (strictPins: bool) : int =
     if not (File.Exists filePath) then

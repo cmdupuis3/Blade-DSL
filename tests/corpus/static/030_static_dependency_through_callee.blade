@@ -1,0 +1,15 @@
+// TEST: Static Dependency Through Callee
+// ============================================================================
+// `let static a = f()` depends on `z` through f's BODY, which the call text
+// never names. The dependency collector used to stop at `f`, so the
+// topological order could fold `a` before `z` and fail with "undefined
+// static variable 'z'" against a program whose `z` is declared first.
+// Callee bodies are walked transitively (with a visited set) when ordering.
+let static z = 10
+static function f() = z
+static function g() = f() + 1
+let static a = f()
+let static b = g()
+// EXPECT: z = 10
+// EXPECT: a = 10
+// EXPECT: b = 11

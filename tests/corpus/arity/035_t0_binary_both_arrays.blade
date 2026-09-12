@@ -1,0 +1,10 @@
+// TEST: T^0 binary function over two arrays
+// Two positions of the SAME rank-0 variable, both supplied at rank 1: no
+// disagreement to reconcile, so the call specializes at the array type and
+// runs elementwise. The control for 036-038, where one position is a scalar.
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let B: Array<Float like Idx<3>> = [10.0, 20.0, 30.0]
+let r = add0(A, B)
+// EXPECT: r = [11.0, 22.0, 33.0]

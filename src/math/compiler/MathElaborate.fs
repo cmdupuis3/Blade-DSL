@@ -8,6 +8,9 @@
 ///
 ///   m.matmul(A, B)                 -- m x k . k x n -> m x n
 ///   m.solve(A, b)                  -- A.x = b by partial-pivoted LU, A n x n, b n -> x n
+///   m.lu(A)                        -- the factorization KEPT: (LU, piv), LU n x n Float64, piv n Int64
+///   m.lu_solve(f, b) | m.lu_solve(LU, piv, b)      -- A.x = b from the factors, bitwise m.solve(A, b)
+///   m.lu_solve_t(f, b) | m.lu_solve_t(LU, piv, b)  -- A^T.x = b from the same factors
 ///   m.svd(A) | m.svd(A, SWEEPS)    -- thin SVD, m >= n -> (U, S, V), S descending
 ///   m.eigh(S) | m.eigh(S, SWEEPS)  -- symmetric -> (Q, LAM), LAM descending
 ///   m.unfold(X, MODE)              -- Kolda-Bader mode-n matricization
@@ -203,9 +206,9 @@ let private ensureT (st: ElabState) (key: string) (make: string -> FunctionDecl)
 // Op elaboration
 
 let private opNames =
-    Set.ofList [ "matmul"; "solve"; "svd"; "eigh"; "eig"; "unfold"; "mode_product"; "hosvd" ]
+    Set.ofList [ "matmul"; "solve"; "lu"; "lu_solve"; "lu_solve_t"; "svd"; "eigh"; "eig"; "unfold"; "mode_product"; "hosvd" ]
 
-let private opList = "matmul, solve, svd, eigh, eig, unfold, mode_product, hosvd"
+let private opList = "matmul, solve, lu, lu_solve, lu_solve_t, svd, eigh, eig, unfold, mode_product, hosvd"
 
 /// Optional trailing SWEEPS argument shared by svd/eigh.
 let private sweepsArg (statics: StaticEnv) (what: string) (rest: Expr list) : Result<int, string> =
@@ -255,6 +258,29 @@ let private elabOp (st: ElabState) (ctx: Ctx) (scope: Scope) (op: string) (args:
                 Error "solve: b must be rank-1 (Array<Float64 like Idx<n>>)"
             | _ -> Error "solve: A must be rank-2 square (Array<Float64 like Idx<n>, Idx<n>>)"))
     | "solve", _ -> Error "solve: expected solve(A, b) -- A an n x n matrix, b a length-n vector, returning x with A.x = b"
+    // FACTOR ONCE (plan-fortran-killer-2 section 6.2): `lu(A)` keeps the
+    // partial-pivoted LU as a value -- an ordinary tuple (LU, piv) of two
+    // fresh arrays -- and `lu_solve` / `lu_solve_t` apply it to any number of
+    // right-hand sides (A x = b / A^T x = b) without refactoring. Both apply
+    // forms take the tuple or its two halves: `m.lu_solve(f, b)` is rewritten
+    // to `__math_lu_solve(f[0], f[1], b)` here, so the checker only ever sees
+    // the three-array marker.
+    | "lu", [aE] ->
+        arrayShape ctx scope "lu" aE |> Result.bind (fun (_, aDims) ->
+            match aDims with
+            | [n; n2] when n = n2 -> Ok (syn (ExprApp (v "__math_lu", [aE])))
+            | [n; n2] -> Error $"lu: A must be square (got {n}x{n2})"
+            | _ -> Error "lu: A must be rank-2 square (Array<Float64 like Idx<n>, Idx<n>>)")
+    | "lu", _ -> Error "lu: expected lu(A) -- A an n x n matrix, returning the factorization (LU, piv)"
+    | ("lu_solve" | "lu_solve_t"), [fE; bE] ->
+        let marker = if op = "lu_solve" then "__math_lu_solve" else "__math_lu_solve_t"
+        let proj (i: int64) = syn (ExprTupleIndex (fE, syn (ExprLit (LitInt i))))
+        Ok (syn (ExprApp (v marker, [proj 0L; proj 1L; bE])))
+    | ("lu_solve" | "lu_solve_t"), [luE; pivE; bE] ->
+        let marker = if op = "lu_solve" then "__math_lu_solve" else "__math_lu_solve_t"
+        Ok (syn (ExprApp (v marker, [luE; pivE; bE])))
+    | ("lu_solve" | "lu_solve_t"), _ ->
+        Error $"{op}: expected {op}(f, b) with f = lu(A), or {op}(LU, piv, b) -- b a length-n vector, returning x"
     | "svd", (aE :: rest) ->
         sweepsArg ctx.Statics "svd" rest |> Result.bind (fun sweeps ->
         arrayShape ctx scope "svd" aE |> Result.bind (fun (_, dims) ->
@@ -468,9 +494,10 @@ let rec private rewriteExpr (st: ElabState) (ctx: Ctx) (aliases: Set<string>) (s
     // contain qualified ops; without this arm they fell through unrewritten and reached the checker as an unbound variable.
     | ExprKind.ExprRecArray def ->
         rOpt (def.SeedArm |> Option.map snd) |> Result.bind (fun seedE ->
+        rOpt def.Guard |> Result.bind (fun guardE ->
         r def.SliceExpr |> Result.map (fun slice' ->
             let seed' = Option.map2 (fun (sv, _) se -> (sv, se)) def.SeedArm seedE
-            inheritSpan e (ExprRecArray { def with SeedArm = seed'; SliceExpr = slice' })))
+            inheritSpan e (ExprRecArray { def with SeedArm = seed'; SliceExpr = slice'; Guard = guardE }))))
     // The rest of the expression algebra: every constructor holding a sub-expression is walked, and the catch-all wildcard
     // is deliberately GONE, so an unhandled case is an FS0025 build warning rather than a qualified call surviving unrewritten.
     | ExprKind.ExprCompute inner -> r inner |> Result.map (fun i -> inheritSpan e (ExprCompute i))
@@ -486,7 +513,6 @@ let rec private rewriteExpr (st: ElabState) (ctx: Ctx) (aliases: Set<string>) (s
     | ExprKind.ExprPartialApp (op, inner, isLeft) -> r inner |> Result.map (fun i -> inheritSpan e (ExprPartialApp (op, i, isLeft)))
     | ExprKind.ExprTranspose (a, d1, d2) -> r a |> Result.map (fun a' -> inheritSpan e (ExprTranspose (a', d1, d2)))
     | ExprKind.ExprDecompact (a, d) -> r a |> Result.map (fun a' -> inheritSpan e (ExprDecompact (a', d)))
-    | ExprKind.ExprBlocked (t, inner) -> r inner |> Result.map (fun i -> inheritSpan e (ExprBlocked (t, i)))
     | ExprKind.ExprHalo (t, offs) -> r offs |> Result.map (fun o -> inheritSpan e (ExprHalo (t, o)))
     | ExprKind.ExprMethodFor es -> rList es |> Result.map (fun es' -> inheritSpan e (ExprMethodFor es'))
     | ExprKind.ExprZip es -> rList es |> Result.map (fun es' -> inheritSpan e (ExprZip es'))
@@ -520,6 +546,8 @@ let rec private rewriteExpr (st: ElabState) (ctx: Ctx) (aliases: Set<string>) (s
         r a |> Result.bind (fun a' -> r k |> Result.map (fun k' -> inheritSpan e (ExprSort (a', k'))))
     | ExprKind.ExprGram (l, rr) ->
         r l |> Result.bind (fun l' -> r rr |> Result.map (fun r' -> inheritSpan e (ExprGram (l', r'))))
+    | ExprKind.ExprGramApply (l, rr, x) ->
+        r l |> Result.bind (fun l' -> r rr |> Result.bind (fun r' -> r x |> Result.map (fun x' -> inheritSpan e (ExprGramApply (l', r', x')))))
     | ExprKind.ExprReduce (a, k, init, ax) ->
         r a |> Result.bind (fun a' ->
         r k |> Result.bind (fun k' ->

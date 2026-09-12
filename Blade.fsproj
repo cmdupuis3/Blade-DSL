@@ -47,6 +47,11 @@
          these directly. -->
     <Compile Include="src/Diagnostics.fs" />
     <Compile Include="src/Types.fs" />
+    <!-- Effect summaries + the optimization decision record (plan-fortran-
+         killer-2.md section 3, P0): needs only Ast.Span, read by IR.fs
+         (IRCallable.Effects), TypeEnv/TypeCheck (computation), IRMono and
+         Optimize (consumers), CliCommands (`blade plan`). -->
+    <Compile Include="src/Effects.fs" />
     <!-- Env-gated compiler perf counters (docs/plan-compile-speed.md Stage 5).
          Dependency-free, and deliberately in FRONT of the pipeline: its two
          instrumented consumers (IR.fs and Unify.fs) sit ~175 entries apart in
@@ -122,8 +127,13 @@
     <Compile Include="src/IR.fs" />
     <Compile Include="src/IRLoopStructure.fs" />
     <Compile Include="src/IRStorage.fs" />
+    <!-- The one IR-level matcher of a halo window read (docs/plans/structural/02
+         section 3.1.2): the carousel, both BL8009 guards and the reverse-mode
+         gather read it instead of scanning for the shape themselves. -->
+    <Compile Include="src/IRAccess.fs" />
     <Compile Include="src/IRLift.fs" />
     <Compile Include="src/IRMono.fs" />
+    <Compile Include="src/Optimize.fs" />
     <Compile Include="src/IRPrint.fs" />
     <Compile Include="src/IRValidate.fs" />
     <!-- Provider registry: the core<->provider seam (ProviderSpec records
@@ -133,6 +143,29 @@
     <Compile Include="src/providers/NetcdfProvider.fs" />
     <Compile Include="src/providers/ZarrProvider.fs" />
     <Compile Include="src/providers/CsvProvider.fs" />
+    <!-- Icechunk (versioned Zarr) provider: repo/ref resolution, the 39-byte
+         header parser and the payload decode are all live. The plan's section
+         6.2 dependency decision landed on the vendored flatc accessors (root
+         tables verified before they are read) plus the managed ZstdSharp.Port,
+         both compile-time only. Reuses ZarrProvider's metadata parsers, so it
+         must follow ZarrProvider.fs; registered by ProviderStatics.fs, which it
+         must precede. -->
+    <Compile Include="src/providers/IcechunkProvider.fs" />
+    <!-- F#-side Icechunk fixture WRITER (tests only): builds real spec-2 repos
+         on local disk through the vendored FlatBuffers object API + ZstdSharp,
+         the ZarrWrite discipline applied to a versioned store. Depends only on
+         the generated accessors and ZstdSharp, NOT on IcechunkProvider (the
+         header layout and Crockford encoder are deliberate independent twins),
+         so its position only has to follow the ProjectReference. -->
+    <Compile Include="src/providers/IcechunkWrite.fs" />
+    <!-- The RepoSpec for the committed demo store
+         (examples/data/station_temps.icechunk), shared by its generator script
+         (examples/tools/make_station_icechunk.fsx, which `#load`s this same
+         file) and by IcechunkTests' regeneration guard, which rebuilds it into
+         a scratch directory and diffs it against the committed bytes. It is a
+         plain value over IcechunkWrite's spec types, so it must follow
+         IcechunkWrite.fs and nothing else constrains it. -->
+    <Compile Include="examples/tools/StationSpec.fs" />
     <Compile Include="src/TypedAst.fs" />
     <Compile Include="src/Deduce.fs" />
     <!-- The generic half of an equivariance-family judgment (C3 stage 0,
@@ -154,6 +187,10 @@
          data reader into StaticEval's provider hook (fold + provenance).
          Must follow both NetcdfProvider.fs and StaticEval.fs. -->
     <Compile Include="src/ProviderStatics.fs" />
+    <!-- Input manifests + run records (plan-fortran-killer-2 section 7): the
+         provider-read table `blade plan` prints and codegen bakes for
+         blade_run_record.hpp. Needs IR/Types only; used by CodeGen and the CLI. -->
+    <Compile Include="src/RunRecord.fs" />
     <!-- Constrained records as index types, stage C1 — the COUNTING half
          (retired constrained-index-types plan, §7). Box enumeration over the
          per-field inclusive bounds, the flat-filter vs arrow-heads
@@ -163,6 +200,14 @@
          argument is a struct NAME, not a value). Needs Ast + StaticEval only;
          must precede TypeCheck.fs, which installs it. -->
     <Compile Include="src/StructIdxSpec.fs" />
+    <!-- The icechunk `checkout` desugar (docs/plans/plan-icechunk-provider.md
+         section 4): `repo.checkout(ref[, marker])` -> the canonical load shape
+         `alias.load("<path>@<kind>:<ref>")`, so no downstream phase needs an
+         arm for it. Needs Ast + Diagnostics ONLY (it runs before the provider
+         registry is installed); must precede its three consumers: TypeCheck.fs
+         (runs it first in the typeCheck pipeline, ahead of Unfold), Lowering.fs
+         (re-applies it to the raw decl list) and Ide.fs. -->
+    <Compile Include="src/ProviderDesugar.fs" />
     <!-- Staged-former unfold pass (staged tower Phase 1): eliminates
          `static method_for/object_for/for` before every elaboration stage.
          Needs Ast + StaticEval only; runs first in typeCheck's pipeline. -->
@@ -349,6 +394,10 @@
     <Compile Include="src/CodeGenLoopNest.fs" />
     <Compile Include="src/CodeGenCuda.fs" />
     <Compile Include="src/CodeGenFusion.fs" />
+    <!-- Revision reuse (docs/plans/structural/04): the tile PLANNER: which
+         bindings tile, and each tile's content key. Needs Fusion's
+         bindingCppName; the emission helpers it feeds live in CodeGenState. -->
+    <Compile Include="src/CodeGenTiles.fs" />
     <Compile Include="src/CodeGenBinding.fs" />
     <Compile Include="src/CodeGen.fs" />
     <!-- The direct LLVM back end (BLADE_LLVM lane): IRProgram -> textual .ll,
@@ -428,6 +477,7 @@
     <Compile Include="tests/Test_Combinators.fs" />
     <Compile Include="tests/Test_Tuples.fs" />
     <Compile Include="tests/Test_RecursiveArrays.fs" />
+    <Compile Include="tests/Test_Segments.fs" />
     <Compile Include="tests/Test_StackJoin.fs" />
     <Compile Include="tests/Test_Bracketed.fs" />
     <Compile Include="tests/Test_IndexTypes.fs" />
@@ -523,6 +573,17 @@
          (cross-module, self-recursive) and which must still decline. Emission
          text only — the decision is invisible in the values. -->
     <Compile Include="tests/ShapeSpecTests.fs" />
+    <!-- Flat-elementwise reach: which index tags reach the flat path and which
+         still decline. Emission text only, for the same reason as the block
+         above — the rewrite is value-preserving, so the corpus cannot see it.
+         Parity pins: the anonymous range must decide as `range<I>` does. -->
+    <Compile Include="tests/FlatPathTests.fs" />
+    <Compile Include="tests/OptimizeTests.fs" />
+    <!-- The interpreter's RNG mirror against Random123's Philox4x32-10
+         known-answer vectors, plus the address identities (chunk / order /
+         subrange invariance) on the generator alone. No toolchain. -->
+    <Compile Include="tests/RandMirrorTests.fs" />
+    <Compile Include="tests/AccessTests.fs" />
     <!-- Eigensolver dispatch emission + the inferEigh rejections (Phase 6 /
          Round B2). Separate block from LinAlgTests because the two gates,
          headers and defines are separate by design — and because this one must
@@ -533,6 +594,13 @@
     <Compile Include="tests/NetcdfTests.fs" />
     <Compile Include="tests/ZarrTests.fs" />
     <Compile Include="tests/CsvTests.fs" />
+    <!-- Input manifests + run records: the manifest table, its emission, and
+         (with g++) the record a run writes, ok and aborting. -->
+    <Compile Include="tests/RunRecordTests.fs" />
+    <Compile Include="tests/IcechunkTests.fs" />
+    <!-- The checkout-desugar pass's own pins (src/ProviderDesugar.fs). Pure
+         in-process AST rewrite: no store, no registry, no g++, never skips. -->
+    <Compile Include="tests/ProviderDesugarTests.fs" />
     <Compile Include="tests/MpiTests.fs" />
     <Compile Include="tests/HybridTests.fs" />
     <Compile Include="tests/DiffOracle.fs" />
@@ -672,6 +740,14 @@
       <Link>cpp/blade_runtime.hpp</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Include="src/cpp/blade_run_record.hpp">
+      <Link>cpp/blade_run_record.hpp</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="src/cpp/blade_tilecache.hpp">
+      <Link>cpp/blade_tilecache.hpp</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <None Include="src/cpp/blade_linalg.hpp">
       <Link>cpp/blade_linalg.hpp</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -725,6 +801,16 @@
       <Link>cpp/linalg_probe_tests.cpp</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+
+  <!-- Icechunk payload decode, the plan's section 6.2 Option B (the FIRST
+       external references in this project, a deliberate decision recorded in
+       docs/plans/plan-icechunk-provider.md): ZstdSharp is a managed-only zstd
+       port (no native library), and Blade.IcechunkFormat is the vendored
+       flatc-generated accessor library over icechunk's own schemas. -->
+  <ItemGroup>
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
+    <ProjectReference Include="src/providers/icechunk-format/Blade.IcechunkFormat.csproj" />
   </ItemGroup>
 
 </Project>

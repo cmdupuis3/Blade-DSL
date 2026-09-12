@@ -1,0 +1,20 @@
+// TEST: Where Repro Function
+// ============================================================================
+// `where repro` on named functions: the emitted body keeps the interpreter's
+// operation sequence (BLADE_REPRO_FN: contraction off, noinline; call form
+// everywhere -- a named kernel's eta wrapper CALLS it, so loops preserve the
+// boundary), and the reorder licence is vetoed even where comm grants it --
+// the omp fold below runs serial with a marker. Values are unchanged by any
+// of that; these pins hold with the clause present or deleted.
+
+type I = Idx<6>
+function axpy1(a: Float64, b: Float64) where repro = 1.0 + a * b
+function myAdd(a: Float64, b: Float64) where comm(a, b), omp, repro = a + b
+
+let xs = method_for(range<I>) <@> lambda(i) -> Float64(i) * 0.125 |> compute
+let ys = method_for(range<I>) <@> lambda(i) -> Float64(i) + 0.5 |> compute
+let zs = method_for(zip(xs, ys)) <@> axpy1 |> compute
+// EXPECT: zs = [1, 1.1875, 1.625, 2.3125, 3.25, 4.4375]
+
+let s = reduce(zs, myAdd, 0.0)
+// EXPECT: s = 13.8125

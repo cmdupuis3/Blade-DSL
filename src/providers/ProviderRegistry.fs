@@ -77,6 +77,27 @@ type ProviderSpec = {
     /// index expressions. Handles are read-only, left open for the program's lifetime.
     GenStreamOpen: (string -> string -> string -> IRArrayType -> string list) option
     GenStreamFiber: (string -> string -> string -> string -> string list -> IRArrayType -> string list) option
+    /// PER-SEGMENT streamed reads of a RANK-1 dense variable (docs/plans/
+    /// structural/07 §3.4): `group_by(A, segments(X))` over `A = s.vars.A |>
+    /// alias.stream` reads each run's cells straight into that group's row --
+    /// no whole-array buffer ever exists. Open args: path, varName,
+    /// cppVarName, arrType (the prologue: metadata probe, chunk scratch
+    /// buffer, fill value). Rows args: path, varName, cppVarName, destination
+    /// pointer expression, lo and hi C++ expressions (the run [lo, hi) in
+    /// the variable's own ordinals), arrType. None: rank-1 streams refuse.
+    GenStreamRowsOpen: (string -> string -> string -> IRArrayType -> string list) option
+    GenStreamRows: (string -> string -> string -> string -> string -> string -> IRArrayType -> string list) option
+    /// The natural block of a streamed variable along its LEADING axis --
+    /// its chunk edge there -- which a streamed fold or run loop walks one
+    /// block at a time (args: path, varName).
+    StreamRowsBlock: (string -> string -> int64) option
+    /// A rectangular WINDOW of a dense variable of any rank, read into
+    /// `dest` row-major over the window's shape: one file per chunk the
+    /// window intersects, the intersection copied. Args: path, varName,
+    /// cppVarName, dest pointer expression, per-dimension (lo, hi) C++
+    /// expressions, arrType. The tile gather of a rank-2 streamed variable
+    /// and the row bands of its run loop are both this.
+    GenStreamWindow: (string -> string -> string -> string -> (string * string) list -> IRArrayType -> string list) option
     /// #include lines injected when a module reads/writes via this provider
     /// (packed/simplex reads also pull linearized_storage.hpp separately).
     Includes: unit -> string list
@@ -108,6 +129,45 @@ let tryFind (name: string) : ProviderSpec option =
 let names () : string list =
     registry.Keys |> List.ofSeq |> List.sort
 
+/// The chunk edge of each dimension of a loaded store, by store BINDING
+/// name (docs/plans/structural/07 §3.1): what `type A = Chunked<s.index.d,
+/// store>` inherits. A provider that knows its chunk grid registers a
+/// reader (store path -> dim -> edge, dims chunked uniformly across the
+/// store's variables only); the load site records the answer beside the
+/// IDE module so type registration never re-opens the store. Same
+/// AsyncLocal discipline as IdeStores (parallel test compilation).
+module DimChunks =
+    open System.Threading
+
+    let private readers =
+        System.Collections.Concurrent.ConcurrentDictionary<string, string -> Map<string, int64>>()
+    let private table = new AsyncLocal<Map<string, Map<string, int64>>>()
+    let private entries () = match box table.Value with null -> Map.empty | _ -> table.Value
+
+    /// A provider's reader: store path -> (dimension -> chunk edge).
+    let registerReader (provider: string) (f: string -> Map<string, int64>) =
+        readers.[provider] <- f
+
+    let reset () = table.Value <- Map.empty
+
+    /// Record the edges for a store binding, if its provider has a reader.
+    let record (binding: string) (provider: string) (path: string) =
+        match readers.TryGetValue provider with
+        | true, f ->
+            let edges = try f path with _ -> Map.empty
+            table.Value <- Map.add binding edges (entries ())
+        | _ -> ()
+
+    /// The edge of `dim` in the store bound to `binding`, if recorded.
+    let tryFind (binding: string) (dim: string) : int64 option =
+        match Map.tryFind binding (entries ()) with
+        | Some edges -> Map.tryFind dim edges
+        | None -> None
+
+    /// Whether the binding's provider recorded anything at all (to tell
+    /// "unchunked dimension" from "provider has no chunk reader").
+    let hasStore (binding: string) : bool = Map.containsKey binding (entries ())
+
 /// IDE side-channel: the provider IRModule built at each `let store =
 /// alias.load(path)` site, keyed by the store binding name. Lets Ide.fs
 /// render dims/vars/index-type hovers by reusing the module already built
@@ -120,7 +180,10 @@ module IdeStores =
     let private modules () = match box store.Value with null -> Map.empty | _ -> store.Value
 
     /// Fresh compilation: cleared before an IDE check runs typeCheck.
-    let reset () = store.Value <- Map.empty
+    let reset () =
+        store.Value <- Map.empty
+        DimChunks.reset ()
+        Blade.Types.SegmentTable.reset ()
 
     /// Record the module built at a provider load site (last write wins).
     let record (name: string) (pm: IRModule) =

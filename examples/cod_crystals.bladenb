@@ -1,0 +1,1535 @@
+// %% [markdown]
+// # Bond-orientational order in real crystals: the theorem, verified on experiment
+//
+// Every notebook in this arc so far earned its exactness by construction —
+// Tetris shapes are literals, the matched-moment classes were engineered
+// sample by sample. This one takes 1104 first-neighbour shells extracted from
+// real, refined crystal structures in the Crystallography Open Database
+// (COD, CC0) — five cubic space groups, four coordination geometries — and
+// finds the same exactness ALREADY THERE, because crystallography put it
+// there. **Cubic site symmetry QUANTIZES neighbour directions**: a
+// symmetry-forced orbit such as the (u,u,u)-type tetrahedron under -43m is a
+// perfect polyhedron for ANY value of the refined free parameters, so the
+// atoms of a real refinement have no freedom to disagree with the group
+// theory. The four classes — simple-cubic, fcc, bcc, tetrahedral shells —
+// are therefore near-discrete points in invariant space.
+//
+// That correction runs in both directions, and it is the honest frame for
+// everything below. **Accuracy is not the claim of this notebook.** With
+// quantized classes, any classifier is close to a table lookup, and reporting
+// its accuracy as an achievement would be theater. What real data CAN carry
+// that no construction can:
+//
+// - the K <= 2 blindness theorem holding at machine zero on 1104 experimental
+//   refinements — nature's whitening, not a generator's;
+// - a REAL degeneracy: bcc and tetrahedral shells are exactly equal in every
+//   even invariant up to order 4 (a cube is a tetrahedron plus its inverse,
+//   and l = 4 is even), separated only by the parity-odd K = 3 moment;
+// - the handful of measurably distorted shells — nine perovskite A-sites —
+//   showing precisely which deviations Neumann's principle permits and which
+//   it forbids;
+// - a yield census: what "real data" costs before a single clean shell
+//   exists (disorder alone removes 55% of cubic COD).
+//
+// The rung ladder at the end trains three deliberately crippled models, and
+// its deliverable is not their accuracy but their CONFUSION STRUCTURE,
+// predicted from representation theory before the training cells run. On
+// quantized classes, a prediction that misses is never noise — it is a bug
+// or a finding.
+
+// %%
+import ml as ml
+import ad as ad
+import zarr as z
+import rand as r
+import plot
+
+let store = z.load("examples/data/cod_shells.zarr")
+type SampTr = store.index.samp_tr
+type SampTe = store.index.samp_te
+type Pt = store.index.pt
+type Xyz = store.index.xyz
+type Klass = store.index.klass
+type PowK = store.index.powk
+type RotK = store.index.rotk
+type Nine = store.index.nine
+
+// `__` marks an internal buffer read with computed integer subscripts (the
+// BL4003 tag-note exemption, as in the sibling notebooks). The `_yzx` copies
+// are pre-permuted to the real l = 1 order (y, z, x) that ml.derive_poly's
+// irreps basis wants; the plain (x, y, z) copies feed the rotation
+// certificate, where the stored row-major 3x3 matrices act. Every shell is
+// zero-padded to 12 points — a zero vector contributes exactly zero to every
+// K >= 1 moment (derive_poly is homogeneous), so dividing by the true
+// coordination number (cnf_*) makes the padded mean exact.
+let __ptr: Array<Float like SampTr, Pt, Xyz> = store.vars.pos_train_yzx |> z.read
+let __pte: Array<Float like SampTe, Pt, Xyz> = store.vars.pos_test_yzx |> z.read
+let __cte: Array<Float like SampTe, Pt, Xyz> = store.vars.pos_test |> z.read
+let __cnftr: Array<Float like SampTr> = store.vars.cnf_train |> z.read
+let __cnfte: Array<Float like SampTe> = store.vars.cnf_test |> z.read
+let __ytr: Array<Float like SampTr, Klass> = store.vars.y_train |> z.read
+let __yte: Array<Float like SampTe, Klass> = store.vars.y_test |> z.read
+let __powtr: Array<Float like SampTr, PowK> = store.vars.pow_train |> z.read
+let __powte: Array<Float like SampTe, PowK> = store.vars.pow_test |> z.read
+let __codtr: Array<Int64 like SampTr> = store.vars.cod_train |> z.read
+let __codte: Array<Int64 like SampTe> = store.vars.cod_test |> z.read
+let __sittr: Array<Int64 like SampTr> = store.vars.site_train |> z.read
+let __labtr: Array<Int64 like SampTr> = store.vars.label_train |> z.read
+let __cntr: Array<Int64 like SampTr> = store.vars.cn_train |> z.read
+let __rot: Array<Float like RotK, Nine> = store.vars.rot3 |> z.read
+
+let static NTR = 829
+let static NTE = 275
+let static NALL = 1104
+let static NPAD = 12
+let static NC = 4
+
+let sizing = [NTR, NTE, NPAD, NC]
+sizing
+// EXPECT: sizing = [829, 275, 12, 4]
+
+// Class order everywhere: 0 = sc (CN 6), 1 = fcc (CN 12), 2 = bcc (CN 8),
+// 3 = tet (CN 4). Class-major layout inside each split.
+function ccount_tr(c: Int) -> Float = {
+    let rec t: Array<Float like SampTr> =
+        match t with
+        | zero -> zero
+        | prefix :: s -> prefix :: __ytr(s, c)
+    reduce(t, (+))
+}
+function ccount_te(c: Int) -> Float = {
+    let rec t: Array<Float like SampTe> =
+        match t with
+        | zero -> zero
+        | prefix :: s -> prefix :: __yte(s, c)
+    reduce(t, (+))
+}
+let counts_train = method_for(range<Idx<4>>) <@> lambda(c) -> ccount_tr(c) |> compute
+counts_train
+// EXPECT: counts_train = [141, 133, 300, 255]
+let counts_test = method_for(range<Idx<4>>) <@> lambda(c) -> ccount_te(c) |> compute
+counts_test
+// EXPECT: counts_test = [46, 44, 100, 85]
+
+// Provenance: every number in this notebook traces to a public database
+// entry. The first training sample of each class, as
+// [COD id, site ordinal, class label, coordination number] — look any of
+// them up at crystallography.net/cod/<id>.cif.
+let prov_sc = [__codtr(0), __sittr(0), __labtr(0), __cntr(0)]
+let prov_fcc = [__codtr(141), __sittr(141), __labtr(141), __cntr(141)]
+let prov_bcc = [__codtr(274), __sittr(274), __labtr(274), __cntr(274)]
+let prov_tet = [__codtr(574), __sittr(574), __labtr(574), __cntr(574)]
+prov_sc
+// EXPECT: prov_sc = [1000041, 0, 0, 6]
+prov_fcc
+// EXPECT: prov_fcc = [1009046, 0, 1, 12]
+prov_bcc
+// EXPECT: prov_bcc = [1000050, 0, 2, 8]
+prov_tet
+// EXPECT: prov_tet = [1001777, 2, 3, 4]
+
+// %% [markdown]
+// ## What real data costs: the yield census
+//
+// The store's generator (`examples/tools/make_cod_zarr.fsx`) counted every
+// rejection on its way from the database to the 1104 stored shells — the
+// yield IS part of the result:
+//
+// | stage | entries / shells |
+// |---|---|
+// | CIF entries fetched (space groups 225, 229, 221, 227, 216) | 1377 |
+// | rejected: disorder — any site occupancy < 1, or split sites | **55% of entries** |
+// | surviving sites, filtered: CN in {4, 6, 8, 12}, clean shell (spread <= 1%), clear distance gap | — |
+// | accepted, labelled by GEOMETRY against the canonical table | 1109 |
+// | of which: sc 187, fcc 177, bcc 405, tet 340 — hcp 0, icosahedral 0 | 1109 |
+// | after the per-class stratified cap (400) | 1104 |
+// | stored: train / test | 829 / 275 |
+//
+// Two lines deserve emphasis. Disorder — partial occupancy — is the single
+// dominant cost: over half of all cubic COD entries describe crystals whose
+// sites are statistical mixtures, for which "the neighbour shell" is not a
+// well-posed point cloud. And the labels are assigned by the shell's OWN
+// measured geometry (its l = 3 and l = 4 invariant powers matched against
+// the canonical table, with the space group never consulted), so the store
+// is self-validating: a mislabelled sample would have to be a shell whose
+// invariants land on the wrong class's canonical point, and the tolerance
+// gates reject anything that matches nothing.
+
+// %% [markdown]
+// ## The representation theory, before any data
+//
+// `PT` is one 3-vector — a single odd l = 1 copy — and `ml.sym_spec(PT, K)`
+// is the representation its K-th moment lives in: Sym^2 = l 0+2, Sym^3 =
+// l 1+3 (both ODD), Sym^4 = l 0+2+4. The three rung input specs below are
+// the experiment's dial: `ISPEC2` sees moments up to K = 2, `ISPEC24` the
+// even orders K = 2 and 4, `ISPEC34` the full K <= 4 jet. Parameter counts
+// printed here are Hom-space dimensions — Schur's lemma, not hyperparameters.
+
+// %%
+let static PT = [(1, 1, 1)]
+let static SK2 = ml.sym_spec(PT, 2)
+let static SK3 = ml.sym_spec(PT, 3)
+let static SK4 = ml.sym_spec(PT, 4)
+let __w2 = [1.0, 1.0]
+let __w3 = [1.0, 1.0]
+let __w4 = [1.0, 1.0, 1.0]
+
+// The three rung input representations.
+let static ISPEC2 = [(0, 0, 1), (1, 1, 1), (2, 0, 1)]
+let static ISPEC24 = [(0, 0, 2), (2, 0, 2), (4, 0, 1)]
+let static ISPEC34 = [(0, 0, 2), (1, 1, 1), (2, 0, 2), (3, 1, 1), (4, 0, 1)]
+// One hidden representation per rung, and the CG-product configuration.
+let static EMBA = [(0, 0, 2), (1, 1, 1), (2, 0, 1)]
+let static EMBB = [(0, 0, 2), (2, 0, 1), (4, 0, 1)]
+let static EMBC = [(0, 0, 2), (1, 1, 1), (2, 0, 1), (3, 1, 1), (4, 0, 1)]
+let static CFGA = (EMBA, EMBA, EMBA)
+let static CFGB = (EMBB, EMBB, EMBB)
+let static CFGC = (EMBC, EMBC, EMBC)
+let static WEA = ml.hom_dim(ISPEC2, EMBA)
+let static WEB = ml.hom_dim(ISPEC24, EMBB)
+let static WEC = ml.hom_dim(ISPEC34, EMBC)
+let static WTA = ml.tp_weight_dim(CFGA)
+let static WTB = ml.tp_weight_dim(CFGB)
+let static WTC = ml.tp_weight_dim(CFGC)
+let static WLA = ml.linear_weight_dim(EMBA, EMBA)
+let static WLB = ml.linear_weight_dim(EMBB, EMBB)
+let static WLC = ml.linear_weight_dim(EMBC, EMBC)
+let static DI2 = ml.total_dim(ISPEC2)
+let static DI24 = ml.total_dim(ISPEC24)
+let static DI34 = ml.total_dim(ISPEC34)
+let static XL4 = ml.irreps_offset(ISPEC34, 4)
+let spec_dims = [DI2, DI24, DI34, XL4]
+spec_dims
+// EXPECT: spec_dims = [9, 21, 31, 22]
+let rung_weight_dims = [WEA, WEB, WEC, WTA, WTB, WTC, WLA, WLB, WLC]
+rung_weight_dims
+// EXPECT: rung_weight_dims = [4, 7, 9, 24, 28, 61, 6, 6, 8]
+// Frozen body + trained readout (4 x channels + 4 biases) per rung.
+let static NPARA = WEA + WTA + WLA + WTA + WLA + 52
+let static NPARB = WEB + WTB + WLB + WTB + WLB + 52
+let static NPARC = WEC + WTC + WLC + WTC + WLC + 76
+let rung_params = [NPARA, NPARB, NPARC]
+rung_params
+// EXPECT: rung_params = [116, 127, 223]
+
+// %% [markdown]
+// ## The canonical table, computed in this notebook
+//
+// Before touching the store, the six canonical first-neighbour shells go
+// through the SAME `ml.derive_poly` jet the samples will: exact vertex sets,
+// mean jet over the shell, and the three block powers
+// [K2 l=2, K3 (all slots), K4 l=4]. Facts the table states:
+//
+// - **every shell's K = 2 l = 2 power is machine zero** — six different
+//   coordination geometries, one identical rank-2 fingerprint (the identity);
+// - the l = 4 powers are the classes' coordinates: sc 2/15, fcc 1/120,
+//   bcc 8/135 — and **tetrahedral is EXACTLY 8/135 too**: a cube is a
+//   tetrahedron plus its inverse, even orders cannot tell them apart;
+// - only the odd K = 3 moment separates that pair: tet 2/9 versus bcc 0.
+//   fcc's K3 is exactly zero (the cuboctahedron is centrosymmetric) while
+//   hcp's anticuboctahedron carries K3 = 1/432 — the fcc/hcp stacking
+//   difference IS a parity statement;
+// - the icosahedron is invisible in EVERY column: its first anisotropic
+//   invariant lives at l = 6, beyond every jet a K <= 4 compiler can build.
+//
+// (These powers are the Steinhardt bond-order parameters of the liquids-and-
+// glasses literature in another normalization: power_l = c_l Q_l^2 with
+// c_l = 2^l (l!)^2 / (2l)!.)
+
+// %%
+let s3v = 1.0 / sqrt(3.0)
+let s2v = 1.0 / sqrt(2.0)
+let hh = sqrt(2.0 / 3.0)
+let hr = 1.0 / sqrt(3.0)
+let hxa = 0.5
+let hxb = 0.8660254037844386
+let hta = hr * hxb
+let htb = hr * hxa
+let __phi = (1.0 + sqrt(5.0)) / 2.0
+let __ib = 1.0 / sqrt(2.0 + __phi)
+let __ia = __ib * __phi
+// Flattened 12-point shells (36 slots), zero-padded like the store's.
+let __shsc: Array<Float like Idx<36>> = [1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let __shfcc: Array<Float like Idx<36>> = [s2v, s2v, 0.0, s2v, -s2v, 0.0, -s2v, s2v, 0.0, -s2v, -s2v, 0.0, s2v, 0.0, s2v, s2v, 0.0, -s2v, -s2v, 0.0, s2v, -s2v, 0.0, -s2v, 0.0, s2v, s2v, 0.0, s2v, -s2v, 0.0, -s2v, s2v, 0.0, -s2v, -s2v]
+let __shbcc: Array<Float like Idx<36>> = [s3v, s3v, s3v, s3v, s3v, -s3v, s3v, -s3v, s3v, s3v, -s3v, -s3v, -s3v, s3v, s3v, -s3v, s3v, -s3v, -s3v, -s3v, s3v, -s3v, -s3v, -s3v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+let __shtet: Array<Float like Idx<36>> = [s3v, s3v, s3v, s3v, -s3v, -s3v, -s3v, s3v, -s3v, -s3v, -s3v, s3v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+// hcp: in-plane hexagon plus ECLIPSED triangles above and below (the
+// anticuboctahedron). Staggering the lower triangle instead gives fcc's
+// cuboctahedron — that 60-degree twist is the entire fcc/hcp difference.
+let __shhcp: Array<Float like Idx<36>> = [1.0, 0.0, 0.0, hxa, hxb, 0.0, -hxa, hxb, 0.0, -1.0, 0.0, 0.0, -hxa, -hxb, 0.0, hxa, -hxb, 0.0, hta, htb, hh, -hta, htb, hh, 0.0, -hr, hh, hta, htb, -hh, -hta, htb, -hh, 0.0, -hr, -hh]
+let __shico: Array<Float like Idx<36>> = [0.0, __ia, __ib, 0.0, __ia, -__ib, 0.0, -__ia, __ib, 0.0, -__ia, -__ib, __ib, 0.0, __ia, -__ib, 0.0, __ia, __ib, 0.0, -__ia, -__ib, 0.0, -__ia, __ia, __ib, 0.0, __ia, -__ib, 0.0, -__ia, __ib, 0.0, -__ia, -__ib, 0.0]
+
+// One point's 31-slot jet (K2 ++ K3 ++ K4), and the shell mean. All shells
+// here are closed under the cyclic coordinate relabelling (y,z,x) — a proper
+// rotation — so feeding the written coordinates directly computes the same
+// rotation-invariant powers.
+function jv31s(__p: Array<Float like Idx<36>>, k: Int) -> Array<Float like Idx<31>> = {
+    let v: Array<Float like IrrepsIdx<PT>> = [__p(k * 3), __p(k * 3 + 1), __p(k * 3 + 2)]
+    let d2 = ml.derive_poly(PT, 2, SK2, v, __w2)
+    let d3 = ml.derive_poly(PT, 3, SK3, v, __w3)
+    let d4 = ml.derive_poly(PT, 4, SK4, v, __w4)
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m < 6 then d2(m)
+                                    else (if m < 16 then d3(m - 6) else d4(m - 16)))
+    o
+}
+function jm31s(__p: Array<Float like Idx<36>>, cn: Float) -> Array<Float like Idx<31>> = {
+    let rec t: Array<Float like Idx<13>, Idx<31>> =
+        match t with
+        | zero -> zero
+        | zero :: q -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: q -> prefix :: (prefix(q - 1) + jv31s(__p, q - 1))
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: t(12, m) / cn
+    o
+}
+// Jet layout: 0 = K2 l0, 1..5 = K2 l2, 6..8 = K3 l1, 9..15 = K3 l3,
+// 16 = K4 l0, 17..21 = K4 l2, 22..30 = K4 l4.
+function pow3row(__j: Array<Float like Idx<31>>) -> Array<Float like Idx<3>> = {
+    let rec a: Array<Float like Idx<31>> =
+        match a with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m >= 1 && m < 6 then __j(m) * __j(m) else 0.0)
+    let rec b: Array<Float like Idx<31>> =
+        match b with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m >= 6 && m < 16 then __j(m) * __j(m) else 0.0)
+    let rec c: Array<Float like Idx<31>> =
+        match c with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m >= 22 then __j(m) * __j(m) else 0.0)
+    [reduce(a, (+)), reduce(b, (+)), reduce(c, (+))]
+}
+let canon_sc = pow3row(jm31s(__shsc, 6.0))
+canon_sc
+let canon_fcc = pow3row(jm31s(__shfcc, 12.0))
+canon_fcc
+let canon_bcc = pow3row(jm31s(__shbcc, 8.0))
+canon_bcc
+let canon_tet = pow3row(jm31s(__shtet, 4.0))
+canon_tet
+let canon_hcp = pow3row(jm31s(__shhcp, 12.0))
+canon_hcp
+let canon_ico = pow3row(jm31s(__shico, 12.0))
+canon_ico
+// The table's claims, as one pinned verdict. c4 = 8/35, so l4 = c4 * Q4^2
+// reproduces the published Steinhardt Q4 values for these shells exactly.
+function ind(a: Float, b: Float) -> Float = if a > b then 1.0 else 0.0
+let static T4SC = 0.13333333333333333
+let static T4FCC = 0.008333333333333333
+let static T4BT = 0.05925925925925926
+let static T3TET = 0.2222222222222222
+let static T3HCP = 0.0023148148148148147
+let canon_ok = [ind(0.000000000001, canon_sc(0) + canon_fcc(0) + canon_bcc(0) + canon_tet(0) + canon_hcp(0) + canon_ico(0)),
+                ind(0.000000000001, abs(canon_sc(2) - T4SC) + abs(canon_fcc(2) - T4FCC) + abs(canon_bcc(2) - T4BT)),
+                ind(0.000000000001, abs(canon_tet(2) - canon_bcc(2))),
+                ind(0.000000000001, abs(canon_tet(1) - T3TET) + canon_bcc(1) + canon_fcc(1) + canon_sc(1)),
+                ind(0.000000000001, abs(canon_hcp(1) - T3HCP)),
+                ind(0.000000000001, canon_ico(1) + canon_ico(2))]
+canon_ok
+// EXPECT: canon_ok = [1, 1, 1, 1, 1, 1]
+
+// %% [markdown]
+// ## The certified stacks, and what stays frozen
+//
+// One architecture, three input representations: a Schur-derived embed, two
+// Clebsch-Gordan blocks (`tensor_product` -> `gated` -> `linear`), and
+// `ml.norms` invariant channels out of every stage — twelve channels for the
+// K <= 2 and even rungs, eighteen for the full jet. As in the sibling
+// notebooks, the certified body is FROZEN at a seeded random point and only
+// the invariant readout trains: every channel is provably the right kind of
+// number, the readout is a convex least-squares problem, and what a rung's
+// representation cannot carry, no amount of training will fish out of it.
+// On THIS dataset that logic runs at full strength — the classes are
+// near-discrete points, so the interesting question is never "how well does
+// it fit" but "which points does this rung's representation merge".
+//
+// Every `where ml.equiv(O3)` clause below is one the compiler will verify —
+// and would have written itself (BL4011) had we left it off; the tetris
+// notebook makes a whole cell of that offer.
+
+// %%
+function embedA(x: Array<Float like IrrepsIdx<ISPEC2>>, we: Array<Float like Idx<WEA>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMBA>> =
+    ml.derive_linear(ISPEC2, EMBA, we, x)
+function embedB(x: Array<Float like IrrepsIdx<ISPEC24>>, we: Array<Float like Idx<WEB>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMBB>> =
+    ml.derive_linear(ISPEC24, EMBB, we, x)
+function embedC(x: Array<Float like IrrepsIdx<ISPEC34>>, we: Array<Float like Idx<WEC>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMBC>> =
+    ml.derive_linear(ISPEC34, EMBC, we, x)
+function eqblkA(x: Array<Float like IrrepsIdx<EMBA>>, wtp: Array<Float like Idx<WTA>>, wl: Array<Float like Idx<WLA>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMBA>> = {
+    let t = ml.tensor_product(CFGA, x, x, wtp)
+    let g = ml.gated(EMBA, t)
+    ml.linear(EMBA, EMBA, wl, g)
+}
+function eqblkB(x: Array<Float like IrrepsIdx<EMBB>>, wtp: Array<Float like Idx<WTB>>, wl: Array<Float like Idx<WLB>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMBB>> = {
+    let t = ml.tensor_product(CFGB, x, x, wtp)
+    let g = ml.gated(EMBB, t)
+    ml.linear(EMBB, EMBB, wl, g)
+}
+function eqblkC(x: Array<Float like IrrepsIdx<EMBC>>, wtp: Array<Float like Idx<WTC>>, wl: Array<Float like Idx<WLC>>)
+                where ml.equiv(O3) -> Array<Float like IrrepsIdx<EMBC>> = {
+    let t = ml.tensor_product(CFGC, x, x, wtp)
+    let g = ml.gated(EMBC, t)
+    ml.linear(EMBC, EMBC, wl, g)
+}
+
+// Frozen bodies: two seeded draws, sliced per rung (`rand.<family>` is legal
+// only as a bare top-level binding value, so the draws come first).
+let __nba = r.normal(20260828, 300)
+let __wa = 0.4 * __nba
+let __nbb = r.normal(8272028, 300)
+let __wb = 0.4 * __nbb
+function apick(base: Int, k: Int) -> Float = __wa(base + k)
+function bpick(base: Int, k: Int) -> Float = __wb(base + k)
+function aslice4(base: Int) -> Array<Float like Idx<4>> = {
+    let rec o: Array<Float like Idx<4>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: apick(base, k)
+    o
+}
+function aslice24(base: Int) -> Array<Float like Idx<24>> = {
+    let rec o: Array<Float like Idx<24>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: apick(base, k)
+    o
+}
+function aslice6(base: Int) -> Array<Float like Idx<6>> = {
+    let rec o: Array<Float like Idx<6>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: apick(base, k)
+    o
+}
+function aslice7(base: Int) -> Array<Float like Idx<7>> = {
+    let rec o: Array<Float like Idx<7>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: apick(base, k)
+    o
+}
+function aslice28(base: Int) -> Array<Float like Idx<28>> = {
+    let rec o: Array<Float like Idx<28>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: apick(base, k)
+    o
+}
+function bslice9(base: Int) -> Array<Float like Idx<9>> = {
+    let rec o: Array<Float like Idx<9>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice61(base: Int) -> Array<Float like Idx<61>> = {
+    let rec o: Array<Float like Idx<61>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+function bslice8(base: Int) -> Array<Float like Idx<8>> = {
+    let rec o: Array<Float like Idx<8>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: bpick(base, k)
+    o
+}
+// Rung A body: embed 4, tp 24, lin 6, tp 24, lin 6 (offsets 0/4/28/34/58).
+let __eAwe = aslice4(0)
+let __eAt1 = aslice24(4)
+let __eAl1 = aslice6(28)
+let __eAt2 = aslice24(34)
+let __eAl2 = aslice6(58)
+// Rung B body: embed 7, tp 28, lin 6, tp 28, lin 6 (offsets 64/71/99/105/133).
+let __eBwe = aslice7(64)
+let __eBt1 = aslice28(71)
+let __eBl1 = aslice6(99)
+let __eBt2 = aslice28(105)
+let __eBl2 = aslice6(133)
+// Rung C body, from the second draw: embed 9, tp 61, lin 8, tp 61, lin 8
+// (offsets 0/9/70/78/139).
+let __eCwe = bslice9(0)
+let __eCt1 = bslice61(9)
+let __eCl1 = bslice8(70)
+let __eCt2 = bslice61(78)
+let __eCl2 = bslice8(139)
+
+function chansA(x: Array<Float like IrrepsIdx<ISPEC2>>) where ml.equiv(O3) -> Array<Float like Idx<12>> = {
+    let e = embedA(x, __eAwe)
+    let b1 = eqblkA(e, __eAt1, __eAl1)
+    let b2 = eqblkA(b1, __eAt2, __eAl2)
+    let ne = ml.norms(EMBA, e)
+    let n1 = ml.norms(EMBA, b1)
+    let n2 = ml.norms(EMBA, b2)
+    [ne(0), ne(1), ne(2), ne(3), n1(0), n1(1), n1(2), n1(3), n2(0), n2(1), n2(2), n2(3)]
+}
+function chansB(x: Array<Float like IrrepsIdx<ISPEC24>>) where ml.equiv(O3) -> Array<Float like Idx<12>> = {
+    let e = embedB(x, __eBwe)
+    let b1 = eqblkB(e, __eBt1, __eBl1)
+    let b2 = eqblkB(b1, __eBt2, __eBl2)
+    let ne = ml.norms(EMBB, e)
+    let n1 = ml.norms(EMBB, b1)
+    let n2 = ml.norms(EMBB, b2)
+    [ne(0), ne(1), ne(2), ne(3), n1(0), n1(1), n1(2), n1(3), n2(0), n2(1), n2(2), n2(3)]
+}
+function chansC(x: Array<Float like IrrepsIdx<ISPEC34>>) where ml.equiv(O3) -> Array<Float like Idx<18>> = {
+    let e = embedC(x, __eCwe)
+    let b1 = eqblkC(e, __eCt1, __eCl1)
+    let b2 = eqblkC(b1, __eCt2, __eCl2)
+    let ne = ml.norms(EMBC, e)
+    let n1 = ml.norms(EMBC, b1)
+    let n2 = ml.norms(EMBC, b2)
+    [ne(0), ne(1), ne(2), ne(3), ne(4), ne(5), n1(0), n1(1), n1(2), n1(3), n1(4), n1(5),
+     n2(0), n2(1), n2(2), n2(3), n2(4), n2(5)]
+}
+// Elaboration probe: run each stack once here, so every ml.* kernel this
+// notebook needs exists before the expensive cells.
+let __exA: Array<Float like IrrepsIdx<ISPEC2>> = [1.0, 0.1, 0.2, 0.3, 0.1, 0.2, 0.3, 0.4, 0.5]
+let __exB: Array<Float like IrrepsIdx<ISPEC24>> = [1.0, 2.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+let __exC: Array<Float like IrrepsIdx<ISPEC34>> = [1.0, 2.0, 0.1, 0.2, 0.3, 0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+let elab_probe = [chansA(__exA)(0), chansB(__exB)(0), chansC(__exC)(0)]
+elab_probe
+
+// %% [markdown]
+// ## The featurization
+//
+// Per sample: the 31-slot jet (K2 ++ K3 ++ K4) of the stored unit-vector
+// shell — mean over the 12 padded points, divided by the true coordination
+// number — plus the K1 row (the plain mean vector). 1104 samples, 12 points,
+// three `derive_poly` orders per point; it runs once and every later cell
+// reads these tables out of the session memo. (All `ml.*` elaboration
+// happened above, on purpose.)
+
+// %%
+function jvtr(n: Int, k: Int) -> Array<Float like Idx<31>> = {
+    let v: Array<Float like IrrepsIdx<PT>> = [__ptr(n, k, 0), __ptr(n, k, 1), __ptr(n, k, 2)]
+    let d2 = ml.derive_poly(PT, 2, SK2, v, __w2)
+    let d3 = ml.derive_poly(PT, 3, SK3, v, __w3)
+    let d4 = ml.derive_poly(PT, 4, SK4, v, __w4)
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m < 6 then d2(m)
+                                    else (if m < 16 then d3(m - 6) else d4(m - 16)))
+    o
+}
+function jvte(n: Int, k: Int) -> Array<Float like Idx<31>> = {
+    let v: Array<Float like IrrepsIdx<PT>> = [__pte(n, k, 0), __pte(n, k, 1), __pte(n, k, 2)]
+    let d2 = ml.derive_poly(PT, 2, SK2, v, __w2)
+    let d3 = ml.derive_poly(PT, 3, SK3, v, __w3)
+    let d4 = ml.derive_poly(PT, 4, SK4, v, __w4)
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m < 6 then d2(m)
+                                    else (if m < 16 then d3(m - 6) else d4(m - 16)))
+    o
+}
+function jmtr(n: Int) -> Array<Float like Idx<31>> = {
+    let rec t: Array<Float like Idx<13>, Idx<31>> =
+        match t with
+        | zero -> zero
+        | zero :: q -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: q -> prefix :: (prefix(q - 1) + jvtr(n, q - 1))
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: t(12, m) / __cnftr(n)
+    o
+}
+function jmte(n: Int) -> Array<Float like Idx<31>> = {
+    let rec t: Array<Float like Idx<13>, Idx<31>> =
+        match t with
+        | zero -> zero
+        | zero :: q -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: q -> prefix :: (prefix(q - 1) + jvte(n, q - 1))
+    let rec o: Array<Float like Idx<31>> =
+        match o with
+        | zero -> zero
+        | prefix :: m -> prefix :: t(12, m) / __cnfte(n)
+    o
+}
+let __jtr = {
+    let rec h: Array<Float like Idx<829>, Idx<31>> =
+        match h with
+        | zero -> zero
+        | prefix :: n -> prefix :: jmtr(n)
+    h
+}
+let __jte = {
+    let rec h: Array<Float like Idx<275>, Idx<31>> =
+        match h with
+        | zero -> zero
+        | prefix :: n -> prefix :: jmte(n)
+    h
+}
+// K1 rows: the mean neighbour vector, in the same (y, z, x) order.
+function m1tr(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: __ptr(n, k, c)
+    reduce(a, (+)) / __cnftr(n)
+}
+function m1te(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: k -> prefix :: __pte(n, k, c)
+    reduce(a, (+)) / __cnfte(n)
+}
+let __m1tr = {
+    let rec t: Array<Float like Idx<829>, Idx<3>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: [m1tr(n, 0), m1tr(n, 1), m1tr(n, 2)]
+    t
+}
+let __m1te = {
+    let rec t: Array<Float like Idx<275>, Idx<3>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: [m1te(n, 0), m1te(n, 1), m1te(n, 2)]
+    t
+}
+let feat_probe = [__jtr(828, 0), __jte(274, 0)]
+feat_probe
+
+// %% [markdown]
+// ## Theorem 1: K <= 2 blindness, at machine zero, on experiment
+//
+// Every sample's K = 2 l = 2 power — recomputed here through `ml.derive_poly`
+// from the stored experimental shells — sits at the floating-point floor,
+// across all 1104 refinements. This is `matched_moments.bladenb`'s whitening
+// theorem with the generator deleted: **no preprocessing manufactured these
+// moments**. The only declared steps are geometric (take the first shell,
+// normalize to unit vectors), and then the site group does the rest — a
+// cubic site admits no invariant vector (K1 = 0) and no invariant rank-2
+// traceless tensor (the l = 2 block of ANY moment vanishes), for any refined
+// lattice parameter, by Neumann's principle. Nature runs the exactness device.
+//
+// The consequence is pinned in the same breath: the K <= 2 feature vector —
+// K1, K2 l0 (which unit normalization fixes at -1/sqrt(3) exactly), K2 l2 —
+// has an across-sample variance at the 1e-31 floor. Any model reading only
+// K <= 2 is a constant function on this dataset: four crystallographically
+// distinct coordination geometries, one indistinguishable feature vector.
+
+// %%
+function dmax(prev: Float, v: Float) -> Float = if v > prev then v else prev
+// Block powers per sample, from the jet tables (train slots then test slots).
+function powtr1(n: Int, w: Int) -> Float = {
+    let lo = if w == 0 then 1 else (if w == 1 then 6 else 22)
+    let hi = if w == 0 then 6 else (if w == 1 then 16 else 31)
+    let rec a: Array<Float like Idx<31>> =
+        match a with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m >= lo && m < hi then __jtr(n, m) * __jtr(n, m) else 0.0)
+    reduce(a, (+))
+}
+function powte1(n: Int, w: Int) -> Float = {
+    let lo = if w == 0 then 1 else (if w == 1 then 6 else 22)
+    let hi = if w == 0 then 6 else (if w == 1 then 16 else 31)
+    let rec a: Array<Float like Idx<31>> =
+        match a with
+        | zero -> zero
+        | prefix :: m -> prefix :: (if m >= lo && m < hi then __jte(n, m) * __jte(n, m) else 0.0)
+    reduce(a, (+))
+}
+let __p2tr = method_for(range<Idx<829>>) <@> lambda(n) -> powtr1(n, 0) |> compute
+let __p3tr = method_for(range<Idx<829>>) <@> lambda(n) -> powtr1(n, 1) |> compute
+let __p4tr = method_for(range<Idx<829>>) <@> lambda(n) -> powtr1(n, 2) |> compute
+let __p2te = method_for(range<Idx<275>>) <@> lambda(n) -> powte1(n, 0) |> compute
+let __p3te = method_for(range<Idx<275>>) <@> lambda(n) -> powte1(n, 1) |> compute
+let __p4te = method_for(range<Idx<275>>) <@> lambda(n) -> powte1(n, 2) |> compute
+let rec __l2mx: Array<Float like Idx<1104>> =
+    match __l2mx with
+    | zero -> zero
+    | zero :: s -> zero :: __p2tr(0)
+    | prefix :: s -> prefix :: dmax(prefix(s - 1), (if s < 829 then __p2tr(s) else __p2te(s - 829)))
+let l2_power_max = __l2mx(1103)
+l2_power_max
+let l2_over_1em12 = reduce(method_for(range<Idx<1104>>) <@> lambda(s) -> ind((if s < 829 then __p2tr(s) else __p2te(s - 829)), 0.000000000001) |> compute, (+))
+l2_over_1em12
+// EXPECT: l2_over_1em12 = 0
+
+// The K <= 2 feature vector's across-sample variance (9 slots: K2 l0, K1,
+// K2 l2), over all 1104 samples.
+function k2slot(s: Int, m: Int) -> Float = {
+    if m < 1 then (if s < 829 then __jtr(s, 0) else __jte(s - 829, 0))
+    else (if m < 4 then (if s < 829 then __m1tr(s, m - 1) else __m1te(s - 829, m - 1))
+    else (if s < 829 then __jtr(s, m - 3) else __jte(s - 829, m - 3)))
+}
+function slotvar(m: Int) -> Float = {
+    let rec a: Array<Float like Idx<1104>> =
+        match a with
+        | zero -> zero
+        | prefix :: s -> prefix :: k2slot(s, m)
+    let mu = reduce(a, (+)) / 1104.0
+    let rec d: Array<Float like Idx<1104>> =
+        match d with
+        | zero -> zero
+        | prefix :: s -> prefix :: (k2slot(s, m) - mu) * (k2slot(s, m) - mu)
+    reduce(d, (+)) / 1104.0
+}
+let __k2vars = method_for(range<Idx<9>>) <@> lambda(m) -> slotvar(m) |> compute
+let k2_var_over_1e24 = reduce(method_for(range<Idx<9>>) <@> lambda(m) -> ind(__k2vars(m), 0.000000000000000000000001) |> compute, (+))
+k2_var_over_1e24
+// EXPECT: k2_var_over_1e24 = 0
+let k2_var_total = reduce(__k2vars, (+))
+k2_var_total
+
+// %% [markdown]
+// ## Theorems 2 and 3: the classes land on the canonical points — and two of
+// ## them land on the SAME one
+//
+// Per-class mean l = 4 and K = 3 powers over the training split, set beside
+// the canonical table computed earlier in this notebook. sc, bcc and tet sit
+// on their targets to ~1e-16 — not approximately, at rounding — because
+// their shells are symmetry-forced orbits with no free parameter to be wrong
+// by. fcc alone carries a visible class deviation (its nine distorted
+// members, next cell). And the degeneracy is REAL IN NATURE:
+//
+// - |mean l4(bcc) - mean l4(tet)| at the 1e-16 floor — two crystal classes,
+//   300 + 255 experimental refinements, indistinguishable at every even
+//   order this compiler can compute;
+// - |mean K3(bcc) - mean K3(tet)| = 2/9 exactly — the odd moment is the
+//   ONLY separator, and it is not small.
+//
+// Theorem 4 rides in the same cell: the store carries each sample's powers
+// computed independently in F# (closed-form real spherical harmonics,
+// power_l = c_l Q_l^2). Two implementations, two bases, two authors — the
+// maximum disagreement across all 3 x 1104 numbers is pinned below 1e-12.
+
+// %%
+function clssum(c: Int, __v: Array<Float like Idx<829>>) -> Float = {
+    let rec t: Array<Float like SampTr> =
+        match t with
+        | zero -> zero
+        | prefix :: s -> prefix :: __ytr(s, c) * __v(s)
+    reduce(t, (+))
+}
+let __cnts4 = method_for(range<Idx<4>>) <@> lambda(c) -> ccount_tr(c) |> compute
+let class_mean_l4 = method_for(range<Idx<4>>) <@> lambda(c) -> clssum(c, __p4tr) / __cnts4(c) |> compute
+class_mean_l4
+let class_mean_k3 = method_for(range<Idx<4>>) <@> lambda(c) -> clssum(c, __p3tr) / __cnts4(c) |> compute
+class_mean_k3
+// Per-sample deviation from the class's canonical l4 point, both splits.
+let t4c = [T4SC, T4FCC, T4BT, T4BT]
+function tgt4tr(s: Int) -> Float = __ytr(s, 0) * t4c(0) + __ytr(s, 1) * t4c(1) + __ytr(s, 2) * t4c(2) + __ytr(s, 3) * t4c(3)
+function tgt4te(s: Int) -> Float = __yte(s, 0) * t4c(0) + __yte(s, 1) * t4c(1) + __yte(s, 2) * t4c(2) + __yte(s, 3) * t4c(3)
+type AllS = Idx<1104>
+let rec __dev4: Array<Float like AllS> =
+    match __dev4 with
+    | zero -> zero
+    | prefix :: s -> prefix :: (if s < 829 then abs(__p4tr(s) - tgt4tr(s)) else abs(__p4te(s - 829) - tgt4te(s - 829)))
+// Max deviation per class (train + test): the "spread 0" statement for the
+// symmetry-locked classes, the honest nonzero for fcc.
+function clsdev(c: Int) -> Float = {
+    let rec t: Array<Float like AllS> =
+        match t with
+        | zero -> zero
+        | zero :: s -> zero :: __ytr(0, c) * __dev4(0)
+        | prefix :: s -> prefix :: dmax(prefix(s - 1), (if s < 829 then __ytr(s, c) else __yte(s - 829, c)) * __dev4(s))
+    t(1103)
+}
+let class_l4_maxdev = method_for(range<Idx<4>>) <@> lambda(c) -> clsdev(c) |> compute
+class_l4_maxdev
+let locked_classes_on_target = [ind(0.0000000000001, clsdev(0)), ind(0.0000000000001, clsdev(2)), ind(0.0000000000001, clsdev(3)), ind(clsdev(1), 0.0001)]
+locked_classes_on_target
+// EXPECT: locked_classes_on_target = [1, 1, 1, 1]
+// The degeneracy, pinned.
+let bcc_tet_l4_gap = abs(class_mean_l4(2) - class_mean_l4(3))
+bcc_tet_l4_gap
+let bcc_tet_k3_gap = abs(class_mean_k3(2) - class_mean_k3(3))
+bcc_tet_k3_gap
+let degeneracy_ok = [ind(0.000000000001, bcc_tet_l4_gap), ind(0.000000000001, abs(bcc_tet_k3_gap - T3TET))]
+degeneracy_ok
+// EXPECT: degeneracy_ok = [1, 1]
+// Theorem 4: derive_poly vs the store's independent F# harmonics.
+let rec __dfmx: Array<Float like AllS> =
+    match __dfmx with
+    | zero -> zero
+    | zero :: s -> zero :: abs(__p2tr(0) - __powtr(0, 0))
+    | prefix :: s -> prefix :: dmax(prefix(s - 1),
+        (if s < 829 then dmax(dmax(abs(__p2tr(s) - __powtr(s, 0)), abs(__p3tr(s) - __powtr(s, 1))), abs(__p4tr(s) - __powtr(s, 2)))
+         else dmax(dmax(abs(__p2te(s - 829) - __powte(s - 829, 0)), abs(__p3te(s - 829) - __powte(s - 829, 1))), abs(__p4te(s - 829) - __powte(s - 829, 2)))))
+let differential_max = __dfmx(1103)
+differential_max
+let differential_ok = ind(0.000000000001, differential_max)
+differential_ok
+// EXPECT: differential_ok = 1
+
+// %% [markdown]
+// ## Theorem 5: the invariants do not move under rotation
+//
+// The store bakes 8 fresh Haar rotations from a seed no sample ever saw.
+// Every test shell is rotated in raw Cartesian coordinates, permuted to the
+// (y, z, x) feeding order, pushed through a freshly recomputed K = 4 jet —
+// and its l = 4 power is compared against the unrotated value. 2200
+// (sample, rotation) pairs; the maximum deviation is floating-point
+// re-association, nothing else.
+
+// %%
+function jrot15(s: Int, k: Int, rk: Int) -> Array<Float like Idx<15>> = {
+    let x = __cte(s, k, 0)
+    let y = __cte(s, k, 1)
+    let zz = __cte(s, k, 2)
+    let rx = __rot(rk, 0) * x + __rot(rk, 1) * y + __rot(rk, 2) * zz
+    let ry = __rot(rk, 3) * x + __rot(rk, 4) * y + __rot(rk, 5) * zz
+    let rz = __rot(rk, 6) * x + __rot(rk, 7) * y + __rot(rk, 8) * zz
+    let v: Array<Float like IrrepsIdx<PT>> = [ry, rz, rx]
+    ml.derive_poly(PT, 4, SK4, v, __w4)
+}
+function pow4rot(s: Int, rk: Int) -> Float = {
+    let rec t: Array<Float like Idx<13>, Idx<15>> =
+        match t with
+        | zero -> zero
+        | zero :: q -> zero :: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        | prefix :: q -> prefix :: (prefix(q - 1) + jrot15(s, q - 1, rk))
+    let rec a: Array<Float like Idx<9>> =
+        match a with
+        | zero -> zero
+        | prefix :: m -> prefix :: (t(12, m + 6) / __cnfte(s)) * (t(12, m + 6) / __cnfte(s))
+    reduce(a, (+))
+}
+function rotdev(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<8>> =
+        match t with
+        | zero -> zero
+        | zero :: rk -> zero :: abs(pow4rot(s, 0) - __p4te(s))
+        | prefix :: rk -> prefix :: dmax(prefix(rk - 1), abs(pow4rot(s, rk) - __p4te(s)))
+    t(7)
+}
+let rec __rdev: Array<Float like Idx<275>> =
+    match __rdev with
+    | zero -> zero
+    | zero :: s -> zero :: rotdev(0)
+    | prefix :: s -> prefix :: dmax(prefix(s - 1), rotdev(s))
+let rot_invariance_max = __rdev(274)
+rot_invariance_max
+let rot_invariance_ok = ind(0.000000000001, rot_invariance_max)
+rot_invariance_ok
+// EXPECT: rot_invariance_ok = 1
+
+// %% [markdown]
+// ## The nine exceptions: Neumann's principle made visible
+//
+// 1095 of 1104 stored shells are byte-ideal — their l = 4 power equals the
+// canonical rational EXACTLY, because their neighbour orbits are fully
+// symmetry-forced. The census below surfaces every sample whose l = 4 power
+// deviates measurably (> 1e-9): there are exactly nine, all fcc, all
+// perovskite A-sites, where free anion positional parameters bend the
+// 12-vertex cuboctahedron. Their COD ids print below — public database
+// entries anyone can pull up.
+//
+// The physics is in what moves and what does not. The distortion shows up
+// at l = 4 (up to +3.6% off 1/120) and leaks a small K3 (up to 0.0027) —
+// but the l = 2 power of those SAME distorted shells stays at 1e-31. The
+// A-site's point group survives the distortion, and a cubic site group
+// forces rank-2 isotropy exactly, whatever the free parameters do:
+// **experiment cannot deviate from what the site symmetry forbids, and it
+// deviates freely where the symmetry is silent.** That is Neumann's
+// principle, printed as nine rows of a public database.
+
+// %%
+let rec __codall: Array<Float like AllS> =
+    match __codall with
+    | zero -> zero
+    | prefix :: s -> prefix :: (if s < 829 then Float64(__codtr(s)) else Float64(__codte(s - 829)))
+let rec __k3all: Array<Float like AllS> =
+    match __k3all with
+    | zero -> zero
+    | prefix :: s -> prefix :: (if s < 829 then __p3tr(s) else __p3te(s - 829))
+let rec __l2all: Array<Float like AllS> =
+    match __l2all with
+    | zero -> zero
+    | prefix :: s -> prefix :: (if s < 829 then __p2tr(s) else __p2te(s - 829))
+let rec __fccall: Array<Float like AllS> =
+    match __fccall with
+    | zero -> zero
+    | prefix :: s -> prefix :: (if s < 829 then __ytr(s, 1) else __yte(s - 829, 1))
+let rec __cum: Array<Float like AllS> =
+    match __cum with
+    | zero -> zero
+    | zero :: s -> zero :: ind(__dev4(0), 0.000000001)
+    | prefix :: s -> prefix :: prefix(s - 1) + ind(__dev4(s), 0.000000001)
+let n_distorted = __cum(1103)
+n_distorted
+// EXPECT: n_distorted = 9
+// All nine are fcc.
+let rec __dfcc: Array<Float like AllS> =
+    match __dfcc with
+    | zero -> zero
+    | zero :: s -> zero :: ind(__dev4(0), 0.000000001) * __fccall(0)
+    | prefix :: s -> prefix :: prefix(s - 1) + ind(__dev4(s), 0.000000001) * __fccall(s)
+let n_distorted_fcc = __dfcc(1103)
+n_distorted_fcc
+// EXPECT: n_distorted_fcc = 9
+// Gather the k-th distorted sample's value of any per-sample column.
+function gath(k: Int, __src: Array<Float like AllS>) -> Float = {
+    let rec t: Array<Float like AllS> =
+        match t with
+        | zero -> zero
+        | prefix :: s -> prefix :: ind(__dev4(s), 0.000000001) * ind(__cum(s), Float64(k) + 0.5) * ind(Float64(k) + 1.5, __cum(s)) * __src(s)
+    reduce(t, (+))
+}
+let distorted_cod_ids = method_for(range<Idx<9>>) <@> lambda(k) -> gath(k, __codall) |> compute
+distorted_cod_ids
+// EXPECT: distorted_cod_ids = [1010195, 1527540, 1532705, 1541441, 1541552, 1543847, 2105525, 1535910, 2002328]
+let distorted_l4_dev = method_for(range<Idx<9>>) <@> lambda(k) -> gath(k, __dev4) |> compute
+distorted_l4_dev
+let distorted_k3 = method_for(range<Idx<9>>) <@> lambda(k) -> gath(k, __k3all) |> compute
+distorted_k3
+let distorted_l2 = method_for(range<Idx<9>>) <@> lambda(k) -> gath(k, __l2all) |> compute
+distorted_l2
+// What symmetry forbids stays forbidden: max l2 among the distorted nine.
+let rec __dl2m: Array<Float like AllS> =
+    match __dl2m with
+    | zero -> zero
+    | zero :: s -> zero :: ind(__dev4(0), 0.000000001) * __l2all(0)
+    | prefix :: s -> prefix :: dmax(prefix(s - 1), ind(__dev4(s), 0.000000001) * __l2all(s))
+let distorted_l2_max = __dl2m(1103)
+distorted_l2_max
+let neumann_ok = ind(0.000000000001, distorted_l2_max)
+neumann_ok
+// EXPECT: neumann_ok = 1
+
+// %% [markdown]
+// ## One refusal
+//
+// The l = 4 block of the jet is nine numbers, and reading the first of them
+// looks like reading any other array element. Under `where ml.equiv(O3)` it
+// is refused with BL4008 naming the read: those nine numbers are components
+// of a rank-4 tensor in a basis, and a rotation mixes them. Everything above
+// exited through `ml.norms` — the sanctioned invariant former — which is why
+// theorem 5 could pin invariance through the whole pipeline.
+// `examples/tetris_shapes.bladenb` runs the full deduction suite (six
+// refusals, a compiler-written clause); `examples/matched_moments.bladenb`
+// carries this same cell.
+//
+// **This cell fails on purpose.** A failing cell never joins the notebook
+// session, so nothing downstream is disturbed.
+
+// %%
+function leak(x: Array<Float like IrrepsIdx<ISPEC34>>) where ml.equiv(O3) -> Float =
+    x(XL4)
+
+// %% [markdown]
+// ## The prediction: confusion structure, before any training
+//
+// Three deliberately crippled models are about to train, and because the
+// classes are quantized points, their test behavior is predictable to the
+// sample. Rows are rungs; entries are predicted hits out of [46, 44, 100, 85]
+// per class:
+//
+// | rung | sc | fcc | bcc | tet | mechanism |
+// |---|---|---|---|---|---|
+// | K <= 2 | 0 | 0 | 100 | 0 | a constant function; biases learn the class priors; bcc (300/829) is the majority |
+// | K2 + K4 (even) | 46 | 44 | 100 | 0 | l = 4 separates sc / fcc / {bcc, tet}; **bcc and tet are the same point in even-invariant space**, and the shared winner is the larger prior — every tet sample is predicted bcc |
+// | + K3 | 46 | 44 | 100 | 85 | the odd moment splits the degenerate pair; the ladder completes |
+//
+// The K <= 2 row is worth a second look because its mechanism is BETTER than
+// the sibling notebook's: in `matched_moments.bladenb` the K <= 2 rung was
+// constant because a generator whitened every sample by hand. Here nothing
+// was whitened:
+// normalizing neighbours to unit vectors fixes the radial moment (K2 l0 =
+// -1/sqrt(3), every sample), and the site group kills K1 and the l = 2 block
+// outright — theorem 1. The constant model is a THEOREM ABOUT CRYSTALS, not
+// a preprocessing artifact. Its argmax is one fixed class for all 275 test
+// samples; least squares drives each bias toward its class frequency, so
+// the fixed class is bcc and the row scores exactly the majority count, 100.
+//
+// The even rung's row is the degeneracy weaponized: bcc and tet present
+// byte-identical invariant channels (their K4 jets are the SAME tensor —
+// a cube is a tetrahedron plus its inverse — merely re-rotated per sample,
+// and channels are rotation-invariant), so no readout can split them, and
+// both classes inherit the shared score. The predicted confusion is not
+// "tet does poorly"; it is **tet -> bcc: 85 out of 85, exactly.**
+//
+// Success bar, stated in advance: all three rows land exactly. With
+// quantized classes, any deviation is a bug or a finding — never noise.
+
+// %%
+// ---- rung K <= 2: the constant model ---------------------------------------
+// Feature rows in ISPEC2 order: K2 l0, K1 (y,z,x), K2 l2.
+function xA_tr(n: Int) -> Array<Float like IrrepsIdx<ISPEC2>> =
+    [__jtr(n, 0), __m1tr(n, 0), __m1tr(n, 1), __m1tr(n, 2),
+     __jtr(n, 1), __jtr(n, 2), __jtr(n, 3), __jtr(n, 4), __jtr(n, 5)]
+function xA_te(n: Int) -> Array<Float like IrrepsIdx<ISPEC2>> =
+    [__jte(n, 0), __m1te(n, 0), __m1te(n, 1), __m1te(n, 2),
+     __jte(n, 1), __jte(n, 2), __jte(n, 3), __jte(n, 4), __jte(n, 5)]
+let __eAtr = {
+    let rec t: Array<Float like Idx<829>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chansA(xA_tr(n))
+    t
+}
+let __eAte = {
+    let rec t: Array<Float like Idx<275>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chansA(xA_te(n))
+    t
+}
+function calmuA(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<829>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __eAtr(n, j)
+    reduce(a, (+)) / 829.0
+}
+function calsdA(j: Int) -> Float = {
+    let mu = calmuA(j)
+    let rec a: Array<Float like Idx<829>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__eAtr(n, j) - mu) * (__eAtr(n, j) - mu)
+    sqrt(reduce(a, (+)) / 829.0)
+}
+let __muA = method_for(range<Idx<12>>) <@> lambda(j) -> calmuA(j) |> compute
+let __scA = method_for(range<Idx<12>>) <@> lambda(j) -> (if calsdA(j) < 0.00000001 then 0.0 else 1.0 / calsdA(j)) |> compute
+// Theorem 1's accuracy consequence, in one number: how many of the twelve
+// channels survive calibration. Zero — every channel is constant across the
+// training split, because the input is.
+let live_channels_A = reduce(method_for(range<Idx<12>>) <@> lambda(j) -> ind(__scA(j), 0.0) |> compute, (+))
+live_channels_A
+// EXPECT: live_channels_A = 0
+function calrowAtr(n: Int) -> Array<Float like Idx<12>> = {
+    let rec o: Array<Float like Idx<12>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__eAtr(n, j) - __muA(j)) * __scA(j)
+    o
+}
+function calrowAte(n: Int) -> Array<Float like Idx<12>> = {
+    let rec o: Array<Float like Idx<12>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__eAte(n, j) - __muA(j)) * __scA(j)
+    o
+}
+let __cAtr = {
+    let rec t: Array<Float like Idx<829>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrowAtr(n)
+    t
+}
+let __cAte = {
+    let rec t: Array<Float like Idx<275>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrowAte(n)
+    t
+}
+let static NWA = 52
+let static NWAX2 = 104
+let static SWA = 105
+let static LR = 0.05
+let static MU = 0.9
+let static NSTEP = 120
+function scoreA(__s: Array<Float like Idx<SWA>>, n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __s(c * 12 + j) * __cAtr(n, j)
+    reduce(a, (+)) + __s(48 + c)
+}
+function sqeA(__s: Array<Float like Idx<SWA>>, n: Int) -> Float = {
+    let e0 = scoreA(__s, n, 0) - __ytr(n, 0)
+    let e1 = scoreA(__s, n, 1) - __ytr(n, 1)
+    let e2 = scoreA(__s, n, 2) - __ytr(n, 2)
+    let e3 = scoreA(__s, n, 3) - __ytr(n, 3)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3
+}
+// Mini-batches: the four interleaved quarters n = 4j + b (class-major layout
+// keeps them class-proportional); j runs to 207 with a mod-829 wrap so the
+// last training sample is not orphaned by 829 = 4 * 207 + 1.
+function lossA(__s: Array<Float like Idx<SWA>>, b: Int) -> Float = {
+    let rec errs: Array<Float like Idx<208>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sqeA(__s, (j * 4 + b) - (((j * 4 + b) / 829) * 829))
+    reduce(errs, (+)) / 208.0
+}
+function pickA(__s: Array<Float like Idx<SWA>>, base: Int, k: Int) -> Float = __s(base + k)
+function blkA(__s: Array<Float like Idx<SWA>>, base: Int) -> Array<Float like Idx<NWA>> = {
+    let rec o: Array<Float like Idx<52>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pickA(__s, base, k)
+    o
+}
+function catA(__wn: Array<Float like Idx<NWA>>, __vn: Array<Float like Idx<NWA>>, lv: Float, k: Int) -> Float =
+    if k < NWA then __wn(k) else (if k < NWAX2 then __vn(k - NWA) else lv)
+function stepA(s: Array<Float like Idx<SWA>>, b: Int) -> Array<Float like Idx<SWA>> = {
+    let mut ds = replicate(SWA, pure(0.0)) |> compute
+    let lv = ad.grad(lossA)(s, b, ds)
+    let vn = MU * blkA(s, NWA) - LR * blkA(ds, 0)
+    let wn = blkA(s, 0) + vn
+    let rec o: Array<Float like Idx<105>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: catA(wn, vn, lv, k)
+    o
+}
+let __rAn = r.normal(41461, SWA)
+let __sA0 = {
+    let rec m: Array<Float like Idx<SWA>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NWA then 0.1 * __rAn(k) else 0.0)
+    m
+}
+let __tjA = {
+    let rec t: Array<Float like Idx<121>, Idx<SWA>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __sA0
+        | prefix :: n -> prefix :: stepA(prefix(n - 1), (n - 1) - ((n - 1) / 4) * 4)
+    t
+}
+let __fA = __tjA(NSTEP)
+let lossA_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> __tjA(n + 1)(NWAX2) |> compute
+// The least-squares floor of a constant scorer is sum_c p_c (1 - p_c) =
+// 0.7198 at these class frequencies. The curve goes flat there almost
+// immediately: the descent has nothing to descend.
+let final_loss_A = __fA(NWAX2)
+final_loss_A
+
+// %%
+let __sax = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> Float64(n) |> compute
+let stream_kA = plot.stream("rung_k2", __sax, lossA_curve, 0: epoch,
+                            "rung K<=2 (the constant model): mini-batch loss": title,
+                            "step": xlabel, "one-vs-rest squared error": ylabel)
+stream_kA
+
+// %%
+// ---- rung K2 + K4: even orders only ----------------------------------------
+// ISPEC24 order: K2 l0, K4 l0, K2 l2, K4 l2, K4 l4.
+function xB_tr(n: Int) -> Array<Float like IrrepsIdx<ISPEC24>> =
+    [__jtr(n, 0), __jtr(n, 16),
+     __jtr(n, 1), __jtr(n, 2), __jtr(n, 3), __jtr(n, 4), __jtr(n, 5),
+     __jtr(n, 17), __jtr(n, 18), __jtr(n, 19), __jtr(n, 20), __jtr(n, 21),
+     __jtr(n, 22), __jtr(n, 23), __jtr(n, 24), __jtr(n, 25), __jtr(n, 26), __jtr(n, 27), __jtr(n, 28), __jtr(n, 29), __jtr(n, 30)]
+function xB_te(n: Int) -> Array<Float like IrrepsIdx<ISPEC24>> =
+    [__jte(n, 0), __jte(n, 16),
+     __jte(n, 1), __jte(n, 2), __jte(n, 3), __jte(n, 4), __jte(n, 5),
+     __jte(n, 17), __jte(n, 18), __jte(n, 19), __jte(n, 20), __jte(n, 21),
+     __jte(n, 22), __jte(n, 23), __jte(n, 24), __jte(n, 25), __jte(n, 26), __jte(n, 27), __jte(n, 28), __jte(n, 29), __jte(n, 30)]
+let __eBtr = {
+    let rec t: Array<Float like Idx<829>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chansB(xB_tr(n))
+    t
+}
+let __eBte = {
+    let rec t: Array<Float like Idx<275>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chansB(xB_te(n))
+    t
+}
+function calmuB(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<829>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __eBtr(n, j)
+    reduce(a, (+)) / 829.0
+}
+function calsdB(j: Int) -> Float = {
+    let mu = calmuB(j)
+    let rec a: Array<Float like Idx<829>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__eBtr(n, j) - mu) * (__eBtr(n, j) - mu)
+    sqrt(reduce(a, (+)) / 829.0)
+}
+let __muB = method_for(range<Idx<12>>) <@> lambda(j) -> calmuB(j) |> compute
+let __scB = method_for(range<Idx<12>>) <@> lambda(j) -> (if calsdB(j) < 0.00000001 then 0.0 else 1.0 / calsdB(j)) |> compute
+// This rung's channels are alive: the l = 4 block varies across classes.
+let live_channels_B = reduce(method_for(range<Idx<12>>) <@> lambda(j) -> ind(__scB(j), 0.0) |> compute, (+))
+live_channels_B
+function calrowBtr(n: Int) -> Array<Float like Idx<12>> = {
+    let rec o: Array<Float like Idx<12>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__eBtr(n, j) - __muB(j)) * __scB(j)
+    o
+}
+function calrowBte(n: Int) -> Array<Float like Idx<12>> = {
+    let rec o: Array<Float like Idx<12>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__eBte(n, j) - __muB(j)) * __scB(j)
+    o
+}
+let __cBtr = {
+    let rec t: Array<Float like Idx<829>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrowBtr(n)
+    t
+}
+let __cBte = {
+    let rec t: Array<Float like Idx<275>, Idx<12>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrowBte(n)
+    t
+}
+function scoreB(__s: Array<Float like Idx<SWA>>, n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __s(c * 12 + j) * __cBtr(n, j)
+    reduce(a, (+)) + __s(48 + c)
+}
+function sqeB(__s: Array<Float like Idx<SWA>>, n: Int) -> Float = {
+    let e0 = scoreB(__s, n, 0) - __ytr(n, 0)
+    let e1 = scoreB(__s, n, 1) - __ytr(n, 1)
+    let e2 = scoreB(__s, n, 2) - __ytr(n, 2)
+    let e3 = scoreB(__s, n, 3) - __ytr(n, 3)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3
+}
+function lossB(__s: Array<Float like Idx<SWA>>, b: Int) -> Float = {
+    let rec errs: Array<Float like Idx<208>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sqeB(__s, (j * 4 + b) - (((j * 4 + b) / 829) * 829))
+    reduce(errs, (+)) / 208.0
+}
+function stepB(s: Array<Float like Idx<SWA>>, b: Int) -> Array<Float like Idx<SWA>> = {
+    let mut ds = replicate(SWA, pure(0.0)) |> compute
+    let lv = ad.grad(lossB)(s, b, ds)
+    let vn = MU * blkA(s, NWA) - LR * blkA(ds, 0)
+    let wn = blkA(s, 0) + vn
+    let rec o: Array<Float like Idx<105>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: catA(wn, vn, lv, k)
+    o
+}
+let __rBn = r.normal(41462, SWA)
+let __sB0 = {
+    let rec m: Array<Float like Idx<SWA>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NWA then 0.1 * __rBn(k) else 0.0)
+    m
+}
+let __tjB = {
+    let rec t: Array<Float like Idx<121>, Idx<SWA>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __sB0
+        | prefix :: n -> prefix :: stepB(prefix(n - 1), (n - 1) - ((n - 1) / 4) * 4)
+    t
+}
+let __fB = __tjB(NSTEP)
+let lossB_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> __tjB(n + 1)(NWAX2) |> compute
+// This rung's floor is the degeneracy itself: on the merged {bcc, tet}
+// point the one-vs-rest optimum is the within-point class frequencies
+// (300/555 and 255/555), leaving (555/829) * 2 * (300/555)(255/555) =
+// 0.3325 that no amount of training can remove. The curve lands there.
+let final_loss_B = __fB(NWAX2)
+final_loss_B
+
+// %%
+let stream_kB = plot.stream("rung_k4", __sax, lossB_curve, 0: epoch,
+                            "rung K2+K4 (even orders): mini-batch loss": title,
+                            "step": xlabel, "one-vs-rest squared error": ylabel)
+stream_kB
+
+// %%
+// ---- rung + K3: the full jet ------------------------------------------------
+// ISPEC34 order: K2 l0, K4 l0, K3 l1, K2 l2, K4 l2, K3 l3, K4 l4.
+function xC_tr(n: Int) -> Array<Float like IrrepsIdx<ISPEC34>> =
+    [__jtr(n, 0), __jtr(n, 16),
+     __jtr(n, 6), __jtr(n, 7), __jtr(n, 8),
+     __jtr(n, 1), __jtr(n, 2), __jtr(n, 3), __jtr(n, 4), __jtr(n, 5),
+     __jtr(n, 17), __jtr(n, 18), __jtr(n, 19), __jtr(n, 20), __jtr(n, 21),
+     __jtr(n, 9), __jtr(n, 10), __jtr(n, 11), __jtr(n, 12), __jtr(n, 13), __jtr(n, 14), __jtr(n, 15),
+     __jtr(n, 22), __jtr(n, 23), __jtr(n, 24), __jtr(n, 25), __jtr(n, 26), __jtr(n, 27), __jtr(n, 28), __jtr(n, 29), __jtr(n, 30)]
+function xC_te(n: Int) -> Array<Float like IrrepsIdx<ISPEC34>> =
+    [__jte(n, 0), __jte(n, 16),
+     __jte(n, 6), __jte(n, 7), __jte(n, 8),
+     __jte(n, 1), __jte(n, 2), __jte(n, 3), __jte(n, 4), __jte(n, 5),
+     __jte(n, 17), __jte(n, 18), __jte(n, 19), __jte(n, 20), __jte(n, 21),
+     __jte(n, 9), __jte(n, 10), __jte(n, 11), __jte(n, 12), __jte(n, 13), __jte(n, 14), __jte(n, 15),
+     __jte(n, 22), __jte(n, 23), __jte(n, 24), __jte(n, 25), __jte(n, 26), __jte(n, 27), __jte(n, 28), __jte(n, 29), __jte(n, 30)]
+let __eCtr = {
+    let rec t: Array<Float like Idx<829>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chansC(xC_tr(n))
+    t
+}
+let __eCte = {
+    let rec t: Array<Float like Idx<275>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: chansC(xC_te(n))
+    t
+}
+function calmuC(j: Int) -> Float = {
+    let rec a: Array<Float like Idx<829>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: __eCtr(n, j)
+    reduce(a, (+)) / 829.0
+}
+function calsdC(j: Int) -> Float = {
+    let mu = calmuC(j)
+    let rec a: Array<Float like Idx<829>> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: (__eCtr(n, j) - mu) * (__eCtr(n, j) - mu)
+    sqrt(reduce(a, (+)) / 829.0)
+}
+let __muC = method_for(range<Idx<18>>) <@> lambda(j) -> calmuC(j) |> compute
+let __scC = method_for(range<Idx<18>>) <@> lambda(j) -> (if calsdC(j) < 0.00000001 then 0.0 else 1.0 / calsdC(j)) |> compute
+let live_channels_C = reduce(method_for(range<Idx<18>>) <@> lambda(j) -> ind(__scC(j), 0.0) |> compute, (+))
+live_channels_C
+function calrowCtr(n: Int) -> Array<Float like Idx<18>> = {
+    let rec o: Array<Float like Idx<18>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__eCtr(n, j) - __muC(j)) * __scC(j)
+    o
+}
+function calrowCte(n: Int) -> Array<Float like Idx<18>> = {
+    let rec o: Array<Float like Idx<18>> =
+        match o with
+        | zero -> zero
+        | prefix :: j -> prefix :: (__eCte(n, j) - __muC(j)) * __scC(j)
+    o
+}
+let __cCtr = {
+    let rec t: Array<Float like Idx<829>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrowCtr(n)
+    t
+}
+let __cCte = {
+    let rec t: Array<Float like Idx<275>, Idx<18>> =
+        match t with
+        | zero -> zero
+        | prefix :: n -> prefix :: calrowCte(n)
+    t
+}
+let static NWC = 76
+let static NWCX2 = 152
+let static SWC = 153
+function scoreC(__s: Array<Float like Idx<SWC>>, n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<18>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __s(c * 18 + j) * __cCtr(n, j)
+    reduce(a, (+)) + __s(72 + c)
+}
+function sqeC(__s: Array<Float like Idx<SWC>>, n: Int) -> Float = {
+    let e0 = scoreC(__s, n, 0) - __ytr(n, 0)
+    let e1 = scoreC(__s, n, 1) - __ytr(n, 1)
+    let e2 = scoreC(__s, n, 2) - __ytr(n, 2)
+    let e3 = scoreC(__s, n, 3) - __ytr(n, 3)
+    e0 * e0 + e1 * e1 + e2 * e2 + e3 * e3
+}
+function lossC(__s: Array<Float like Idx<SWC>>, b: Int) -> Float = {
+    let rec errs: Array<Float like Idx<208>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sqeC(__s, (j * 4 + b) - (((j * 4 + b) / 829) * 829))
+    reduce(errs, (+)) / 208.0
+}
+function pickC(__s: Array<Float like Idx<SWC>>, base: Int, k: Int) -> Float = __s(base + k)
+function blkC(__s: Array<Float like Idx<SWC>>, base: Int) -> Array<Float like Idx<NWC>> = {
+    let rec o: Array<Float like Idx<76>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: pickC(__s, base, k)
+    o
+}
+function catC(__wn: Array<Float like Idx<NWC>>, __vn: Array<Float like Idx<NWC>>, lv: Float, k: Int) -> Float =
+    if k < NWC then __wn(k) else (if k < NWCX2 then __vn(k - NWC) else lv)
+function stepC(s: Array<Float like Idx<SWC>>, b: Int) -> Array<Float like Idx<SWC>> = {
+    let mut ds = replicate(SWC, pure(0.0)) |> compute
+    let lv = ad.grad(lossC)(s, b, ds)
+    let vn = MU * blkC(s, NWC) - LR * blkC(ds, 0)
+    let wn = blkC(s, 0) + vn
+    let rec o: Array<Float like Idx<153>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: catC(wn, vn, lv, k)
+    o
+}
+let __rCn = r.normal(41463, SWC)
+let __sC0 = {
+    let rec m: Array<Float like Idx<SWC>> =
+        match m with
+        | zero -> zero
+        | prefix :: k -> prefix :: (if k < NWC then 0.1 * __rCn(k) else 0.0)
+    m
+}
+let __tjC = {
+    let rec t: Array<Float like Idx<121>, Idx<SWC>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __sC0
+        | prefix :: n -> prefix :: stepC(prefix(n - 1), (n - 1) - ((n - 1) / 4) * 4)
+    t
+}
+let __fC = __tjC(NSTEP)
+let lossC_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> __tjC(n + 1)(NWCX2) |> compute
+let final_loss_C = __fC(NWCX2)
+final_loss_C
+
+// %%
+let stream_kC = plot.stream("rung_k34", __sax, lossC_curve, 0: epoch,
+                            "rung +K3 (the full jet): mini-batch loss": title,
+                            "step": xlabel, "one-vs-rest squared error": ylabel)
+let plot_rungs = plot.line(__sax, lossC_curve,
+                           "rung +K3: mini-batch loss": title,
+                           "step": xlabel, "one-vs-rest squared error": ylabel)
+plot_rungs
+
+// %% [markdown]
+// ## The measured matrix
+//
+// Per rung, per class: test hits — a strict argmax agreeing with the label —
+// out of [46, 44, 100, 85]. This is the table the prediction cell committed
+// to; every row is pinned at its predicted integers.
+
+// %%
+function hit(sc0: Float, sc1: Float, sc2: Float, sc3: Float, __yr: Array<Float like Klass>) -> Float = {
+    let st = sc0 * __yr(0) + sc1 * __yr(1) + sc2 * __yr(2) + sc3 * __yr(3)
+    let ng = ind(sc0, st) + ind(sc1, st) + ind(sc2, st) + ind(sc3, st)
+    if ng < 0.5 then 1.0 else 0.0
+}
+function tescoreA(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __fA(c * 12 + j) * __cAte(n, j)
+    reduce(a, (+)) + __fA(48 + c)
+}
+function tescoreB(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<12>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __fB(c * 12 + j) * __cBte(n, j)
+    reduce(a, (+)) + __fB(48 + c)
+}
+function tescoreC(n: Int, c: Int) -> Float = {
+    let rec a: Array<Float like Idx<18>> =
+        match a with
+        | zero -> zero
+        | prefix :: j -> prefix :: __fC(c * 18 + j) * __cCte(n, j)
+    reduce(a, (+)) + __fC(72 + c)
+}
+function hit_of(rung: Int, n: Int) -> Float = {
+    if rung == 0 then hit(tescoreA(n, 0), tescoreA(n, 1), tescoreA(n, 2), tescoreA(n, 3), __yte(n))
+    else (if rung == 1 then hit(tescoreB(n, 0), tescoreB(n, 1), tescoreB(n, 2), tescoreB(n, 3), __yte(n))
+    else hit(tescoreC(n, 0), tescoreC(n, 1), tescoreC(n, 2), tescoreC(n, 3), __yte(n)))
+}
+function cls_hits(rung: Int, c: Int) -> Float = {
+    let rec a: Array<Float like SampTe> =
+        match a with
+        | zero -> zero
+        | prefix :: n -> prefix :: hit_of(rung, n) * __yte(n, c)
+    reduce(a, (+))
+}
+let matrix_A = method_for(range<Idx<4>>) <@> lambda(c) -> cls_hits(0, c) |> compute
+matrix_A
+// EXPECT: matrix_A = [0, 0, 100, 0]
+let matrix_B = method_for(range<Idx<4>>) <@> lambda(c) -> cls_hits(1, c) |> compute
+matrix_B
+// EXPECT: matrix_B = [46, 44, 100, 0]
+let matrix_C = method_for(range<Idx<4>>) <@> lambda(c) -> cls_hits(2, c) |> compute
+matrix_C
+// EXPECT: matrix_C = [46, 44, 100, 85]
+let rung_totals = [reduce(matrix_A, (+)), reduce(matrix_B, (+)), reduce(matrix_C, (+))]
+rung_totals
+// EXPECT: rung_totals = [100, 190, 275]
+// The even rung's confusion, isolated: every tet test sample lands on bcc.
+function tet_as_bcc(n: Int) -> Float = {
+    let s2 = tescoreB(n, 2)
+    let m0 = ind(s2, tescoreB(n, 0)) * ind(s2, tescoreB(n, 1)) * ind(s2, tescoreB(n, 3))
+    m0 * __yte(n, 3)
+}
+let rec __tb: Array<Float like SampTe> =
+    match __tb with
+    | zero -> zero
+    | zero :: n -> zero :: tet_as_bcc(0)
+    | prefix :: n -> prefix :: prefix(n - 1) + tet_as_bcc(n)
+let tet_predicted_bcc = __tb(274)
+tet_predicted_bcc
+// EXPECT: tet_predicted_bcc = 85
+
+// %% [markdown]
+// ## What cubic COD cannot contain
+//
+// Two absences in the yield census are as load-bearing as the four presences.
+// The geometry matcher carried hcp and icosahedral rows in its canonical
+// table, and across all 1109 accepted shells they matched **zero** samples —
+// exactly as the space groups dictate: an anticuboctahedral first shell
+// needs hexagonal stacking, and no cubic space group can produce one; an
+// icosahedral shell is incompatible with any crystallographic translation
+// lattice at all. The absence of evidence here IS evidence — the search was
+// constrained to space groups 216-229, and the data obeyed.
+//
+// The icosahedral row of the canonical table is also this compiler's honest
+// resolution boundary, measured: every one of its jet invariants through
+// K = 4 is machine zero (`canon_ico` above), because icosahedral symmetry
+// admits no invariant between l = 1 and l = 6 — and `ml.derive_poly` caps K
+// at 4 (BL5000). A quasicrystal's local order, or icosahedral clusters in a
+// supercooled liquid, would be INVISIBLE to every certified jet this
+// notebook can form. The cap is not an apology; it is a statement of which
+// physics this type system can currently see, with a symmetry class
+// attached.
+
+// %% [markdown]
+// ## What this notebook adds — and what it does not claim
+//
+// Added, on top of the matched-moment control experiment (`matched_moments.bladenb`):
+//
+// - **The theorem survives contact with experiment.** K <= 2 blindness at
+//   the 1e-31 floor on 1104 real refinements, with no exactness device in
+//   the pipeline — the site group is the device (theorem 1); the compiler's
+//   jets agreeing with an independent F# implementation to ~1e-16 (theorem
+//   4) and holding under fresh rotations (theorem 5).
+// - **The degeneracy exists in nature.** bcc and tetrahedral first shells —
+//   555 experimental samples — are the same point in even-invariant space to
+//   1e-16, split only by the parity-odd K3 = 2/9 (theorem 3). The even rung
+//   measured that theorem as a confusion matrix: 85 out of 85 tet samples
+//   predicted bcc, exactly as written in the prediction cell.
+// - **Neumann's principle, printed.** Nine distorted perovskite A-sites that
+//   move at l = 4, leak at K3, and stay pinned at l = 2 — deviation exactly
+//   where symmetry is silent, none where it forbids.
+// - **The census.** Disorder removes 55% of cubic COD before any science
+//   happens; hcp and icosahedral order match zero cubic entries.
+//
+// Not claimed: learning. The classes are quantized by site symmetry, so
+// classification here is a lookup and its accuracy is trivial — the ladder's
+// content is WHICH mergers each representation is forced to make, and the
+// measured matrices landed on the predicted integers, 100 / 190 / 275.
+// The honest next dataset is one where the shells are genuinely noisy —
+// liquids, glasses, MD trajectories of supercooled melts — where the same
+// certified invariants become statistics rather than lookups, accuracy
+// becomes a real claim, and the K <= 4 boundary (no l = 6, no icosahedral
+// channel) becomes a live experimental constraint. This notebook is the
+// exactness anchor that build would cite.

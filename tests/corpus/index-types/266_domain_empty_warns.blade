@@ -1,0 +1,15 @@
+// TEST: Enumerable Domain: An Empty Domain Warns And Iterates Zero Times
+// WARN: BL4010
+// The projection detects infeasibility at planning time (i - j <= -20 over
+// 0..8 admits nothing): the domain has no cells, the loop runs zero times,
+// and the advisory says so rather than leaving a silent no-op.
+static struct Empty {
+    i: Int<min=0, max=8>,
+    j: Int<min=0, max=8>
+} where i - j <= -20
+
+let static CARD = idx_card(Empty)
+// EXPECT: CARD = 0
+let R = method_for(range<Empty>) <@> lambda(i, j) -> i + j |> compute
+let n = reduce(R, (+), 0)
+// EXPECT: n = 0

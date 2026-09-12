@@ -165,7 +165,7 @@ let private equivStamp (group: string) (fd: FunctionDecl) : FunctionDecl =
         | Some w -> { w with Custom = w.Custom @ [ conj ] }
         | None ->
             { Commutativity = []; Antisymmetry = []; Parallel = []
-              TDims = []; Custom = [ conj ] }
+              Repro = false; TDims = []; Custom = [ conj ] }
     { fd with WhereClause = Some wc }
 
 /// The strongest group admitted by a spec's l = 0 content, for the two
@@ -1790,9 +1790,10 @@ let rec private rewriteExpr (st: ElabState) (statics: StaticEnv) (aliases: Set<s
     // checker as an unbound variable.
     | ExprKind.ExprRecArray def ->
         rOpt (def.SeedArm |> Option.map snd) |> Result.bind (fun seedE ->
+        rOpt def.Guard |> Result.bind (fun guardE ->
         r def.SliceExpr |> Result.map (fun slice' ->
             let seed' = Option.map2 (fun (sv, _) se -> (sv, se)) def.SeedArm seedE
-            inheritSpan e (ExprRecArray { def with SeedArm = seed'; SliceExpr = slice' })))
+            inheritSpan e (ExprRecArray { def with SeedArm = seed'; SliceExpr = slice'; Guard = guardE }))))
     // The rest of the expression algebra. Every constructor holding a
     // sub-expression is walked, and the catch-all wildcard is deliberately
     // GONE: an unhandled case is an FS0025 incomplete-match warning at build
@@ -1810,7 +1811,6 @@ let rec private rewriteExpr (st: ElabState) (statics: StaticEnv) (aliases: Set<s
     | ExprKind.ExprPartialApp (op, inner, isLeft) -> r inner |> Result.map (fun i -> inheritSpan e (ExprPartialApp (op, i, isLeft)))
     | ExprKind.ExprTranspose (a, d1, d2) -> r a |> Result.map (fun a' -> inheritSpan e (ExprTranspose (a', d1, d2)))
     | ExprKind.ExprDecompact (a, d) -> r a |> Result.map (fun a' -> inheritSpan e (ExprDecompact (a', d)))
-    | ExprKind.ExprBlocked (t, inner) -> r inner |> Result.map (fun i -> inheritSpan e (ExprBlocked (t, i)))
     | ExprKind.ExprHalo (t, offs) -> r offs |> Result.map (fun o -> inheritSpan e (ExprHalo (t, o)))
     | ExprKind.ExprMethodFor es -> rList es |> Result.map (fun es' -> inheritSpan e (ExprMethodFor es'))
     | ExprKind.ExprZip es -> rList es |> Result.map (fun es' -> inheritSpan e (ExprZip es'))
@@ -1844,6 +1844,8 @@ let rec private rewriteExpr (st: ElabState) (statics: StaticEnv) (aliases: Set<s
         r a |> Result.bind (fun a' -> r k |> Result.map (fun k' -> inheritSpan e (ExprSort (a', k'))))
     | ExprKind.ExprGram (l, rr) ->
         r l |> Result.bind (fun l' -> r rr |> Result.map (fun r' -> inheritSpan e (ExprGram (l', r'))))
+    | ExprKind.ExprGramApply (l, rr, x) ->
+        r l |> Result.bind (fun l' -> r rr |> Result.bind (fun r' -> r x |> Result.map (fun x' -> inheritSpan e (ExprGramApply (l', r', x')))))
     | ExprKind.ExprReduce (a, k, init, ax) ->
         r a |> Result.bind (fun a' ->
         r k |> Result.bind (fun k' ->
@@ -1921,9 +1923,9 @@ let private expandModule (decls: Located<Decl> list) : Result<Located<Decl> list
                 | _ -> d)
         let st = { Counter = 0; Made = Map.empty; Decls = []; SigmoidName = None }
         let emptyStatics : StaticEnv =
-            { Values = Map.empty; Functions = Map.empty
+            { Values = Map.empty; Globals = Map.empty; Functions = Map.empty
               CalledFunctions = ref Set.empty; ProviderRoots = Map.empty
-              Structs = Map.empty }
+              Structs = Map.empty; Segments = Map.empty }
         // Run rewriteExpr over every expression-bearing decl.
         let mapDecls (statics: StaticEnv) (opsEnabled: bool) (ds: Located<Decl> list) =
             ds |> List.fold (fun acc d ->

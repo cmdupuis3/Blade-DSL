@@ -1,0 +1,18 @@
+// TEST: While Guard Budget Exhausted Aborts (aborts)
+// ============================================================================
+// A `while` guard that never goes false within the declared extent is a
+// RUNTIME ABORT, not a silent freeze: a solve that did not converge cannot
+// pretend it did (plan-match-statements.md 3). The doubling recurrence
+// stays below the threshold for all 8 budgeted steps, so the guard is
+// still true when the budget runs out and BL8010 names the array and
+// the budget.
+// ============================================================================
+type It = Idx<8>
+let rec y: Array<Float like It> =
+    match y with
+    | zero -> zero
+    | zero :: s -> zero :: 1.0
+    | prefix :: n while prefix(n - 1) < 1000000.0 -> prefix :: prefix(n - 1) * 2.0
+let out = y((7 : It))
+out
+// ABORT: error[BL8010]

@@ -1,0 +1,11 @@
+// TEST: While Loop Steer (rejects)
+// ============================================================================
+// `while` is not a keyword (a program may bind the name), so an imperative
+// `while cond { ... }` dies as an unbound variable -- which now carries the
+// declarative-iteration steer instead of a bare name error. Fired at the
+// unbound-variable site, so a genuinely bound `while` never trips it.
+
+let mut s = 0
+while s < 10 { s += 1 }
+// ERROR: BL2001
+// ERROR-CONTAINS: Blade has no imperative loops

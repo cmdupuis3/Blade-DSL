@@ -1,0 +1,158 @@
+// %% [markdown]
+// # Versioned weather: an Icechunk repo, four refs, one type system
+//
+// [Icechunk](https://icechunk.io) is a transactional storage engine over
+// Zarr: a repo of **immutable snapshots** with git-like branches and tags,
+// and exactly one mutable file (the ref table). This notebook reads one —
+// `examples/data/station_temps.icechunk`, a small station-temperature grid
+// written by `examples/tools/make_station_icechunk.fsx` — through Blade's
+// icechunk provider.
+//
+// What Blade does differently with a versioned store:
+//
+// - **Everything resolves at compile time.** A checkout pins ref → snapshot
+//   → manifests → per-chunk byte ranges while the program compiles; the
+//   generated executable does raw offset reads with no Icechunk logic in it
+//   at all. Immutability is what makes that sound.
+// - **Provenance is exact.** Compile-time folds print the snapshot id their
+//   bytes came from — not a file hash, the actual commit identity.
+// - **Refusals are features.** Two checkouts may only mix where their axes
+//   are provably the same axis; anything else refuses at compile time.
+//
+// The repo's history is authored for the story: tag `v1.0` is the raw
+// ingest, with a +1.5 K warm bias in the eastern third of the domain;
+// branch `main` is the bias-correction commit — a *data-only* change whose
+// coordinate arrays are byte-identical to v1.0's; branch `regrid` rewrites
+// the latitude axis at twice the resolution; and `release` exists as both
+// a branch *and* a tag, deliberately.
+//
+// %%
+import icechunk as ic
+
+// The path is relative to THIS FILE: a notebook cell evaluates with the
+// notebook's own directory as its working directory.
+// Running the same code as a plain .blade from the repo root instead wants
+// `examples/data/station_temps.icechunk`.
+let repo = ic.load("data/station_temps.icechunk")
+
+// %% [markdown]
+// `repo` is a **repo handle** — it has no variables, because "the data" is
+// not a meaningful notion until a ref says *which* data. `checkout` is the
+// factory: give it a branch, tag, or snapshot id, and the result is a typed
+// store whose dims and vars come from that snapshot's metadata.
+//
+// %%
+let now = repo.checkout("main")
+let temp_now = now.vars.temp |> ic.read
+let mean_now = reduce(temp_now, (+), axes = 3) / 2880.0
+mean_now
+
+// %% [markdown]
+// A compile-time fold announces exactly which commit fed it: watch the
+// `[provenance] folded ... snapshot ...` line — that is the snapshot id,
+// straight from the ref resolution, not a checksum.
+//
+// Note what a folded array *is*. `let static` asks for a value the compiler
+// can hold, and the compile-time value language has no array carrier, so the
+// cells arrive as a structural **tuple** -- the staging model, not a quirk of
+// this provider. The array path is the plain `|> ic.read` above. So fold small
+// things: this two-cell latitude-bounds pair reads nicely, where folding the
+// field itself would hand back a 2880-element tuple.
+//
+// %%
+let static lat_span = ic.read(now.vars.lat_bounds)
+lat_span
+
+// %% [markdown]
+// Branches and tags are **separate namespaces** in Icechunk, so a bare name
+// resolves only while it is unique. The provider module ships three
+// unit-typed markers — `ic.branch`, `ic.tag`, `ic.snapshot` — and
+// `checkout` dispatches on the marker's *unit*: same method, three
+// namespaces, disambiguated by type rather than by string prefixes.
+//
+// %%
+let v1 = repo.checkout("v1.0", ic.tag)
+let temp_v1 = v1.vars.temp |> ic.read
+
+// %% [markdown]
+// ## The headline: arithmetic across checkouts
+//
+// `temp_now` and `temp_v1` come from **different commits** — yet subtracting
+// them typechecks. That is not a loophole; it is a proof obligation the
+// compiler discharged from metadata alone: between the two snapshots, the
+// `time`/`lat`/`lon` coordinate arrays have the same stable node ids, the
+// same metadata bytes, and the same chunk tables — no diff — so each axis
+// is *the same axis*, and the two arrays share its index type. Only the
+// data changed, which is exactly what the subtraction is for.
+//
+// The bias band is 4 of 12 longitudes at +1.5 K, so the mean drift is
+// −0.5 K exactly.
+//
+// %%
+let drift = temp_now - temp_v1
+let mean_drift = reduce(drift, (+), axes = 3) / 2880.0
+mean_drift
+// EXPECT: mean_drift = -0.5
+
+// %% [markdown]
+// A tag can move only by deliberate re-tagging; a snapshot id can never
+// move — the id *is* a truncated hash of the snapshot's own contents, so
+// the same twenty characters can never be handed to a different dataset.
+// Pinning one makes a program bit-exactly reproducible — the compiled
+// binary reads those chunks or fails loudly, forever.
+//
+// %%
+let pinned = repo.checkout("9ZDMT4JXK0A92JRXYXRG", ic.snapshot)
+let temp_pin = pinned.vars.temp |> ic.read
+reduce(temp_pin - temp_v1, (+), axes = 3)
+// EXPECT: 0 exactly -- the tag v1.0 points at this very snapshot
+
+// %% [markdown]
+// ## Refusal one: the regridded branch
+//
+// `regrid` rewrote the latitude axis at twice the resolution. Its `temp` is
+// a perfectly good array — but its lat axis is *not the same axis* as
+// `main`'s, so mixing them refuses at compile time. **This cell fails on
+// purpose**: the point is the error, an index-type mismatch naming the two
+// incompatible axes, instead of a silently wrong broadcast.
+//
+// %%
+let rg = repo.checkout("regrid")
+let bad = (rg.vars.temp |> ic.read) - temp_now
+
+// %% [markdown]
+// ## Refusal two: the ambiguous name
+//
+// `release` names a branch *and* a tag — legal in Icechunk, since the two
+// are separate namespaces. A bare checkout refuses rather than guess.
+// **This cell fails on purpose**; the message names both candidates and the
+// marker spellings that resolve them.
+//
+// %%
+let rel = repo.checkout("release")
+
+// %% [markdown]
+// The remedy is the marker — and the tag `release` turns out to be the raw
+// snapshot again:
+//
+// %%
+let rel_tag = repo.checkout("release", ic.tag)
+let rel_temp = rel_tag.vars.temp |> ic.read
+reduce(rel_temp - temp_v1, (+), axes = 3)
+// EXPECT: 0 exactly -- tag release = v1.0's snapshot
+
+// %% [markdown]
+// ## What just happened
+//
+// Four refs, one type system: `main` and `v1.0` interoperate because their
+// axes carry no diff; `regrid` refuses because its axis genuinely diverged;
+// the ambiguous `release` refuses until a unit marker names its namespace;
+// and the pinned snapshot will read identically for as long as the commit
+// exists. Every one of those decisions was made at compile time, from
+// metadata alone — the running program only ever executed straight-line
+// chunk reads.
+//
+// To poke at the store itself, regenerate it with
+// `dotnet fsi examples/tools/make_station_icechunk.fsx` and try rewriting
+// a coordinate array in one snapshot: the headline cell above will refuse,
+// and it will tell you which axis diverged.

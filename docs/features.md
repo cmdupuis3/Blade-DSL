@@ -11,6 +11,7 @@ in [formalism.md](formalism.md) and the per-module feature docs.
 |---------|-------|--------|---------------------|
 | Base numeric types | `Int32/Int64/Float32/Float64/`<br>`Complex64/Complex128` | Core | Double-check for exhaustiveness |
 | Explicit numeric casts | `Float32(x)`, `Float64(extents(a))`,<br>`Int64(floor(x))`, `Complex128(r)` | Core | Scalar type name in call position; shadowable plain-call intrinsic. Complex→real refuses (BL3019: project with `real`/`imag`/`abs`/`arg`); float→int only through a floor/ceil visible at the cast site. Arrays lift elementwise. Implicit mixed-type promotion of a non-literal operand warns BL3020 |
+| Fused multiply-add | `fma(a, b, c)` | Core | `a*b + c` rounded ONCE; Float64 scalars; shadowable plain-call intrinsic. Its own IR node, so it is bit-identical across the compiled, interpreted and LLVM lanes under any `BLADE_FP_CONTRACT` (unlike `a*b + c`). The building block of error-free transformations / double-double arithmetic. AD: partials b, a, 1 |
 | Type variables | `A -> B -> ...` | Core | Same letter = same type in a signature |
 | Complex conjugates | `conj(x)` | Core |  |
 | Units of measure | `Unit meters`, `Float<velocity>`,<br> unit arithmetic | Core | Annotations on primitive types only |
@@ -76,6 +77,7 @@ in [formalism.md](formalism.md) and the per-module feature docs.
 | Ragged index type | `RaggedIdx<lengths>` | Core |  |
 | Dependent index type | `DepIdx<I, f: Nat -> Idx<N>>` | Core |  Static function `f` maps each index of `I` to a new `Idx` |
 | Equivariant index type | `EquivIdx<n, G, ρ>` | Planned? | group-representation-annotated indices |
+| Enumerable constrained domain | `range<R>`, `Array<T like R>` over a `static struct R ... where ...` | Core (v1) | the struct's solution set as the iteration space, lex order, one positional kernel param per field; linear conjuncts (`i - j <= w`, `abs(..) <= w`, `l3 <= l1 + l2`, `m1 + m2 == m_out`) enumerate in CLOSED FORM (Fourier–Motzkin-projected difference constraints, affine level bounds; uncapped), anything else is tabled below the 100,000-cell box cap with a BL4010 advisory or refused BL4020 above it; `Int` and `Nat` fields; SparseIdx-shaped output; docs/plans/structural/06; corpus `index-types/260-267` |
 | Sparse index type | `SparseIdx<keys>` | Core | explicit valid-key enumeration (rank-1 array of Nat tuples; `static` list or runtime tuple-array) with hash-table lookup. Tuple indexing with wildcards for partial gathers. Built with  `sparse(values, keys)` |
 | Orbit (iterated-wreath) index type | `OrbIdx<[(r₁,s₁), ..., (r_d,s_d)], n>` | Partial | flat list of `(rank, ±)` levels, OUTERMOST-LAST, over one extent; group `S_{r₁} ≀ ... ≀ S_{r_d}` on `∏rᵢ` raw axes, character the product of the level signs. **Depth ≤ 1 is fully supported and is not a new type**: `[]` normalizes to `Idx<n>`, `[(r,+)]` to `SymIdx<r,n>`, `[(r,-)]` to `AntisymIdx<r,n>` — the same records, so the same storage, iteration and printing. Rank-1 levels drop at either sign. **Depth ≥ 2 is DEDUCED-ONLY**: a `comm` tie over a repeated compact argument produces the class — gated for soundness when the inner class carries a `-` level, where the tie additionally requires the kernel provably sign-odd in each argument (`h(-p,q) = -h(p,q)`, e.g. `p * q`; refused with BL4015 otherwise, `p + q` included) — and such a value is allocated (closed-form iterated binomial), filled by the segment-peeled `orb_visit` nest, printed, subscripted at any raw tuple `W(i,j,k,l)` (flat coordinates; a mirrored tuple returns the signed cell, a zero-set tuple returns 0), fully decompacted with `decompact(W, 0)`, and round-tripped through a Zarr store (the spec_version 2 `"orbit"` head over the flat canonical pool — [providers/ZarrTriangularSpec.md](../src/providers/ZarrTriangularSpec.md); depth-1 classes keep their `sym`/`antisym` spelling on disk). Still refused with BL4003: WRITING the class down as an annotation (a Zarr store is now a producer, but the annotation also admits classes nothing produces), `reduce`/`prodsum` over the pool (decompact first), partial subscripts, partial (per-level) decompaction, `transpose`, provider I/O outside Zarr. See [plan-orbit-index-types.md](plan-orbit-index-types.md) and [plan-orbidx-decompaction.md](plan-orbidx-decompaction.md) |
 | Nested/mixed symmetry | `NestedSymIdx` (elasticity),<br> `RiemannIdx` (curvature) | Speculative | Cardinality formulas specified. `RiemannIdx` is shorthand for `OrbIdx<[(2,-), (2,+)], n>` |
@@ -109,6 +111,7 @@ in [formalism.md](formalism.md) and the per-module feature docs.
 | Reynolds operators — `reynolds(g)`, `reynolds(g, Antisymmetric)`, partial positions | Core | The surface combinator is the VALUE-LEVEL wrapper (permutes kernel arguments; H = Sₙ by construction) — output symmetry still follows H ∩ Stab, so identity is required (dense output for distinct arrays, pinned by reynolds/013). The proof tower's per-dimension INDEX-LEVEL Reynolds (`reynolds_full_product_symmetry`, lossless canonical access) is a distinct prospective operator, not currently a surface construct |
 | `gram` — Gram-matrix construction (dense / symmetric / Hermitian) | Core | `corpus/index-types` 066–069; differential oracle in `tests/Oracles.fs` (Gram-Hermitian was an oracle lesson); not in v10 |
 | `hermitian` — adjoint operator | Core | `corpus/index-types` 070; not in v10 |
+| `gram_apply(A, B, x)` — the action of `gram(A, B)` on a vector without forming the Gram matrix (two rank-1 temporaries; BLAS route = transposed gemv + gemv; reverse-mode adjoint action is itself a `gram_apply`) | Core | `corpus/math` 077–082, `corpus/ad-jvp-comb` 109, emission and policy pins in `tests/LinAlgTests.fs`; docs/plans/structural/05 step 1 |
 | `zero` kernel and zero-arity base cases (`f(())` = identity element) | Core | Monadic zero. |
 | Arithmetic symmetry annotations (`(+)` Symmetric, `(-)` Antisymmetric, ...) driving comm inference | Core | v10 §7.1.2 |
 | Elementwise vs bracketed operators: `+` vs `[+]` | Core | Elementwise ops (e.g. `+` or `(+)`) provide sugar for `A op B = method_for(zip(A, B)) <@> op`, as opposed to bracketed ops, which use Blade-native outer-product spaces: `A [op] B = method_for(A, B) <@> op`. |
@@ -122,7 +125,7 @@ in [formalism.md](formalism.md) and the per-module feature docs.
 | S-dimensions |  | Core | S-dimensions derived from rank gap at kernel call. Rank gap = arg rank - parameter rank |
 | T-dimensions |  | Core | Derived from kernel output dimensions |
 | Virtual arrays | `range<I>`, `reverse<I>`, etc. | Core | Index type maps to yield or reorder indices. Behaves as an array with no content. |
-| Anonymous ranges | `m..n` | Core | Shorthand equivalent to `range<Idx<n-m>> + m` |
+| Anonymous ranges | `m..n` | Core | Half-open, equivalent to `range<Idx<n-m>> + m`; a first-class rank-1 array value: lifts elementwise (`x0 + dx * Float64(0..n)`), folds (`reduce(0..n, (+))`), materializes when bound bare or `\|> compute`d |
 | Multi-dimensional for-loops | `for (A, B) <@> ...` | Core | Shorthand for `object_for` and `method_for`; allows co-iterations with `in` |
 | Co-iteration | `for (A, B) in range<I> <@> ...` | Core | Iterate elementwise over a shared index space. |
 
@@ -189,6 +192,13 @@ Full semantics in [features/sql.md](features/sql.md). All implemented and tested
 | `... !contains(B, x)` | Antijoin | Idiom |
 | `group_keys(k₁, k₂, ...)` | GROUP BY keys | CSR grouping structure; static (Idx / EnumIdx) and dynamic dispatch |
 | `group_by(values, gk)` | GROUP BY | Rank-2 ragged result; per-group kernels/reduces; elementwise map rejected by design |
+| `Chunked<I, K>` / `Chunked<s.index.d, store>` / `Chunked<s1.index.d, [[s1, store], [s2, 2]]>` | segmented axis | The alias IS the axis; a regular grid, a store-inherited grid (zarr), or stores tiling the dimension with their own grids. Coordinates never consulted. docs/plans/structural/07, sql.md 7c |
+| `segments(A)` / `files(A)` / `segments(C0, C1)` / `segments(a)` | structural GROUP BY | Groupings with no key array and no permutation; `files` is the labelled file level of a tiled axis; the two-alias form is the tile grouping of a rank-2 array in slot order; over a value, the tiling its annotation declared. Statically evaluable for literal grids |
+| Print selection (`blade run --print a,b` / `BLADE_PRINT`) | benchmarking, large arrays, pipelines whose inputs are not the answer | the compiled program prints only the named top-level bindings instead of every one, in both lanes; an unknown name refuses (BL7004). What a program prints is its own cost at scale: a 4000 x 4000 map printed 231 MB and took 31 s, of which 28 s was the printing | Core | `CodeGenState.printSelection`, `CodeGen.genPrintStatements`, `Interp/Run`; pins in `blade test cli` |
+| Revision reuse: tile cache across Icechunk snapshots (`BLADE_TILE_CACHE=<dir>`; a pure elementwise map / co-iteration over whole-variable dense icechunk reads runs one leading-axis tile at a time, each tile keyed by the task text, the output geometry and the content identities of exactly the chunks it reads; a warm run skips the recompute and, with the probe hoisted before the read, the chunk reads of every unchanged tile; cold = warm = interpreter stdout; an input nothing observes but the tiled nest -- with `--print` selecting away the array itself -- never fetches the chunks its hit tiles would have needed, which is where the saving becomes real: 2.5x warm over untiled on a 4000 x 4000 field with a transcendental kernel) | Core (v1, opt-in) | `src/CodeGenTiles.fs`, `src/cpp/blade_tilecache.hpp`, `ZarrProvider.genAssembleFlatPhased`; docs/plans/structural/04; `tests/IcechunkTests.fs` §22; `BLADE_TILE_CACHE_VERBOSE=1` prints the `[tiles]`/`[chunks]` census |
+| Input manifests + run records (`blade plan` lists every provider read and compile-time fold with element type, axes, storage and identity policy -- `content` hash for folds, `version` size+mtime for runtime reads; `BLADE_RUN_RECORD=<path>` / `blade run --run-record` makes the executable write a JSON record at exit: status incl. BLxxxx aborts, observed inputs, executable + toolchain identity, march/fp policy and linked routes via `-DBLADE_RR_*`, RNG generator) | Core | `src/RunRecord.fs`, `src/cpp/blade_run_record.hpp`; plan-fortran-killer-2 §7; `tests/RunRecordTests.fs` (`blade test run-record`) |
+| `.stream` on `Chunked` axes (rank 1 and 2) | out-of-core consumers | `reduce` folds block by block in storage order (bitwise the flat fold), `group_by` under a structural grouping reads one run (rank 2: one tile window) per group, elementwise maps/binops/zips run one block or band of rows at a time, a halo map runs one segment at a time with its ghost cells; each recorded for `blade plan` (`segment-streaming`). Zarr today |
+| `ungroup(G[, A])` / `ungroup([r1, ..], A)` | inverse of a structural grouping | Rows written back over the axis; the row form names a multi-store variable over a tiled axis. `join` untouched |
 | `sort(A, keyFn)` | ORDER BY | Stable, key-extractor (not comparator); dense result |
 | `reduce(A[, kernel[, init]][, axes = n])` | Aggregates | Default `(+)`; folds RIGHT-TO-LEFT, the innermost `n` axes with `n = 1` by default (rank k in, rank k−n out; `axes = rank(A)` is the full fold to a scalar — named slot, since the 3rd positional argument is the seed; `n` must be an integer literal, 1 ≤ n ≤ rank). 3-arg init form seeds EACH folded group and defines the empty result (landed, arc 4) — without init, statically-empty rejected and dynamic extents guarded |
 | `extents(A)` | COUNT(*) | Cardinality on compound = post-WHERE count |
@@ -235,6 +245,7 @@ Full semantics in [features/sql.md](features/sql.md). All implemented and tested
 | NetCDF | Core |  |
 | Zarr | Core |  |
 | Triangular Zarr file format | Partly Done | Provides Zarr storage spec for natively triangular or wreath-shaped tensors |
+| Icechunk | Partly Done | Versioned (transactional) Zarr: `repo.checkout` with branch/tag/snapshot unit markers, compile-time snapshot pinning, cross-checkout axis identity. Writes, `read_window`, and packed-blocks reads pending. `.stream` and `load_compound` are REFUSED outright (`GenStreamOpen` / `GenReadCompoundVar` are `None`; the refusals are pinned in the icechunk test lane), not silently degraded — docs/plans/plan-icechunk-provider.md |
 
 ## 16. Backends and performance
 
@@ -349,6 +360,26 @@ region; hoist it to its own `let`), multi-leaf `<&!>` fused fold trees, and
 reduce over compact symmetric/antisymmetric/Hermitian storage (rejected at
 typecheck for all folds — `decompact` first).
 
+**`where repro` — the reproducibility demand (named functions only).** The
+inverse of the reorder licence: the function's emitted body must keep the
+interpreter's operation sequence. Discharged as (a) `BLADE_REPRO_FN` on the
+emitted definition — `noinline` + `-ffp-contract=off` on GCC, so the body
+neither contracts to FMA nor gets re-inlined into a contraction-licensed
+caller; (b) call form everywhere a named function already has it (direct
+calls, kernel positions via the eta wrapper — loops call the function rather
+than inlining its arithmetic); (c) a veto inside `foldReorderLicensed`, which
+covers the OpenMP fold paths, every `BLADE_FP_REASSOC` lane, and the LLVM
+lane's fast-math flags at once — `where comm(a, b), omp, repro` on a fold
+kernel emits serial with a `// [omp] requested but emitted serial: fold
+kernel is `where repro`` marker; and (d) BLAS/LAPACK/cuBLAS routing declined
+while the body emits (BLAS differs in the last ULP; an eigenbasis is not even
+unique). Refusals: on a lambda (the annotation cannot travel into textual
+inlining — name the kernel), on a `static function` (compile-time evaluation
+has no emitted body), and combined with `cuda` (device contraction/rounding
+cannot discharge the demand). A main-local emission (function forced into
+`main()` as a `std::function`) keeps the routing veto but cannot carry the
+attribute; the emitted text says so rather than staying silent.
+
 ## 17. Equivariance and ML (shipped module)
 
 Module doc: [features/equivariant-nn.md](features/equivariant-nn.md), canonical.
@@ -384,7 +415,7 @@ compile-time only, zero runtime cost.
 | Norm activation | Near-term | ml-spec §8.2; `ml.norms` (invariant norm readout) is shipped and is a different op |
 | Message passing: `scatter` / `gather` | Near-term | ml-spec §9 (expressible today as loops — `ml-e2e/00*` do; dedicated ops pending) |
 | Reynolds applications: symmetric message passing, higher-order interactions, antisymmetric applications | Near-term | ml-spec §14; the CG exchange-symmetry compaction shipped as `derive_sym_tp` / `derive_alt_tp` (measured 30–42%, not the 2–4× originally claimed — module doc §9) |
-| Automatic differentiation (`ad.grad` reverse mode, v1 subset; `ad.jvp` forward mode, strict superset incl. overwrites/recurrences/product folds/if-else/units/combinators through C7 pipelines) | Core | AST-level source transforms, one pass; module doc §11 has both ABIs + subsets; composition `ad.jvp(ad.grad(f))` = HVP, `ad.jvp(ad.jvp(f))` = second-order; corpus `ad/` + `ad-jvp/` + `ad-jvp-comb/` + `ml-e2e/`; remaining work in [features/equivariant-nn.md](features/equivariant-nn.md) §11 |
+| Automatic differentiation (`ad.grad` reverse mode, v1 subset incl. any first-order recursive-array recurrence `prefix :: g(prefix(n-1), ..)` through the direct loop run backwards, O(n) -- structural/01 milestones A+B; `ad.jvp` forward mode, strict superset incl. overwrites/recurrences/product folds/if-else/units/combinators through C7 pipelines; array-valued `ad.jvp` = `(y, J v)` and the seeded `ad.vjp` = `Jᵀ w` into grad's buffers -- a matrix-free linearization, incl. the LU derivative actions through `m.lu_solve[_t]`, plan-fortran-killer-2 §6.3, corpus `ad-jvp-comb/110-114`) | Core | AST-level source transforms, one pass; module doc §11 has both ABIs + subsets; composition `ad.jvp(ad.grad(f))` = HVP, `ad.jvp(ad.jvp(f))` = second-order; corpus `ad/` + `ad-jvp/` + `ad-jvp-comb/` + `ml-e2e/`; remaining work in [features/equivariant-nn.md](features/equivariant-nn.md) §11 |
 
 ## 18. Graphs and trees (planned module)
 

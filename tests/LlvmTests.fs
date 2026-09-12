@@ -269,8 +269,8 @@ let private runExeCapture (exeFile: string) : Result<int * string * string, stri
         psi.CreateNoWindow <- true
         psi.WorkingDirectory <- Path.GetDirectoryName full
         use proc = Process.Start psi
-        let outTask = proc.StandardOutput.ReadToEndAsync()
-        let errTask = proc.StandardError.ReadToEndAsync()
+        let outTask = Blade.Runtime.readToEndOffPool proc.StandardOutput
+        let errTask = Blade.Runtime.readToEndOffPool proc.StandardError
         if proc.WaitForExit 60000 then Ok (proc.ExitCode, outTask.Result, errTask.Result)
         else
             (try proc.Kill() with _ -> ())

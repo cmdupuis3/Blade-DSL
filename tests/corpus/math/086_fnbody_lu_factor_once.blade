@@ -1,0 +1,32 @@
+// TEST: Fnbody lu: one factorization inside a function serves two solves
+// The factor-once shape where it pays: a helper that takes several
+// right-hand sides against one matrix factors ONCE and applies the factors
+// per side, plain and transposed. Both factor pools are scope-freed with the
+// helper's frame (they are tuple members, owned like eigh's pair), and a
+// helper whose whole answer is an applied solve hands back a pool whose
+// extents table survives the frame (the return-extent ABI, math/075).
+import math as m
+type N = Idx<3>
+function two_solves(a: Array<Float64 like N, N>, b1: Array<Float64 like N>, b2: Array<Float64 like N>) -> Float64 = {
+    let f = m.lu(a)
+    let x1 = m.lu_solve(f, b1)
+    let x2 = m.lu_solve(f, b2)
+    let xt = m.lu_solve_t(f, b1)
+    reduce(x1, (+)) + reduce(x2, (+)) * 10.0 + reduce(xt, (+)) * 100.0
+}
+function apply_factor(a: Array<Float64 like N, N>, b: Array<Float64 like N>) -> Array<Float64 like N> = {
+    let f = m.lu(a)
+    m.lu_solve(f, b)
+}
+let A: Array<Float64 like N, N> = [[1.0, 1.0, 1.0], [2.0, 4.0, 1.0], [1.0, 0.0, 2.0]]
+let b1: Array<Float64 like N> = [6.0, 13.0, 7.0]
+let b2: Array<Float64 like N> = [3.0, 7.0, 3.0]
+// x1 = [1,2,3] sums to 6 and x2 = [1,1,1] sums to 3; the transposed solve's
+// sum is whatever the same arithmetic gives in both lanes (the interpreter
+// differential is the pin for `s`).
+let s = two_solves(A, b1, b2)
+let x = apply_factor(A, b1)
+// EXPECT: x = [1, 2, 3]
+let xs = m.solve(A, b1)
+let d = reduce(x - xs, (+))
+// EXPECT: d = 0

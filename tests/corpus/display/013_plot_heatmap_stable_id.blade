@@ -1,0 +1,52 @@
+// TEST: Plot Stable Id And Camera Slots
+// ============================================================================
+// `plot.heatmap`/`plot.contourf` `pid: plotid, cam: camera` -- the
+// re-evaluatable-view surface (stdlib/plot.blade's plotid/camera markers).
+//
+// What this file guards:
+//
+//   * both new slots route by NOMINAL, in any order, alongside older slots;
+//   * a non-empty `plotid` routes the frame through `display.emit_id` -- the
+//     stream primitive -- so the frame's meta.id is the GIVEN id, and, like
+//     `stream`, the emit consumes NO ordinal: the plain heatmap emitted
+//     AFTER the id'd one is still this run's first `blade-<n>` frame;
+//   * a non-empty `camera` puts `"blade_camera":{"bindings":<contract>}` in
+//     the figure LAYOUT (runtime-built JSON), never in the frame meta, which
+//     BL5700 keeps a literal;
+//   * left at their defaults, both slots emit bytes identical to the
+//     pre-slot module -- `plain` below rides the same assertions the older
+//     display tests pin;
+//   * through `blade test interp display`, that both lanes put byte-identical
+//     frames on stdout, id splice and untouched ordinal included.
+// ============================================================================
+import plot
+
+type Ax = Idx<3>
+let ax = (method_for(range<Ax>) <@> lambda(j) -> 0.5 * Float64(j)) |> compute
+let g = (method_for(range<Ax, Ax>) <@> lambda(i, j) -> Float64(i) + Float64(j)) |> compute
+
+// Both new slots, out of declaration order, mixed among older ones.
+let zoomable = plot.heatmap(ax, ax, g, "cx,cy,r": camera, "view": title, "stable-1": plotid)
+
+// plotid alone: stable id, no camera entry in the layout.
+let id_only = plot.heatmap(ax, ax, g, "stable-2": plotid)
+
+// camera alone: ordinal id, contract in the layout.
+let cam_only = plot.heatmap(ax, ax, g, "a,b,c": camera)
+
+// The defaults: byte-identical to the pre-slot module, and -- because the
+// id'd emits above consumed no ordinal -- STILL not this run's first
+// ordinal (cam_only took blade-1); this one is blade-2.
+let plain = plot.heatmap(ax, ax, g)
+
+// contourf carries the identical pair: same routing, same layout entry,
+// same untouched ordinal.
+// ...and rides the Heat colorscale (index 5, an inline stop ARRAY rather
+// than a quoted name -- the __cmap_json seam), pinned through both lanes.
+let zoomable_cf = plot.contourf(ax, ax, g, "cf-view": plotid, "cx,cy,r": camera, 12: levels, 5: cmap, 1: smoothing)
+
+// EXPECT: zoomable = true
+// EXPECT: zoomable_cf = true
+// EXPECT: id_only = true
+// EXPECT: cam_only = true
+// EXPECT: plain = true

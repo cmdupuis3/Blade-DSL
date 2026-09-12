@@ -1,0 +1,15 @@
+// TEST: While Is An Ordinary Identifier
+// ============================================================================
+// `while` is deliberately NOT a keyword. It is recognized positionally -- as
+// a clause on a recursive-array inductive arm -- so a program that binds the
+// name keeps working, and the imperative `while cond { ... }` dies as an
+// unbound variable carrying the declarative-iteration steer rather than as a
+// parse error. This pins the identifier half.
+
+let while = 5
+let y = while + 1
+// EXPECT: y = 6
+
+let do = 2.5
+let z = do * 2.0
+// EXPECT: z = 5

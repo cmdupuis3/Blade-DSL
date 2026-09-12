@@ -92,8 +92,46 @@ let checkModule (env: TypeEnv) (modul: ModuleDecl) : TypedModule * TypeEnv * Com
     let mutable currentEnv = preEnv
     let mutable decls = []
     let mutable errors = []
-    
+    // Module-scope `function` names already declared, first span each (BL2009).
+    let mutable declaredFunctions : Map<string, Span> = Map.empty
+
     for d in modul.Decls do
+        // BL2009 -- duplicate top-level `function` name. Without this the
+        // later declaration silently rebinds the name (checkFunctionDecl's
+        // bindVarSimple), and a call matching the FIRST signature dies with a
+        // rank/type mismatch blaming the caller. Refuse here, at module decl
+        // level, so nested `function`s (desugared to block lets, checked in
+        // inferBlock) keep their legal shadowing of outer names, and imports
+        // (DeclImport, not DeclFunction) cannot trip it. The duplicate decl is
+        // NOT checked: references keep resolving against the first declaration,
+        // so the refusal is the only diagnostic instead of the root cause plus
+        // downstream mismatch noise. Prerequisite for same-name clause
+        // dispatch (plan-match-statements.md §5 R1).
+        let duplicateOf =
+            match d.Value with
+            | DeclFunction f ->
+                match Map.tryFind f.Name declaredFunctions with
+                | Some firstSpan -> Some (f.Name, firstSpan)
+                | None ->
+                    declaredFunctions <- Map.add f.Name d.Span declaredFunctions
+                    None
+            | _ -> None
+        match duplicateOf with
+        | Some (name, firstSpan) ->
+            // The duplicate decl skips checkDecl, whose per-decl reset would
+            // otherwise clear the PREVIOUS decl's expression span -- without
+            // this, locateError's precision order picks that stale span and
+            // the refusal points into the FIRST declaration's body.
+            resetCurrentStmtSpan ()
+            let firstSite =
+                let where = $"line {firstSpan.StartLine}, column {firstSpan.StartCol}"
+                match firstSpan.File, d.Span.File with
+                | Some f1, Some f2 when f1 <> f2 -> $"{f1}, {where}"
+                | _ -> where
+            let ce = locateError d.Span currentEnv (DuplicateFunctionDecl (name, firstSite))
+            errors <- ce :: errors
+        | None ->
+
         // Pre-validation: inline TyEnumIdx<[mixed values]> occurrences. The
         // alias-site check in registerTypeDecl catches `type X = EnumIdx<[...]>`
         // declarations but not inline embeddings like `let x: Array<EnumIdx<[1,
@@ -204,6 +242,18 @@ let checkProgram (program: Program) : TypedProgram * IRBuilder * CompileError li
             Units = finalEnv.Units
             StaticFunctions = finalEnv.StaticFunctions |> Map.filter (fun k _ -> not (k.Contains(".")))
             StaticValues = finalEnv.StaticValues |> Map.filter (fun k _ -> not (k.Contains(".")))
+            // Snapshot NOW: the tables are shared by reference and name-keyed,
+            // so the next module's `f` would overwrite this module's entry.
+            Defaults =
+                finalEnv.FuncDefaults
+                |> Seq.filter (fun kv -> not (kv.Key.Contains(".")) && Map.containsKey kv.Key finalEnv.Variables)
+                |> Seq.map (fun kv -> (kv.Key, kv.Value))
+                |> Map.ofSeq
+            DefaultCaptures =
+                finalEnv.FuncDefaultCaptures
+                |> Seq.filter (fun kv -> not (kv.Key.Contains(".")) && Map.containsKey kv.Key finalEnv.Variables)
+                |> Seq.map (fun kv -> (kv.Key, kv.Value))
+                |> Map.ofSeq
         }
         moduleExports <- Map.add moduleName export moduleExports
     // env.Warnings is shared by reference across all envWithExports updates
@@ -246,11 +296,17 @@ let typeCheck (program: Program) : Result<TypedProgram * IRBuilder * string list
     // ANY resolveStatics pass runs (the ML and PPL elaborations each run
     // their own; all inherit the fold through StaticEval's hook).
     Blade.ProviderStatics.install ()
+    // A fresh fold log for this program (the run record's `content`-identity
+    // inputs; see ProviderStatics.resetFoldLog).
+    Blade.ProviderStatics.resetFoldLog ()
     // The constrained-index counting layer's `idx_card(R)` builtin, on the
     // same footing and for the same reason: registered before ANY
     // resolveStatics pass, so every elaboration's own statics can size
     // against it.
     Blade.StructIdxSpec.install ()
+    // The `__ad_body` conjunct Grad stamps on synthesized derivatives (its
+    // body scope vetoes implicit unit-scale conversions -- Constraints.fs).
+    Blade.Constraints.registerAdBody ()
     IdePartial.reset ()
     PinSuggestions.reset ()
     WarningLog.reset ()
@@ -302,9 +358,21 @@ let typeCheck (program: Program) : Result<TypedProgram * IRBuilder * string list
             Some (Blade.DeduceRep.EngineRefutes
                     $"the Lie-discharge post-accept guard tripped while validating this body: {msg}"))
     IdeDeductions.reset ()
-    // Staged-former unfold FIRST: `static method_for/object_for/for`
-    // argument lists elaborate to plain formers before any other stage
-    // (ML/PPL/math/grad and the checker never see ExprStatic).
+    // Provider checkout desugar BEFORE EVERYTHING: `repo.checkout("v1.0",
+    // ic.tag)` becomes the ordinary load shape `ic.load("path@tag:v1.0")`,
+    // so typecheck, every elaborator's own `resolveStatics`, and
+    // `checkModule`'s provider-roots scan all see a form they already
+    // handle. It has to be first because Unfold, immediately below, is
+    // itself the earliest `resolveStatics` consumer -- and StaticEval's miss
+    // would be SILENT ("not foldable"), not an error. No-op, and
+    // reference-equal, for programs with no `import icechunk`.
+    match Blade.ProviderDesugar.expand program with
+    | Error diags -> Error (diags |> List.map (compileErrorOfDiagnostic ["provider checkout desugar"]))
+    | Ok program ->
+    // Staged-former unfold FIRST of the elaborations: `static
+    // method_for/object_for/for` argument lists elaborate to plain formers
+    // before any other stage (ML/PPL/math/grad and the checker never see
+    // ExprStatic).
     match Blade.Unfold.expand program with
     | Error diags -> Error (diags |> List.map (compileErrorOfDiagnostic ["static unfold"]))
     | Ok program ->

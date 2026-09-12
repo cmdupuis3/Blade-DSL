@@ -1,0 +1,18 @@
+// TEST: Match Tuple Guard Slot Binding
+// ============================================================================
+// A tuple pattern in a NON-LAST guarded arm must bind each variable at its
+// own slot. The emitter once re-derived slot indices positionally over the
+// filtered binder list, so `(_, b, _)` read slot 0 and returned 10 here --
+// a silent wrong answer. The last-arm path always carried the slot; both do
+// now.
+
+let t = (10, 20, 30)
+let r = match t with
+    | (_, b, _) if b > 0 -> b
+    | _ -> 0
+// EXPECT: r = 20
+
+let s = match t with
+    | (_, _, c) if c > 25 -> c
+    | (a, _, _) -> a
+// EXPECT: s = 30

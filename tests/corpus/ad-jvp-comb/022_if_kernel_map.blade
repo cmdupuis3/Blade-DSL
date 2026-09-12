@@ -13,7 +13,6 @@ function f(a: Array<Float like I>) -> Float = {
     reduce(m, (+))
 }
 
-// WARN: BL4003
 let (p, t) = ad.jvp(f)([1.0, -2.0, 3.0, -4.0], [1.0, 1.0, 1.0, 1.0])
 // EXPECT: p = 10
 // EXPECT: t = 8

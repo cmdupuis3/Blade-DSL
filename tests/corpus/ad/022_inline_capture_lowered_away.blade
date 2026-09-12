@@ -1,0 +1,40 @@
+// TEST: AD Inline Rename Capture Lowered Away
+import ad as ad
+// ============================================================================
+// WAS a (rejects) test. The C2-reverse lowering
+// (plan-equivariant-nn-notebooks.md 5.2) changed the answer, and this file
+// records the change rather than hiding it.
+//
+// Inlining binds a callee parameter by RENAMING it to the caller's variable:
+// `helper(y, arr)` renames `p` to `y`. helper's kernel used to bind `y`, so
+// the renamed `p` would have been captured by it, and the transform refused.
+// The pre-pass now runs on helper's body BEFORE the inliner sees it, and the
+// eager-map lowering ERASES the kernel's parameter binder -- `lambda(y) -> y
+// * p` becomes `scaled(__mi) = arr(__mi) * p`. There is no `y` binder left,
+// so there is no capture, and the program is simply legal.
+//
+// The refusal itself is not gone and is not untested: forward mode keeps the
+// map as a loop object, so the lambda binder survives there, and
+// `ad-jvp-comb/105` is this exact program under `ad.jvp` pinning the capture
+// message. `ad-jvp-comb/042` remains the negative control (a kernel merely
+// REUSING the caller's name, where an eager name-clash check would refuse
+// wrongly).
+//
+//   helper(p, arr) = sum_i arr(i) * p = p * (1 + 2 + 3) = 6 p
+//   loss(y, arr)   = 6 y     ->  lv = 12 at y = 2,  dly = 6,  darr(i) = y = 2
+// ============================================================================
+type I = Idx<3>
+function helper(p: Float, arr: Array<Float like I>) -> Float = {
+    let scaled = method_for(arr) <@> lambda(y: Float) -> y * p |> compute
+    reduce(scaled, (+))
+}
+function loss(y: Float, arr: Array<Float like I>) -> Float = helper(y, arr)
+// (The lowered read `arr(__mi)` used to draw a BL4003 untagged-index note
+// pointing at a subscript the author never wrote; a subscript that mentions
+// a compiler-reserved `__` name is now recognized as synthesized, like a
+// `__` buffer, and the note is not raised.)
+let mut darr = [0.0, 0.0, 0.0]
+let (lv, dly) = ad.grad(loss)(2.0, [1.0, 2.0, 3.0], darr)
+// EXPECT: lv = 12
+// EXPECT: dly = 6
+// EXPECT: darr = [2, 2, 2]

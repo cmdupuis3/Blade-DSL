@@ -1,0 +1,23 @@
+// TEST: AD While-Guarded Recursive Array (rejects)
+// ERROR: BL5500
+import ad as ad
+// ============================================================================
+// A `while`-guarded recursive array is not differentiable (v1): the guard
+// makes the stopping ordinal DATA-DEPENDENT, so the adjoint sweep's trip
+// count would depend on primal values -- refused loudly at grad expansion.
+// (v2 direction: the guard declares a fixed point, the right structure for
+// an implicit-function-theorem adjoint.)
+// ============================================================================
+let xs = [4.0, 5.0, 6.0]
+function h(w: Array<Float like Idx<3>>) -> Float = {
+    let rec s: Array<Float like Idx<3>> =
+        match s with
+        | zero -> zero
+        | zero :: n -> zero :: 0.0
+        | prefix :: n while prefix(n - 1) < 100.0 -> prefix :: prefix(n - 1) + w(n - 1) * xs(n - 1)
+    s(2)
+}
+let w0 = [1.0, 2.0, 3.0]
+let mut dh = [0.0, 0.0, 0.0]
+let hv = ad.grad(h)(w0, dh)
+hv

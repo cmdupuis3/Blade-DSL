@@ -1,0 +1,13 @@
+// TEST: Fused Rank-2 Elementwise Chain
+// ============================================================================
+// Multi-record dense co-iteration fuses the same way rank 1 does: the whole
+// chain becomes one nest over the shared (Y, X) records.
+
+type Y = Idx<3>
+type X = Idx<4>
+let m = method_for(range<Y>, range<X>) <@> lambda(y, x) -> Float64(y) * 10.0 + Float64(x) |> compute
+let n = method_for(range<Y>, range<X>) <@> lambda(y, x) -> Float64(y) + Float64(x) * 0.5 |> compute
+
+let w = m + n * m - n
+let t = reduce(w, (+), axes = 2)
+// EXPECT: t = 446

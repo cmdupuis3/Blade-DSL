@@ -1,0 +1,56 @@
+// TEST: Match Struct Pattern With Guard
+// ============================================================================
+// A struct pattern in MATCH position. Lowering used to erase the field names
+// and hand codegen a positional tuple pattern, which cost two different
+// things:
+//   1. the C++ lane read a real struct with `std::get<0>(p)` -- not valid
+//      C++ on a struct, so any struct match died at g++ after a clean
+//      typecheck;
+//   2. a pattern listing fields out of DECLARATION order bound every one of
+//      them to the wrong slot, silently, in BOTH evaluators.
+// The pattern now carries its field names all the way to codegen, so the
+// access is `p.x` and the name -- not the position -- selects the field.
+
+struct Point {
+    x: Float64,
+    y: Float64
+}
+
+let p = Point { x = 3.0, y = 4.0 }
+
+// The guard reads a binder from the pattern and falls through when false.
+let r = match p with
+    | Point { x, y } if x > 10.0 -> x + y
+    | Point { x, y } -> x - y
+// EXPECT: r = -1
+
+// FIELD ORDER IS THE POINT: `{ y, x }` lists the declaration's second field
+// first. Positionally that reads y = 3 and x = 4 and answers 1; by name it
+// reads y = 4 and x = 3 and answers -1.
+let ordered = match p with
+    | Point { y, x } -> x - y
+// EXPECT: ordered = -1
+
+// A field pattern may be a literal, which makes the struct arm refutable
+// -- the test rides the field ACCESS, so it has to name the field too.
+// (Integers: float patterns are not parser-reachable.)
+struct Cell {
+    row: Int64,
+    col: Int64
+}
+let c = Cell { row = 3, col = 4 }
+let picked = match c with
+    | Cell { row: 9, col } -> col
+    | Cell { row, col } -> row * 10 + col
+// EXPECT: picked = 34
+
+// A nested pattern under a field binds through the field access -- two
+// levels of naming, `seg.head.x`. (`from` is a keyword, hence `head`/`tail`.)
+struct Segment {
+    head: Point,
+    tail: Point
+}
+let seg = Segment { head = Point { x = 1.0, y = 2.0 }, tail = Point { x = 5.0, y = 7.0 } }
+let dx = match seg with
+    | Segment { head: Point { x: ax, y: ay }, tail: Point { x: bx, y: by } } -> (bx - ax) + (by - ay)
+// EXPECT: dx = 9

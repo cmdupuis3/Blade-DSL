@@ -1,0 +1,20 @@
+// TEST: T^0 call mixing two array RANKS (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: share no iteration space
+// ============================================================================
+// A scalar broadcasts; two arrays of DIFFERENT ranks do not. There is no
+// common index space to iterate and therefore nothing to deduce an output
+// rank from, so the lift declines and the call is refused precisely -- rather
+// than picking argument 1's shape and letting g++ discover the rest.
+//
+// This refusal and the LIFT are two arms of one predicate: the lift fires
+// when the disagreement is {scalar, array}, and `firstAbstractVarConflict`
+// judges everything it declines. The refusal is the exact mirror of what
+// IR-phase monomorphization would otherwise DROP.
+// ============================================================================
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let M: Array<Float like Idx<2>, Idx<3>> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+let r = add0(A, M)

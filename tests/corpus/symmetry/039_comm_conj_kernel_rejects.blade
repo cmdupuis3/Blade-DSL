@@ -1,0 +1,15 @@
+// TEST: Comm contradicts conjugating kernel (rejects)
+// ERROR: BL4013
+// The Hermitian third of the pair-swap contradiction family. `x * conj(y)`
+// is NOT commutative over complex elements -- it CONJUGATES under the swap
+// (f(y, x) = conj(f(x, y)), deduced PConj via the conjugate-mirror rule:
+// the swap image of `x` is `conj(y)` un-conjugated). Declared `comm` would
+// put the values on a triangle whose identity mirror answers every read
+// across the diagonal with the stored value un-conjugated: r(1, 0) would
+// come back (11, 2) where the truth is (11, -2). Historically this
+// compiled and silently corrupted the imaginary half (the demonstrator in
+// docs/plans/plan-cosmology-nongaussianity.md section 5.0); PBottom bodies remain
+// trusted, and the same body over REAL elements stays accepted -- conj is
+// the identity there, so symmetry/047 pins the licensed twin.
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let bad = method_for(A, A) <@> lambda(x, y) where comm(x, y) -> x * conj(y) |> compute

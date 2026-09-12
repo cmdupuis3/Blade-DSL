@@ -1,0 +1,13 @@
+// TEST: Match Non-Exhaustive Int Aborts (aborts)
+// ============================================================================
+// A non-exhaustive match panics BL8002 at runtime. The abort IIFE is typed
+// as the MATCH RESULT: it was hardcoded `-> double`, which poisoned an
+// Int64-valued ternary chain to double and turned this program into a g++
+// float-conversion error instead of a reachable runtime abort.
+
+let x = 7
+let r = match x with
+    | 1 -> 10
+    | 2 -> 20
+r
+// ABORT: error[BL8002]

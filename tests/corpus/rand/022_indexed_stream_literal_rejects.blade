@@ -1,0 +1,7 @@
+// TEST: Rand Indexed: a literal stream key outside [0, 2^32) is refused (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: the stream key must be in [0, 2^32)
+// The checker's twin of the runtime guard in 021: the address layout is
+// visible at the call, so a literal that cannot be a stream key never compiles.
+import rand as r
+let u = r.uniform_at(5, 4294967296, 0, 4)

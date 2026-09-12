@@ -1,0 +1,12 @@
+// TEST: Enumerable Domain: Non-Linear Over The Box Cap Is Refused (rejects)
+// ERROR: BL4020
+// Neither route exists: the conjunct is not linear (no closed form) and the
+// box (400 x 400 = 160,000 cells) is over the cap for enumerating a domain
+// by table. The message names both facts and the linear spellings that
+// would enumerate in closed form.
+static struct Big {
+    i: Int<min=0, max=399>,
+    j: Int<min=0, max=399>
+} where (i * j) % 7 == 1
+
+let R = method_for(range<Big>) <@> lambda(i, j) -> i + j |> compute

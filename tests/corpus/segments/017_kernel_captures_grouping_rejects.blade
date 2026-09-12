@@ -1,0 +1,20 @@
+// TEST: Kernel Body Capturing A Grouping Is Refused (rejects)
+// `group_by(x, seg)` INSIDE a kernel body, with `seg` bound outside it, needs
+// the grouping's state -- `seg__ngroups`, `seg__offsets`, `seg__at`, locals of
+// the scope that bound it -- but the kernel is compiled as a separate C++
+// function that sees only its parameters, and a grouping is an opaque
+// sentinel with nothing to pass. This used to reach g++ as "'seg__ngroups'
+// was not declared in this scope"; it is now a codegen refusal that steers to
+// grouping once outside the kernel (016) or to a named function.
+// REJECT-AT: codegen
+// WARN-CODEGEN: a kernel body captures the grouping 'seg'
+// ERROR-CONTAINS: a kernel body captures the grouping 'seg'
+type X = Chunked<Idx<10>, 4>
+type K = Idx<3>
+let A: Array<Float like X> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+let seg = segments(X)
+let totals = method_for(range<K>) <@> lambda(k) -> {
+    let g = group_by(A, seg)
+    let s = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+    reduce(s, (+)) + Float64(k)
+} |> compute

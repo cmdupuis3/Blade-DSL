@@ -314,6 +314,11 @@ let joinDeferrableIdsMany (exprs: IRExpr list) : Set<IRId> =
                         match a with
                         | IRVar (id, _) -> bump joinRefs id
                         | _ -> ()
+                // A leg whose LEAF is the named map itself (`reduce(<name>,
+                // op)` beside `prodsum(<name>, v)`): the typechecker keeps
+                // the name so the emitter binds the share once and this leg
+                // reads it. That read is a join reference like the slot's.
+                | IRVar (id, _) -> bump joinRefs id
                 | _ -> ()
          | _ -> ())
         match e with
@@ -461,7 +466,11 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
                 | _ -> None
             match staticOff with
             | Some o -> IRHaloUnhash (f, o)
-            | None -> failwith "halo window read over a masked domain: the offset must be an integer literal (e.g. w(-1), w(0), w(1))"
+            // Unreachable from a checked program: TypeCheck's window-read
+            // walk (haloExtentClash's checkSite) refuses a non-literal
+            // offset over a compound inner with a spanned diagnostic. Kept
+            // as the invariant it now is.
+            | None -> failwith "internal: halo window read over a masked domain reached lowering with a non-literal offset (TypeCheck.checkSite should have refused it)"
         else
             IRBinOp (IRElementwise, IRAdd, f, lowerTypedExpr env offArg)
 
@@ -528,6 +537,9 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
         // reshape it as part of the surrounding rank, producing wrong-rank
         // arrays.
         IRComplex (lowerTypedExpr env re, lowerTypedExpr env im)
+
+    | TExprFma (a, b, c) ->
+        IRFma (lowerTypedExpr env a, lowerTypedExpr env b, lowerTypedExpr env c)
     
     | TExprArrayLit (elems, arrTy) ->
         let es = elems |> List.map (lowerTypedExpr env)
@@ -657,8 +669,6 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
     | TExprReverse indexType ->
         IRVirtualReverse indexType
     
-    | TExprBlocked (indexType, size) ->
-        IRBlocked (indexType, lowerTypedExpr env size)
     
     | TExprZip exprs ->
         IRZip (exprs |> List.map (lowerTypedExpr env))
@@ -757,8 +767,9 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
     | TExprContains (a, v) ->
         IRContains (lowerTypedExpr env a, lowerTypedExpr env v)
 
-    | TExprDisplayEmit (head, quoted, data, metaTail) ->
-        IRDisplayEmit (head, quoted, lowerTypedExpr env data, metaTail)
+    | TExprDisplayEmit (head, quoted, data, metaTail, idOpt) ->
+        IRDisplayEmit (head, quoted, lowerTypedExpr env data, metaTail,
+                       idOpt |> Option.map (lowerTypedExpr env))
 
     | TExprDisplayJson (rank, data) ->
         IRDisplayJson (rank, lowerTypedExpr env data)
@@ -777,6 +788,21 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
 
     | TExprGroupBucket grouping ->
         IRGroupBucket (lowerTypedExpr env grouping)
+
+    | TExprSegments (_, offsets, labels) ->
+        IRSegments (offsets, labels)
+
+    | TExprSegmentsGrid (_, bounds) ->
+        IRSegmentsGrid bounds
+
+    | TExprUngroupGrid (grouped, sources, bounds) ->
+        IRUngroupGrid (lowerTypedExpr env grouped, sources, bounds)
+
+    | TExprUngroup (grouped, source) ->
+        IRUngroup (lowerTypedExpr env grouped, source)
+
+    | TExprUngroupRows (rows, offsets, source) ->
+        IRUngroupRows (rows |> List.map (lowerTypedExpr env), offsets, source)
     
     | TExprSort (array, key) ->
         IRSort (lowerTypedExpr env array, lowerTypedExpr env key)
@@ -812,10 +838,16 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
         IRDecompact (lowerTypedExpr env array, dim)
     | TExprGram (left, right, isSameArray) ->
         IRGram (lowerTypedExpr env left, lowerTypedExpr env right, isSameArray)
+    | TExprGramApply (left, right, vec) ->
+        IRGramApply (lowerTypedExpr env left, lowerTypedExpr env right, lowerTypedExpr env vec)
     | TExprMatmul (left, right) ->
         IRMatmul (lowerTypedExpr env left, lowerTypedExpr env right)
     | TExprEigh operand ->
         IREigh (lowerTypedExpr env operand)
+    | TExprLu matrix ->
+        IRLu (lowerTypedExpr env matrix)
+    | TExprLuSolve (lu, piv, rhs, t) ->
+        IRLuSolve (lowerTypedExpr env lu, lowerTypedExpr env piv, lowerTypedExpr env rhs, t)
     | TExprSolve (matrix, rhs) ->
         IRSolve (lowerTypedExpr env matrix, lowerTypedExpr env rhs)
     | TExprArrayNegate array ->
@@ -866,11 +898,24 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
         IRArity (None, paramName)
     
     | TExprRank e ->
-        // Resolve rank statically from the typed expression's type
-        let rank = match e.Type with
-                   | ArrayElem at -> at.IndexTypes |> List.sumBy _.Rank
-                   | _ -> 0
-        IRLit (IRLitInt (int64 rank))
+        // Resolve rank statically from the typed expression's type -- but
+        // ONLY when the type is actually resolved. Inside a generic body an
+        // abstract parameter's type is still an inference var here, and the
+        // old blanket `| _ -> 0` fallback baked `IRLit 0` into the body that
+        // every HM specialization then shared: `match rank(x)` answered the
+        // rank-0 arm at every rank, silently. An unresolved operand now
+        // lowers to the SYMBOLIC IRRank (every lane already handles it), and
+        // the constant-match fold resolves it per specialization, once the
+        // clone's types are concrete (IRMono.foldConstIntMatch).
+        let rec rankOfType (t: IRType) : int option =
+            match t with
+            | ArrayElem at -> Some (at.IndexTypes |> List.sumBy _.Rank)
+            | IRTInfer _ -> None
+            | IRTUnitAnnotated (inner, _) -> rankOfType inner
+            | _ -> Some 0
+        (match rankOfType e.Type with
+         | Some rank -> IRLit (IRLitInt (int64 rank))
+         | None -> IRRank (lowerTypedExpr env e))
     
     | TExprStruct (typeName, fields) ->
         IRStructLit (typeName, fields |> List.map (fun (fname, e) -> fname, lowerTypedExpr env e))
@@ -881,10 +926,13 @@ let rec lowerTypedExpr (env: TypedLowerEnv) (texpr: TypedExpr) : IRExpr =
     | TExprAssign (lhs, rhs) ->
         IRAssign (lowerTypedExpr env lhs, lowerTypedExpr env rhs)
 
-    | TExprConstraintCheck (cond, message) ->
+    | TExprConstraintCheck (cond, code, message) ->
         // Carry the constraint's source span into IR so the runtime panic
-        // (BL8001) can report file:line. texpr is the whole node in hand.
-        IRConstraintCheck (lowerTypedExpr env cond, message, texpr.Span)
+        // can report file:line. texpr is the whole node in hand.
+        IRConstraintCheck (lowerTypedExpr env cond, code, message, texpr.Span)
+
+    | TExprBreakIf cond ->
+        IRBreakIf (lowerTypedExpr env cond)
     
     | TExprSequence exprs ->
         // sequence(c1, c2, ..., cn) -> IRSequence (flat n-ary parallel)
@@ -1036,8 +1084,13 @@ and lowerTypedPattern (pat: TypedPattern) : IRPattern =
     | TPatCons (h, t) -> IRPatCons (lowerTypedPattern h, lowerTypedPattern t)
     | TPatVariant (tag, payload, isEnum) -> 
         IRPatVariant (tag, hash tag, payload |> Option.map lowerTypedPattern, isEnum)
-    | TPatStruct (_, fields) ->
-        IRPatTuple (fields |> List.map (fun (_, p) -> lowerTypedPattern p))
+    | TPatStruct (typeName, fields) ->
+        // Field names are KEPT (they used to be dropped here, collapsing the
+        // pattern to a positional tuple): the C++ lane needs them to emit
+        // `.x` rather than `std::get<0>` on a real struct, and BOTH lanes
+        // need them for a pattern whose field order differs from the
+        // declaration's.
+        IRPatStruct (typeName, fields |> List.map (fun (n, p) -> (n, lowerTypedPattern p)))
     | TPatGuarded (p, _) -> lowerTypedPattern p
 
 /// Lower a typed block into nested IRLet
@@ -1471,9 +1524,20 @@ let lowerTypedFuncDecl (env: TypedLowerEnv) (decl: TypedFunctionDecl) : IRFuncDe
           IsArityPoly  = isArityPoly
           ArityParam   = polyParamNames |> List.tryHead }
     let funcDef =
-        mkCallable env.Builder funcOpts irParams body decl.ReturnType []
-                   (not decl.CommGroups.IsEmpty) decl.CommGroups
-                   parallelism isOmpParallel isCudaKernel cudaBlockSize isMpiParallel
+        { mkCallable env.Builder funcOpts irParams body decl.ReturnType []
+                     (not decl.CommGroups.IsEmpty) decl.CommGroups
+                     parallelism isOmpParallel isCudaKernel cudaBlockSize isMpiParallel
+            with
+                // `where repro`, grafted here exactly as lowerTypedLambda
+                // grafts AntisymGroups: this is the one construction site
+                // that still sees the clause.
+                IsRepro =
+                    (match decl.WhereClause with
+                     | Some wc -> wc.Repro
+                     | None -> false)
+                // The effect summary, from the same typed declaration -- the
+                // shared legality fact fusion's splice reads (IRMono.pureBody).
+                Effects = decl.Effects }
 
     let env' = bindTypedVar decl.Name decl.FuncId env
     (funcDef, env')
@@ -1829,7 +1893,19 @@ let tryProviderWrite (env: TypedLowerEnv) (typeDefs: IRTypeDef list) (binding: T
                   // Dimension names, best source first: (a) the source is
                   // itself a provider read, ask its provider for the store's
                   // names; (b) a module-level named index type with a
-                  // matching Id; (c) synthesized dim<i>.
+                  // matching Id; (c) the slot's own index TAG; (d) dim<i>.
+                  //
+                  // (c) exists because (b) misses the case it was written for.
+                  // A named index type reaches an array through
+                  // `lowerIndexType`, which "stamps a fresh Id per use"
+                  // (TypeEnv's own note at the provider-axis registration), so
+                  // `it.Id = idx.Id` does not hold for a user-declared alias
+                  // and never did: `type LatIdx = Idx<2>` written out as
+                  // `nc.write("out.nc", A)` produced "dim0", discarding the
+                  // one name the program actually stated. The Tag survives
+                  // that re-stamping -- it is the axis's NOMINAL identity, the
+                  // same field `unify` refuses to co-iterate across -- so it is
+                  // the reliable carrier of the declared name.
                   let fromSourceStore =
                       match Map.tryFind srcId env.ProviderReads with
                       | Some rspec ->
@@ -1837,6 +1913,29 @@ let tryProviderWrite (env: TypedLowerEnv) (typeDefs: IRTypeDef list) (binding: T
                            | Some p -> p.VarDimNames rspec.FilePath rspec.VarName
                            | None -> None)
                       | None -> None
+                  // A tag only names a dimension if it names it UNIQUELY.
+                  // `Array<T like LatIdx, LatIdx>` is one dimension used
+                  // twice, but the writers emit one dimension DEFINITION per
+                  // slot (netcdf's `nc_def_dim` would fail NC_ENAMEINUSE on
+                  // the repeat), so a repeated tag names no slot and every
+                  // slot carrying it falls through to dim<i> -- exactly
+                  // today's behaviour for that shape. Reusing one dimid
+                  // across slots is the writers' question, not this one's.
+                  let repeatedTags =
+                      arrTy.IndexTypes
+                      |> List.choose (fun idx -> idx.Tag)
+                      |> List.countBy id
+                      |> List.choose (fun (t, n) -> if n > 1 then Some t else None)
+                      |> Set.ofList
+                  // `__`-prefixed tags are the compiler's own sentinels and
+                  // provenance keys (`__anon`, `__orbidx`, `__icaxis|lat@...`)
+                  // -- not names a user wrote, and not names a store should
+                  // carry. An icechunk axis still gets its real name from
+                  // (a), which asks the provider.
+                  let nominalTag (idx: IRIndexType) =
+                      match idx.Tag with
+                      | Some t when not (t.StartsWith "__") && not (Set.contains t repeatedTags) -> Some t
+                      | _ -> None
                   let dimNames =
                       match fromSourceStore with
                       | Some names when names.Length = arrTy.IndexTypes.Length -> names
@@ -1846,6 +1945,7 @@ let tryProviderWrite (env: TypedLowerEnv) (typeDefs: IRTypeDef list) (binding: T
                               |> List.tryPick (function
                                   | IRTDIndexType (n, it) when it.Id = idx.Id -> Some n
                                   | _ -> None)
+                              |> Option.orElseWith (fun () -> nominalTag idx)
                               |> Option.defaultValue $"dim{i}")
                   Some { Provider = pname
                          FilePath = path
@@ -2068,14 +2168,15 @@ let lowerTypedModule (env: TypedLowerEnv) (modul: TypedModule) (rawDecls: Locate
             // The categorical weights array lowers in the same env for the same
             // reason -- it is always an earlier binding -- and carries the
             // checker-pinned static extent through unchanged.
-            let kind, keyIR, parIRs, weightsIR =
+            let kind, keyIR, parIRs, weightsIR, addressIR =
                 match binding.Value.Kind with
-                | TExprRandGen (k, key, pars, weights, _) ->
+                | TExprRandGen (k, key, pars, weights, address, _) ->
                     k,
                     lowerTypedExpr currentEnv key,
                     (pars |> List.map (lowerTypedExpr currentEnv)),
-                    (weights |> Option.map (fun (w, n) -> (lowerTypedExpr currentEnv w, n)))
-                | _ -> "uniform", IRLit (IRLitInt 0L), [], None  // unreachable: guarded by the `when` above
+                    (weights |> Option.map (fun (w, n) -> (lowerTypedExpr currentEnv w, n))),
+                    (address |> Option.map (fun (s, o) -> (lowerTypedExpr currentEnv s, lowerTypedExpr currentEnv o)))
+                | _ -> "uniform", IRLit (IRLitInt 0L), [], None, None  // unreachable: guarded by the `when` above
             let bd = {
                 Id = binding.VarId
                 Name = binding.Name
@@ -2086,7 +2187,7 @@ let lowerTypedModule (env: TypedLowerEnv) (modul: TypedModule) (rawDecls: Locate
             }
             bindings <- bindings @ [bd]
             currentEnv <- bindTypedVar binding.Name binding.VarId currentEnv
-            currentEnv <- { currentEnv with RandomInits = Map.add binding.VarId (RandGen (kind, keyIR, parIRs, weightsIR)) currentEnv.RandomInits }
+            currentEnv <- { currentEnv with RandomInits = Map.add binding.VarId (RandGen (kind, keyIR, parIRs, weightsIR, addressIR)) currentEnv.RandomInits }
         | TDeclLet binding when (match binding.Value.Kind with TExprCompound _ -> true | _ -> false) ->
             // Compound-construction constructor: materialized via P0
             // (genCompoundIndexFromMask) + a dense->compact scatter (the
@@ -2224,6 +2325,19 @@ let lowerTypedModule (env: TypedLowerEnv) (modul: TypedModule) (rawDecls: Locate
 
 /// Lower a typed program (with optional raw program for static evaluation)
 let lowerTypedProgram (program: TypedProgram) (rawProgram: Program option) (builder: IRBuilder) : IRProgram =
+    // The scratch-reuse plan is keyed by let id and let ids restart per
+    // compile, so a stale plan from an earlier program in this flow (the test
+    // harness compiles hundreds) must never reach this one.
+    Blade.Types.PoolReuseTable.reset ()
+    // The raw decl list callers hand us is the program they PARSED, not the
+    // one `TypeCheck.typeCheck` desugared inside itself -- so the icechunk
+    // checkout rewrite is applied again here, ahead of Phase 0's
+    // `resolveStatics` (whose `providerRoots` scan reads exactly this list,
+    // and whose miss is silent). Idempotent -- a rewritten binding loads a
+    // path carrying `@`, which the repo-handle scan declines -- and
+    // reference-equal for programs with no `import icechunk`. Errors cannot
+    // arise on this path: typecheck ran `expand` first and rejected them.
+    let rawProgram = rawProgram |> Option.map Blade.ProviderDesugar.desugarOrIdentity
     let env = { emptyTypedEnv() with Builder = builder }
     let mutable currentExports = Map.empty<string, ModuleExport>
     let mutable irModules = []
@@ -2316,6 +2430,18 @@ let lowerTypedProgram (program: TypedProgram) (rawProgram: Program option) (buil
         // var), so it gets the same elementwise-loop lowering top-level
         // `x + y` does.
         let irModule = IRMono.lowerArrayBinOpsModule irModule env.Builder
+        // The semantic-equivalence optimization stage (Blade.Optimize --
+        // see its charter): constant-scrutinee match folding (which also
+        // resolves symbolic ranks per specialization) and elementwise-chain
+        // fusion, in that order. Runs after the monomorphizers and the
+        // binop rewrite (so specialized literals and late-minted
+        // pack-element combinators are candidates), before
+        // liftInlineFormsModule (so lifted forms inherit the optimized
+        // shape), and in Lowering rather than a back end so codegen and the
+        // interpreter consume one tree. Per-pass gates: BLADE_FUSION,
+        // BLADE_FREEZE_IDIOM (the latter's recognition runs pre-lowering at
+        // inferRecArray, where the idiom's shape is still declarative).
+        let irModule = Optimize.optimizeModule env.Builder irModule
         // Lift inline forms (mask/sort/intersect/union/group_by/group_keys
         // appearing in non-let-RHS positions) into auto-let bindings so
         // codegen sees the canonical "let-bound" pattern uniformly.
@@ -2343,6 +2469,15 @@ let lowerTypedProgram (program: TypedProgram) (rawProgram: Program option) (buil
                 Functions =
                     irModule.Functions
                     |> List.map (fun f -> { f with Body = forceCallableBody f.Body }) }
+        // Scratch reuse across barriers (Blade.Optimize.planPoolReuse): runs
+        // HERE, after the second S2/S4 application, because its candidates
+        // are the forced (`IRCompute`-wrapped) body-local applies and the
+        // bare ones left behind are exactly the deferred join operands it
+        // must see through. Records into Types.PoolReuseTable for codegen.
+        // Let-level CSE over repeatable values first (fewer lets, fewer
+        // pools), then the scratch-reuse plan over what remains.
+        let irModule = Optimize.cseModule irModule
+        Optimize.planPoolReuse irModule
         // mask+contains fusion always runs a linear scan; the semijoin
         // hash-set is a separate, not-yet-implemented optimization.
         irModule)

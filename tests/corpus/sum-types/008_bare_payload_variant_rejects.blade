@@ -1,0 +1,13 @@
+// TEST: Bare Payload Variant Pattern (rejects)
+// ============================================================================
+// A payload-carrying constructor used WITHOUT its payload in pattern
+// position used to become an irrefutable variable binder named after the
+// constructor -- matching everything and silently killing every later arm.
+// Now it demands the payload be spelled.
+
+type Option = Some : Int | None
+let x = Some(42)
+let r = match x with
+    | Some -> 1
+    | None -> 2
+// ERROR-CONTAINS: carries a payload

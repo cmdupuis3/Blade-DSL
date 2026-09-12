@@ -164,8 +164,8 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         | TExprFillRandom e -> TExprFillRandom (z e)
         // The weights extent is a resolved static int, not a type -- only the
         // paired expression is zonked.
-        | TExprRandGen (k, key, pars, weights, dims) ->
-            TExprRandGen (k, z key, List.map z pars, weights |> Option.map (fun (w, n) -> (z w, n)), dims)
+        | TExprRandGen (k, key, pars, weights, address, dims) ->
+            TExprRandGen (k, z key, List.map z pars, weights |> Option.map (fun (w, n) -> (z w, n)), address |> Option.map (fun (s, o) -> (z s, z o)), dims)
         | TExprRank e -> TExprRank (z e)
         | TExprDotDot (lo, hi) -> TExprDotDot (z lo, z hi)
         | TExprReynolds (k, a) -> TExprReynolds (z k, a)
@@ -186,21 +186,29 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         | TExprUnion (a, b) -> TExprUnion (z a, z b)
         | TExprUnique a -> TExprUnique (z a)
         | TExprContains (a, v) -> TExprContains (z a, z v)
-        | TExprDisplayEmit (h, q, d, m) -> TExprDisplayEmit (h, q, z d, m)
+        | TExprDisplayEmit (h, q, d, m, idOpt) -> TExprDisplayEmit (h, q, z d, m, Option.map z idOpt)
         | TExprDisplayJson (r, d) -> TExprDisplayJson (r, z d)
         | TExprDisplayNum d -> TExprDisplayNum (z d)
         | TExprDisplayStr d -> TExprDisplayStr (z d)
         | TExprGroupBy (v, k) -> TExprGroupBy (z v, z k)
         | TExprGroupKeys ks -> TExprGroupKeys (List.map z ks)
         | TExprGroupBucket gk -> TExprGroupBucket (z gk)
+        | TExprSegments _ -> expr.Kind
+        | TExprUngroup (g, src) -> TExprUngroup (z g, src)
+        | TExprUngroupRows (rows, offs, src) -> TExprUngroupRows (zs rows, offs, src)
+        | TExprSegmentsGrid _ -> expr.Kind
+        | TExprUngroupGrid (g, srcs, b) -> TExprUngroupGrid (z g, srcs, b)
         | TExprSort (a, k) -> TExprSort (z a, z k)
         | TExprReduce (a, k, i) -> TExprReduce (z a, z k, Option.map z i)
         | TExprProdSum args -> TExprProdSum (List.map z args)
         | TExprTranspose (a, d1, d2) -> TExprTranspose (z a, d1, d2)
         | TExprDecompact (a, d) -> TExprDecompact (z a, d)
         | TExprGram (l, r, s) -> TExprGram (z l, z r, s)
+        | TExprGramApply (l, r, x) -> TExprGramApply (z l, z r, z x)
         | TExprMatmul (l, r) -> TExprMatmul (z l, z r)
         | TExprEigh a -> TExprEigh (z a)
+        | TExprLu a -> TExprLu (z a)
+        | TExprLuSolve (l, p, b, t) -> TExprLuSolve (z l, z p, z b, t)
         | TExprSolve (a, b) -> TExprSolve (z a, z b)
         | TExprArrayNegate a -> TExprArrayNegate (z a)
         | TExprArrayConjugate a -> TExprArrayConjugate (z a)
@@ -208,7 +216,8 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         | TExprZero -> TExprZero
         | TExprReplicate (c, b) -> TExprReplicate (z c, z b)
         | TExprAssign (l, r) -> TExprAssign (z l, z r)
-        | TExprConstraintCheck (c, msg) -> TExprConstraintCheck (z c, msg)
+        | TExprConstraintCheck (c, code, msg) -> TExprConstraintCheck (z c, code, msg)
+        | TExprBreakIf c -> TExprBreakIf (z c)
         | TExprPartialApp (op, arg, isL) -> TExprPartialApp (op, z arg, isL)
         // Ternary
         | TExprIf (c, t, e) -> TExprIf (z c, z t, z e)
@@ -221,6 +230,7 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         // Collections
         | TExprTuple es -> TExprTuple (zs es)
         | TExprComplexLit (re, im) -> TExprComplexLit (z re, z im)
+        | TExprFma (a, b, c) -> TExprFma (z a, z b, z c)
         // THE LITERAL'S OWN ARRAY TYPE TOO, for TExprApply's reason (see its
         // ArrayTypes note below). `inferArrayLitType` snapshots the ELEMENT
         // type off `exprs.[0].Type` at the moment the literal is inferred, so
@@ -241,7 +251,6 @@ let rec zonkExpr (subst: Subst) (expr: TypedExpr) : TypedExpr =
         | TExprJoin (es, d) -> TExprJoin (zs es, d)
         | TExprSequence es -> TExprSequence (zs es)
         | TExprAlign (es, sp) -> TExprAlign (zs es, sp)
-        | TExprBlocked (it, bs) -> TExprBlocked (it, z bs)
         // Structured
         | TExprLet (name, vid, value, body) -> TExprLet (name, vid, z value, z body)
         | TExprMatch (scr, cases) ->

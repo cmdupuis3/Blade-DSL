@@ -1,0 +1,65 @@
+// TEST: Reduction Join Share Read By A Direct Fold Leg
+// The join's sharing declaration read from the LEG's side (docs/plans/
+// structural/03, defect D2). `e` is a named deferred map; `reduce(e, (+))`
+// folds it DIRECTLY while `prodsum(e, v)` reads it in an operand slot. Both
+// legs read ONE per-iteration share of `e`: the fused loop spells the
+// producer once (tests/OptimizeTests.fs pins the emission). Before, the
+// direct-fold leg was spliced as a copy of the producer and re-spelled it
+// beside the share it never read -- two exponentials per iteration for a
+// join that declared one. The pins are values: sharing must not move a bit
+// against the same statistics read out of materialized arrays.
+type J = Idx<11>
+let k = method_for(range<J>) <@> lambda(j) -> 0.2 * Float64(j) - 0.4 |> compute
+let v = method_for(range<J>) <@> lambda(j) -> 1.0 + 0.1 * Float64(j) |> compute
+
+// Leaf + slot: two legs, one share.
+let e = method_for(k) <@> lambda(b) -> exp(-b * b)
+let z, u = object_for(<&!>) <@> (reduce(e, (+)), prodsum(e, v))
+
+// Leaf twice + slot: three legs, still one share (the max leg is seeded).
+let z2, m2, u2 = object_for(<&!>) <@> (reduce(e, (+)),
+                                        reduce(e, lambda(a, b) -> if a > b then a else b, -1.0e300),
+                                        prodsum(e, v))
+
+// A named map spelled ONCE is not a share: that leg keeps its own nest.
+let e1 = method_for(k) <@> lambda(b) -> b * b
+let s1, t1 = object_for(<&!>) <@> (reduce(e1, (+)), prodsum(v, v))
+
+// The same shape as a body-local binding inside a function.
+function rowstat(qi: Float64) -> Float64 = {
+    let w = method_for(k) <@> lambda(b) -> exp(-(qi - b) * (qi - b))
+    let zw, uw = object_for(<&!>) <@> (reduce(w, (+)), prodsum(w, v))
+    uw / zw
+}
+let r = rowstat(0.3)
+
+// The same statistics out of MATERIALIZED arrays.
+let em = (method_for(k) <@> lambda(b) -> exp(-b * b)) |> compute
+let zm = reduce(em, (+))
+let mm = reduce(em, lambda(a, b) -> if a > b then a else b, -1.0e300)
+let um = prodsum(em, v)
+let e1m = (method_for(k) <@> lambda(b) -> b * b) |> compute
+let s1m = reduce(e1m, (+))
+let t1m = prodsum(v, v)
+let wm = (method_for(k) <@> lambda(b) -> exp(-(0.3 - b) * (0.3 - b))) |> compute
+let rm = prodsum(wm, v) / reduce(wm, (+))
+
+let dz = z - zm
+let du = u - um
+let dz2 = z2 - zm
+let dm2 = m2 - mm
+let du2 = u2 - um
+let ds1 = s1 - s1m
+let dt1 = t1 - t1m
+let dr = r - rm
+// EXPECT: dz = 0.0
+// EXPECT: du = 0.0
+// EXPECT: dz2 = 0.0
+// EXPECT: dm2 = 0.0
+// EXPECT: du2 = 0.0
+// EXPECT: ds1 = 0.0
+// EXPECT: dt1 = 0.0
+// EXPECT: dr = 0.0
+// EXPECT: s1 = 8.36
+// EXPECT: t1 = 25.85
+// EXPECT: r = 1.4143930738902

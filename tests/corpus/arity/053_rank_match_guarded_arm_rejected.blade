@@ -1,0 +1,22 @@
+// TEST: Guarded arm on a rank match (rejects)
+// ERROR: BL3021
+// ERROR-CONTAINS: arm selection happens at specialization
+// ============================================================================
+// The rank twin of 052: `match rank(x)` over an abstract (caret) parameter
+// dispatches per HM specialization -- the scrutinee lowers symbolically and
+// the constant-match fold picks one arm per clone (see 051). A guard on such
+// an arm is the same category error as on an arity match: the arm is chosen
+// at specialization, where a runtime value has no answer. Refused by the same
+// BL3021 rule. Scope fence: `rank(a)` over a CONCRETE array is an ordinary
+// static int match and keeps accepting guards (its fold simply declines and
+// the match runs at runtime), and `match (arity(A) + 0)` -- not syntactically
+// the intrinsic -- keeps today's behavior with the specializer's bail as the
+// backstop.
+// ============================================================================
+let flag = 1.0
+function describe(x: T^r) -> Int64 = match rank(x) with
+    | 0 if flag > 0.0 -> 100
+    | 0 -> 101
+    | 1 -> 200
+    | _ -> 300
+let a = describe(4.0)

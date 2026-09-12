@@ -6,7 +6,11 @@
 // leg. Its storage-keyed sibling `<|:>` IS differentiable (006); the
 // distinction is the whole point of having both.
 // ERROR: BL5501
-// ERROR-CONTAINS: combinator operators
+// The message is `<|>`'s own since the per-operator split: it says
+// DISCONTINUITY (not "unsupported"), names the jump, and points at `guard`
+// -- plan-ad-combinators.md 2.13's recommendation, which was "keep the
+// refusal; improve the message".
+// ERROR-CONTAINS: it selects the first NON-ZERO cell
 import ad as ad
 
 function f(a: Array<Float like Idx<2>>, b: Array<Float like Idx<2>>) -> Float = {

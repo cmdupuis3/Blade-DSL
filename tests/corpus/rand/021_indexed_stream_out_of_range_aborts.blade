@@ -1,0 +1,9 @@
+// TEST: Rand Indexed: a stream key outside one counter word aborts (aborts)
+// ABORT: error[BL8001]
+// ABORT: stream key
+// The stream key occupies one 32-bit word of the Philox counter; a value
+// outside [0, 2^32) would alias another stream, so it is refused rather than
+// truncated -- a literal at typecheck, a runtime value here, in both lanes.
+import rand as r
+let big = 4294967295 + 1
+let u = r.uniform_at(5, big, 0, 4)

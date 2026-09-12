@@ -1,0 +1,39 @@
+// TEST: CoIter Abstract Param Agree
+// The GREEN companion to diagnostics/075 and 076: the co-iteration agreement
+// obligation must refuse only the mismatch, never the agreeing program.
+//
+// `addup` zips two abstract `T^1` parameters, so it carries the obligation --
+// every call below satisfies it and must keep compiling and giving the right
+// values, in both lanes:
+//   sum_pr : 1+10, 2+20, 3+30 folded  ->  66  (the answer diagnostics/075's
+//            mismatched call was silently computing from past-the-end memory)
+//   sum_pp : zip(p, p) -- one parameter passed twice. A group needs two
+//            DISTINCT positions, so this contributes no obligation at all; it
+//            would agree with itself in any case.
+//   sum_fwd: the forwarding chain of 076, with extents that agree.
+//   wsum_p : the ONE-SIDED obligation of diagnostics/077 -- a parameter zipped
+//            with a CONCRETE array -- satisfied: 1*1 + 2*1 + 3*1.
+// A differently-NAMED index type of the same extent is a separate question
+// (diagnostics/074 pins it at the zip); these operands share one index space.
+type A = Idx<3>
+
+function addup(a: T^1, b: T^1) -> T^0 =
+    reduce(method_for(zip(a, b)) <@> lambda(x, y) -> x + y, (+))
+function outer(x: T^1, y: T^1) -> T^0 = addup(x, y)
+
+let p: Array<Float64 like A> = [1.0, 2.0, 3.0]
+let r: Array<Float64 like A> = [10.0, 20.0, 30.0]
+
+let sum_pr = addup(p, r)
+let sum_pp = addup(p, p)
+let sum_fwd = outer(p, r)
+
+let weights: Array<Float64 like A> = [1.0, 1.0, 1.0]
+function wsum(a: T^1) -> T^0 =
+    reduce(method_for(zip(a, weights)) <@> lambda(x, y) -> x * y, (+))
+let wsum_p = wsum(p)
+
+// EXPECT: sum_pr = 66
+// EXPECT: sum_pp = 12
+// EXPECT: sum_fwd = 66
+// EXPECT: wsum_p = 6

@@ -1,0 +1,10 @@
+// TEST: Static And Or Short Circuit
+// ============================================================================
+// `&&` and `||` short-circuit at compile time exactly as they do at runtime.
+// The static evaluator visited both operands before dispatching, so
+// `false && (1 / 0 == 1)` was a static division-by-zero error while the same
+// guard at runtime is simply `false`.
+let static x = false && (1 / 0 == 1)
+let static y = true || (1 / 0 == 1)
+// EXPECT: x = false
+// EXPECT: y = true

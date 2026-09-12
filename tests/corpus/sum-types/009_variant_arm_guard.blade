@@ -1,0 +1,40 @@
+// TEST: Variant Arm Guard Falls Through
+// ============================================================================
+// A guard on a NON-LAST variant arm was read by the typechecker and then
+// dropped on the floor by the emitter, which rendered the arm as an
+// unconditional `(tag_test ? body : rest)`. The arm therefore fired whenever
+// its tag matched, guard or no guard -- a silent wrong answer, and a
+// divergence from the interpreter, which has always re-tried the next arm on
+// a false guard.
+//
+// HAND DERIVATION: x is Some(5), so arm 1's tag matches but 5 > 10 is false;
+// arm 2's tag matches with no guard and answers 2 * 5 = 10.
+
+type Option = Some : Int64 | None
+
+let x = Some(5)
+let r = match x with
+    | Some(v) if v > 10 -> v
+    | Some(v) -> v * 2
+    | None -> 0
+// EXPECT: r = 10
+
+// The guard on the LAST arm falls through to the non-exhaustive abort, so a
+// TRUE one has to be what selects it -- pinning it proves the last arm is
+// still reachable after the rewrite made it carry a tag test of its own.
+let y = Some(20)
+let s = match y with
+    | None -> 0
+    | Some(v) if v > 10 -> v + 1
+// EXPECT: s = 21
+
+// Enum-like (no payload) arms take the same path: tag test, then guard.
+type Direction = North | South | East | West
+let d = South
+let t = match d with
+    | South if 1 > 2 -> 100
+    | South -> 2
+    | North -> 1
+    | East -> 3
+    | West -> 4
+// EXPECT: t = 2

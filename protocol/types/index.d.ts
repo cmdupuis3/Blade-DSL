@@ -38,6 +38,22 @@ export interface Decoder {
   push(chunk: string): ServeResponse[];
 }
 
+/** The `render` response: one camera change's OUTCOME, not its pictures --
+ *  those arrive as live display events while the executable runs. */
+export interface RenderResponse {
+  id: number;
+  ok: boolean;
+  /** The executable was reused rather than rebuilt. The steady state, and
+   *  the whole reason this command exists; false only on the first call of
+   *  a session (or after an edit changed the program around the camera). */
+  cached: boolean;
+  /** How many display frames the run emitted, all already published. */
+  frames: number;
+  elapsedMs: number;
+  exitCode: number;
+  stderr: string;
+}
+
 /** The `renderPlot` request minus its envelope — everything the caller
  *  chooses, in one object (see ./serve.d.ts for the field rules). */
 export type RenderPlotArgs = Omit<RenderPlotRequest, "id" | "cmd">;
@@ -234,6 +250,22 @@ export interface BladeClient {
    *  override for anything real. */
   eval(session: string, source: string, cwd?: string, timeoutMs?: number): Promise<EvalResponse>;
   resetSession(session: string, timeoutMs?: number): Promise<OkResponse>;
+  /** THE RENDER FAST PATH: recompute an already-evaluated session under a
+   *  new camera WITHOUT re-running it. The compiler builds the program once
+   *  with `bindings` erased into a run-time read, then re-runs that
+   *  executable per call with only `values` changed -- about 400ms a frame
+   *  against seconds for a session evaluation. `bindings` are the camera
+   *  names the figure's layout declared; `values` are positional.
+   *
+   *  The camera stays in the caller's cell -- rewrite it as before, so the
+   *  notebook keeps saying where the lens points; the compiled program
+   *  simply never sees a literal, which is what lets the binary be reused.
+   *
+   *  Frames arrive on the display bus as live events, NOT in the response.
+   *  Rejects with `protocolError` on a compiler predating the command --
+   *  fall back to re-running the camera cell. */
+  render(session: string, bindings: string[], values: number[], cwd?: string,
+         opts?: { timeoutMs?: number }): Promise<RenderResponse>;
   /** Re-render a retained figure spec as a static image through the
    *  compiler's GR worker. Resolves with a complete display frame, ready for
    *  `display.decodeFrame`/`display.publish`. A ProtocolError means either a

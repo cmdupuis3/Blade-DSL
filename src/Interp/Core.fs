@@ -50,6 +50,13 @@ module N = Blade.Interp.Numerics
 /// caller can report precisely which construct is not yet interpreted.
 exception InterpUnsupported of feature: string
 
+/// Control-flow signal for IRBreakIf (the rec-array `while` guard): thrown by
+/// the break-if arm, caught ONLY by the enclosing IRForRange arm, which stops
+/// iterating -- the twin of the C++ `break` genForRangeBinding emits. Escaping
+/// a loop entirely (an IRBreakIf outside any for-range) is a compiler bug and
+/// surfaces as an unhandled exception rather than being silently swallowed.
+exception InterpBreak
+
 /// Runtime bridge from the scalar Core evaluator down to the M2 loop/array
 /// layer (Interp/Loops.fs). Core must stay free of a *compile-time* dependency
 /// on Loops, because Loops calls back into Core.evalExpr for kernel bodies --
@@ -482,6 +489,17 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let i = toF64 (evalExpr st env im)
         VComplex (r, i)
 
+    // fma(a, b, c): ONE rounding. Math.FusedMultiplyAdd is the hardware fma
+    // where the CPU has it and a correctly-rounded software fma otherwise,
+    // which is exactly the contract of the std::fma the compiled lane calls
+    // -- so this node is bit-identical across lanes under ANY BLADE_FP_CONTRACT
+    // (the one arithmetic node for which that is true by construction).
+    | IRFma (a, b, c) ->
+        let x = toF64 (evalExpr st env a)
+        let y = toF64 (evalExpr st env b)
+        let z = toF64 (evalExpr st env c)
+        VFloat (System.Math.FusedMultiplyAdd (x, y, z))
+
     // `&&` / `||` short-circuit exactly like the emitted C++ (CodeGen.fs:782):
     // the right operand is not evaluated when the left decides the result.
     | IRBinOp (_, IRAnd, l, r) ->
@@ -516,6 +534,8 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
             | IRGroupKeys keys ->
                 let ty = groupKeysTypeInScope id body |> Option.defaultValue IRTUnit
                 buildGroupKeysValue st env keys ty
+            | IRSegments (offsets, _) -> segmentsValue offsets
+            | IRSegmentsGrid bounds -> segmentsGridValue bounds
             | _ -> evalExpr st env value
         // Copy semantics for assignable array lets initialized from an
         // existing array (`let mut a = Z` -- st.MutableArrayLets): deep-copy
@@ -596,21 +616,33 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
         let hiV = toI64 (evalExpr st env hi)
         let cell = envBind env vid (VInt loV)
         let mutable i = loV
-        while i < hiV do
-            cell.V <- VInt i
-            evalExpr st env body |> ignore
-            i <- i + 1L
+        // InterpBreak = the C++ `break` genForRangeBinding emits for IRBreakIf
+        // (the rec-array while guard): it unwinds to HERE, ending this loop and
+        // resuming after it. The handler wraps the whole loop rather than each
+        // trip -- one guarded region per loop execution instead of one per
+        // iteration -- and being per loop LEVEL it still stops only the
+        // innermost enclosing loop when they nest.
+        (try
+            while i < hiV do
+                cell.V <- VInt i
+                evalExpr st env body |> ignore
+                i <- i + 1L
+         with InterpBreak -> ())
         VUnit
 
-    | IRConstraintCheck (cond, message, span) ->
-        // `if (!(cond)) blade_rt::panic("BL8001", message, file, line)`
+    | IRBreakIf cond ->
+        if toBoolV (evalExpr st env cond) then raise InterpBreak
+        else VUnit
+
+    | IRConstraintCheck (cond, code, message, span) ->
+        // `if (!(cond)) blade_rt::panic(code, message, file, line)`
         // (CodeGen.fs:7166). File is nullptr when empty, line 0 when unset --
         // reproduced here so Run.fs can render the identical stderr line.
         if toBoolV (evalExpr st env cond) then VUnit
         else
             let fileOpt = match span.File with Some f when f <> "" -> Some f | _ -> None
             let line = if span.StartLine > 0 then span.StartLine else 0
-            raise (InterpPanic ("BL8001", message, fileOpt, line))
+            raise (InterpPanic (code, message, fileOpt, line))
 
     | IRRank arr ->
         // Rank is static in CodeGen (from the type). Scalars are rank 0; a
@@ -695,27 +727,35 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     //      flushes the buffer ahead of the binding prints, which is exactly
     //      where the compiled binary's std::cout writes land (inside main()'s
     //      body, before the timing line). Same bytes, same order, both lanes.
-    | IRDisplayEmit (head, quoted, dataExpr, metaTail) ->
-        (match evalExpr st env dataExpr with
-         | VString s -> VBool (Blade.Display.Frame.emit head quoted s metaTail)
+    | IRDisplayEmit (head, quoted, dataExpr, metaTail, idOpt) ->
+        (match evalExpr st env dataExpr, idOpt with
+         | VString s, None -> VBool (Blade.Display.Frame.emit head quoted s metaTail)
+         // display.emit_id: the frame's meta.id is this second runtime String.
+         // A live sink (ide serve) may intercept a STREAM-mime frame here
+         // instead of buffering it; with no sink -- every other lane -- the
+         // line is buffered exactly like emit's.
+         | VString s, Some idExpr ->
+             (match evalExpr st env idExpr with
+              | VString idText -> VBool (Blade.Display.Frame.emitId head quoted s metaTail idText)
+              | _ -> raise (InterpUnsupported "display.emit_id: id did not evaluate to a String"))
          | _ -> raise (InterpUnsupported "display.emit: payload did not evaluate to a String"))
 
     // ---- display.json_array / display.json_num: JSON text of a numeric
     //      array / scalar. Formatting parity is the contract:
-    //      CppFormat.formatFloat15 is the byte-exact mirror of the C++
-    //      helpers' `setprecision(15)` stream (blade_display::json1/json2 in
-    //      Blade.Display.Frame.cppRuntime), so the differential gate pins
+    //      CppFormat.formatFloatShortest is the byte-exact mirror of the C++
+    //      helpers' shortest round-trip rendering (blade_display::jsonfloat
+    //      in Blade.Display.Frame.cppRuntime), so the differential gate pins
     //      the two lanes together exactly as it does for prints.
     | IRDisplayJson (rank, dataExpr) ->
         (match forceValue st env (evalExpr st env dataExpr) with
          | VArray ba ->
              // Frame.jsonNumber is the non-finite guard -- NaN/+-Inf go out as
-             // `null`, everything else as the 15-significant-digit rendering.
+             // `null`, everything else as the shortest round-trip rendering.
              // Its C++ mirror is blade_display::jsonval.
              let jsonF (x: float) =
-                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat15 x) x
+                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest x) x
              let jsonF32 (x: float32) =
-                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat32 x) (float x)
+                 Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest (float x)) (float x)
              let elemStr (store: Store) (i: int) : string =
                  match store with
                  | SFloat a -> jsonF a.[i]
@@ -768,8 +808,8 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
 
     | IRDisplayNum dataExpr ->
         (match forceValue st env (evalExpr st env dataExpr) with
-         | VFloat f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat15 f) f)
-         | VFloat32 f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloat32 f) (float f))
+         | VFloat f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest f) f)
+         | VFloat32 f -> VString (Blade.Display.Frame.jsonNumber (Blade.Interp.CppFormat.formatFloatShortest (float f)) (float f))
          | VInt n -> VString (string n)
          | VInt32 n -> VString (string n)
          | _ -> raise (InterpUnsupported "display.json_num: operand did not evaluate to a numeric scalar"))
@@ -803,6 +843,11 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     | IRGroupBucket _ ->
         evalArrayNode st env expr
 
+    // ---- ungroup(G) -> the rows of a segment-grouped array over the source
+    //      axis (docs/plans/structural/07 §3.3). Same backend route.
+    | IRUngroup _ | IRUngroupRows _ | IRUngroupGrid _ ->
+        evalArrayNode st env expr
+
     // ---- extents(gk) -> a dense rank-1 Int64 array of per-group sizes.
     | IRGroupSizes _ ->
         evalArrayNode st env expr
@@ -816,8 +861,8 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     // ---- M2 virtual-array sources (range / reverse / blocked): no standalone
     //      store -- consumed only as nest inputs (ArraySource.SVirtual). The
     //      suspended (expr, env) lets the Loops backend read the IRRange /
-    //      IRVirtualReverse / IRBlocked descriptor when it wires the nest.
-    | IRRange _ | IRVirtualReverse _ | IRBlocked _ ->
+    //      IRVirtualReverse descriptor when it wires the nest.
+    | IRRange _ | IRVirtualReverse _ ->
         VDeferred (expr, env)
 
     // ---- M2 indexing / currying / poly-index over a concrete array. Force a
@@ -882,14 +927,14 @@ let rec evalExpr (st: InterpState) (env: Env) (expr: IRExpr) : Value =
     //      negate/conjugate. Like the eager set/reshape ops these MATERIALIZE a
     //      fresh array, so route to the Loops backend (mirrors CodeGen's
     //      materialize{Decompact,Gram,Negate/Conjugate}Form emitters).
-    | IRDecompact _ | IRGram _ | IRMatmul _ | IRSolve _ | IRArrayNegate _ | IRArrayConjugate _ ->
+    | IRDecompact _ | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _ | IRArrayNegate _ | IRArrayConjugate _ ->
         evalArrayNode st env expr
 
     // ---- eigh: same materializing family, but its value is a TUPLE (Q, LAM)
     //      rather than one array, so the Loops backend returns a VTuple here.
     //      Reachable only when the LAPACK gate was on at elaboration; gate
     //      off, `math.eigh` is synthesized Blade source and this node never exists.
-    | IREigh _ ->
+    | IREigh _ | IRLu _ | IRLuSolve _ ->
         evalArrayNode st env expr
 
     | other ->
@@ -984,7 +1029,12 @@ and evalCall (st: InterpState) (callable: IRCallable) (captures: Map<IRId, Value
 /// is false) leaves no bindings visible to later cases.
 and evalMatch (st: InterpState) (env: Env) (sv: Value) (cases: IRMatchCase list) : Value =
     match cases with
-    | [] -> raise (InterpPanic ("BL8006", "no matching case in match expression", None, 0))
+    // BL8002 to match codegen and the LLVM lane byte-for-byte: all three
+    // evaluators panic the SAME code and message on a non-exhaustive match,
+    // so the differential gates can pin the event once. (This site used to
+    // say BL8006 -- the out-of-bounds family -- and the interp-diff harness
+    // caught the drift the day a corpus test pinned the abort.)
+    | [] -> raise (InterpPanic ("BL8002", "Blade: non-exhaustive match", None, 0))
     | c :: rest ->
         let caseEnv = envChild env
         if tryMatch caseEnv sv c.Pattern then
@@ -1010,18 +1060,37 @@ and tryMatch (env: Env) (scrut: Value) (pat: IRPattern) : bool =
         match scrut with
         | VTuple els when els.Length = List.length pats ->
             List.forall2 (fun p v -> tryMatch env v p) pats (List.ofArray els)
-        // Struct destructuring patterns lower to IRPatTuple with field NAMES
-        // dropped (Lowering.fs:656-657), so a VStruct scrutinee is matched
-        // POSITIONALLY -- the same shape the compiled side sees. Without this
-        // arm a VStruct silently fails every IRPatTuple, wrongly falling
-        // through to the next case / the non-exhaustive panic.
+        // A struct pattern keeps its field names (IRPatStruct) and is
+        // handled below; this arm is what a genuinely POSITIONAL pattern over
+        // a struct scrutinee means, and it stays because the compiled lane
+        // decodes the same shape the same way (by declaration order).
         | VStruct (_, fields) when fields.Length = List.length pats ->
             List.forall2 (fun p (_, v) -> tryMatch env v p) pats (List.ofArray fields)
         | _ -> false
+    | IRPatStruct (_, fieldPats) ->
+        // BY NAME, not by position: `Point { y, x }` binds y to the y field
+        // however the struct declared its order. The type name is not
+        // re-checked -- typecheck already fixed the scrutinee's type, and a
+        // struct value carries no sum-type tag to discriminate on.
+        match scrut with
+        | VStruct (_, fields) ->
+            fieldPats |> List.forall (fun (fname, fpat) ->
+                match fields |> Array.tryFind (fun (n, _) -> n = fname) with
+                | Some (_, v) -> tryMatch env v fpat
+                | None -> false)
+        | _ -> false
     | IRPatCons (hp, tp) ->
         match scrut with
-        | VTuple els when els.Length >= 1 ->
-            tryMatch env els.[0] hp && tryMatch env (VTuple els.[1..]) tp
+        | VTuple els when els.Length >= 2 ->
+            // Blade has no 1-tuple -- `(x)` IS `x` -- so a pair's remainder is
+            // the BARE element, not a one-element tuple. That is the rule
+            // Lowering's `subBindingValue` applies to `let h :: t` and the one
+            // TypeCheck types the leaf by; handing back `VTuple [|x|]` here
+            // made `h :: t` on a pair a type-lie no compiled lane could
+            // reproduce. A 1-element scrutinee has no remainder at all, so
+            // cons does not match it.
+            let tail = if els.Length = 2 then els.[1] else VTuple els.[1..]
+            tryMatch env els.[0] hp && tryMatch env tail tp
         | _ -> false
     | IRPatVariant (_, tag, innerOpt, _) ->
         // Dispatch by tag (= hash constructorName), matching construction above.
@@ -1070,6 +1139,30 @@ and evalAssign (st: InterpState) (env: Env) (target: IRExpr) (v: Value) : unit =
 /// the twin of what genFuncBodyScoped's group_keys arm does. Either way an
 /// IRTUnit (nothing found) lands on dynamic discovery, which is also what every
 /// un-annotated key array gets.
+/// The structural grouping's value: offsets are the run boundaries, the
+/// member permutation is the identity over the source extent.
+and private segmentsValue (offsets: int64 list) : Value =
+    let offs = Array.ofList offsets
+    let n = int (Array.last offs)
+    VGroupKeys { Offsets = offs; Members = Array.init n int64; Coords = None }
+
+/// The grid grouping's value: tile-major member order, each position carrying
+/// its (i, j) coordinate (genSegmentsGridBinding's twin).
+and private segmentsGridValue (bounds: int64 list list) : Value =
+    let b0, b1 = Array.ofList bounds.[0], Array.ofList bounds.[1]
+    let coords = ResizeArray<int64 list>()
+    let offs = ResizeArray<int64>()
+    offs.Add 0L
+    for t0 in 0 .. b0.Length - 2 do
+        for t1 in 0 .. b1.Length - 2 do
+            for i in b0.[t0] .. b0.[t0 + 1] - 1L do
+                for j in b1.[t1] .. b1.[t1 + 1] - 1L do
+                    coords.Add [ i; j ]
+            offs.Add (int64 coords.Count)
+    let n1 = b1.[b1.Length - 1]
+    let members = coords |> Seq.map (fun c -> c.[0] * n1 + c.[1]) |> Array.ofSeq
+    VGroupKeys { Offsets = offs.ToArray(); Members = members; Coords = Some (coords.ToArray()) }
+
 and private buildGroupKeysValue (st: InterpState) (env: Env) (keys: IRExpr list) (ty: IRType) : Value =
     let keyArrs =
         keys |> List.map (fun k ->
@@ -1161,6 +1254,10 @@ let evalBinding (st: InterpState) (env: Env) (b: IRBinding) : Value =
     // the bare IRGroupKeys node does not carry.
     | IRGroupKeys keys ->
         buildGroupKeysValue st env keys b.Type
+    // segments(A): the structural grouping -- static offsets, identity
+    // members (docs/plans/structural/07 §3.2; genSegmentsBinding's twin).
+    | IRSegments (offsets, _) -> segmentsValue offsets
+    | IRSegmentsGrid bounds -> segmentsGridValue bounds
     | v when shouldDeferBinding env b.Type v ->
         VDeferred (b.Value, env)
     | _ ->
@@ -1178,7 +1275,7 @@ let evalBinding (st: InterpState) (env: Env) (b: IRBinding) : Value =
         // too, not a silently mis-shaped array (func-arrays T12 abort probe).
         (match b.Value, value with
          | IRArrayLit (elements, arrType), VArray arr ->
-             let cppName = if b.Name = "_" then $"__tup_{b.Id}" else b.Name
+             let cppName = if b.Name.StartsWith "_(" then $"__tup_{b.Id}" else b.Name
              checkArrayLitRowExtents cppName elements arrType arr
          | _ -> ())
         // Copy semantics for assignable top-level array bindings whose

@@ -1,0 +1,11 @@
+# The committed Icechunk store is binary in every file, including the small
+# metadata ones: git only guesses that from an early NUL byte, and a
+# regenerated repo/snapshot file without one would be CRLF-mangled under
+# core.autocrlf and stop parsing.
+examples/data/station_temps.icechunk/** binary
+
+# Same reasoning for the golden repo written by icechunk-python (the one
+# fixture in tests/fixtures/icechunk_repos/ that IS committed): its metadata
+# files are zstd frames and its chunk files are raw float64 cells. Neither is
+# text, and neither survives an end-of-line conversion.
+tests/fixtures/icechunk_repos/golden_py/** binary

@@ -1,0 +1,32 @@
+// TEST: C1 Reverse Refuses <|:> By Name (rejects)
+// The sibling of 106, and the more interesting wall. `<|:>` branches on
+// ALLOCATION, not on a value, so it is linear in both legs -- which is
+// exactly why 006 differentiates it forward and why plan-ad-combinators.md
+// 2.14 rates it FREE there. Reverse is where the asymmetry bites: the
+// adjoint is a storage-keyed SPLIT, and WHICH split it is differs by regime
+// (dense-left copies the cotangent whole and never touches the right
+// operand, which is never even forced; compound-left routes it through the
+// mask and its complement). The regime is the left operand's INDEX TYPE, and
+// this transform runs BEFORE typecheck -- so the information the rule needs
+// does not exist yet at the seam where the rule would live. Not an effort
+// gap; a pipeline-slot one, and the message says so.
+//
+// Note the parse: `a <|:> b |> compute` binds as `(a <|:> b) |> compute`, so
+// the wrapper is outermost. The refusal looks THROUGH `pure`/`compute`/
+// annotations before naming the form, or this would be reported as a shape
+// problem instead.
+// ERROR: BL5500
+// ERROR-CONTAINS: selects by ALLOCATION rather than by value
+import ad as ad
+
+type I = Idx<3>
+
+function f(a: Array<Float like I>, b: Array<Float like I>) -> Float = {
+    let c = a <|:> b |> compute
+    c(0) + c(2)
+}
+
+let mut da = [0.0, 0.0, 0.0]
+let mut db = [0.0, 0.0, 0.0]
+let v = ad.grad(f)([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], da, db)
+v

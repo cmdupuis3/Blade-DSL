@@ -129,6 +129,7 @@ let rec internal substArityInTy (resolve: Ident -> int option) (unresolved: Resi
     | TyOrbIdx (levels, b) -> TyOrbIdx (levels, sb b)
     | TyBoundedIdx (lo, hi) -> TyBoundedIdx (ex lo, ex hi)
     | TyCompoundIdx m -> TyCompoundIdx (ex m)
+    | TyChunked (t, s) -> TyChunked (ty t, ex s)
     | TySparseIdx k -> TySparseIdx (ex k)
     | TyEquivIdx (d, g, r) -> TyEquivIdx (ex d, ty g, ty r)
     | TyHermitianIdx e -> TyHermitianIdx (ex e)
@@ -318,8 +319,6 @@ and internal unrollPackExpr (ctx: Ctx) (fname: string) (budget: int ref)
     | ExprKind.ExprRange tys -> subTys tys |> Result.map (fun ts -> re (ExprRange ts))
     | ExprKind.ExprTyped (i, t) ->
         go i |> Result.bind (fun i' -> subTy t |> Result.map (fun t' -> re (ExprTyped (i', t'))))
-    | ExprKind.ExprBlocked (t, x) ->
-        go x |> Result.bind (fun x' -> subTy t |> Result.map (fun t' -> re (ExprBlocked (t', x'))))
     | ExprKind.ExprHalo (t, offs) ->
         go offs |> Result.bind (fun o' -> subTy t |> Result.map (fun t' -> re (ExprHalo (t', o'))))
     // -- ordinary structure --------------------------------------------------
@@ -360,6 +359,8 @@ and internal unrollPackExpr (ctx: Ctx) (fname: string) (budget: int ref)
     | ExprKind.ExprPartialApp (op, x, l) -> g1 (fun a -> ExprPartialApp (op, a, l)) x
     | ExprKind.ExprReynolds (k, anti) -> g1 (fun a -> ExprReynolds (a, anti)) k
     | ExprKind.ExprGram (l, r) -> g2 (fun a b -> ExprGram (a, b)) l r
+    | ExprKind.ExprGramApply (l, r, x) ->
+        go l |> Result.bind (fun l' -> go r |> Result.bind (fun r' -> go x |> Result.map (fun x' -> re (ExprGramApply (l', r', x')))))
     | ExprKind.ExprGuard (c, b) -> g2 (fun a b2 -> ExprGuard (a, b2)) c b
     | ExprKind.ExprReplicate (c, b) -> g2 (fun a b2 -> ExprReplicate (a, b2)) c b
     | ExprKind.ExprMask (a, p) -> g2 (fun x y -> ExprMask (x, y)) a p

@@ -1,0 +1,28 @@
+// TEST: C2-Reverse Refuses A Kernel Carrying A where Clause (rejects)
+// The lowering emits a DENSE construction loop. `comm(a, b)` is an
+// interchangeable-for-iteration DECLARATION, not a claim that the kernel is
+// symmetric (`formalism.md` 8: "not a truth claim about g"), so the symmetric
+// form computes canonical cells and MIRRORS the rest while the dense form
+// evaluates every cell. For a kernel that is not actually symmetric those are
+// different numbers -- a silent wrong answer, exactly the class the C-track's
+// verification stance exists to catch. Refused, by name, with the two ways
+// out: drop the clause, or use forward mode, which keeps the loop object and
+// its `range<SymIdx>` fast path (pinned by 075/077).
+//
+// The same refusal covers `omp`/`cuda`: a parallelism licence has no loop
+// object left to ride on once the map is a sequential construction loop, and
+// the omp census invariant says a dropped licence is never silent.
+// ERROR: BL5500
+// ERROR-CONTAINS: kernel carries a `where` clause
+import ad as ad
+
+type I = Idx<3>
+
+function loss(x: Array<Float like I>) -> Float = {
+    let m = method_for(x, x) <@> lambda(a: Float, b: Float) where comm(a, b) -> a * b |> compute
+    m(0, 1) + m(2, 2)
+}
+
+let mut dx = [0.0, 0.0, 0.0]
+let lv = ad.grad(loss)([1.0, 2.0, 3.0], dx)
+lv

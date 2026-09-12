@@ -85,6 +85,7 @@ and Keyword =
     | KwAntisymIdx
     | KwHermitianIdx
     | KwCompoundIdx
+    | KwChunked
     | KwSparseIdx
     | KwOrbIdx
     | KwEnumIdx
@@ -103,6 +104,7 @@ and Keyword =
     | KwTranspose
     | KwHermitian
     | KwGram
+    | KwGramApply
     | KwDecompact
     | KwPure
     | KwCompute
@@ -208,6 +210,7 @@ let keywordEntries : (string * Keyword) list =
       "AntisymIdx", KwAntisymIdx
       "HermitianIdx", KwHermitianIdx
       "CompoundIdx", KwCompoundIdx
+      "Chunked", KwChunked
       "SparseIdx", KwSparseIdx
       "OrbIdx", KwOrbIdx
       "EnumIdx", KwEnumIdx
@@ -226,6 +229,7 @@ let keywordEntries : (string * Keyword) list =
       "transpose", KwTranspose
       "hermitian", KwHermitian
       "gram", KwGram
+      "gram_apply", KwGramApply
       "decompact", KwDecompact
       "pure", KwPure
       "compute", KwCompute

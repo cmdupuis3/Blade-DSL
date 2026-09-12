@@ -76,6 +76,19 @@ let binaryMathIntrinsics : Set<string> =
 
 let isBinaryMathIntrinsic (name: string) : bool = Set.contains name binaryMathIntrinsics
 
+/// TERNARY math intrinsics: `fma(a, b, c)` = a*b + c rounded once. TypeCheck
+/// types it as its own TExprFma node (never a binop chain, so no pass can
+/// split the fusion). For AD it is exactly a*b + c: d/da = b, d/db = a,
+/// d/dc = 1 -- the sweeps below differentiate it through those partials,
+/// and the derivative code is ordinary (unfused) arithmetic, which is the
+/// right call: a gradient does not need the single rounding, the forward
+/// value does. Keep in sync with StaticEval.evalBuiltin's fma arm and the
+/// ide `surface` census.
+let ternaryMathIntrinsics : Set<string> =
+    Set.ofList [ "fma" ]
+
+let isTernaryMathIntrinsic (name: string) : bool = Set.contains name ternaryMathIntrinsics
+
 /// Subset of the intrinsics that have std::complex overloads in <complex>
 /// and so are permitted on complex operands (result is complex, same
 /// width). exp/log/sqrt and the trig/hyperbolic families qualify; floor/
@@ -239,6 +252,21 @@ let internal errMode = ref "grad"
 let internal err (fname: string) (msg: string) : Result<'a, string> =
     Error $"{errMode.Value}({fname}): {msg}"
 
+/// Route selector for the reverse-mode halo stencil rule (docs/plans/
+/// structural/02, section 3.3). ON (the default): the map is KEPT and its
+/// adjoint is the gather -- one guarded loop per (array, offset) the kernel
+/// reads. OFF: the map lowers into the construction loop like any other
+/// eager map and its adjoint scatters. The two are the same function; the
+/// harness (tests/AccessTests.fs) runs both and compares the outputs
+/// byte-for-byte. Read per call, never cached, so that toggle works.
+let internal haloGatherEnabled () : bool =
+    match System.Environment.GetEnvironmentVariable "BLADE_AD_HALO_GATHER" with
+    | null | "" -> true
+    | s ->
+        match s.Trim().ToLowerInvariant() with
+        | "0" | "off" | "false" | "no" -> false
+        | _ -> true
+
 // Kernel-shape refusal wording, spoken by more than one site.
 //
 // `asKernelLambda` (further down) decides what counts as a kernel and
@@ -311,7 +339,6 @@ let rec internal mentionsDeep (names: Set<string>) (e: Expr) : bool =
     | ExprKind.ExprBlock (ss, fe) -> (ss |> List.exists (stmtMentionsDeep names)) || opt fe
     | ExprKind.ExprObjectFor k -> m k
     | ExprKind.ExprDotDot (l, h) -> m l || m h
-    | ExprKind.ExprBlocked (_, b) -> m b
     | ExprKind.ExprHalo (_, o) -> m o
     | ExprKind.ExprPure i | ExprKind.ExprCompute i | ExprKind.ExprRead i
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprGroupBucket i
@@ -324,6 +351,7 @@ let rec internal mentionsDeep (names: Set<string>) (e: Expr) : bool =
     | ExprKind.ExprContains (l, r) | ExprKind.ExprGroupBy (l, r)
     | ExprKind.ExprSort (l, r) | ExprKind.ExprGram (l, r)
     | ExprKind.ExprAssign (l, r) -> m l || m r
+    | ExprKind.ExprGramApply (a, b, x) -> m a || m b || m x
     | ExprKind.ExprReduce (a, k, i, ax) -> m a || m k || opt i || opt ax
     | ExprKind.ExprStruct (_, fields, spread) ->
         (fields |> List.exists (fun (_, fe) -> m fe)) || opt spread
@@ -334,6 +362,7 @@ let rec internal mentionsDeep (names: Set<string>) (e: Expr) : bool =
         || opt k
     | ExprKind.ExprRecArray d ->
         m d.SliceExpr || (match d.SeedArm with Some (_, se) -> m se | None -> false)
+        || (match d.Guard with Some g -> m g | None -> false)
     | ExprKind.ExprLit _ | ExprKind.ExprWildcard | ExprKind.ExprQualified _
     | ExprKind.ExprRange _ | ExprKind.ExprReverse _ | ExprKind.ExprArity _
     | ExprKind.ExprNth | ExprKind.ExprZero | ExprKind.ExprSection _ -> false
@@ -377,7 +406,6 @@ let rec internal allVarsDeep (e: Expr) : Set<string> =
         ss |> List.fold (fun acc s -> Set.union acc (stmtAllVarsDeep s)) (opt fe)
     | ExprKind.ExprObjectFor k -> allVarsDeep k
     | ExprKind.ExprDotDot (l, h) -> any [l; h]
-    | ExprKind.ExprBlocked (_, b) -> allVarsDeep b
     | ExprKind.ExprHalo (_, o) -> allVarsDeep o
     | ExprKind.ExprPure i | ExprKind.ExprCompute i | ExprKind.ExprRead i
     | ExprKind.ExprRank i | ExprKind.ExprUnique i | ExprKind.ExprGroupBucket i
@@ -390,6 +418,7 @@ let rec internal allVarsDeep (e: Expr) : Set<string> =
     | ExprKind.ExprContains (l, r) | ExprKind.ExprGroupBy (l, r)
     | ExprKind.ExprSort (l, r) | ExprKind.ExprGram (l, r)
     | ExprKind.ExprAssign (l, r) -> any [l; r]
+    | ExprKind.ExprGramApply (a, b, x) -> any [a; b; x]
     | ExprKind.ExprReduce (a, k, i, ax) -> Set.union (any [a; k]) (Set.union (opt i) (opt ax))
     | ExprKind.ExprStruct (_, fields, spread) ->
         fields |> List.fold (fun acc (_, fe) -> Set.union acc (allVarsDeep fe)) (opt spread)
@@ -400,8 +429,10 @@ let rec internal allVarsDeep (e: Expr) : Set<string> =
              | ForKernel k2 -> allVarsDeep k2)
             (opt k)
     | ExprKind.ExprRecArray d ->
-        Set.union (allVarsDeep d.SliceExpr)
-                  (match d.SeedArm with Some (_, se) -> allVarsDeep se | None -> Set.empty)
+        Set.unionMany
+            [ allVarsDeep d.SliceExpr
+              (match d.SeedArm with Some (_, se) -> allVarsDeep se | None -> Set.empty)
+              (match d.Guard with Some g -> allVarsDeep g | None -> Set.empty) ]
     | ExprKind.ExprLit _ | ExprKind.ExprWildcard | ExprKind.ExprQualified _
     | ExprKind.ExprRange _ | ExprKind.ExprReverse _ | ExprKind.ExprArity _
     | ExprKind.ExprNth | ExprKind.ExprZero | ExprKind.ExprSection _ -> Set.empty
@@ -465,7 +496,6 @@ let rec internal substKernMany (subs: Map<string, Expr>) (e: Expr) : Expr option
     | ExprKind.ExprMethodFor ops -> sList ops |> Option.bind (fun o -> re (ExprMethodFor o))
     | ExprKind.ExprObjectFor k -> s1 (fun a -> ExprObjectFor a) k
     | ExprKind.ExprDotDot (l, h) -> s2 (fun a b -> ExprDotDot (a, b)) l h
-    | ExprKind.ExprBlocked (t, x) -> s1 (fun a -> ExprBlocked (t, a)) x
     | ExprKind.ExprHalo (t, offs) -> s1 (fun a -> ExprHalo (t, a)) offs
     | ExprKind.ExprZip es -> sList es |> Option.bind (fun es' -> re (ExprZip es'))
     | ExprKind.ExprAlign (es, spec) -> sList es |> Option.bind (fun es' -> re (ExprAlign (es', spec)))
@@ -498,6 +528,10 @@ let rec internal substKernMany (subs: Map<string, Expr>) (e: Expr) : Expr option
     | ExprKind.ExprTranspose (a, d1, d2) -> s1 (fun x -> ExprTranspose (x, d1, d2)) a
     | ExprKind.ExprDecompact (a, d) -> s1 (fun x -> ExprDecompact (x, d)) a
     | ExprKind.ExprGram (l, r) -> s2 (fun x y -> ExprGram (x, y)) l r
+    | ExprKind.ExprGramApply (l, r, x) ->
+        (match s l, s r, s x with
+         | Some l', Some r', Some x' -> re (ExprGramApply (l', r', x'))
+         | _ -> None)
     | ExprKind.ExprExtents a -> s1 (fun x -> ExprExtents x) a
     | ExprKind.ExprPartialApp (op, x, isLeft) -> s1 (fun a -> ExprPartialApp (op, a, isLeft)) x
     | ExprKind.ExprAssign (l, r) -> s2 (fun x y -> ExprAssign (x, y)) l r
@@ -670,9 +704,41 @@ let internal (|LinearForm|_|) (e: Expr) : (Expr list * (Expr list -> Expr)) opti
 /// linear combinator is tracked as an ARRAY. Under-reporting here is a
 /// silent-zero bug (an element read of an untracked array yields no
 /// tangent), so the forms are listed exhaustively rather than inferred.
+// The LU derivative actions (plan-fortran-killer-2 section 6.3). A body
+// that factors once (`let f = m.lu(A)`, elaborated `__math_lu(A)`) and
+// applies the factors (`m.lu_solve(f, b)` -> `__math_lu_solve(f[0], f[1], b)`)
+// differentiates by MORE SOLVES against the same factors, never by
+// differentiating the factorization: forward, `A dx = db - dA x`; reverse,
+// `bbar += A^{-T} xbar` and `Abar += -(A^{-T} xbar) x^T` (roles swapped for
+// the transposed solve). The factor binding is STRUCTURAL -- no tangent, no
+// cotangent -- and the solve arms find the matrix through this map.
+let internal isLuSolveName (n: string) = n = "__math_lu_solve" || n = "__math_lu_solve_t"
+let internal luTransposedOf (n: string) = if n = "__math_lu_solve" then "__math_lu_solve_t" else "__math_lu_solve"
+/// factor name -> matrix name, for every `let f = __math_lu(A)` in a body
+/// (loop bodies included; a factor taken from a non-name is not recorded and
+/// the solve arms refuse it).
+let rec internal luFactorsOf (stmts: NStmt list) : Map<string, string> =
+    stmts |> List.fold (fun acc s ->
+        match s with
+        | NLet (f, _, { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_lu" }, [ { Kind = ExprKind.ExprVar a } ]) }) ->
+            Map.add f a acc
+        | NFor (_, _, _, body) -> Map.fold (fun m k v -> Map.add k v m) acc (luFactorsOf body)
+        | _ -> acc) Map.empty
+/// The matrix behind a solve's factor operand: `f[0]` with `f` a recorded
+/// factor. Anything else (the two-halves spelling, a factor from outside the
+/// body) is not traceable and the arms refuse with `luFactorMsg`.
+let internal luFactorMatrix (luOf: Map<string, string>) (luE: Expr) : string option =
+    match luE.Kind with
+    | ExprKind.ExprTupleIndex ({ Kind = ExprKind.ExprVar f }, { Kind = ExprKind.ExprLit (LitInt 0L) }) -> Map.tryFind f luOf
+    | _ -> None
+let internal luFactorMsg =
+    "differentiating lu_solve needs the factor as a let-bound `let f = m.lu(A)` in the same body applied as `m.lu_solve(f, b)` (v1); the two-halves spelling `m.lu_solve(LU, piv, b)` and a factor taken outside the function are not traceable to their matrix"
+
 let rec internal producesArray (arrays: Set<string>) (e: Expr) : bool =
     match e.Kind with
     | ExprKind.ExprArrayLit _ -> true
+    // a solve against LU factors is a vector shaped like its right-hand side
+    | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar n }, _) when isLuSolveName n -> true
     | ExprKind.ExprVar n -> Set.contains n arrays
     | ExprKind.ExprStack _ | ExprKind.ExprSequence _ | ExprKind.ExprJoin _
     | ExprKind.ExprReplicate _ | ExprKind.ExprTranspose _ | ExprKind.ExprDecompact _
@@ -687,6 +753,6 @@ let rec internal producesArray (arrays: Set<string>) (e: Expr) : bool =
     // grouping-derived data arrays (2.17a): the row->bucket map and
     // per-group sizes are Int arrays read by index
     | ExprKind.ExprGroupBucket _ | ExprKind.ExprExtents _ -> true
-    | ExprKind.ExprGram _ -> true
+    | ExprKind.ExprGram _ | ExprKind.ExprGramApply _ -> true
     | _ -> false
 

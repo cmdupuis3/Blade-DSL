@@ -481,7 +481,13 @@ let many parser (tokens: Token list) =
 /// is no legitimate backtrack it could be cutting off. Without this the
 /// precise diagnostic is swallowed and the caller re-reports far away
 /// ("Expected ')' but got identifier 't'" at the parameter NAME).
-let isHardParseError (e: ParseError) : bool = e.Code = "BL1004"
+/// BL1003 qualifies for the same reason: every site that raises it is a
+/// REMOVED/RELOCATED-CONSTRUCT steer (the imperative `for`, `if` on a
+/// recursive-array arm, `while` on an ordinary one), fired only after the
+/// distinctive token sequence has already been consumed. There is no
+/// production that could still succeed from there, so a swallowed BL1003 is
+/// always a curated message traded for a generic one.
+let isHardParseError (e: ParseError) : bool = e.Code = "BL1004" || e.Code = "BL1003"
 
 let sepBy parser sep (tokens: Token list) =
     match parser tokens with

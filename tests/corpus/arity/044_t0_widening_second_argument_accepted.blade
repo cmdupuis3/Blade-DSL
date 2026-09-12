@@ -1,0 +1,9 @@
+// TEST: T^0 call whose later argument WIDENS is accepted
+// The accepted direction of 043's rule: the monomorph is built from argument
+// 1 as `double add0(double, double)` and the int64 promotes into it, which is
+// ordinary C++ and works today. Pinned so the narrowing refusal cannot grow
+// into a blanket "all teachings must be identical" rule.
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let r = add0(2.5, 3)
+// EXPECT: r = 5.5

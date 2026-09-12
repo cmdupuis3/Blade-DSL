@@ -602,6 +602,71 @@ let z = dump(V)
          check "reject: c.write inside a function body is refused"
              (e.Contains "MODULE-LEVEL declaration form") e)
 
+    // ---------------------------------------------------------------
+    // 9. Annotation vs store shape (BL3016)
+    //
+    // `unify` does not compare extents (deliberate general policy) and the
+    // provider read arm returns its operand's type unchanged, so an
+    // annotation used to win the TYPE while the file still won the
+    // ALLOCATION. On the 2x3 lw_grid fixture,
+    //     let bad: Array<Float64 like Idx<5>, Idx<9>> = g.vars.data |> c.read
+    // typechecked clean in both `check` and `ide check`, emitted
+    // `new double[6]` from the file's real shape, indexed it `bad[4][8]`,
+    // and segfaulted (exit 139). Covered here rather than in tests/corpus
+    // because there is no provider corpus category to pin it in.
+    // ---------------------------------------------------------------
+    printfn "\n--- annotation vs store shape ---"
+    /// A program over the 2x3 matrix fixture whose only variable part is the
+    /// declaration of V, so every spelling of the ascription is one string.
+    let gridProgram (decl: string) =
+        sprintf """
+import csv as c
+let g = c.load("%s")
+%s
+let s = reduce(V, (+), axes = 2)
+"""
+                (fixFile "lw_grid.csv") decl
+    /// `lower` hands back FORMATTED text, not the BLxxxx code, so key on the
+    /// phrase only this arm's message carries.
+    let saysStoreShape (e: string) = e.Contains "typed BY THE STORE"
+    let rejectsShape (name: string) (decl: string) (alsoContains: string) =
+        match lower (gridProgram decl) with
+        | Ok _ -> check name false "it type-checked (the OOB read is back)"
+        | Error e ->
+            check name (saysStoreShape e && e.Contains alsoContains) e
+    // The audit's own repro, and its mirror on the trailing slot: the message
+    // must name the offending SLOT, not just report a disagreement.
+    rejectsShape "reject: annotation over-states the leading extent"
+        "let V: Array<Float64 like Idx<5>, Idx<3>> = g.vars.data |> c.read"
+        "extent 5 on index slot 1"
+    rejectsShape "reject: annotation over-states the trailing extent"
+        "let V: Array<Float64 like Idx<2>, Idx<9>> = g.vars.data |> c.read"
+        "extent 9 on index slot 2"
+    // Every spelling that reaches a checking position, not just the pipe:
+    // the `alias.read(view)` application, the `(e) : T` ascription, and the
+    // annotation written through a named index alias (which is how the audit
+    // first hit it -- the alias hides the extent from the reader too).
+    rejectsShape "reject: same clash through the c.read(view) call spelling"
+        "let V: Array<Float64 like Idx<5>, Idx<3>> = c.read(g.vars.data)"
+        "index slot 1"
+    rejectsShape "reject: same clash through the `(e) : T` ascription spelling"
+        "let V = (g.vars.data |> c.read) : Array<Float64 like Idx<5>, Idx<3>>"
+        "index slot 1"
+    rejectsShape "reject: same clash hidden behind a named index alias"
+        "type Wrong = Idx<5>\nlet V: Array<Float64 like Wrong, Idx<3>> = g.vars.data |> c.read"
+        "index slot 1"
+    // The other direction, and the point of the gate being extent-only: an
+    // annotation that AGREES with the store still passes, including the one
+    // that matters -- giving the store's anonymous axes nominal names, which
+    // is the whole reason to annotate a read. A gate that refused these would
+    // have read as "annotations on provider reads are refused".
+    (match lower (gridProgram "let V: Array<Float64 like Idx<2>, Idx<3>> = g.vars.data |> c.read") with
+     | Ok _ -> check "accept: annotation that matches the store's shape" true ""
+     | Error e -> check "accept: annotation that matches the store's shape" false e)
+    (match lower (gridProgram "type Row = Idx<2>\ntype Col = Idx<3>\nlet V: Array<Float64 like Row, Col> = g.vars.data |> c.read") with
+     | Ok _ -> check "accept: naming the store's axes at their true extents" true ""
+     | Error e -> check "accept: naming the store's axes at their true extents" false e)
+
     (try Directory.Delete(tmp, true) with _ -> ())
 
     printfn "\n=== CSV Provider Tests: %d passed, %d failed ===" passed failed

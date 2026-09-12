@@ -1,0 +1,14 @@
+// TEST: Pipeline Block Kernels Stage Types
+// ============================================================================
+// Block-bodied named kernels decline fusion, so this runs the STAGED path.
+// Each stage's store used to borrow the INPUT's element type: the Int64
+// input made the Float64 intermediate an Int64 buffer (g++ float-conversion
+// error; the interpreter truncated to `[0, 2, 2]`). Each stage now carries
+// its kernel's result type.
+let A = [1, 2, 3]
+function half(x: Int64) -> Float64 = { Float64(x) / 2.0 }
+function double_it(x: Float64) -> Float64 = { x * 2.0 }
+let piped = (object_for(half) >>@ object_for(double_it)) <@> A |> compute
+let direct = method_for(A) <@> lambda(x) -> double_it(half(x)) |> compute
+// EXPECT: piped = [1, 2, 3]
+// EXPECT: direct = [1, 2, 3]

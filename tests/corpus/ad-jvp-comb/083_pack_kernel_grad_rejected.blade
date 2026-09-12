@@ -1,9 +1,18 @@
-// TEST: Pack Kernel Under ad.grad Inherits The Map Refusal (rejects)
-// Reverse mode refuses every `<@>` map today, and a pack kernel is a map
-// like any other -- so it inherits that refusal verbatim. Pinned because the
-// interesting failure mode is the other one: an unroller that ran first
-// would have to be careful not to turn "grad does not do maps" into an
-// unrolling crash or a mislabelled BL5502.
+// TEST: Pack Kernel Under ad.grad Refused By Name (rejects)
+// NARROWED by the C2-reverse lowering (plan-equivariant-nn-notebooks.md 5.2).
+// This used to pin the blanket "loop-object combinator operators" message,
+// because reverse mode refused EVERY `<@>` map and a pack kernel is a map
+// like any other. Reverse mode now lowers eager maps, so that refusal no
+// longer applies and the message must say what actually remains refused:
+// there is no reverse unroller. `tryUnrollPackKernel` (Route A, 2.19b) runs
+// inside the TANGENT map rule, which reverse mode never reaches -- so
+// `ad.jvp` differentiates this kernel (075-079, 084) and `ad.grad` does not.
+//
+// Refused by NAME, ahead of kernel normalization: `asKernelLambda` would
+// otherwise report the `match arity(a)` body as a generic "block body" and
+// say nothing at all about the pack. The other failure mode this guards
+// against is unchanged -- an unroller that ran first must not turn "grad has
+// no pack rule" into an unrolling crash or a mislabelled BL5502.
 import ad as ad
 
 type I = Idx<3>
@@ -23,4 +32,4 @@ function f(a: Array<Float like I>) -> Float = {
 
 let g = ad.grad(f)([1.0, 2.0, 3.0])
 // ERROR: BL5500
-// ERROR-CONTAINS: loop-object combinator operators
+// ERROR-CONTAINS: arity-polymorphic `Poly<...>` pack kernel

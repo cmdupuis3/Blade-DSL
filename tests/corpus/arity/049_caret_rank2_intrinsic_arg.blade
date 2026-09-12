@@ -1,0 +1,43 @@
+// TEST: Caret Rank-2 Intrinsic Arg
+// ============================================================================
+// The other half of 047's fix, on the shared path rather than reduce's private
+// one. `requireArrayArgMinRank` (TypeCheckSupport) is what every array
+// intrinsic calls to give an unresolved operand a shape, and it minted rank 1
+// unconditionally -- so `extents(x)` on a `T^2` parameter refused itself:
+//
+//   BL3999: a `^2` type variable is a rank-2 array, but this position supplies
+//           Array<T?10001 like Idx<__extents_inferred_n_4>>
+//
+// i.e. the checker rejecting the very shape it had just synthesized, one line
+// earlier, from a rank it already held. It now synthesizes
+// `max(minRank, arity pin)` slots, so a rank-2 parameter arrives at the
+// intrinsic as a rank-2 array and `extents` answers with the TUPLE of extents
+// that rank-2 arrays get, indexable per axis.
+//
+// MAX, not the pin outright: an intrinsic whose own minRank exceeds the pin
+// (gram, transpose over a `T^1`) still synthesizes minRank and still fails at
+// unify, which is the correct refusal and already names both ranks.
+//
+// The extents are Int64 (the rank-1 `extents(x)` is Int64 too, and a `-> Nat`
+// return of it is refused): a literal tuple projection now takes its
+// element's type instead of a fresh variable, which is what let `-> Nat`
+// pass here before.
+// ============================================================================
+type Row = Idx<3>
+type Col = Idx<4>
+
+function nrows(x: T^2) -> Int64 = extents(x)[0]
+function ncols(x: T^2) -> Int64 = extents(x)[1]
+
+// Nested peel inside one body: the outer `reduce` sees the INNER one's rank-1
+// result, so the pin has to survive the first peel as well as reach it.
+function total_all(x: T^2) -> T^0 = reduce(reduce(x, (+)), (+))
+
+let a: Array<Float64 like Row, Col> = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]]
+
+let r = nrows(a)
+// EXPECT: r = 3
+let c = ncols(a)
+// EXPECT: c = 4
+let m = total_all(a)
+// EXPECT: m = 78

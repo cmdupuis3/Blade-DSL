@@ -1,0 +1,27 @@
+// TEST: Segments Of A Regular Chunk Grid
+// ============================================================================
+// `type CI = Chunked<I, 4>` segments the ten-cell axis I into runs of four
+// (docs/plans/structural/07 §2.1-2.2): [0,4), [4,8), [8,10). `segments(CI)`
+// is the STRUCTURAL grouping of I -- a group_keys whose partition is the
+// segment table, with no key array and no permutation -- and `group_by`
+// over it is the ordinary groups x members view. `ungroup` reassembles the
+// runs over I itself (§2.3): the alias CI IS I, so the result unifies with
+// the original under either name.
+// ============================================================================
+type I = Idx<10>
+type CI = Chunked<I, 4>
+let a: Array<Float like I> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+let seg = segments(CI)
+let sizes = extents(seg)
+// EXPECT: sizes = [4, 4, 2]
+let g = group_by(a, seg)
+let sums = method_for(g) <@> lambda(r) -> reduce(r, (+)) |> compute
+// EXPECT: sums = [10, 26, 19]
+let first = method_for(g) <@> lambda(r) -> r(0) |> compute
+// EXPECT: first = [1, 5, 9]
+let back = ungroup(g)
+// EXPECT: back = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+let back2: Array<Float like CI> = ungroup(g, CI)
+// EXPECT: back2 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+let same = reduce(back - a, (+))
+// EXPECT: same = 0

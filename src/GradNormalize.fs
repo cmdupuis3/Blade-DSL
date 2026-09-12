@@ -10,6 +10,406 @@ open Blade.GradExpand
 open Blade.GradFusion
 open Blade.GradPackUnroll
 
+// Units
+
+/// The unit argument of a (resolved) Float type as a SURFACE unit expression:
+/// `Float<meters>` (a lone name), `Float<meters/second>` (the parser's
+/// TyUnitExpr), `Float<meters^2>` (the rank-marked type-variable spelling
+/// the parser gives `name^INT`). None for a bare Float or a non-Float.
+let internal unitArgOf (ctx: Ctx) (t: TypeExpr) : UnitExpr option =
+    match resolveTy ctx t with
+    | TyNamed (("Float" | "Float64" | "Float32"), [arg]) ->
+        (match arg with
+         | TyNamed (n, []) -> Some (UnitNamed n)
+         | TyUnitExpr ue -> Some ue
+         | TyVar (n, Some k) -> Some (UnitPow (UnitNamed n, k))
+         | _ -> None)
+    | _ -> None
+
+/// The ELEMENT unit of a scalar or array type: `Float<u>` and
+/// `Array<Float<u> like ...>` both answer `u`.
+let internal elemUnitOf (ctx: Ctx) (t: TypeExpr) : UnitExpr option =
+    match resolveTy ctx t with
+    | TyArray (elem, _) -> unitArgOf ctx elem
+    | other -> unitArgOf ctx other
+
+
+// The C2-reverse lowering: eager map pipelines, lowered pre-grad
+//
+// `plan-equivariant-nn-notebooks.md` 5.2, a scoped amendment to
+// `plan-ad-combinators.md` 4's C6 verdict. C6's reasoning still bounds it:
+// no general reverse-through-combinators pass is built here, and no new
+// adjoint theory is introduced. An eager map is REWRITTEN, before the sweeps
+// run, into the element-write construction loop grad's v1 subset already
+// differentiates -- exactly what `expandRecArray` does for `let rec`, and
+// what `fuseProgram` does for pipelines. The adjoint is then the existing
+// loop replay (`adjointOfStmt`'s NFor arm), which is why this buys reverse
+// mode a capability without buying it a rule.
+
+/// One loop operand, decomposed: the axes it contributes to the map's
+/// iteration space, and one substitution per kernel parameter it feeds
+/// (a `zip` operand feeds one parameter per zipped array; every other form
+/// feeds exactly one).
+type private MapSlot = {
+    Axes: int list
+    Readers: (Expr list -> Expr) list
+    /// A halo slot: the reader hands its parameter the INTERIOR ordinal, and
+    /// the kernel body's window reads `w(k)` are rewritten against it rather
+    /// than the parameter being substituted (GradExpand.substWindowReads).
+    Window: Blade.Types.HaloAccess option
+}
+
+/// Statements that are pure loop-object / kernel PLUMBING: `let L =
+/// method_for(...)`, `let O = object_for(k)`, `let P = L1 <*> L2`,
+/// `let k = lambda(...)`. The eager-map lowering resolves these by name at
+/// the application site, which leaves the binding itself dead -- and a dead
+/// one still trips the combinator refusal the rewrite exists to avoid.
+let private loopPlumbingName (s: Stmt) : string option =
+    match unwrapStmt s with
+    | StmtLet { Pattern = { Kind = PatternKind.PatVar nm }
+                Value = { Kind = ExprKind.ExprMethodFor _ | ExprKind.ExprObjectFor _
+                               | ExprKind.ExprLambda _
+                               | ExprKind.ExprBinOp (_, OpArrayProd, _, _) } } -> Some nm
+    | _ -> None
+
+/// Every variable a surface statement mentions (binders ignored -- this is
+/// liveness for a whole-name drop, where over-reporting only KEEPS a binding).
+let rec private stmtVarsOf (s: Stmt) : Set<string> =
+    match unwrapStmt s with
+    | StmtLet b -> allVarsDeep b.Value
+    | StmtExpr e -> allVarsDeep e
+    | StmtAssign (l, _, r) -> Set.union (allVarsDeep l) (allVarsDeep r)
+    | StmtForIn (_, rg, body) ->
+        body |> List.fold (fun acc s2 -> Set.union acc (stmtVarsOf s2)) (allVarsDeep rg)
+    | StmtSpanned _ -> Set.empty
+
+/// Drop the loop-object and kernel bindings the eager-map lowering consumed.
+/// A binding still mentioned anywhere AFTER it is KEPT, so a shape the
+/// lowering declined keeps refusing exactly as it did before.
+///
+/// REVERSE MODE ONLY: forward mode resolves let-bound loop objects at their
+/// APPLICATION sites (`noteLoopBinding`), so the bindings are live there.
+let private dropDeadLoopBindings (stmts: Stmt list) (fin: Expr option) : Stmt list =
+    if errMode.Value <> "grad" then stmts else
+    let seed = match fin with Some e -> allVarsDeep e | None -> Set.empty
+    List.foldBack (fun s (acc, used) ->
+        match loopPlumbingName s with
+        | Some nm when not (Set.contains nm used) -> (acc, used)
+        | _ -> (s :: acc, Set.union used (stmtVarsOf s)))
+        stmts ([], seed)
+    |> fst
+
+/// The extent of an index type, when it is a literal `Idx<n>` after alias
+/// resolution. Deliberately narrow: `SymIdx`/`AntisymIdx` hand a `range`
+/// kernel PREFIX OFFSETS rather than canonical indices
+/// (`plan-ad-combinators.md` 1a), so a dense loop over them would compute the
+/// wrong cells silently -- they must fail this test and be refused by name.
+let private literalIdxExtent (ctx: Ctx) (t: TypeExpr) : int option =
+    match resolveTy ctx t with
+    | TyIdx { Kind = ExprKind.ExprLit (LitInt n) } -> Some (int n)
+    | _ -> None
+
+/// Buffer-size backstop. The lowering materializes its output as a zero
+/// LITERAL (the only shape `zerosLikeLiteral` can build a cotangent for), so
+/// the emitted AST is proportional to the iteration space. Past this the
+/// refusal names the size rather than letting the compiler grind.
+let private maxLoweredCells = 65536
+
+/// ROUTE G admissibility (docs/plans/structural/02, 3.3): a sole-halo
+/// stencil map whose reverse rule is the GATHER. Direct spelling with a
+/// literal `Idx<n>` inner and literal offsets; a plain rank-0 lambda kernel
+/// with no `where`; and a READ DISCIPLINE -- the window is read only as the
+/// sole subscript of an array read `x(w(k))` with k literal, never passed to
+/// a user function -- so every cotangent target the kernel's adjoint
+/// produces is `__g_x(i + K)` with K static, and the gather's inverse is
+/// exact. Anything else falls to the construction-loop lowering (route S),
+/// which scatters and needs none of this.
+let internal haloGatherPlan (ctx: Ctx) (resolve: string -> Expr option) (value: Expr)
+    : (Blade.Types.HaloAccess * int * string * Expr) option =
+    match soleHaloOfWith resolve value with
+    | Some (inner, offs, kern) when (match kern.Kind with ExprKind.ExprLambda _ -> true | _ -> false) ->
+        (match haloAccessOfSurface ctx inner offs, asKernelLambda ctx kern with
+         | Some (h, n), Ok ([ p ], None, kbody, None)
+                 when n - int h.Shrink >= 0
+                      && (match p.Type |> Option.map (resolveTy ctx) with
+                          | Some (TyVar (_, Some r)) -> r = 0
+                          | Some (TyAbstractArray _) | Some (TyArray _) -> false
+                          | _ -> true) ->
+             let w = p.Name
+             let isCombinatorOp op =
+                 match op with
+                 | OpApply | OpBind | OpParallel | OpFusion | OpArrayProd | OpFunctor | OpChoice
+                 | OpComposeObj | OpComposeMeth | OpCompose | OpCons -> true
+                 | _ -> false
+             let rec ok (e: Expr) : bool =
+                 match e.Kind with
+                 | ExprKind.ExprLit _ -> true
+                 | ExprKind.ExprVar n -> n <> w
+                 // the one admitted window read: `x(w(k))`, k literal
+                 | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar f },
+                                     [ { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar w' }, [ off ]) } ])
+                         when w' = w && f <> w && not (Map.containsKey f ctx.Decls) ->
+                     (literalOffsetOf off).IsSome
+                 | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar f }, args) when f <> w && not (Map.containsKey f ctx.Decls) ->
+                     args |> List.forall ok
+                 | ExprKind.ExprApp _ -> false
+                 | ExprKind.ExprBinOp (_, op, l, r) -> not (isCombinatorOp op) && ok l && ok r
+                 | ExprKind.ExprUnaryOp (_, x) | ExprKind.ExprTyped (x, _) -> ok x
+                 | ExprKind.ExprIf (c, t, f) -> ok c && ok t && ok f
+                 | _ -> false
+             if ok kbody then Some (h, n, w, kbody) else None
+         | _ -> None)
+    | _ -> None
+
+/// Lower an EAGER map pipeline into the element-write construction loop the
+/// reverse sweep already differentiates:
+///
+///     let m = method_for(range<Idx<n>>) <@> lambda(i) -> BODY |> compute
+///  becomes
+///     let mut m = <zeros of the iteration shape>
+///     for __mi0 in 0 .. n { m(__mi0) = BODY[i := __mi0] }
+///
+/// Both spellings (`method_for(ops) <@> k`, `object_for(k) <@> ops`) and both
+/// indirections (a let-bound loop object, a let-bound kernel lambda) reach
+/// the same decomposition, via `MapApplyWith` and `asKernelLambda`.
+///
+/// Operands: `range<Idx<n>>` (the parameter IS the loop index), a named array
+/// with statically-known dims (the parameter is its cell), and `zip(...)` of
+/// such arrays (co-iteration -- one shared axis group, one parameter each).
+/// Several operands are the outer product, so their axes CONCATENATE.
+///
+/// REVERSE MODE ONLY. Forward mode has a Tier-2 map rule (`tangentOfMap`)
+/// that keeps the loop object, its `range<SymIdx>` symmetric fast path, and
+/// its parallelism licences; densifying a map for jvp would be a regression,
+/// not a widening.
+///
+/// Returns `Ok None` when the initializer is not an eager map -- the caller
+/// is then byte-identical to before. An `Error` is a map this cannot lower,
+/// named: today EVERY map in reverse-differentiated code is refused by one
+/// blanket message, so a specific refusal is a strict improvement.
+let internal expandEagerMap (fname: string) (ctx: Ctx)
+                           (extents: Map<string, int>) (denv: Map<string, int list>)
+                           (loopEnv: Map<string, Expr>)
+                           (name: string) (annot: TypeExpr option) (value: Expr)
+    : Result<(Stmt list * int list) option, string> =
+    if errMode.Value <> "grad" then Ok None else
+    // `|> compute` is a materialization barrier with no value content; a
+    // deferred binding read by index materializes anyway. Both strip.
+    let rec strip (e: Expr) =
+        match e.Kind with
+        | ExprKind.ExprCompute inner -> strip inner
+        | _ -> e
+    // `<*>` concatenates two loops' operand lists and is symmetry-neutral --
+    // "commutativity comes from the kernel later" (`formalism.md` 10.2), so
+    // `method_for(A) <*> method_for(B)` IS `method_for(A, B)`. Flatten it
+    // before the decomposition and the whole family below applies unchanged;
+    // there is nothing else to say about `<*>` in either mode.
+    let rec flattenProd (e: Expr) : Expr option =
+        match e.Kind with
+        | ExprKind.ExprMethodFor _ -> Some e
+        | ExprKind.ExprVar n -> Map.tryFind n loopEnv |> Option.bind flattenProd
+        | ExprKind.ExprBinOp (_, OpArrayProd, l, r) ->
+            (match flattenProd l, flattenProd r with
+             | Some { Kind = ExprKind.ExprMethodFor a }, Some { Kind = ExprKind.ExprMethodFor b } ->
+                 Some (inheritSpan e (ExprMethodFor (a @ b)))
+             | _ -> None)
+        | _ -> None
+    let core =
+        match (strip value).Kind with
+        | ExprKind.ExprBinOp (bm, OpApply, lo, rhs) when (match lo.Kind with
+                                                          | ExprKind.ExprBinOp (_, OpArrayProd, _, _) -> true
+                                                          | _ -> false) ->
+            (match flattenProd lo with
+             | Some flat -> inheritSpan (strip value) (ExprBinOp (bm, OpApply, flat, rhs))
+             | None -> strip value)
+        | _ -> strip value
+    let resolveLoop (n: string) : Expr option =
+        match Map.tryFind n loopEnv with
+        | Some ({ Kind = ExprKind.ExprMethodFor _ | ExprKind.ExprObjectFor _ } as b) -> Some b
+        | Some ({ Kind = ExprKind.ExprBinOp (_, OpArrayProd, _, _) } as b) -> flattenProd b
+        | _ -> None
+    match core with
+    // C7 sort plumbing (`let __sx_s = method_for(range<I>) <@> lambda(i) -> i
+    // |> compute`) is an INDEX array admitted by both sweeps as constant
+    // plumbing. Lowering it would replace an Int iota with a Float buffer and
+    // strand `SortPermForm`, which recognizes the surface shape.
+    | IndexIota -> Ok None
+    // ROUTE G keeps the map: its reverse rule is the gather in
+    // GradSweeps.adjointOfInit, and it replays verbatim in the forward half.
+    | MapApplyWith resolveLoop _ when haloGatherEnabled () && (haloGatherPlan ctx resolveLoop core).IsSome -> Ok None
+    | MapApplyWith resolveLoop mv ->
+        let refuse (m: string) : Result<(Stmt list * int list) option, string> = err fname m
+        let kernE =
+            match mv.Kern.Kind with
+            | ExprKind.ExprVar n ->
+                (match Map.tryFind n loopEnv with
+                 | Some ({ Kind = ExprKind.ExprLambda _ } as b) -> b
+                 | _ -> mv.Kern)
+            | _ -> mv.Kern
+        // An arity-polymorphic kernel is refused BY NAME, ahead of
+        // `asKernelLambda` -- which would report its `match arity(a)` body as
+        // a generic "block body" and say nothing about the pack. Reverse mode
+        // has no unroller: `tryUnrollPackKernel` (Route A) runs inside the
+        // TANGENT map rule, which reverse mode does not reach.
+        let packParams (ps: ParamDecl list) =
+            ps |> List.exists (fun p ->
+                match p.Type |> Option.map (resolveTy ctx) with
+                | Some (TyPoly _) -> true
+                | _ -> false)
+        let isPackKernel =
+            match kernE.Kind with
+            | ExprKind.ExprVar f when Map.containsKey f ctx.Decls -> packParams ctx.Decls.[f].Params
+            | ExprKind.ExprLambda (lps, _, _) ->
+                lps |> List.exists (fun p ->
+                    match p.Type |> Option.map (resolveTy ctx) with
+                    | Some (TyPoly _) -> true
+                    | _ -> false)
+            | _ -> false
+        if isPackKernel then
+            refuse "reverse mode does not differentiate an arity-polymorphic `Poly<...>` pack kernel (v1): the surface unroller that expands one at its apply site (Route A) lives in the TANGENT map rule, so `ad.jvp` differentiates this kernel and `ad.grad` does not -- write the kernel at its fixed arity, or take the gradient through `ad.jvp` basis sweeps"
+        else
+        match asKernelLambda ctx kernE with
+        | Error (KernBlockBody f) -> refuse (kernBlockBodyMsg f)
+        | Error KernUnsupported -> refuse kernUnsupportedMsg
+        | Ok (_, _, _, Some _) ->
+            refuse "reverse mode differentiates a map with a plain lambda kernel (v1); a `reynolds(...)` kernel symmetrizes reads ACROSS loop slots, whose adjoint accumulation multiplicity this lowering does not model -- use `ad.jvp`, which has the Tier-2 reynolds rule"
+        | Ok (_, Some _, _, None) ->
+            refuse "reverse mode cannot lower a map whose kernel carries a `where` clause (v1): the lowering emits a DENSE construction loop, so a `comm`/`anticomm` license -- an iteration declaration, not a claim that the kernel IS symmetric -- would change which cells are computed, and an `omp`/`cuda` license has no loop object left to ride on. Drop the clause inside the differentiated function, or use `ad.jvp`, which keeps the loop object and its symmetric fast path"
+        | Ok (ps, None, kbody, None) ->
+        // A rank-raising kernel (an array-literal body) makes the result's
+        // rank exceed the iteration space, which the zero buffer below cannot
+        // size. Named rather than mis-shaped.
+        match kbody.Kind with
+        | ExprKind.ExprArrayLit _ ->
+            refuse "reverse mode cannot lower a map whose kernel body is an array literal (a rank-raising row map, v1): the construction buffer is sized from the ITERATION space, which such a kernel exceeds"
+        | _ ->
+        if mv.Ops.IsEmpty then refuse "a differentiated map needs at least one loop operand" else
+        // -- operand classification -------------------------------------------
+        let arrayDims (n: string) =
+            match Map.tryFind n denv with
+            | Some ds when not ds.IsEmpty -> Some ds
+            | _ -> None
+        let classify (op: Expr) : Result<MapSlot, string> =
+            match op.Kind with
+            | ExprKind.ExprRange [t] ->
+                (match literalIdxExtent ctx t with
+                 | Some n -> Ok { Axes = [n]; Readers = [ fun ixs -> List.head ixs ]; Window = None }
+                 | None ->
+                     err fname "reverse mode lowers `range<I>` loops over a literal `Idx<n>` only (v1): a `SymIdx`/`AntisymIdx`/compound range hands the kernel PREFIX OFFSETS rather than canonical indices, so a dense construction loop would address the wrong cells")
+            | ExprKind.ExprRange _ ->
+                err fname "reverse mode lowers single-index `range<I>` loops only (v1); a multi-index `range<I, J>` is not supported -- spell it as `method_for(range<I>, range<J>)`"
+            | ExprKind.ExprVar n ->
+                (match arrayDims n with
+                 | Some ds -> Ok { Axes = ds; Readers = [ fun ixs -> syn (ExprApp (v n, ixs)) ]; Window = None }
+                 | None ->
+                     err fname $"reverse mode needs each map operand to be a named array with statically-known extents (v1); '{n}' has none here -- annotate it `Array<Float like Idx<n>, ...>` or pass it as a parameter")
+            | ExprKind.ExprZip zs ->
+                let named =
+                    zs |> List.map (fun z ->
+                        match z.Kind with
+                        | ExprKind.ExprVar n -> arrayDims n |> Option.map (fun ds -> (n, ds))
+                        | _ -> None)
+                if named |> List.exists Option.isNone then
+                    err fname "reverse mode co-iterates `zip(...)` over named arrays with statically-known extents (v1); bind each zipped operand first"
+                else
+                    let named = named |> List.map Option.get
+                    let ds0 = snd named.Head
+                    if named |> List.exists (fun (_, ds) -> ds <> ds0) then
+                        err fname "reverse mode co-iterates `zip(...)` over operands of IDENTICAL extents (v1); zip's shared min-rank prefix rule is not modelled by this lowering"
+                    else
+                        Ok { Axes = ds0
+                             Readers = named |> List.map (fun (n, _) -> fun ixs -> syn (ExprApp (v n, ixs)))
+                             Window = None }
+            // ROUTE S (docs/plans/structural/02, 3.2): a halo slot iterates
+            // the shrunk interior [0, N - Shrink); the kernel's window reads
+            // become interior-ordinal-plus-offset reads of the operand, so
+            // the construction loop's element write differentiates by the
+            // ordinary rule and the adjoint SCATTERS -- no zero-Pad boundary
+            // is needed, because a window that exists reads only inside.
+            | ExprKind.ExprHalo (inner, offs) ->
+                (match haloAccessOfSurface ctx inner offs with
+                 | Some (h, n) when n - int h.Shrink >= 0 ->
+                     Ok { Axes = [ n - int h.Shrink ]; Readers = [ fun ixs -> List.head ixs ]; Window = Some h }
+                 | _ ->
+                     err fname "reverse mode lowers a `halo<I, [offs]>` stencil map over a literal `Idx<n>` inner index with a literal offset set (v1); a compound inner or a computed offset set has no static interior here -- use `ad.jvp`, whose capture-read rule keeps the window")
+            | ExprKind.ExprReverse _ ->
+                err fname "reverse mode lowers `range<I>`, named-array and `zip(...)` map operands (v1); a `reverse<I>` traversal is not supported"
+            | _ ->
+                err fname "reverse mode needs each map operand to be `range<Idx<n>>`, a named array with statically-known extents, or `zip(...)` of such arrays (v1)"
+        mv.Ops |> traverseR classify |> Result.bind (fun slots ->
+        let expectedParams = slots |> List.sumBy (fun s -> s.Readers.Length)
+        if ps.Length <> expectedParams then
+            refuse $"kernel arity {ps.Length} does not match the {expectedParams} cell(s) its {mv.Ops.Length} loop operand(s) supply in differentiated code"
+        else
+        // A parameter bound to a rank-k FIBER is not a cell, and the reverse
+        // rule for a fiber map is a partial fold, not a construction loop.
+        let rankOfTy (t: TypeExpr option) =
+            match t |> Option.map (resolveTy ctx) with
+            | Some (TyVar (_, Some r)) -> r
+            | Some (TyAbstractArray (_, { Kind = ExprKind.ExprLit (LitInt r) }, _)) -> int r
+            | Some (TyArray (_, its)) -> its.Length
+            | _ -> 0
+        match ps |> List.tryFind (fun p -> rankOfTy p.Type > 0) with
+        | Some p ->
+            refuse $"kernel parameter '{p.Name}' is rank-carrying (`T^k` / `Array<...>`), so it is bound to a FIBER rather than a cell; reverse mode lowers rank-0 (scalar-cell) kernels (v1) -- the fiber adjoint is a contraction over the remaining axes, which is `ad.jvp` territory today"
+        | None ->
+        let dims = slots |> List.collect (fun s -> s.Axes)
+        let cells = dims |> List.fold (*) 1
+        if cells > maxLoweredCells then
+            refuse $"this map's iteration space is {cells} cells; reverse mode materializes it as a zero-literal construction buffer, which is capped at {maxLoweredCells} (v1)"
+        else
+        // The annotation, if any, must agree with the iteration space -- the
+        // buffer keeps it so downstream reads keep their index types.
+        let annotOk =
+            match annot with
+            | None -> Ok None
+            | Some t ->
+                match arrayLiteralExtents (resolveArrayTy ctx t) with
+                | Some (true, ds) when ds = dims -> Ok (Some t)
+                | _ ->
+                    err fname $"the annotation on '{name}' does not read as `Array<Float like Idx<n>, ...>` matching the map's iteration space {dims} (v1); drop it, or spell the extents literally"
+        annotOk |> Result.bind (fun keptAnnot ->
+        // -- substitution -------------------------------------------------------
+        let idxNames = dims |> List.map (fun _ -> fresh ctx "__mi")
+        let idxVars = idxNames |> List.map v
+        // hand each operand the index variables for ITS OWN axes, in order
+        let _, subs =
+            slots |> List.fold (fun (rest: Expr list, acc) slot ->
+                let mine, remaining = List.splitAt slot.Axes.Length rest
+                (remaining, acc @ (slot.Readers |> List.map (fun r -> r mine))))
+                (idxVars, [])
+        // A halo slot's parameter is the window: its reads are rewritten in
+        // the body against the interior ordinal; every other parameter is
+        // substituted by its reader's expression.
+        let windows = slots |> List.collect (fun s -> s.Readers |> List.map (fun _ -> s.Window))
+        List.zip3 (ps |> List.map _.Name) subs windows
+        |> List.fold (fun acc (pn, sub, win) ->
+            acc |> Result.bind (fun (body, keep) ->
+                match win with
+                | Some h -> substWindowReads fname pn h sub body |> Result.map (fun b -> (b, keep))
+                | None -> Ok (body, keep @ [ (pn, sub) ])))
+            (Ok (kbody, []))
+        |> Result.bind (fun (kbody', keep) ->
+        substParamMany fname keep kbody'
+        |> Result.bind (fun substituted ->
+        // A `reduce` inside the kernel body is now in STATEMENT position, so
+        // it lowers by the ordinary additive-fold rule -- into the innermost
+        // loop, where its accumulator is loop-local and replays exactly.
+        hoistReduces fname ctx extents substituted |> Result.map (fun (pre, body') ->
+        let bufLet =
+            StmtLet { Mutability = BindMut
+                      Pattern = synPat (PatVar name)
+                      Type = keptAnnot
+                      Value = zerosOfDims dims }
+        let write =
+            StmtExpr (syn (ExprAssign (syn (ExprApp (v name, idxVars)), body')))
+        let loops =
+            List.foldBack2 (fun nm n inner ->
+                [ StmtForIn (nm, syn (ExprDotDot (iLit 0L, iLit (int64 n))), inner) ])
+                idxNames dims (pre @ [write])
+        (Some (bufLet :: loops, dims)))))))
+    | _ -> Ok None
+
 /// The pre-pass proper: rewrite one function body's statements, expanding
 /// recursive-array lets and hoisting reduces, threading an extent env so
 /// reduce sources can recover their loop bound.
@@ -72,6 +472,26 @@ let internal preNormalizeBody (fname: string) (ctx: Ctx) (fd0: FunctionDecl) : R
                 | StmtForIn (_, _, body) -> collect m body
                 | _ -> m) acc
         collect paramIdxTys stmts0
+    // A unit-carrying annotation on a let is a CONVERSION site (`let y:
+    // Float<meters> = x` with x in km multiplies by 1000 --
+    // TypeCheck.convertScaleTo), and the NStmt form the sweeps consume has no
+    // annotation slot: the conversion would vanish from the replayed primal
+    // and the derivative alike, silently. Refused up front, scanning through
+    // StmtSpanned like `idxTys` above (the fold below passes spanned
+    // statements through untouched). A dimensionless annotation converts
+    // nothing and passes.
+    let unitLetCheck : Result<unit, string> =
+        let rec scan (ss: Stmt list) : string option =
+            ss |> List.tryPick (fun s ->
+                match unwrapStmt s with
+                | StmtLet { Pattern = { Kind = PatternKind.PatVar nm }; Type = Some t }
+                        when (elemUnitOf ctx t).IsSome -> Some nm
+                | StmtForIn (_, _, body) -> scan body
+                | _ -> None)
+        match scan stmts0 with
+        | Some nm ->
+            err fname $"`let {nm}` is annotated with a unit-carrying type inside the differentiated body, which would be a unit conversion site whose factor the AD transform cannot see; convert outside the differentiated function, or drop the annotation (the value keeps the magnitude it was computed in)"
+        | None -> Ok ()
     // Materialized index arrays already in the body -- see `SortPermForm`.
     let surfaceIotas =
         let rec collect (acc: Set<string>) (ss: Stmt list) =
@@ -81,14 +501,47 @@ let internal preNormalizeBody (fname: string) (ctx: Ctx) (fd0: FunctionDecl) : R
                 | StmtForIn (_, _, body) -> collect m body
                 | _ -> m) acc
         collect Set.empty stmts0
-    let rec goStmts (env: Map<string, int>) (ss: Stmt list) : Result<Map<string, int> * Stmt list, string> =
+    // FULL static dims per named array, for the eager-map lowering: it sizes
+    // a construction buffer and bounds its loops, where the extent env above
+    // needs only the leading axis. Seeded from the module bindings (constant
+    // data a kernel may read or iterate) and overlaid with the parameters,
+    // which shadow them.
+    let paramDims =
+        fd.Params |> List.choose (fun p ->
+            match p.Type with
+            | Some t -> (match arrayLiteralExtents (resolveArrayTy ctx t) with
+                         | Some (true, ds) -> Some (p.Name, ds)
+                         | _ -> None)
+            | None -> None)
+        |> Map.ofList
+    let initDims =
+        let moduleDims =
+            ctx.ModuleLets |> Map.toSeq
+            |> Seq.choose (fun (n, ml) ->
+                let byAnn =
+                    ml.Ty |> Option.bind (fun t ->
+                        match arrayLiteralExtents (resolveArrayTy ctx t) with
+                        | Some (true, ds) -> Some ds
+                        | _ -> None)
+                match byAnn with
+                | Some ds -> Some (n, ds)
+                | None -> staticDimsOf ctx Map.empty ml.Value |> Option.map (fun ds -> (n, ds)))
+            |> Map.ofSeq
+        paramDims |> Map.fold (fun acc n ds -> Map.add n ds acc) moduleDims
+    // (extent env, dims env, let-bound loop objects / kernel lambdas)
+    let rec goStmts (st0: Map<string, int> * Map<string, int list> * Map<string, Expr>) (ss: Stmt list)
+        : Result<(Map<string, int> * Map<string, int list> * Map<string, Expr>) * Stmt list, string> =
         ss |> List.fold (fun acc s ->
-            acc |> Result.bind (fun (env, outp) ->
+            acc |> Result.bind (fun ((env, denv, loopEnv), outp) ->
+                /// A binding REBINDS its name: drop whatever the two
+                /// name-keyed envs held for it rather than leaving them
+                /// pointing at the previous value.
+                let rebound nm = (Map.remove nm denv, Map.remove nm loopEnv)
                 match unwrapStmt s with
                 // C7: the plumbing this pass itself emitted (recognized by
                 // shape) rides through untouched -- a composition round
                 // re-runs the pre-pass over an already-expanded body.
-                | StmtLet { Value = SortPermForm surfaceIotas _ } -> Ok (env, outp @ [s])
+                | StmtLet { Value = SortPermForm surfaceIotas _ } -> Ok ((env, denv, loopEnv), outp @ [s])
                 // C7: `let s = sort(A, key)` -- materialize the permutation
                 // (and, in reverse mode, its inverse) BEFORE the unchanged
                 // primal sort.
@@ -100,52 +553,96 @@ let internal preNormalizeBody (fname: string) (ctx: Ctx) (fd0: FunctionDecl) : R
                             match Map.tryFind plan.Src env with
                             | Some cnt -> Map.add nm cnt env
                             | None -> env
-                        (env', outp @ plumbing @ [StmtLet b]))
+                        let denv0, loopEnv' = rebound nm
+                        let denv' =
+                            match Map.tryFind plan.Src denv0 with
+                            | Some ds -> Map.add nm ds denv0
+                            | None -> denv0
+                        ((env', denv', loopEnv'), outp @ plumbing @ [StmtLet b]))
                 | StmtLet { Value = { Kind = ExprKind.ExprSort _ } } ->
                     err fname "differentiating `sort` requires it to bind a single name (v1)"
                 | StmtLet { Value = { Kind = ExprKind.ExprRecArray def }; Type = Some annot; Pattern = { Kind = PatternKind.PatVar nm } } ->
                     expandRecArray fname ctx nm annot def
-                    |> Result.map (fun (emitted, ext) -> (Map.add nm ext env, outp @ emitted))
+                    |> Result.map (fun (emitted, ext) ->
+                        let denv0, loopEnv' = rebound nm
+                        ((Map.add nm ext env, Map.add nm [ext] denv0, loopEnv'), outp @ emitted))
                 | StmtLet { Value = { Kind = ExprKind.ExprRecArray _ } } ->
                     err fname "recursive array must bind a single annotated name to be differentiable (v1)"
+                // A let-bound loop object or kernel lambda: RECORDED, so the
+                // eager-map lowering can resolve `L <@> k` by name, and kept
+                // -- `dropDeadLoopBindings` removes it only once every use has
+                // been rewritten away, so a shape the lowering declined still
+                // meets the combinator refusal it met before.
+                | StmtLet ({ Pattern = { Kind = PatternKind.PatVar nm } } as b)
+                        when errMode.Value = "grad" && (loopPlumbingName s).IsSome ->
+                    Ok ((env, Map.remove nm denv, Map.add nm b.Value loopEnv), outp @ [s])
                 | StmtLet ({ Pattern = { Kind = PatternKind.PatVar nm } } as b) ->
                     noNestedSort $"the initializer of '{nm}'" b.Value |> Result.bind (fun () ->
-                    hoistReduces fname ctx env b.Value |> Result.map (fun (pre, value') ->
-                        let env' =
+                    // C2-reverse: an eager map becomes the construction loop
+                    // the sweeps already differentiate, BEFORE hoistReduces
+                    // (which would otherwise meet the map as a reduce source
+                    // and refuse it).
+                    let plainLet () =
+                        hoistReduces fname ctx env b.Value |> Result.map (fun (pre, value') ->
                             let byAnn =
                                 match b.Type with
-                                | Some t -> (match arrayLiteralExtents (resolveArrayTy ctx t) with Some (true, [n]) -> Some n | _ -> None)
+                                | Some t -> arrayLiteralExtents (resolveArrayTy ctx t)
                                 | None -> None
-                            let byLit = staticExtentOf ctx env value'
-                            match (match byAnn with Some _ -> byAnn | None -> byLit) with
-                            | Some cnt -> Map.add nm cnt env
-                            | None -> env
-                        (env', outp @ pre @ [StmtLet { b with Value = value' }])))
+                            let env' =
+                                let byAnnLead = match byAnn with Some (true, [n]) -> Some n | _ -> None
+                                let byLit = staticExtentOf ctx env value'
+                                match (match byAnnLead with Some _ -> byAnnLead | None -> byLit) with
+                                | Some cnt -> Map.add nm cnt env
+                                | None -> env
+                            let denv0, loopEnv' = rebound nm
+                            let denv' =
+                                match (match byAnn with
+                                       | Some (true, ds) -> Some ds
+                                       | _ -> staticDimsOf ctx denv0 value') with
+                                | Some ds -> Map.add nm ds denv0
+                                | None -> denv0
+                            ((env', denv', loopEnv'), outp @ pre @ [StmtLet { b with Value = value' }]))
+                    expandEagerMap fname ctx env denv loopEnv nm b.Type b.Value
+                    |> Result.bind (fun mapped ->
+                        match mapped with
+                        | Some (emitted, dims) ->
+                            let denv0, loopEnv' = rebound nm
+                            let env' =
+                                match dims with
+                                | d :: _ -> Map.add nm d env
+                                | [] -> env
+                            Ok ((env', Map.add nm dims denv0, loopEnv'), outp @ emitted)
+                        | None -> plainLet ()))
                 | StmtLet b ->
                     noNestedSort "a let initializer" b.Value |> Result.bind (fun () ->
                     hoistReduces fname ctx env b.Value |> Result.map (fun (pre, value') ->
-                        (env, outp @ pre @ [StmtLet { b with Value = value' }])))
+                        let names = patternBoundNames b.Pattern
+                        let denv' = names |> List.fold (fun m n -> Map.remove n m) denv
+                        let loopEnv' = names |> List.fold (fun m n -> Map.remove n m) loopEnv
+                        ((env, denv', loopEnv'), outp @ pre @ [StmtLet { b with Value = value' }])))
                 | StmtExpr ex ->
                     noNestedSort "this statement" ex |> Result.bind (fun () ->
                     hoistReduces fname ctx env ex |> Result.map (fun (pre, ex') ->
-                        (env, outp @ pre @ [StmtExpr ex'])))
+                        ((env, denv, loopEnv), outp @ pre @ [StmtExpr ex'])))
                 | StmtAssign (lhs, op, rhs) ->
                     noNestedSort "this assignment" rhs |> Result.bind (fun () ->
                     hoistReduces fname ctx env rhs |> Result.map (fun (pre, rhs') ->
-                        (env, outp @ pre @ [StmtAssign (lhs, op, rhs')])))
+                        ((env, denv, loopEnv), outp @ pre @ [StmtAssign (lhs, op, rhs')])))
                 | StmtForIn (var, range, body) ->
-                    goStmts env body |> Result.map (fun (_, body') ->
-                        (env, outp @ [StmtForIn (var, range, body')]))
-                | StmtSpanned _ -> Ok (env, outp @ [s])))
-            (Ok (env, []))
-    goStmts paramExtents stmts0 |> Result.bind (fun (env, stmts') ->
+                    goStmts (env, denv, loopEnv) body |> Result.map (fun (_, body') ->
+                        ((env, denv, loopEnv), outp @ [StmtForIn (var, range, body')]))
+                | StmtSpanned _ -> Ok ((env, denv, loopEnv), outp @ [s])))
+            (Ok (st0, []))
+    unitLetCheck
+    |> Result.bind (fun () -> goStmts (paramExtents, initDims, Map.empty) stmts0)
+    |> Result.bind (fun ((env, _, _), stmts') ->
         match finalOpt with
         | Some fe ->
             noNestedSort "the returned expression" fe |> Result.bind (fun () ->
             hoistReduces fname ctx env fe |> Result.map (fun (pre, fe') ->
-                inheritSpan fd.Body (ExprBlock (stmts' @ pre, Some fe'))))
+                inheritSpan fd.Body (ExprBlock (dropDeadLoopBindings (stmts' @ pre) (Some fe'), Some fe'))))
         | None ->
-            Ok (inheritSpan fd.Body (ExprBlock (stmts', None))))
+            Ok (inheritSpan fd.Body (ExprBlock (dropDeadLoopBindings stmts' None, None))))
 
 /// How deep call substitution may nest before the transform gives up. One
 /// constant for BOTH inliners -- `normalizeBody`'s statement-level one and
@@ -309,36 +806,31 @@ type internal ParamClass =
     | DiffScalar
     | NonDiff
 
-/// Classify one parameter. Unit-carrying Floats and complex types get
-/// EXPLICIT refusals rather than the NonDiff fall-through: silently treating
-/// `y: Float<meters>` as non-differentiable drops its partial from the
-/// gradient with no diagnostic -- the same wrong-answer class as an
-/// unknown-derivative intrinsic, and worse than refusing.
+/// Classify one parameter. Complex types get an EXPLICIT refusal rather than
+/// the NonDiff fall-through: silently treating a parameter as
+/// non-differentiable drops its partial from the gradient with no diagnostic
+/// -- the same wrong-answer class as an unknown-derivative intrinsic, and
+/// worse than refusing. Unit-carrying Floats are differentiable in BOTH
+/// modes: forward gives a tangent the primal's type, reverse declares each
+/// cotangent as <loss>/<parameter> (Grad.cotangentTy) and lets the checker
+/// hold the synthesized arithmetic to it.
 let internal classifyParam (fname: string) (ctx: Ctx) (p: ParamDecl) : Result<ParamClass, string> =
     match p.Type with
     | None -> err fname $"parameter '{p.Name}' must have a type annotation"
     | Some t0 ->
-        let refuseUnits (what: string) =
-            err fname $"parameter '{p.Name}' {what}: unit-carrying parameters are not differentiable (v1) -- a gradient's units are <loss>/<parameter>, which the grad ABI (buffer type = parameter type) cannot express; strip the unit at the call boundary or compute the unit-carrying part outside the differentiated function"
         let refuseComplex (what: string) =
             err fname $"parameter '{p.Name}' {what}: complex parameters are not differentiable (v1); complex derivatives need a holomorphic/Wirtinger convention the AD subset does not define"
         let t = resolveTy ctx t0
         match t with
         | _ when isFloatTy t -> Ok DiffScalar
-        | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) ->
-            // FORWARD mode supports units correctly for free: a tangent has
-            // the primal's type verbatim, units included. Reverse cannot --
-            // a gradient's units are <loss>/<param>, which the grad ABI
-            // (buffer type = parameter type) cannot express.
-            if errMode.Value = "jvp" then Ok DiffScalar else refuseUnits "carries units"
+        | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) -> Ok DiffScalar
         | TyComplex64 | TyComplex128 | TyNamed (("Complex64" | "Complex128"), _) -> refuseComplex "is complex"
         | TyArray (elem, _) ->
             let el = resolveTy ctx elem
             if isFloatTy el then Ok DiffArray
             else
                 (match el with
-                 | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) ->
-                     if errMode.Value = "jvp" then Ok DiffArray else refuseUnits "is an array of unit-carrying Floats"
+                 | TyNamed (("Float" | "Float64" | "Float32"), _ :: _) -> Ok DiffArray
                  | TyComplex64 | TyComplex128 | TyNamed (("Complex64" | "Complex128"), _) -> refuseComplex "is a complex array"
                  | _ -> Ok NonDiff)
         | _ -> Ok NonDiff
@@ -403,6 +895,7 @@ let internal analyze (fname: string) (ctx: Ctx)
     : Result<Set<string> * Set<string>, string> =
     let mutable diff = diffParams
     let mutable arrays = arrayParams
+    let luOf = luFactorsOf stmts
     let touches (e: Expr) : Result<bool, string> =
         let mutable hit = false
         walkExpr fname ctx (fun n -> if Set.contains n diff then hit <- true) false e
@@ -410,6 +903,20 @@ let internal analyze (fname: string) (ctx: Ctx)
     let rec pass (ss: NStmt list) : Result<unit, string> =
         ss |> iterR (fun s ->
             match s with
+            // An LU factor (`let f = m.lu(A)`, elaborated `__math_lu(A)`) is
+            // STRUCTURAL: it carries no taint of its own -- the solve arms
+            // consult the matrix it was taken from (GradSweeps' lu arms) --
+            // and a tuple is neither an array nor a scalar carrier.
+            | NLet (_, _, { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar "__math_lu" }, _) }) -> Ok ()
+            // A solve against a factor is active when its right-hand side is
+            // OR the factored matrix is (the factor itself never is).
+            | NLet (name, _, { Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar op }, [ luE; _; bE ]) }) when isLuSolveName op ->
+                arrays <- Set.add name arrays
+                let viaMatrix =
+                    match luFactorMatrix luOf luE with
+                    | Some a -> Set.contains a diff
+                    | None -> false
+                touches bE |> Result.map (fun t -> if t || viaMatrix then diff <- Set.add name diff)
             | NLet (name, _, value) ->
                 (match value with
                  | { Kind = ExprKind.ExprArrayLit _ } | ConstFill _ -> arrays <- Set.add name arrays
@@ -544,6 +1051,79 @@ let internal checkWriteAfterRead (fname: string) (ctx: Ctx) (stmts: NStmt list) 
                             |> Result.bind (fun () -> checkBody b2))
                 checkBody body))
 
+/// `for t in lo..hi { lets*; s(t) = s(t - 1) + INC }` -- the additive carry
+/// the recursive-array pre-pass emits (GradExpand.expandRecArray) -- and,
+/// since milestone B (docs/plans/structural/01, 2.3), any FIRST-ORDER slice
+/// `s(t) = g(s(t-1), ..)`: the rhs and the lets may mention `s` only as the
+/// read `s(t - 1)`. Its adjoint is the same loop run BACKWARDS: the
+/// general-overwrite rule saves and zeros `__g_s(t)`, the array-read rule
+/// scatters `c * dg/ds` into `__g_s(t - 1)` with `dg/ds` evaluated at the
+/// primal `s(t-1)` (final at that point of the descending sweep -- the
+/// trajectory buffer is the tape), and the other operands' adjoints follow
+/// -- every step is already right, only the ORDER was not (the generic
+/// `NFor` adjoint replays ascending). GradSweeps' `NFor` arm uses this to
+/// emit the descending sweep; checkLoopDiscipline uses it to exempt the
+/// buffer from the "array recurrence" refusal. Structural, so it survives
+/// the inliner's renaming (a name-keyed table would not).
+/// Returns (buffer, step var, lo, hi, leading lets, step expression): the
+/// step expression is INC for the additive shape and the whole rhs
+/// otherwise (its only use is the discipline walk against OTHER accumulators).
+let internal (|CarryLoop|_|) (s: NStmt) : (string * string * Expr * Expr * NStmt list * Expr) option =
+    match s with
+    | NFor (t, lo, hi, body) when not body.IsEmpty ->
+        let lets, last = List.splitAt (body.Length - 1) body
+        let allLets = lets |> List.forall (function NLet _ -> true | _ -> false)
+        let isStepMinusOne (e: Expr) =
+            match e.Kind with
+            | ExprKind.ExprBinOp (_, OpSub, { Kind = ExprKind.ExprVar sv }, { Kind = ExprKind.ExprLit (LitInt 1L) }) -> sv = t
+            | _ -> false
+        let rec strip (e: Expr) = match e.Kind with ExprKind.ExprTyped (i, _) -> strip i | _ -> e
+        let isPrevRead (buf: string) (e: Expr) =
+            match (strip e).Kind with
+            | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar b }, [idx]) -> b = buf && isStepMinusOne idx
+            | _ -> false
+        let isLitOne (e: Expr) = match e.Kind with ExprKind.ExprLit (LitInt 1L) -> true | _ -> false
+        // `e` mentions `buf` only as the read `buf(t - 1)`. Conservative over
+        // the expression forms a slice can contain (the same set
+        // expandRecArray's `onlyPrevReads` admits, plus a tuple projection);
+        // an unknown form answers false and the loop keeps the generic
+        // "array recurrence" refusal.
+        let rec readsOnlyPrev (buf: string) (e: Expr) : bool =
+            match e.Kind with
+            | ExprKind.ExprApp ({ Kind = ExprKind.ExprVar b }, [ idx ]) when b = buf -> isStepMinusOne idx
+            | ExprKind.ExprVar b -> b <> buf
+            | ExprKind.ExprLit _ -> true
+            | ExprKind.ExprTyped (inner, _) | ExprKind.ExprUnaryOp (_, inner) -> readsOnlyPrev buf inner
+            | ExprKind.ExprBinOp (_, _, l, r) | ExprKind.ExprDotDot (l, r) | ExprKind.ExprTupleIndex (l, r) ->
+                readsOnlyPrev buf l && readsOnlyPrev buf r
+            | ExprKind.ExprApp (fh, args) -> readsOnlyPrev buf fh && List.forall (readsOnlyPrev buf) args
+            | ExprKind.ExprArrayLit es -> List.forall (readsOnlyPrev buf) es
+            | ExprKind.ExprIf (c, a, b) -> readsOnlyPrev buf c && readsOnlyPrev buf a && readsOnlyPrev buf b
+            | _ -> not (mentionsVar buf e)
+        (match last with
+         | [ NAssign ({ Kind = ExprKind.ExprApp ({ Kind = ExprKind.ExprVar buf }, [ { Kind = ExprKind.ExprVar tv } ]) }, rhs) ]
+                when tv = t && allLets && isLitOne lo ->
+             let letsMention = lets |> List.exists (function NLet (_, _, value) -> mentionsVar buf value | _ -> false)
+             let step =
+                 match (strip rhs).Kind with
+                 // the additive carry: the increment alone is the step expression
+                 | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevRead buf a && not (mentionsVar buf b) -> Some b
+                 | ExprKind.ExprBinOp (_, OpAdd, a, b) when isPrevRead buf b && not (mentionsVar buf a) -> Some a
+                 // any other first-order slice: the whole rhs. The carry may
+                 // pass through a hoisted let (`let prev = s(t - 1)` from an
+                 // inlined step function), in which case the rhs itself need
+                 // not mention the buffer; a loop that mentions it nowhere is
+                 // plain construction, not a carry, and keeps the generic arm.
+                 | _ when readsOnlyPrev buf rhs && (mentionsVar buf rhs || letsMention) -> Some rhs
+                 | _ -> None
+             let letsOk =
+                 lets |> List.forall (function NLet (_, _, value) -> readsOnlyPrev buf value | _ -> false)
+             (match step with
+              | Some step when letsOk -> Some (buf, t, lo, hi, lets, step)
+              | _ -> None)
+         | _ -> None)
+    | _ -> None
+
 /// Non-additive reassignment of a differentiable SCALAR is rejected
 /// everywhere: its adjoint needs the pre-statement value, which the
 /// re-evaluating reverse sweep cannot see. (Array ELEMENT writes stay legal
@@ -602,6 +1182,24 @@ let internal checkLoopDiscipline (fname: string) (ctx: Ctx) (loops: NStmt list) 
                              else Ok ())
                      | _ -> err fname "unsupported assignment target")
             | NAssign _ -> Ok ()
+            | CarryLoop (buf, _, _, _, lets, inc) ->
+                // The additive carry: its one element write reads the same
+                // buffer at the previous ordinal BY DESIGN (that is the
+                // recurrence), and its adjoint is exact in the descending
+                // sweep -- so the "array recurrence" refusal below does not
+                // apply. The increment and the leading lets are held to the
+                // ordinary discipline against every OTHER accumulator.
+                let declared = boundNames lets |> Set.ofList
+                let accums = Set.difference (assignedNames lets) declared
+                let outer = if inLoop then Set.union loopAccums accums else accums
+                check lets true outer
+                |> Result.bind (fun () ->
+                    let mutable bad = None
+                    walkExpr fname ctx (fun n -> if Set.contains n outer && bad.IsNone then bad <- Some n) false inc
+                    |> Result.bind (fun () ->
+                        match bad with
+                        | Some n -> err fname $"accumulation reads accumulator '{n}' mutated in the same loop; restructure"
+                        | None -> Ok ()))
             | NFor (_, _, _, body) ->
                 // loop-local declarations are replay-reconstructed --
                 // exclude them from the read ban

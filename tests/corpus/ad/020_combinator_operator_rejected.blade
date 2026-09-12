@@ -2,9 +2,13 @@
 // The operator spelling (`<&!>`) is an ordinary BinOp and used to slip past
 // the fragment walk whenever both operands were plain names, dying much
 // later in the adjoint with a generic "unsupported expression form" that
-// never said the word combinator. It now refuses up front, by name.
+// never said the word combinator. It now refuses up front, by name -- and
+// since the C2-reverse lowering (plan-equivariant-nn-notebooks.md 5.2) the
+// refusal is PER OPERATOR, so the pin below names `<&!>` itself and the
+// spelling that works, rather than the eleven-operator family list that used
+// to answer for all of them.
 // ERROR: BL5500
-// ERROR-CONTAINS: combinator operators
+// ERROR-CONTAINS: `<&!>` (full fusion) joins several computations
 import ad as ad
 
 function f(a: Array<Float like Idx<3>>, b: Array<Float like Idx<3>>) -> Float = {

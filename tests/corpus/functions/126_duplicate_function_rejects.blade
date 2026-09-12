@@ -1,0 +1,13 @@
+// TEST: Duplicate Function Declaration (rejects)
+// ============================================================================
+// A second top-level `function` with an already-declared name used to
+// silently shadow the first, leaving a call matching the first signature to
+// die with a rank mismatch blaming the CALL SITE. Refused (BL2009) until
+// same-name clause dispatch exists (plan-match-statements.md §5 R1). The
+// refusal names both declaration sites, and references keep resolving
+// against the FIRST declaration, so this is the only diagnostic.
+function total(x: Float64) -> Float64 = x
+function total(x: T^1) -> Float64 = reduce(x, (+))
+let r = total(3.0)
+// ERROR: BL2009 @ 9:1
+// ERROR-CONTAINS: already declares it at line 8, column 1

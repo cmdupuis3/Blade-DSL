@@ -1,0 +1,15 @@
+// TEST: Gram Mixed Element Types (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: share one element type
+// ============================================================================
+// gram's operands must already agree on an element type. The old rule chose
+// a RESULT width ("the complex operand, else the left one") and converted
+// neither operand: this pair checked clean and then failed in g++, which has
+// no `complex<float> * double`. A Float32 left operand against a Float64
+// right one failed the same way, accumulating double products into a float.
+//
+// Blade has explicit numeric casts, which lift elementwise over an array, so
+// the conversion can be named at the call site instead (see 259).
+let A: Array<Complex64 like Idx<1>, Idx<1>> = [[complex(1.0, 1.0)]]
+let B: Array<Float64 like Idx<1>, Idx<1>> = [[1.0]]
+let G = gram(A, B)

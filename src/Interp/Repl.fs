@@ -43,6 +43,21 @@ type LoweredSession =
 /// the rustc-style block.
 let lowerSessionDiag (fileName: string option) (source: string)
     : Result<LoweredSession, Blade.Diagnostics.Diagnostic list * Blade.Diagnostics.SourceMap> =
+    // Fresh-compilation lifecycle reset, mirroring the IDE lanes and the CLI
+    // driver. Safe here, and only here, because `source` is the WHOLE
+    // accumulated session, re-parsed and re-typechecked from scratch on every
+    // submission (SSA IRIds are freshly minted each pass, so nothing
+    // incremental survives a boundary) -- so this precedes the one
+    // `typeCheck` call that mints this submission's axis identities, and
+    // lowering happens further down this same function, never between them.
+    //
+    // Without it, a long-lived REPL/notebook process kept axis identities for
+    // session text since edited away: the mint table's identity LIST is what
+    // names an axis (`lat#2` is the second entry), so a stale entry renamed a
+    // live axis and its `Refs` list grew names no longer anywhere in the
+    // session.
+    Blade.ProviderRegistry.IdeStores.reset ()
+    Blade.IcechunkProvider.resetAxisMint ()
     let key = defaultArg fileName "<input>"
     // File-based imports resolve here for the same reason `blade run` resolves
     // them: a session that says `import units.SI` should mean the same thing it

@@ -1,0 +1,14 @@
+// TEST: Complex outer product dense truth
+// The UNDECLARED spelling of symmetry/039's kernel: no `where` clause, so
+// the output is a dense square and both triangles are computed. This pins
+// the ground truth the conjugate-mirror refusal protects -- r(0, 1) and
+// r(1, 0) are CONJUGATES, not equal -- and is the corpus's two-operand
+// outer-product apply over complex arrays (the shape that had no coverage
+// when the corruption shipped). Deduced PConj proposes no pin (there is no
+// writable Hermitian clause yet), so this stays warning-free.
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let result = method_for(A, A) <@> lambda(x, y) -> x * conj(y) |> compute
+let r01 = result(0, 1)
+let r10 = result(1, 0)
+// EXPECT: r01 = (11,2)
+// EXPECT: r10 = (11,-2)

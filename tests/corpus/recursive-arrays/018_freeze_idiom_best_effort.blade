@@ -1,0 +1,17 @@
+// TEST: Freeze Idiom Is Best-Effort
+// ============================================================================
+// The contract half of recognition: a recognized idiom that NEVER freezes
+// (the guard stays true through the whole budget) simply runs to the end --
+// no BL8010, no abort, the full trajectory. That is if/else's meaning, and
+// an optimization may change cost, never contract; the abort belongs to the
+// `while` spelling alone (recursive-arrays/013 pins that side).
+
+type It = Idx<8>
+let rec zs: Array<Float like It> =
+    match zs with
+    | zero -> zero
+    | zero :: s -> zero :: 1.0
+    | prefix :: n -> prefix :: (if prefix(n - 1) < 1000000.0 then prefix(n - 1) * 2.0 else prefix(n - 1))
+
+let top = zs((7 : It))
+// EXPECT: top = 128

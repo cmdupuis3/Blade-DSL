@@ -259,6 +259,7 @@ let rec internal cudaScalarNodeOk (e: IRExpr) : bool =
     | IRBinOp (IRElementwise, _, l, r) -> cudaScalarNodeOk l && cudaScalarNodeOk r
     | IRUnaryOp (_, x) -> cudaScalarNodeOk x
     | IRComplex (re, im) -> cudaScalarNodeOk re && cudaScalarNodeOk im
+    | IRFma (a, b, c) -> cudaScalarNodeOk a && cudaScalarNodeOk b && cudaScalarNodeOk c  // device fma()
     | IRIf (c, t, f) -> cudaScalarNodeOk c && cudaScalarNodeOk t && cudaScalarNodeOk f
     | _ -> false
 
@@ -1957,7 +1958,13 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
     let peelSourceStreamed =
         lazy (not (Map.isEmpty ctx.StreamedArrays)
               && info.Arrays |> List.exists (fun a ->
-                    Map.containsKey (exprToCppCtx ctx a) ctx.StreamedArrays))
+                    // By the binding's NAME: a streamed operand RENDERS as the
+                    // refusal sentinel, which is never a StreamedArrays key.
+                    Map.containsKey
+                        (match a with
+                         | IRVar (vid, _) -> Map.tryFind vid ctx.VarNames |> Option.defaultValue ""
+                         | _ -> exprToCppCtx ctx a)
+                        ctx.StreamedArrays))
     let peelStreamBlocker () : string option =
         if peelSourceStreamed.Force () then
             Some "the peeled source is a streamed provider read (shared per-source handles and per-argument buffers are not thread-safe)"
@@ -2653,7 +2660,8 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
                 // `<name>_cidx->unhash(r)[c]` (genElementBindingNew). The
                 // compound slot must be the range's SOLE index type for now;
                 // mixing (range<CompoundIdx<m>, J>) is unsupported.
-                let rname = $"__range{i}"
+                // per OUTPUT: two tabulated ranges in one program would otherwise redeclare one driver index
+                let rname = $"__range{i}_{name}"
                 (match idxTys with
                  | [ix] ->
                      (match ix.Extent with
@@ -2683,11 +2691,12 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
                 // (genLoopBoundExpr, genElementBindingNew, the extents fill)
                 // serve both tabulated kinds unchanged. Iteration visits the
                 // keys in GIVEN order (never sorted).
-                let rname = $"__range{i}"
+                // per OUTPUT: two tabulated ranges in one program would otherwise redeclare one driver index
+                let rname = $"__range{i}_{name}"
                 (match idxTys with
                  | [ix] ->
                      (match ix.Extent with
-                      | IRSparseKeys (SkStatic _ as src) ->
+                      | IRSparseKeys ((SkStatic _ | SkDomain _) as src) ->
                           let idxLines = genSparseIndexFromKeys src None ix.Rank ($"{rname}_cidx")
                           preCode <- preCode @ (idxLines |> List.map (fun s -> ind + s))
                           registerShapedAlloc ($"{rname}_cidx")
@@ -2706,9 +2715,8 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
                  | _ ->
                      preCode <- preCode @ codegenError ctx ind "range<SparseIdx<keys>, ...>: a sparse range slot cannot be combined with other index types in one range<> (not yet supported)")
                 (rname, arr)
-            | IRRange _ -> ($"__range{i}", arr)
+            | IRRange _ -> ($"__range{i}_{name}", arr)
             | IRVirtualReverse _ -> ($"__rev{i}", arr)
-            | IRBlocked _ -> ($"__blk{i}", arr)
             | IRMask _ | IRIntersect _ | IRUnion _ | IRUnique _ ->
                 // Auto-materialize: when a method_for receives an inline form
                 // as one of its arrays, generate a temporary binding before
@@ -2781,8 +2789,10 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
         |> List.choose (fun ix ->
             match ix.Tag with
             | Some tag when tag.StartsWith (haloWinTagPrefix + "d:") ->
-                (match ix.Extent, haloShrinkOfTag tag with
-                 | IRLit (IRLitInt shrunk), Some shrink -> Some (tag, shrunk + shrink)
+                // The declared inner extent is the window's forward DEMAND
+                // over the whole shrunk output: N = M + Shrink.
+                (match ix.Extent, haloAccessOfTag tag with
+                 | IRLit (IRLitInt shrunk), Some h -> Some (tag, snd (haloDemand h (0L, shrunk)))
                  | _ -> None)
             | _ -> None)
         // Same-tag ambiguity rule as TypeCheck's haloExtentClash: the tag
@@ -2799,24 +2809,20 @@ let genApplyCombinator (ctx: CodeGenContext) (name: string) (info: ApplyInfo) (b
         match resolveCallable info.Kernel with
         | None -> ()
         | Some callable ->
-            let haloTagOfIdx (e: IRExpr) =
-                match e with
-                | IRBinOp (_, IRAdd, IRVar (_, IRTIdxTagged (_, IRefNamed t)), _)
-                | IRBinOp (_, IRAdd, IRParam (_, _, IRTIdxTagged (_, IRefNamed t)), _)
-                    when t.StartsWith (haloWinTagPrefix + "d:") -> Some t
-                | _ -> None
+            // Every window read in the body, from the one shared scan
+            // (IRAccess.windowReadsOf), computed offsets included -- the
+            // extent obligation does not depend on the offset.
             let mutable guards : (string * int * int64) list = []
-            iterIRExpr (fun e ->
-                match e with
-                | IRIndex (IRVar (tid, _), idxs, _) ->
-                    idxs |> List.iteri (fun d ix ->
-                        match haloTagOfIdx ix |> Option.bind (fun t -> Map.tryFind t haloDecl) with
-                        | Some declared ->
-                            (match Map.tryFind tid tempCtx.VarNames with
-                             | Some tname -> guards <- (tname, d, declared) :: guards
-                             | None -> ())
-                        | None -> ())
-                | _ -> ()) callable.Body
+            for r in Blade.IRAccess.windowReadsOf (fun wv -> (Blade.IRAccess.denseHaloTagOf wv).IsSome) callable.Body do
+                match Blade.IRAccess.denseHaloTagOf r.Window |> Option.bind (fun t -> Map.tryFind t haloDecl) with
+                | Some declared ->
+                    (match Map.tryFind r.ArrayId tempCtx.VarNames with
+                     // a STREAMED source has no array here to check: its extent
+                     // is the store's, and the segment-run window alias carries
+                     // exactly the declared one (segmentRun below)
+                     | Some tname when not (Map.containsKey tname ctx.StreamedArrays) -> guards <- (tname, r.Dim, declared) :: guards
+                     | _ -> ())
+                | None -> ()
             let guardLines =
                 guards
                 |> List.distinct
@@ -2903,6 +2909,170 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                     { codeGen with KernelExpr = IRApp (IRVar (rk.Callable.Id, IRTUnit), args, rk.Callable.RetType) }
                 | None -> codeGen
 
+        // CO-ITERATION EXTENT GUARD (BL8011; the runtime half of TypeCheck's
+        // extent agreement, BL3016/coIterClash). A co-iteration level is
+        // bounded by its FIRST operand's extent and peels EVERY operand at
+        // that level, so a shorter later operand is read past its end. The
+        // checker compares literal extents at the call site, but inside a
+        // function over `T^k` parameters the extents are the caller's, and
+        // a curried call (`f(a)(b)`, `let h = f(a); h(b)`) or an inner-axis
+        // disagreement (`T^2 + T^2` with equal leading extents) reached the
+        // nest unchecked -- `[5, 7, <garbage>]` for a 3-vector plus a
+        // 2-vector. One comparison per (level, later operand), emitted ONCE
+        // before the nest, only for REAL arrays whose records are dense or
+        // symmetry-packed (`Array<T, R>` with `.extents`; a range is bounded
+        // by its own record, a compound/ragged operand has no `.extents`).
+        //
+        // WHEN LITERALS ARE TRUSTED: two equal literals on NON-parameter
+        // arrays are the checker's business and the allocation's truth, so
+        // the guard is skipped there (no emitted-text change for the common
+        // fully-static nest). A PARAMETER's literal is not a statement about
+        // the runtime array -- shape monomorphization pins a `T^k` parameter
+        // from one argument and the body's unification copies it onto the
+        // other (`f_HM_..._e3` typed `b` at 3 while the call passed 2), so a
+        // parameter operand is always compared at runtime. Mirrored by the
+        // interpreter's materializeApply, which reads runtime extents anyway.
+        (let isParamOperand (pos: int) =
+            match List.tryItem pos info.Arrays with
+            | Some (IRVar (id, _)) -> Set.contains id ctx.ParamIds
+            | _ -> false
+         let hasExtents (pos: int) =
+            match List.tryItem pos info.ArrayTypes with
+            | Some at -> at.IndexTypes |> List.forall (fun ix -> match ix with IxDense | IxSymmetryLike -> true | _ -> false)
+            | None -> false
+         let guardLines =
+            codeGen.Bindings
+            |> List.collect (fun b ->
+                match b.FusedRank, b.Elements with
+                | None, e0 :: rest when not rest.IsEmpty
+                                        && (match e0.Virtual with RealArray -> true | _ -> false)
+                                        && hasExtents e0.ArrayPosition ->
+                    let litOf (e: ElementBinding) =
+                        match List.tryItem e.ArrayPosition info.ArrayTypes with
+                        | Some at -> literalExtentOfArray at e.DimIndex
+                        | None -> None
+                    let lit0 = litOf e0
+                    let param0 = isParamOperand e0.ArrayPosition
+                    let boundText =
+                        match lit0 with
+                        | Some n when not param0 -> $"{n}LL"
+                        | _ -> $"(int64_t)({e0.ArrayName}.extents[{e0.DimIndex}])"
+                    rest |> List.collect (fun e ->
+                        let trusted =
+                            not param0 && not (isParamOperand e.ArrayPosition)
+                            && lit0.IsSome && litOf e = lit0
+                        match e.Virtual with
+                        | RealArray when hasExtents e.ArrayPosition && not trusted ->
+                            [ $$"""{{ind}}if ((int64_t)({{e.ArrayName}}.extents[{{e.DimIndex}}]) != {{boundText}}) {"""
+                              $"{ind}    std::cerr << \"Blade runtime: co-iteration over '{e0.ArrayName}' and '{e.ArrayName}' needs equal extents on axis {e.DimIndex}, but '{e0.ArrayName}' has \" << {e0.ArrayName}.extents[{e0.DimIndex}] << \" and '{e.ArrayName}' has \" << {e.ArrayName}.extents[{e.DimIndex}] << \" -- the walk is bounded by the first operand, so the shorter one would be read past its end\" << std::endl;"
+                              $"{ind}    blade_rt::panic(\"BL8011\", \"co-iteration extent mismatch\", nullptr, 0);"
+                              $"{ind}}}" ]
+                        | _ -> [])
+                | _ -> [])
+         if not guardLines.IsEmpty then preCode <- preCode @ guardLines)
+
+        // STENCIL OVER SEGMENTS (docs/plans/structural/07 §2.3): a halo map
+        // whose window reads go to a rank-1 STREAMED variable on a `Chunked`
+        // axis runs one segment at a time. Per run, the halo's own reach
+        // (HaloAccess.haloDemand) says which input cells the run's windows
+        // touch -- the run plus its ghost cells -- and exactly those are
+        // read from the store into a window buffer; the variable's name is
+        // then bound, inside the run, to an Array whose data pointer is the
+        // window shifted back by the window's start, so the nest's GLOBAL
+        // subscripts land in the window unchanged. The nest itself is the
+        // ordinary one with its outermost bounds rewritten to the run's
+        // interior ordinals (the MpiSlab bound variables, defined per run);
+        // the carousel stays off, as under any slab. Nothing of the variable
+        // exists outside the window.
+        // The run plan: (run boundaries, first/one-past-last centre, reach
+        // below/above, the centre shift the nest applies, the streamed
+        // sources (cpp name, spec)). Two shapes produce one:
+        //   - a HALO map whose window reads go to a streamed rank-1 source:
+        //     runs are the `Chunked` alias's, the reach is the halo's;
+        //   - an ELEMENTWISE map or zip with streamed rank-1 OPERANDS
+        //     (StreamingIONotes v1 refused these: its only in-nest read was a
+        //     whole trailing fiber at a site, and a rank-0 result has no fiber
+        //     to read): runs are blocks of the store's own chunk edge, reach
+        //     zero -- a run is exactly its window, and the traversal order is
+        //     the store's.
+        let streamedOf (e: IRExpr) =
+            match e with
+            | IRVar (aid, _) ->
+                Map.tryFind aid ctx.VarNames
+                |> Option.bind (fun vn -> Map.tryFind vn ctx.StreamedArrays |> Option.map (fun s -> (vn, s)))
+            | _ -> None
+        let segmentRun =
+            match info.Arrays with
+            | [ IRRange ([ ix ], _) ] ->
+                (match ix.Tag with
+                 | Some tag ->
+                     (match Blade.Types.haloAccessOfTag tag with
+                      | Some h when not h.IsCompound && h.Inner <> "" ->
+                          (match Blade.Types.SegmentTable.tryFind h.Inner with
+                           | Some offsets ->
+                               let reads =
+                                   Blade.IRAccess.windowReadsOf
+                                       (fun wv -> (Blade.IRAccess.denseHaloTagOf wv).IsSome) codeGen.KernelExpr
+                               let streamedReads =
+                                   reads
+                                   |> List.choose (fun r ->
+                                       Map.tryFind r.ArrayId ctx.VarNames
+                                       |> Option.bind (fun vn -> Map.tryFind vn ctx.StreamedArrays |> Option.map (fun s -> (vn, s, r.Rank))))
+                                   |> List.distinctBy (fun (vn, _, _) -> vn)
+                               (match streamedReads with
+                                | [ (vn, spec, 1) ] when spec.VarType.IndexTypes.Length = 1 ->
+                                    let n = (match spec.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets)
+                                    let reach = Blade.Types.haloReach h
+                                    Some (offsets, h.Start, n - (h.Shrink - h.Start), int64 (List.min reach), int64 (List.max reach), h.Start, [ (vn, spec) ], "stencil")
+                                | [] -> None
+                                | _ ->
+                                    raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan
+                                        "a stencil over segments streams ONE rank-1 variable through the window; bind the others with .read")))
+                           | None -> None)
+                      | _ -> None)
+                 | None -> None)
+            | arrays ->
+                let sources = arrays |> List.choose streamedOf |> List.distinctBy fst
+                // a streamed operand bound to a rank-1 KERNEL PARAMETER is the
+                // FIBER stream of StreamingIONotes v1: that path stays as it is.
+                // A rank-0 (cell) parameter over a rank-2 operand is an
+                // elementwise consumer, run one band of rows at a time.
+                let fiberBound =
+                    // index-safe: a multi-slot range is one operand feeding several parameters
+                    let ranks = info.KernelInputRanks
+                    info.Arrays
+                    |> List.mapi (fun i a -> (a, (if i < ranks.Length then ranks.[i] else 0)))
+                    |> List.exists (fun (a, kr) -> (streamedOf a).IsSome && kr > 0)
+                match sources with
+                | [] -> None
+                | _ when fiberBound -> None
+                | _ when sources |> List.exists (fun (_, s) -> s.VarType.IndexTypes.Length > 2) ->
+                    raise (Blade.Diagnostics.BladeDiagnosticException (Blade.Diagnostics.Codes.backendLimit Blade.Ast.noSpan
+                        "an elementwise consumer streams rank-1 and rank-2 variables today; bind a higher-rank streamed variable with .read"))
+                | (_, s0) :: _ ->
+                    let n = (match s0.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> 0L)
+                    let pspec = (Blade.ProviderRegistry.tryFind s0.Provider).Value
+                    let block =
+                        match pspec.StreamRowsBlock with
+                        | Some f -> max 1L (f s0.FilePath s0.VarName)
+                        | None -> 4096L
+                    let runs = [ for b in 0L .. block .. n - 1L -> b ] @ [ n ]
+                    Some (runs, 0L, n, 0L, 0L, 0L, sources, "elementwise")
+        // inside the run each streamed source IS an array (its window alias)
+        let ctx =
+            match segmentRun with
+            | Some (_, _, _, _, _, _, sources, _) ->
+                sources |> List.fold (fun c (vn, _) -> { c with StreamedArrays = Map.remove vn c.StreamedArrays }) ctx
+            | None -> ctx
+        // ...so its reads render by name for the rest of this emission, the
+        // same fact as the StreamedArrays removal above, for the renderers that
+        // see only a name map (CodeGenState, "STREAMED VALUES NEVER REACH
+        // C++"). Disposed when this block ends.
+        use _runAliasMask =
+            maskStreamedNames
+                (match segmentRun with
+                 | Some (_, _, _, _, _, _, sources, _) -> sources |> List.map fst
+                 | None -> [])
         // STREAMED provider inputs (`alias.stream`): no materialized arrays
         // exist -- the nest inlines per-fiber reads at the S/T boundary.
         // Pre-allocate one destination buffer per streamed fiber binding (a
@@ -3133,7 +3303,11 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
             // below; the Allgatherv afterward restores the full output on all
             // ranks (SPMD invariant -- downstream code needs no changes).
             let mpiDense = (mpiShape = Some MpiDense)
-            let codeGen = if mpiDense then { codeGen with MpiSlab = true } else codeGen
+            // Revision reuse (docs/plans/structural/04): a tiled binding's nest
+            // runs one leading-axis tile at a time through the same outer-level
+            // slab substitution the MPI slab and the segment run use.
+            let tilePlan = Map.tryFind name ctx.TilePlans
+            let codeGen = if mpiDense || segmentRun.IsSome || tilePlan.IsSome then { codeGen with MpiSlab = true } else codeGen
 
             // Generate loop nest. The LinAlg dispatch is tried first: a
             // recognised BLAS shape is a strictly stronger rewrite than a flat
@@ -3149,12 +3323,14 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
             // agreement rather than assume it (Blade's unify does not compare
             // extents).
             let loopCode =
-                match tryGenLinAlgNest streamedMap info.ArrayTypes codeGen
-                                       tempCtx.VarNames tempCtx.Indent with
+                // a segment run loop owns the outer bounds: neither the BLAS
+                // rewrite nor the flat collapse honours them
+                match (if segmentRun.IsSome || tilePlan.IsSome then None
+                       else tryGenLinAlgNest streamedMap info.ArrayTypes codeGen tempCtx.VarNames tempCtx.Indent) with
                 | Some la -> la
                 | None ->
-                match tryGenFlatElementwiseNest streamedMap info.ArrayTypes codeGen
-                                                tempCtx.VarNames tempCtx.Indent with
+                match (if segmentRun.IsSome || tilePlan.IsSome then None
+                       else tryGenFlatElementwiseNest streamedMap info.ArrayTypes codeGen tempCtx.VarNames tempCtx.Indent) with
                 | Some flat -> flat
                 | None -> genLoopNestStreamed streamedMap codeGen tempCtx.VarNames tempCtx.Indent
 
@@ -3294,6 +3470,83 @@ provably sign-odd in tied argument %d; typecheck should have refused this applic
                     registerPoolAlloc (classifyOutputStorage codeGen.OutputType)
                         outputElemType outputRank symmArg extentsName name ownedExtents
                 | _ -> ()
+                // The run loop of a stencil over segments (see segmentRun
+                // above): per run, the interior centres it holds, the window
+                // the reach demands, the read, the alias, the slab bounds.
+                let segLoop =
+                    match segmentRun with
+                    | None ->
+                        (match tilePlan with
+                         | Some plan ->
+                             (tilesUsedCell ()).Value <- true
+                             tileLoopLines ind plan loopCode
+                         | None -> loopCode)
+                    | Some (offsets, cMin, cMax, rLo, rHi, start, sources, kind) ->
+                        let missing =
+                            sources |> List.tryFind (fun (_, s) -> ((Blade.ProviderRegistry.tryFind s.Provider).Value).GenStreamRows.IsNone)
+                        match missing with
+                        | Some (_, s) ->
+                            recordCodegenRefusal $"provider '{s.Provider}' does not support per-segment streamed reads ('{s.VarName}' -- bind with .read)"
+                            loopCode
+                        | None ->
+                            let g = offsets.Length - 1
+                            let table = offsets |> List.map (fun b -> $"{b}UL") |> String.concat ", "
+                            let maxWin =
+                                List.pairwise offsets
+                                |> List.map (fun (lo, hi) -> (min hi cMax) - (max lo cMin) + (rHi - rLo))
+                                |> List.fold max 1L
+                            // scratch names are per OUTPUT and per source: two
+                            // consumers may share one source, one zip may hold two
+                            let runs = $"{name}__runs"
+                            let windows =
+                                sources |> List.mapi (fun k (vn, spec) ->
+                                    let genRows = ((Blade.ProviderRegistry.tryFind spec.Provider).Value).GenStreamRows.Value
+                                    let elemCpp = elemTypeToCpp spec.VarType.ElemType
+                                    let extents =
+                                        spec.VarType.IndexTypes |> List.map (fun ix -> match ix.Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets)
+                                    let n = extents.Head
+                                    let trailing = extents |> List.tail |> List.fold (*) 1L
+                                    let rank = extents.Length
+                                    let ext = $"{name}__srcext{k}"
+                                    let win = $"{name}__win{k}"
+                                    let rows = $"{name}__rows{k}"
+                                    let extTable = extents |> List.map (fun e -> $"{e}UL") |> String.concat ", "
+                                    let decl =
+                                        [ $"{ind}size_t {ext}[{rank}] = {{ {extTable} }};"
+                                          $"{ind}{elemCpp}* {win} = new {elemCpp}[{maxWin * trailing}];" ]
+                                        @ (if rank = 2 then [ $"{ind}{elemCpp}** {rows} = new {elemCpp}*[{n}]();" ] else [])
+                                    let alias =
+                                        if rank = 1 then
+                                            // the window shifted back by its start: global subscripts land inside it
+                                            [ $"{ind}    Array<{elemCpp}, 1> {vn} = {{ {win} - __w_lo, {ext} }};" ]
+                                        else
+                                            // a row-pointer table over the full leading extent; only the band's rows are live
+                                            [ $"{ind}    for (size_t __r = __w_lo; __r < __w_hi; __r++) {rows}[__r] = {win} + (__r - __w_lo) * {trailing}UL;"
+                                              $"{ind}    Array<{elemCpp}, 2> {vn} = {{ {rows}, {ext} }};" ]
+                                    let read =
+                                        (genRows spec.FilePath spec.VarName vn win "__w_lo" "__w_hi" spec.VarType
+                                         |> List.map (fun s -> ind + "    " + s))
+                                        @ alias
+                                    (decl, read, [ $"{ind}delete[] {win};" ] @ (if rank = 2 then [ $"{ind}delete[] {rows};" ] else [])))
+                            let what = sources |> List.map (fun (_, s) -> $"'{s.VarName}'") |> String.concat ", "
+                            let lastN = sources |> List.map (fun (_, s) -> match s.VarType.IndexTypes.[0].Extent with IRLit (IRLitInt n) -> n | _ -> List.last offsets) |> List.min
+                            [ (if kind = "stencil"
+                               then $"{ind}// stencil over segments: {what} streamed one run at a time, each run read with its ghost cells [{rLo}, {rHi}] (HaloAccess.haloDemand); no whole-array buffer"
+                               else $"{ind}// elementwise over segments: {what} streamed one run at a time (the store's chunk edge), each run its own window; no whole-array buffer")
+                              $"{ind}const size_t {runs}[{g + 1}] = {{ {table} }};" ]
+                            @ (windows |> List.collect (fun (d, _, _) -> d))
+                            @ [ $$"""{{ind}}for (size_t __seg = 0; __seg < {{g}}; __seg++) {"""
+                                $"{ind}    size_t __c_lo = {runs}[__seg] < {cMin}UL ? {cMin}UL : {runs}[__seg];"
+                                $"{ind}    size_t __c_hi = {runs}[__seg + 1] > {cMax}UL ? {cMax}UL : {runs}[__seg + 1];"
+                                $"{ind}    if (__c_lo >= __c_hi) continue;"
+                                $"{ind}    size_t __w_lo = __c_lo + ({rLo}L); size_t __w_hi = __c_hi + ({rHi}L);"
+                                $"{ind}    if (__w_hi > {lastN}UL) __w_hi = {lastN}UL;" ]
+                            @ (windows |> List.collect (fun (_, r, _) -> r))
+                            @ [ $"{ind}    size_t __blade_mpi_lo_{name} = __c_lo - {start}UL;"
+                                $"{ind}    size_t __blade_mpi_hi_{name} = __c_hi - {start}UL;" ]
+                            @ (loopCode |> List.map (fun s -> "    " + s))
+                            @ [ $"{ind}}}" ]
+                            @ (windows |> List.collect (fun (_, _, f) -> f))
                 preCode @ streamPrologue @ [""] @ extentDecls @ [""; allocDecl; ""]
-                @ mpiSlabPrologue @ loopCode @ mpiGather
+                @ mpiSlabPrologue @ segLoop @ mpiGather
 

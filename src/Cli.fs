@@ -17,6 +17,21 @@ let private dispatchInner (args: string[]) : int =
     // its g++ fallback; hand it over once, here, so every front end that
     // reaches an unsupported node from this process gets the same lane.
     Blade.ReplSession.installCompiledLane compiledReplLane
+    // ...and the RENDER FAST PATH its own, for the same reason and by the same
+    // route: IdeServe.fs is compiled before Build.fs, so it cannot name
+    // compileToExe. It needs the EXE PATH back, not just the run's output, so
+    // that a camera change can re-run a binary it already built.
+    Blade.IdeServe.installRenderLane renderCompileLane renderRunLane
+    // Reset per-invocation provider state ahead of every verb: without it, the
+    // icechunk axis mint table and the IDE stores side-channel carry over
+    // whatever a previous compilation in this process minted, so a checkout's
+    // axis could print `lat#2` for no reason in the source. Must land here,
+    // not between typecheck and lowering, or it orphans identities typecheck
+    // just minted. `test` and `repl` compile many programs per process, so
+    // they re-arm this at their own boundaries (`Interp.Repl.lowerSessionDiag`,
+    // and where the icechunk block regenerates a fixture in place).
+    Blade.ProviderRegistry.IdeStores.reset ()
+    Blade.IcechunkProvider.resetAxisMint ()
     // `--strict-pins` is a build MODE, not a positional argument, and only
     // means anything for the four verbs that own a typecheck. Strip it from
     // the argv the verb patterns match on so every arm shape accepts it in
@@ -43,6 +58,33 @@ let private dispatchInner (args: string[]) : int =
     if noCacheVerb && Array.contains "--no-cache" args then
         System.Environment.SetEnvironmentVariable("BLADE_EXE_CACHE", "0")
     let args = if noCacheVerb then args |> Array.filter (fun a -> a <> "--no-cache") else args
+    // `--print <names>` is a MODE like the two above: it selects WHICH
+    // top-level bindings the compiled program prints (every one, by default).
+    // The CLI has printed all of them since there was a CLI, which makes a
+    // program's own output dominate its cost on a large array -- see
+    // docs/plans/structural/04's scale run. It changes the EMISSION, so it
+    // travels as a process-level env pin that codegen reads at its own site
+    // (and the interpreter mirrors, so both lanes print one set); the
+    // executable cache keys on the emitted text, so a selection can never
+    // serve a binary that printed something else. Stripped as a PAIR from
+    // argv so every verb pattern accepts it in any position.
+    let printFlagErr =
+        match args |> Array.tryFindIndex (fun a -> a = "--print") with
+        | None -> None
+        | Some i ->
+            if i + 1 >= args.Length || args.[i + 1].StartsWith "--" then
+                Some "--print requires a comma-separated list of top-level binding names (e.g. run prog.blade --print total)"
+            else
+                System.Environment.SetEnvironmentVariable("BLADE_PRINT", args.[i + 1])
+                None
+    let args =
+        match args |> Array.tryFindIndex (fun a -> a = "--print") with
+        | Some i when i + 1 < args.Length && not (args.[i + 1].StartsWith "--") ->
+            Array.append args.[.. i - 1] args.[i + 2 ..]
+        | _ -> args
+    match printFlagErr with
+    | Some msg -> eprintfn "Error: %s" msg; 1
+    | None ->
     match args with
     // User-facing commands.
     // `run <file> [--verbose] [--mpi N] [--memcheck]` -- flags in any order
@@ -85,6 +127,15 @@ let private dispatchInner (args: string[]) : int =
                  | true, v when v > 0 -> mpiRanks <- Some v; parse tl
                  | _ -> bad <- Some $"--mpi expects a positive rank count, got '{n}'")
             | ["--mpi"] -> bad <- Some "--mpi requires a rank count (e.g. run prog.blade --mpi 4)"
+            | "--run-record" :: p :: tl when not (p.StartsWith "--") ->
+                // The executable writes its run record (input manifest +
+                // observed identities + status) to this path at exit. A
+                // process-level pin, as --memcheck is: the child inherits
+                // the environment, and the exe runs with ITS directory as
+                // cwd, so the path is made absolute here.
+                System.Environment.SetEnvironmentVariable("BLADE_RUN_RECORD", System.IO.Path.GetFullPath p)
+                parse tl
+            | ["--run-record"] | "--run-record" :: _ -> bad <- Some "--run-record requires a destination path (e.g. run prog.blade --run-record run.json)"
             | f :: tl when file.IsNone && not (f.StartsWith "--") -> file <- Some f; parse tl
             | f :: _ -> bad <- Some $"unexpected argument '{f}'"
         parse rest
@@ -108,6 +159,10 @@ let private dispatchInner (args: string[]) : int =
     | [| "emit"; file; "-o"; output; "--verbose" |] -> emitFile file (Some output) true strictPins
 
     | [| "check"; file |] -> checkFile file strictPins
+
+    // The optimization decision record (Blade.Effects.Decisions).
+    | [| "plan"; file |] -> planFile file false
+    | [| "plan"; file; "--json" |] | [| "plan"; "--json"; file |] -> planFile file true
 
     // Native-toolchain health report (docs/plans/plan-toolchain-packaging.md).
     | [| "doctor" |] -> Blade.Doctor.runDoctor false

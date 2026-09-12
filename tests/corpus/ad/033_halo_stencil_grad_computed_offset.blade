@@ -1,0 +1,20 @@
+// TEST: AD Reverse Halo Stencil, Computed Offset Takes The Scatter Route
+import ad as ad
+// ============================================================================
+// The window offset is a module-level value rather than a literal, so the
+// gather route's read discipline declines (its inverse needs a STATIC
+// offset per read) and the map lowers into the construction loop instead,
+// whose adjoint scatters (docs/plans/structural/02, 3.2). Same function as
+// ad/030, same answers: the route is a cost decision, never a contract one.
+// ============================================================================
+type H = Idx<5>
+let one = 1
+function f(a: Array<Float like H>) -> Float = {
+    let d = method_for(halo<H, [-1, 0, 1]>) <@> lambda(w) -> a(w(one)) - a(w(0 - one)) |> compute
+    reduce(d, (+))
+}
+let a0: Array<Float like H> = [0.0, 1.0, 2.0, 3.0, 4.0]
+let mut da: Array<Float like H> = [0.0, 0.0, 0.0, 0.0, 0.0]
+let fv = ad.grad(f)(a0, da)
+// EXPECT: fv = 6
+// EXPECT: da = [-1, -1, 0, 1, 1]

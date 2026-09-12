@@ -1,0 +1,40 @@
+// TEST: Display JSON Floats Are Shortest Round-Trip
+// ============================================================================
+// Every float in a display frame goes out at its SHORTEST round-trip
+// rendering (blade_display::jsonfloat / CppFormat.formatFloatShortest), not
+// the print block's setprecision(15). The two differ exactly where it
+// matters for a zoom lens: 15 digits quantize a Float64 near 0.74 to steps
+// of 1e-15, so a 256-sample axis with half-width 1e-13 collided in the
+// PANEL a decade before Float64 itself ran out of numbers
+// (examples/mandelbrot.bladenb, the Float64-floor cell).
+//
+// The values below cover every layout branch of the shared %.17g-style
+// rule: fixed with trailing digits (0.1, 1/3 -- 16 digits, not 15), fixed
+// at the small end of the fixed range (1e-4), scientific just past it
+// (1e-5), an integer-valued double (123456789), the largest fixed integer
+// exponent (1e16 -> 17 digits, padded with zeros), the first scientific
+// exponent (1e17), a subnormal (5e-324), DBL_MAX, the seahorse center, a
+// negative zero, and 0.1 + 0.2 (17 digits). The frame lines ride stdout,
+// so `blade test interp display` diffs the serialized text byte for byte
+// across the compiled and interpreted lanes; the Float32 series checks the
+// float32 path renders the float's exact DOUBLE value the same way in both.
+// ============================================================================
+import plot
+type I12 = Idx<12>
+let xs: Array<Float64 like I12> = [0.1, 1.0 / 3.0, 1.0e-4, 1.0e-5, 123456789.0, 1.0e16,
+    1.0e17, 5.0e-324, 1.7976931348623157e308, -0.743643887037151, -0.0, 0.1 + 0.2]
+let ys: Array<Float64 like I12> = [1.0e-15, 1.1e-16, 7.8125e-17, 2.5, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0]
+let p1 = plot.line(xs, ys, "shortest round-trip": title)
+type I4 = Idx<4>
+let x4: Array<Float64 like I4> = [0.0, 1.0, 2.0, 3.0]
+let f32: Array<Float32 like I4> = [0.1, 0.3, 1.0e-5, 16777217.0]
+let p2 = plot.line(x4, f32)
+// The axis samples of the deep lens, as the panel receives them: adjacent
+// Float64 samples one ulp apart near 0.74 are DISTINCT at shortest digits
+// (they were identical at 15).
+let a0 = -0.743643887037151
+let a1 = a0 + 1.1102230246251565e-16
+let distinct = a1 > a0
+// EXPECT: p1 = true
+// EXPECT: p2 = true
+// EXPECT: distinct = true

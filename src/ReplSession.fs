@@ -263,9 +263,57 @@ module ReplTypes =
 let private bindingNameRe =
     Regex(@"^\s*(?:let\s+(?:mut\s+|static\s+|rec\s+)?|static\s+function\s+|function\s+|type\s+|Unit\s+)([A-Za-z_][A-Za-z0-9_]*)")
 
+/// A destructuring declaration: `let (a, b) = ...`, `let mut (x, _) = ...`,
+/// nested parens allowed. Group 1 is the pattern text between the outer parens.
+let private destructureNameRe =
+    Regex(@"^\s*let\s+(?:mut\s+)?\(((?:[^()]|\([^()]*\))*)\)\s*=")
+
+/// The first line that is neither blank nor a `//` comment: the line a
+/// snippet's SHAPE is read from. Every textual probe in this module has to
+/// look past a leading comment, because a declaration routinely sits under
+/// one -- a `///` doc comment in a file, a prose banner in a notebook cell.
+/// `classifyTarget` (below) is the same question asked for classification.
+let firstSignificantLine (s: string) =
+    s.Replace("\r\n", "\n").Split('\n')
+    |> Array.tryFind (fun l ->
+        let t = l.TrimStart()
+        t <> "" && not (t.StartsWith "//"))
+    |> Option.defaultValue ""
+
+/// The name a snippet declares, read from its first significant line.
+///
+/// Reading it from the RAW snippet was a silent-wrong-answer bug: the regex is
+/// anchored `^\s*`, and `\s` spans newlines, so a BLANK-led declaration matched
+/// but a COMMENT-led one returned None. `spliceDeclaration` takes None to mean
+/// "no name to supersede" and APPENDS -- so re-running a commented declaration
+/// left the old binding standing and added the new one after any consumer that
+/// had spliced in place, which then read the stale value. Nothing failed; the
+/// answer was just wrong.
 let bindingName (snippet: string) : string option =
-    let m = bindingNameRe.Match snippet
-    if m.Success then Some m.Groups.[1].Value else None
+    let line = firstSignificantLine snippet
+    let m = bindingNameRe.Match line
+    if m.Success then Some m.Groups.[1].Value
+    else
+        // A destructuring `let (a, b) = ...` declares its LEAVES; its rebind
+        // key is the leaf list, `(a,b)`, so re-running the cell supersedes the
+        // earlier one in place like any other declaration -- and the key is
+        // spelled exactly as TypeCheck names the binding, so the memo
+        // invalidation below (`topLevelBindingNames`) drops it. Without this the
+        // regex above found no name, the splice APPENDED a second binding of
+        // the same leaves, and the interpreter's name-keyed session memo then
+        // adopted the FIRST tuple's cached value for the new one -- the rebind
+        // was silently a no-op (measured: `let (a, b) = pair(7.0)` echoed the
+        // pair(1.5) values). Wildcards are dropped from the key; a nested
+        // tuple pattern flattens, which is also how TypeCheck names the
+        // binding (`_(a,b)`, see checkDecl).
+        let d = destructureNameRe.Match line
+        if d.Success then
+            let leaves =
+                d.Groups.[1].Value.Split([| ','; '('; ')' |], System.StringSplitOptions.RemoveEmptyEntries)
+                |> Array.map (fun x -> x.Trim())
+                |> Array.filter (fun x -> x <> "" && x <> "_")
+            if leaves.Length = 0 then None else Some ("_(" + String.concat "," leaves + ")")
+        else None
 
 /// The names a MULTI-LINE submission declares at top level.
 ///
@@ -303,7 +351,13 @@ let topLevelBindingNames (source: string) : string list =
     for line in source.Replace("\r\n", "\n").Split('\n') do
         if depth <= 0 then
             match bindingName line with
-            | Some n -> acc.Add n
+            | Some n ->
+                acc.Add n
+                // A destructuring line binds its LEAVES too, each a memo key
+                // of its own (the interpreter publishes `a` and `b` beside
+                // the parent `_(a,b)`); a rebind must drop all three.
+                if n.StartsWith "_(" then
+                    for leaf in n.Substring(2, n.Length - 3).Split(',') do acc.Add leaf
             | None -> ()
         depth <- advance depth line
     List.ofSeq acc
@@ -424,13 +478,10 @@ let private referencedNames (snippet: string) : Set<string> =
     identTokensRe.Matches snippet |> Seq.map _.Value |> Set.ofSeq
 
 /// Classification looks at the first non-comment, non-blank line so a
-/// doc-commented declaration isn't mistaken for a bare expression.
-let classifyTarget (s: string) =
-    s.Replace("\r\n", "\n").Split('\n')
-    |> Array.tryFind (fun l ->
-        let t = l.TrimStart()
-        t <> "" && not (t.StartsWith "//"))
-    |> Option.defaultValue ""
+/// doc-commented declaration isn't mistaken for a bare expression -- the same
+/// line `bindingName` reads the declared name from, so the two can never
+/// disagree about which line a snippet's shape lives on.
+let classifyTarget (s: string) = firstSignificantLine s
 
 // Splitting a submission into its top-level statements.
 //
@@ -1078,8 +1129,12 @@ type ReplSession(runCwd: string) =
                 let reassigns = dropped |> List.exists (fun s -> assignRe.IsMatch(s.Trim()))
                 if memo.MutationFree && allNamed && not reassigns then
                     let gone = names |> List.concat |> Set.ofList
+                    // Frames travel with their value: a name whose value is
+                    // dropped must not keep a cached picture behind, or the
+                    // map outlives every session that could replay from it.
                     { memo with
-                        Values = memo.Values |> Map.filter (fun nm _ -> not (Set.contains nm gone)) }
+                        Values = memo.Values |> Map.filter (fun nm _ -> not (Set.contains nm gone))
+                        Frames = memo.Frames |> Map.filter (fun nm _ -> not (Set.contains nm gone)) }
                 else Blade.Interp.Run.emptyMemo
         let watch = System.Diagnostics.Stopwatch.StartNew()
         match Blade.Interp.Repl.lowerSessionDiag (Some srcPath) src with

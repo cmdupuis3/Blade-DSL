@@ -1,0 +1,18 @@
+// TEST: Halo compound-inner non-literal offset rejected (rejects)
+// Over a masked domain the neighbour is the (center + o)-th PRESENT cell,
+// whose coordinate is a rank-table lookup, so nothing shows a RUNTIME offset
+// to stay inside the shrunk interior -- the dense case's saving grace (the
+// ordinal is the index, and the shrink bounds it) does not apply. This was
+// already refused, but by a bare `failwith` in Lowering: an
+// internal-error-shaped crash for an ordinary user mistake, with no span.
+// It is a typecheck refusal now, in the same family as the non-static
+// offset SET of loops/075. The dense sibling stays legal: loops/080 reads
+// `S(w(0 - i))` with an offset from a sibling range slot.
+// ERROR: BL3999
+// ERROR-CONTAINS: must be an integer literal
+type T = Idx<8>
+type Lag = Idx<2>
+let dense: Array<Float64 like T> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+let m: Array<Bool like T> = [true, false, true, true, false, true, true, false]
+let d = method_for(halo<CompoundIdx<m>, [0, 1]>, range<Lag>) <@> lambda(w, i) -> dense(w(0 + i)) |> compute
+d

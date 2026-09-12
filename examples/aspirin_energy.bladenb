@@ -1,0 +1,931 @@
+// %% [markdown]
+// # Aspirin, from first principles of symmetry: a benchmark in a type system
+//
+// [MD17](http://sgdml.org) is the standard proving ground for machine-learned
+// force fields, and aspirin is its hardest small molecule: 21 atoms, C9 O4 H8,
+// four rotatable bonds, and a potential-energy surface that moves by only a
+// few kcal/mol across the whole trajectory. The coupled-cluster (CCSD)
+// variant used here ships 1000 training and 500 test geometries with their
+// energies and forces — the same file sGDML, NequIP and MACE are measured on.
+//
+// The model below is an O(3)-equivariant network: a per-species pooled
+// featurization, a Schur-derived embedding, three Clebsch-Gordan blocks, and
+// an invariant readout to a single energy. What makes it a Blade notebook
+// rather than a PyTorch one is that **the equivariance is in the types**. The
+// four admissible moves carry `where ml.equiv(O3)` clauses the compiler
+// *verifies*; a fifth, plausible-looking move is a program that does not
+// exist; and the parameter counts are dimensions of Hom-spaces, printed from
+// the specs before a single weight is drawn.
+//
+// The payoff arrives at the end, and it is not the regression score. Take
+// the trained energy, differentiate it with respect to the atomic positions
+// with `ad.grad`, and you get forces — first-order reverse mode, never
+// trained on. Rotate the molecule and those force *vectors* rotate with it,
+// to fifteen decimal places. Nothing in the training loop arranged that. The
+// type system did, at compile time.
+//
+// Data comes from `examples/data/aspirin.zarr`, written by
+// `examples/tools/make_aspirin_zarr.fsx`. That script reads the raw sGDML
+// `.npy` members, and its first job is to survive a trap: `R` and `F` are
+// stored `fortran_order: True`. Read column-major they are a molecule; read
+// row-major they are 21 points with nearest neighbours 0.08 A apart. The
+// generator asserts the chemistry rather than trusting the flag.
+//
+// The full deduction suite — four refusals, the compiler writing a clause,
+// and a chirality theorem delivered as a compile error — lives in
+// `examples/tetris_shapes.bladenb`. Here it appears twice, briefly.
+
+// %%
+import ml as ml
+import ad as ad
+import zarr as z
+import rand as r
+import plot
+
+let store = z.load("examples/data/aspirin.zarr")
+type SampTr = store.index.samp_tr
+type SampTe = store.index.samp_te
+type Atom = store.index.atom
+type Xyz = store.index.xyz
+type Species = store.index.species
+type Stat = store.index.stat
+type Epoch = store.index.epoch
+type RotK = store.index.rotk
+type Nine = store.index.nine
+
+// `__` marks an internal buffer: these are read with COMPUTED integer
+// subscripts (a flat weight vector, an atom index, a pair index), which is
+// exactly what the `__` convention exempts from the BL4003 tag note.
+let __pos_tr: Array<Float like SampTr, Atom, Xyz> = store.vars.pos_train |> z.read
+let __pos_te: Array<Float like SampTe, Atom, Xyz> = store.vars.pos_test |> z.read
+let __e_tr: Array<Float like SampTr> = store.vars.e_train |> z.read
+let __e_te: Array<Float like SampTe> = store.vars.e_test |> z.read
+let __spec: Array<Float like Atom, Species> = store.vars.spec_w |> z.read
+let __stats: Array<Float like Stat> = store.vars.e_stats |> z.read
+let __perm: Array<Int64 like Epoch, SampTr> = store.vars.perm |> z.read
+let __rot: Array<Float like RotK, Nine> = store.vars.rot3 |> z.read
+let __f_te: Array<Float like SampTe, Atom, Xyz> = store.vars.f_test |> z.read
+let __z: Array<Int64 like Atom> = store.vars.z_atoms |> z.read
+
+// `pos_train` and `pos_test` are separate variables, so they carry separate
+// named index types: a loss that reached into the test split by accident
+// would not typecheck. The atomic numbers, straight out of the store:
+let composition = [__z(0), __z(7), __z(13), extents(__z)]
+composition
+// EXPECT: composition = [6, 8, 1, 21]
+
+let static NATOM = 21
+let static NP3 = 63
+let static NPAIR = 210
+let static NBIN = 6
+let static NTR = 500
+let static NTE = 100
+
+// A feature is not an array of numbers, it is an array of numbers WITH a
+// representation: `IrrepsIdx<[(l, parity, multiplicity), ...]>`. HSPEC says
+// "21 invariant scalars, 3 odd vectors, 3 even rank-2 tensors" -- the pooled
+// description of one geometry. ESPEC and MSPEC are the network's hidden
+// widths, EVSPEC the invariant channels the energy is read out of.
+let static HSPEC = [(0, 0, 21), (1, 1, 3), (2, 0, 3)]
+let static ESPEC = [(0, 0, 2), (1, 1, 1), (2, 0, 1)]
+let static MSPEC = [(0, 0, 3), (1, 1, 1), (2, 0, 1)]
+let static EVSPEC = [(0, 0, 39)]
+let static OUT1 = [(0, 0, 1)]
+let static CFG1 = (ESPEC, ESPEC, MSPEC)
+let static CFG2 = (MSPEC, MSPEC, MSPEC)
+let static NEV = 39
+
+// Once the specs are fixed the parameter counts are not hyperparameters. They
+// are Schur's lemma: `ml.hom_dim` counts the equivariant linear maps between
+// two representations, `ml.tp_weight_dim` counts the admissible
+// Clebsch-Gordan paths, and `ml.linear_weight_dim` the multiplicity mixings.
+// Printing them is printing a dimension of a Hom-space.
+let static DH = ml.total_dim(HSPEC)
+let static DE = ml.total_dim(ESPEC)
+let static DM = ml.total_dim(MSPEC)
+let static WE = ml.hom_dim(HSPEC, ESPEC)
+let static W1 = ml.tp_weight_dim(CFG1)
+let static W2 = ml.tp_weight_dim(CFG2)
+let static WL = ml.linear_weight_dim(MSPEC, MSPEC)
+let static WR = ml.hom_dim(EVSPEC, OUT1)
+let sizes = [DH, DE, DM, WE, W1, W2, WL, WR]
+sizes
+// EXPECT: sizes = [45, 10, 11, 48, 30, 49, 11, 39]
+
+// %% [markdown]
+// ## The featurization, and the one thing no signature can state
+//
+// Turning Cartesian coordinates into a representation-typed feature is the
+// single uncertified step, and it is deliberately the first one: the premise
+// "these three numbers really are the components of a vector" is what the
+// signature assumes rather than proves. Everything after it is checked.
+//
+// Two kinds of channel go in, and the split is physical:
+//
+// - **21 invariant channels** — a smoothed pair-distance histogram. All 210
+//   interatomic distances are dropped into six Gaussian shells whose centres
+//   and width are fixed multiples of the data's own RMS atomic radius, and
+//   pooled by the species of the central atom (C, O, H). This is the
+//   two-body part of an ACE/MTP descriptor, and it is where the conformational
+//   signal actually lives: aspirin's energy is set by dihedral angles, which
+//   move interatomic distances and barely move the molecular multipoles.
+// - **3 vector and 3 tensor channels** — the pooled `ml.y_to(2, ...)` spherical
+//   harmonic expansion of the atoms about the molecular centroid, weighted by
+//   a Gaussian in the radius and summed per species. These carry no invariant
+//   information the histogram lacks, and they are the l > 0 content the whole
+//   Clebsch-Gordan machinery downstream is for.
+//
+// Pooling over atoms is what makes the result a function of the point *set*,
+// so nothing depends on how the 21 atoms were numbered.
+//
+// Two Blade details are load-bearing. The pair index `q -> (i, j)` is a
+// closed form over the strict upper triangle, evaluated once into two `Int64`
+// tables — reverse-mode differentiation has no `if`, so a branch-free decode
+// is not a nicety. And the features are calibrated per (channel, block):
+// invariant channels get centre and spread, l > 0 blocks get spread only,
+// since subtracting a constant from a vector is not equivariant and the
+// compiler would be within its rights to say so.
+//
+// Watch for a bonus deduction in this cell's warnings: nobody asked, but the
+// compiler notices that `dslot` — a distance between two positions — is
+// invariant under a Galilean boost, and offers to write `where ml.galilean(p)`
+// for it (BL4014).
+
+// %%
+// Flat pair index q -> the unordered pair (i, j), i < j, row-major over the
+// strict upper triangle. The row is the largest i with S(i) = (41 i - i^2)/2
+// at most q, i.e. i = floor((41 - sqrt(1681 - 8q)) / 2).
+function tri_i(q: Int) -> Int64 = {
+    let d = sqrt(1681.0 - 8.0 * Float64(q))
+    Int64(floor((41.0 - d) * 0.5 + 0.000000001))
+}
+function tri_j(q: Int) -> Int64 = {
+    let i = tri_i(q)
+    Int64(q) - (i * 20 - i * (i - 1) / 2) + i + 1
+}
+let __pi = method_for(range<Idx<NPAIR>>) <@> lambda(q) -> tri_i(q) |> compute
+let __pj = method_for(range<Idx<NPAIR>>) <@> lambda(q) -> tri_j(q) |> compute
+// Per pair, per species: how much that pair contributes to the species-s
+// histogram. An ordered-pair sum pooled by the CENTRAL atom's species equals
+// the unordered sum with weight w(i, s) + w(j, s) -- computed once, here, so
+// the inner loop is a multiply-add.
+let __invn: Array<Float like Idx<3>> = [0.1111111111111111, 0.25, 0.125]
+function pw_of(m: Int) -> Float = {
+    let q = m / 3
+    let s = m - q * 3
+    (__spec(__pi(q), s) + __spec(__pj(q), s)) * __invn(s)
+}
+let __pw = method_for(range<Idx<630>>) <@> lambda(m) -> pw_of(m) |> compute
+// Shell centres and width, in units of the data's own RMS atomic radius.
+let __sig = __stats(2)
+let __isig = 1.0 / __sig
+let __shw = 1.0 / (0.185 * __sig * 0.185 * __sig)
+let __shr = method_for(range<Idx<NBIN>>) <@> lambda(b) -> (0.34 + 0.2 * Float64(b)) * __sig |> compute
+
+function dslot(p: Array<Float like Idx<NP3>>, q: Int) -> Float = {
+    let i = __pi(q)
+    let j = __pj(q)
+    let dx = p(i * 3) - p(j * 3)
+    let dy = p(i * 3 + 1) - p(j * 3 + 1)
+    let dz = p(i * 3 + 2) - p(j * 3 + 2)
+    sqrt(dx * dx + dy * dy + dz * dz)
+}
+function gslot(__dt: Array<Float like Idx<NPAIR>>, m: Int) -> Float = {
+    let q = m / NBIN
+    let b = m - q * NBIN
+    let u = __dt(q) - __shr(b)
+    exp(-u * u * __shw)
+}
+// From here to `as_h` every `let rec` sits in the call graph of `ad.grad`
+// (`hraw` <- `hfeat` <- `energy`, and `h_tr_of` <- `sq1` <- `loss`), so the
+// declarative form -- `reduce(method_for(range<I>) <@> k |> compute, (+))` --
+// is refused: gap #15, reverse mode admits no combinators (BL5500, the
+// `GradExpand.fs:478/518` fence). The flat `let rec` is the differentiable
+// spelling of a map, not a recurrence: no arm reads `prefix`.
+function pslot(__gb: Array<Float like Idx<1260>>, k: Int) -> Float = {
+    let s = k / NBIN
+    let b = k - s * NBIN
+    let rec t: Array<Float like Idx<210>> =
+        match t with
+        | zero -> zero
+        | prefix :: q -> prefix :: __pw(q * 3 + s) * __gb(q * NBIN + b)
+    reduce(t, (+))
+}
+function yslot(p: Array<Float like Idx<NP3>>, i: Int) -> Float = {
+    let a = i / 9
+    let __v = ml.y_to(2, p(a * 3) * __isig, p(a * 3 + 1) * __isig, p(a * 3 + 2) * __isig)
+    __v(i - a * 9)
+}
+function cslot(p: Array<Float like Idx<NP3>>, __yt: Array<Float like Idx<189>>, k: Int) -> Float = {
+    let s = k / 9
+    let comp = k - s * 9
+    let rec t: Array<Float like Idx<21>> =
+        match t with
+        | zero -> zero
+        | prefix :: a -> prefix :: __spec(a, s) * __invn(s)
+                                   * exp(-(p(a * 3) * p(a * 3) + p(a * 3 + 1) * p(a * 3 + 1)
+                                           + p(a * 3 + 2) * p(a * 3 + 2)) * __isig * __isig)
+                                   * __yt(a * 9 + comp)
+    reduce(t, (+))
+}
+// The array literal at the bottom IS the layout contract: 18 histogram
+// channels and 3 pooled l = 0 values, then the l = 1 block (3 multiplicities
+// x 3 components) and the l = 2 block (3 x 5), in the order `IrrepsIdx<HSPEC>`
+// prescribes. Every downstream op reads that order from the spec, not from a
+// convention. It stays a positional literal because it is a PERMUTATION
+// gather of `pb` and `cb`, which no assembly combinator expresses: `stack`
+// demands equal extents and `join` concatenates in operand order (gap #50).
+function hraw(p: Array<Float like Idx<NP3>>) -> Array<Float like Idx<DH>> = {
+    let rec __dt: Array<Float like Idx<210>> =
+        match __dt with
+        | zero -> zero
+        | prefix :: q -> prefix :: dslot(p, q)
+    let rec __gb: Array<Float like Idx<1260>> =
+        match __gb with
+        | zero -> zero
+        | prefix :: m -> prefix :: gslot(__dt, m)
+    let rec pb: Array<Float like Idx<18>> =
+        match pb with
+        | zero -> zero
+        | prefix :: k -> prefix :: pslot(__gb, k)
+    let rec __yt: Array<Float like Idx<189>> =
+        match __yt with
+        | zero -> zero
+        | prefix :: i -> prefix :: yslot(p, i)
+    let rec cb: Array<Float like Idx<27>> =
+        match cb with
+        | zero -> zero
+        | prefix :: k -> prefix :: cslot(p, __yt, k)
+    [pb(0), pb(1), pb(2), pb(3), pb(4), pb(5), pb(6), pb(7), pb(8),
+     pb(9), pb(10), pb(11), pb(12), pb(13), pb(14), pb(15), pb(16), pb(17),
+     cb(0), cb(9), cb(18), cb(1), cb(2), cb(3), cb(10), cb(11), cb(12),
+     cb(19), cb(20), cb(21), cb(4), cb(5), cb(6), cb(7), cb(8), cb(13),
+     cb(14), cb(15), cb(16), cb(17), cb(22), cb(23), cb(24), cb(25), cb(26)]
+}
+// Flattening a geometry is a map, and nothing here is differentiated, so it
+// is written as one.
+function pos_tr_flat(n: Int) -> Array<Float like Idx<NP3>> = {
+    let __row = __pos_tr(n)
+    method_for(range<Idx<NP3>>) <@> lambda(k) -> __row(k / 3, k - (k / 3) * 3) |> compute
+}
+function pos_te_flat(n: Int) -> Array<Float like Idx<NP3>> = {
+    let __row = __pos_te(n)
+    method_for(range<Idx<NP3>>) <@> lambda(k) -> __row(k / 3, k - (k / 3) * 3) |> compute
+}
+// The featurization depends on no weight, so it is computed ONCE, outside
+// every gradient -- which is also what lets these two be row maps: a loop
+// object raising rank by returning a row, rather than a `let rec` faking one.
+let __r2_tr = method_for(range<Idx<NTR>>) <@> lambda(n) -> hraw(pos_tr_flat(n)) |> compute
+let __r2_te = method_for(range<Idx<NTE>>) <@> lambda(n) -> hraw(pos_te_flat(n)) |> compute
+
+// Calibration, per (channel, block). Invariant channels get a centre and a
+// spread; an l > 0 block gets ONE spread shared by its whole multiplicity,
+// because a per-component rescale would not commute with a rotation.
+function rmu(i: Int) -> Float = {
+    let col = method_for(range<Idx<NTR>>) <@> lambda(n) -> __r2_tr(n, i) |> compute
+    reduce(col, (+)) / 500.0
+}
+function rms2(i: Int) -> Float = {
+    let col = method_for(range<Idx<NTR>>) <@> lambda(n) -> __r2_tr(n, i) * __r2_tr(n, i) |> compute
+    reduce(col, (+)) / 500.0
+}
+let __rmu = method_for(range<Idx<DH>>) <@> lambda(i) -> rmu(i) |> compute
+let __rms2 = method_for(range<Idx<DH>>) <@> lambda(i) -> rms2(i) |> compute
+function grp_ms(base: Int, d: Int) -> Float = {
+    let a = method_for(range<Idx<5>>) <@> lambda(j) -> (if j < d then __rms2(base + j) else 0.0) |> compute
+    reduce(a, (+)) / Float64(d)
+}
+function hmu_of(i: Int) -> Float = if i < 21 then __rmu(i) else 0.0
+function hsc_of(i: Int) -> Float = {
+    let v = if i < 21 then __rms2(i) - __rmu(i) * __rmu(i)
+            else (if i < 30 then grp_ms(21 + ((i - 21) / 3) * 3, 3)
+                  else grp_ms(30 + ((i - 30) / 5) * 5, 5))
+    if v < 0.000000000001 then 0.0 else 1.0 / sqrt(v)
+}
+let __hmu = method_for(range<Idx<DH>>) <@> lambda(i) -> hmu_of(i) |> compute
+let __hsc = method_for(range<Idx<DH>>) <@> lambda(i) -> hsc_of(i) |> compute
+// `as_h` re-types 45 numbers as a representation. It has to be a positional
+// literal: no combinator can produce an `IrrepsIdx` leading axis -- `stack`
+// and `join` fence their operands to plain index slots and hard-code a plain
+// (resp. inherited-plain) result index, so an annotated array literal and the
+// `ml.*` producers are the only two routes to an irreps-typed value (gap #51).
+function as_h(f: Array<Float like Idx<DH>>) -> Array<Float like IrrepsIdx<HSPEC>> =
+    [f(0), f(1), f(2), f(3), f(4), f(5), f(6), f(7), f(8), f(9),
+     f(10), f(11), f(12), f(13), f(14), f(15), f(16), f(17), f(18), f(19),
+     f(20), f(21), f(22), f(23), f(24), f(25), f(26), f(27), f(28), f(29),
+     f(30), f(31), f(32), f(33), f(34), f(35), f(36), f(37), f(38), f(39),
+     f(40), f(41), f(42), f(43), f(44)]
+// `hfeat` is the differentiable path: positions in, representation out. The
+// force cell at the end differentiates straight through it.
+function hfeat(p: Array<Float like Idx<NP3>>) -> Array<Float like IrrepsIdx<HSPEC>> = {
+    let __f = hraw(p)
+    let rec c: Array<Float like Idx<45>> =
+        match c with
+        | zero -> zero
+        | prefix :: i -> prefix :: (__f(i) - __hmu(i)) * __hsc(i)
+    as_h(c)
+}
+function h_tr_of(n: Int) -> Array<Float like IrrepsIdx<HSPEC>> = {
+    let rec f: Array<Float like Idx<45>> =
+        match f with
+        | zero -> zero
+        | prefix :: k -> prefix :: (__r2_tr(n, k) - __hmu(k)) * __hsc(k)
+    as_h(f)
+}
+// The test twin of `h_tr_of`, and the contrast is the point: nothing
+// differentiates through the test split, so this one gets to say what it
+// means. Its identical-looking twin above cannot (gap #15).
+function h_te_of(n: Int) -> Array<Float like IrrepsIdx<HSPEC>> =
+    as_h(method_for(range<Idx<45>>) <@> lambda(k) -> (__r2_te(n, k) - __hmu(k)) * __hsc(k) |> compute)
+// Geometry 0, raw: histogram slot 0 (carbon centres, innermost shell) and
+// the first component of the pooled l = 1 block, then the two calibration
+// scales those slots get. The histogram counts about two pairs; the multipole
+// is a thousandth of that, which is exactly why the calibration exists.
+let feat0 = [__r2_tr(0, 0), __r2_tr(0, 21), __hsc(0), __hsc(21)]
+feat0
+
+// %% [markdown]
+// ## The four admissible moves
+//
+// A layer that maps representations to representations may do exactly four
+// things, and the `where ml.equiv(O3)` clause is the compiler checking which:
+//
+// - **`ml.tensor_product`** — the Clebsch-Gordan contraction. The only
+//   sanctioned way to multiply two representation-typed values, because it is
+//   the only bilinear map whose output transforms as a representation.
+// - **`ml.gated`** — a nonlinearity that acts on the invariant scalars and
+//   multiplies each l > 0 block by its gate. A sigmoid applied componentwise
+//   to a vector is not a function of the vector, it is a function of the basis.
+// - **`ml.linear` / `ml.derive_linear`** — mixing within a multiplicity, with
+//   the Hom-space basis built by the compiler from the two specs.
+// - **`ml.norms` / `ml.scalars`** — the exits back to ordinary numbers.
+//
+// One piece of plumbing sits outside the clauses and is worth naming. The
+// tensor product is bilinear, so scaling its inputs and scaling its weights
+// are the same operation; `gain_e` and `gain_m` compute an invariant from the
+// block's own norms and rescale the weight vector by it, which keeps the
+// three blocks at the same numeric scale without touching the certificate.
+// Weights are ordinary numbers; the certified functions never see the rescale.
+//
+// The cell below produces no output. Compile-time acceptance is the payload.
+
+// %%
+function embed(h: Array<Float like IrrepsIdx<HSPEC>>, we: Array<Float like Idx<WE>>)
+               where ml.equiv(O3) -> Array<Float like IrrepsIdx<ESPEC>> =
+    ml.derive_linear(HSPEC, ESPEC, we, h)
+
+function block_e(x: Array<Float like IrrepsIdx<ESPEC>>,
+                 wt: Array<Float like Idx<W1>>, wl: Array<Float like Idx<WL>>)
+                 where ml.equiv(O3) -> Array<Float like IrrepsIdx<MSPEC>> = {
+    let t = ml.tensor_product(CFG1, x, x, wt)
+    let g = ml.gated(MSPEC, t)
+    ml.linear(MSPEC, MSPEC, wl, g)
+}
+function block_m(x: Array<Float like IrrepsIdx<MSPEC>>,
+                 wt: Array<Float like Idx<W2>>, wl: Array<Float like Idx<WL>>)
+                 where ml.equiv(O3) -> Array<Float like IrrepsIdx<MSPEC>> = {
+    let t = ml.tensor_product(CFG2, x, x, wt)
+    let g = ml.gated(MSPEC, t)
+    ml.linear(MSPEC, MSPEC, wl, g)
+}
+// No clause here on purpose -- see the BL4011 cell below.
+function invariants(h: Array<Float like IrrepsIdx<HSPEC>>,
+                    e: Array<Float like IrrepsIdx<ESPEC>>,
+                    m3: Array<Float like IrrepsIdx<MSPEC>>)
+                    -> Array<Float like Idx<NEV>> = {
+    let sh = ml.scalars(HSPEC, h)
+    let nh = ml.norms(HSPEC, h)
+    let ne = ml.norms(ESPEC, e)
+    let n3 = ml.norms(MSPEC, m3)
+    let s3 = ml.scalars(MSPEC, m3)
+    // Five segments of five different extents, taken at five different
+    // offsets, concatenated into one. `stack` refuses ragged operands
+    // (BL4004) and `join` concatenates whole arrays in operand order, so
+    // even outside a gradient this needs a `subset`-per-segment first
+    // (gap #50) -- and inside `ad.grad(loss)`, gap #15 forbids both anyway.
+    [sh(0), sh(1), sh(2), sh(3), sh(4), sh(5), sh(6), sh(7),
+     sh(8), sh(9), sh(10), sh(11), sh(12), sh(13), sh(14), sh(15),
+     sh(16), sh(17), sh(18), sh(19), sh(20), nh(21), nh(22), nh(23),
+     nh(24), nh(25), nh(26), ne(0), ne(1), ne(2), ne(3), n3(0),
+     n3(1), n3(2), n3(3), n3(4), s3(0), s3(1), s3(2)]
+}
+function readout(ev: Array<Float like IrrepsIdx<EVSPEC>>, wr: Array<Float like Idx<WR>>)
+                 where ml.equiv(O3) -> Float = {
+    let __o = ml.scalars(OUT1, ml.derive_linear(EVSPEC, OUT1, wr, ev))
+    __o(0)
+}
+
+// The whole model is one flat `Array<Float like Idx<499>>`: 249 weights, 249
+// momentum slots, and one slot for the loss measured on the way past. Slicing
+// it is a recursive array per block; the offsets are statics, so a wrong one
+// is an extent error and not a silently mis-trained layer.
+let static OFF_E = 0
+let static OFF_T1 = 48
+let static OFF_L1 = 78
+let static OFF_T2 = 89
+let static OFF_L2 = 138
+let static OFF_T3 = 149
+let static OFF_L3 = 198
+let static OFF_R = 209
+let static OFF_B = 248
+let static NPAR = 249
+let static NP2 = 498
+let static SW = 499
+
+// Eight slicers rather than one because the return EXTENT differs per block
+// and there is no dependent return type; and each is a `let rec` rather than
+// the obvious `subset(__s, base, n)` because all eight are reached from
+// `ad.grad(loss)`, where every combinator -- `subset` included -- is refused
+// (gap #15). Read them as eight maps that are not allowed to say so.
+function wp(__s: Array<Float like Idx<SW>>, base: Int, k: Int) -> Float = __s(base + k)
+function we_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<WE>> = {
+    let rec o: Array<Float like Idx<48>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_E, k)
+    o
+}
+function wt1_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<W1>> = {
+    let rec o: Array<Float like Idx<30>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_T1, k)
+    o
+}
+function wt2_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<W2>> = {
+    let rec o: Array<Float like Idx<49>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_T2, k)
+    o
+}
+function wt3_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<W2>> = {
+    let rec o: Array<Float like Idx<49>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_T3, k)
+    o
+}
+function wl1_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<WL>> = {
+    let rec o: Array<Float like Idx<11>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_L1, k)
+    o
+}
+function wl2_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<WL>> = {
+    let rec o: Array<Float like Idx<11>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_L2, k)
+    o
+}
+function wl3_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<WL>> = {
+    let rec o: Array<Float like Idx<11>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_L3, k)
+    o
+}
+function wr_of(__s: Array<Float like Idx<SW>>) -> Array<Float like Idx<WR>> = {
+    let rec o: Array<Float like Idx<39>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: wp(__s, OFF_R, k)
+    o
+}
+function gain_e(x: Array<Float like IrrepsIdx<ESPEC>>) -> Float = {
+    let n = ml.norms(ESPEC, x)
+    4.0 / (n(0) * n(0) + n(1) * n(1) + n(2) * n(2) + n(3) * n(3) + 1.0)
+}
+function gain_m(x: Array<Float like IrrepsIdx<MSPEC>>) -> Float = {
+    let n = ml.norms(MSPEC, x)
+    5.0 / (n(0) * n(0) + n(1) * n(1) + n(2) * n(2) + n(3) * n(3) + n(4) * n(4) + 1.0)
+}
+function scal30(w: Array<Float like Idx<W1>>, s: Float) -> Array<Float like Idx<W1>> = {
+    let rec o: Array<Float like Idx<30>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: w(k) * s
+    o
+}
+function scal49(w: Array<Float like Idx<W2>>, s: Float) -> Array<Float like Idx<W2>> = {
+    let rec o: Array<Float like Idx<49>> =
+        match o with
+        | zero -> zero
+        | prefix :: k -> prefix :: w(k) * s
+    o
+}
+function ev_raw(h: Array<Float like IrrepsIdx<HSPEC>>, __s: Array<Float like Idx<SW>>) -> Array<Float like Idx<NEV>> = {
+    let e = embed(h, we_of(__s))
+    let m1 = block_e(e, scal30(wt1_of(__s), gain_e(e)), wl1_of(__s))
+    let m2 = block_m(m1, scal49(wt2_of(__s), gain_m(m1)), wl2_of(__s))
+    let m3 = block_m(m2, scal49(wt3_of(__s), gain_m(m2)), wl3_of(__s))
+    invariants(h, e, m3)
+}
+// Positional literal for the same reason as `as_h`: an `IrrepsIdx` result
+// index is unreachable from `stack`/`join`/`sequence` (gap #51).
+function as_ev(c: Array<Float like Idx<NEV>>) -> Array<Float like IrrepsIdx<EVSPEC>> =
+    [c(0), c(1), c(2), c(3), c(4), c(5), c(6), c(7), c(8), c(9),
+     c(10), c(11), c(12), c(13), c(14), c(15), c(16), c(17), c(18), c(19),
+     c(20), c(21), c(22), c(23), c(24), c(25), c(26), c(27), c(28), c(29),
+     c(30), c(31), c(32), c(33), c(34), c(35), c(36), c(37), c(38)]
+
+// One pass over the training geometries at the seeded initial weights fixes
+// the numeric scale of each readout channel. Centring an invariant leaves it
+// invariant, so this is arithmetic, not modelling -- the certified pipeline
+// decides WHAT the channels are; ordinary numerics still has to decide what
+// they are measured in. `rand.<family>` is legal only as a bare top-level
+// binding value, so the seed row is drawn first and scaled second.
+let __n0 = r.normal(20260826, SW)
+let __pmask = method_for(range<Idx<SW>>) <@> lambda(k) -> (if k < OFF_R then 1.0 else 0.0) |> compute
+let __w0 = (0.4 * __n0) * __pmask
+let __ev0 = method_for(range<Idx<NTR>>) <@> lambda(n) -> ev_raw(h_tr_of(n), __w0) |> compute
+function evmean(j: Int) -> Float = {
+    let col = method_for(range<Idx<NTR>>) <@> lambda(n) -> __ev0(n, j) |> compute
+    reduce(col, (+)) / 500.0
+}
+function evsd(j: Int) -> Float = {
+    let mu = evmean(j)
+    let dev = method_for(range<Idx<NTR>>) <@> lambda(n) -> (__ev0(n, j) - mu) * (__ev0(n, j) - mu) |> compute
+    sqrt(reduce(dev, (+)) / 500.0)
+}
+let __ivmu = method_for(range<Idx<NEV>>) <@> lambda(j) -> evmean(j) |> compute
+// A channel whose spread is below the calibration floor is scaled BY the
+// floor, not by its own vanishing spread: dividing by 0.002 would hand the
+// readout a hundredfold amplifier on rounding noise.
+let __ivsc = method_for(range<Idx<NEV>>) <@> lambda(j) -> (if evsd(j) < 0.05 then 20.0 else 1.0 / evsd(j)) |> compute
+// Back inside the differentiated call graph (`fwd` <- `loss`), so back to the
+// flat `let rec` map: gap #15 again, and gap #36 on top of it -- a `let rec`
+// whose leading axis is `IrrepsIdx` is refused outright, which is why the
+// standardization and the re-typing are two steps rather than one.
+function ev_std(v: Array<Float like Idx<NEV>>) -> Array<Float like IrrepsIdx<EVSPEC>> = {
+    let rec c: Array<Float like Idx<39>> =
+        match c with
+        | zero -> zero
+        | prefix :: j -> prefix :: (v(j) - __ivmu(j)) * __ivsc(j)
+    as_ev(c)
+}
+function fwd(h: Array<Float like IrrepsIdx<HSPEC>>, __s: Array<Float like Idx<SW>>) -> Float =
+    readout(ev_std(ev_raw(h, __s)), wr_of(__s)) + __s(OFF_B)
+
+// %% [markdown]
+// ## One refusal
+//
+// The gate above multiplies a representation by an invariant. Multiplying two
+// representations *componentwise* looks like the same shape of code and is a
+// different thing entirely: rotate both inputs and the product is not the
+// rotation of the output, because a Hadamard product depends on the basis the
+// components were written in. The compiler refuses, and names the sanctioned
+// bilinear operation.
+//
+// **This cell fails on purpose.** A failing cell never joins the notebook
+// session, so nothing downstream is disturbed.
+
+// %%
+function gate_mix(x: Array<Float like IrrepsIdx<MSPEC>>, g: Array<Float like IrrepsIdx<MSPEC>>)
+                  where ml.equiv(O3) -> Array<Float like IrrepsIdx<MSPEC>> =
+    x * g
+
+// %% [markdown]
+// ## One deduction
+//
+// The certificate channel runs in the other direction too. `block_free` below
+// is `block_m` with the `where` clause deleted — an uncertified function is
+// not a wrong function, only an unproved one. The compiler hypothesizes the
+// conjunct anyway, runs the same judgment it would have checked, and emits
+// BL4011 carrying the exact clause and the deduced signature, down to the
+// spec each argument transforms under. This cell compiles; the warning *is*
+// the output.
+//
+// The same thing already happened, unprompted, one cell up: `invariants`,
+// `gain_e`, `gain_m` and `ev_raw` all carry BL4011 notes saying they are
+// O(3)-equivariant maps to invariants. Nothing in this notebook wrote that
+// down. `examples/tetris_shapes.bladenb` runs the full suite, including the
+// case where the deduction is a chirality theorem delivered as a compile
+// error.
+
+// %%
+function block_free(x: Array<Float like IrrepsIdx<MSPEC>>,
+                    wt: Array<Float like Idx<W2>>, wl: Array<Float like Idx<WL>>)
+                    -> Array<Float like IrrepsIdx<MSPEC>> = {
+    let t = ml.tensor_product(CFG2, x, x, wt)
+    let g = ml.gated(MSPEC, t)
+    ml.linear(MSPEC, MSPEC, wl, g)
+}
+
+// %% [markdown]
+// ## Training
+//
+// There are no loops in this language, so the optimizer is a **recursive
+// array**: one row per step, each row the previous row's state pushed one step
+// downhill. `sgd_step` zeroes a gradient buffer, calls `ad.grad(loss)`, and
+// reassembles the next row from the updated weights, the updated momentum, and
+// the loss it saw on the way past. Momentum is not a feature of the optimizer;
+// it is more slots in the same array.
+//
+// Mini-batching rides on the gradient ABI. `ad.grad` differentiates with
+// respect to Float-array parameters and treats trailing `Int` primals as
+// constants, so `loss(state, epoch, batch)` takes its schedule as two
+// integers, looks the sample indices up in the store's permutation table, and
+// gets no gradient buffer for either. The language has no `rand.shuffle`, so
+// the permutations were drawn by the generator and shipped with the data.
+//
+// The training set is **every second frame** of the benchmark's 1000-geometry
+// train split, so the 500 geometries span the whole trajectory rather than a
+// stretch of it; the test set is every fifth frame of the shipped test split,
+// standardized by the training mean and spread. Batches of 20, 25 batches an
+// epoch, two epochs. That is a **deliberately small budget** and the results
+// section says what it costs.
+
+// %%
+let static BS = 20
+let static NB = 25
+let static NEP = 2
+let static NSTEP = 50
+let static NROW = 51
+let static LR = 0.002
+let static MU = 0.9
+
+function sq1(__s: Array<Float like Idx<SW>>, n: Int) -> Float = {
+    let d = fwd(h_tr_of(n), __s) - __e_tr(n)
+    d * d
+}
+function loss(__s: Array<Float like Idx<SW>>, ep: Int, b: Int) -> Float = {
+    // The batch is a map, not a recurrence -- but this IS the body of
+    // `ad.grad`, so the map has to be spelled as a `let rec` (gap #15).
+    let rec errs: Array<Float like Idx<20>> =
+        match errs with
+        | zero -> zero
+        | prefix :: j -> prefix :: sq1(__s, __perm(ep, b * BS + j))
+    reduce(errs, (+)) / 20.0
+}
+function blk(__s: Array<Float like Idx<SW>>, base: Int) -> Array<Float like Idx<NPAR>> =
+    method_for(range<Idx<NPAR>>) <@> lambda(k) -> wp(__s, base, k) |> compute
+function sgd_step(s: Array<Float like Idx<SW>>, ep: Int, b: Int) -> Array<Float like Idx<SW>> = {
+    let mut ds = replicate(SW, pure(0.0)) |> compute
+    let lv = ad.grad(loss)(s, ep, b, ds)
+    let vn = MU * blk(s, NPAR) - LR * blk(ds, 0)
+    let wn = blk(s, 0) + vn
+    // The next row is three segments of UNEQUAL extent -- 249 weights, 249
+    // momenta, one loss. `stack` refuses ragged operands (BL4004); `join` is
+    // the combinator that admits them, and this is legal here precisely
+    // because `sgd_step` CALLS `ad.grad` rather than living inside it.
+    // (`replicate(1, pure(lv)) |> compute` would NOT do: at extent 1 it
+    // collapses to a scalar and `join` then rejects it -- gap #52.)
+    let lrow: Array<Float like Idx<1>> = [lv]
+    join(wn, vn, lrow, 0)
+}
+// THE recursive array of this notebook, and the only one here that earns the
+// name: every row reads the row before it. Nothing about it is index-driven,
+// and no loop object can express it.
+let __traj = {
+    let rec t: Array<Float like Idx<NROW>, Idx<SW>> =
+        match t with
+        | zero -> zero
+        | zero :: n -> zero :: __w0
+        | prefix :: n -> prefix :: sgd_step(prefix(n - 1), (n - 1) / NB, (n - 1) - ((n - 1) / NB) * NB)
+    t
+}
+let final_row = __traj(NSTEP)
+function loss_at(n: Int) -> Float = __traj(n + 1)(NP2)
+let loss_curve = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> loss_at(n) |> compute
+let final_loss = final_row(NP2)
+final_loss
+
+// %% [markdown]
+// The loss curve goes to the notebook's plot channel from its own cell, on
+// purpose. A binding that emits a display frame is excluded from the session
+// memo and re-runs on every later evaluation; put `plot.stream` in the
+// training binding and every subsequent cell would re-run the whole descent.
+//
+// `plot.stream` carries one epoch's batch losses at a time under a stable
+// channel name, and the panel merges the chunks on that name as they arrive —
+// during a long run the chart fills in live rather than appearing at the end.
+// The final `plot.line` is the version that persists as this cell's output.
+
+// %%
+let __ax0 = method_for(range<Idx<NB>>) <@> lambda(n) -> Float64(n) |> compute
+let __ax1 = method_for(range<Idx<NB>>) <@> lambda(n) -> Float64(n + NB) |> compute
+let __ly0 = method_for(range<Idx<NB>>) <@> lambda(n) -> loss_at(n) |> compute
+let __ly1 = method_for(range<Idx<NB>>) <@> lambda(n) -> loss_at(n + NB) |> compute
+let stream_ep0 = plot.stream("aspirin_loss", __ax0, __ly0, 0: epoch,
+                             "mini-batch loss, standardized energy": title,
+                             "batch": xlabel, "mean squared error": ylabel)
+let stream_ep1 = plot.stream("aspirin_loss", __ax1, __ly1, 1: epoch,
+                             "mini-batch loss, standardized energy": title,
+                             "batch": xlabel, "mean squared error": ylabel)
+let __ax = method_for(range<Idx<NSTEP>>) <@> lambda(n) -> Float64(n) |> compute
+let loss_plot = plot.line(__ax, loss_curve,
+                          "mini-batch loss, standardized energy": title,
+                          "batch": xlabel, "mean squared error": ylabel)
+loss_plot
+
+// %% [markdown]
+// ## The score, against the only baseline that matters
+//
+// Energies were standardized by the generator — reverse-mode `ad.grad` refuses
+// a unit-carrying loss, and a target sitting at -405686 kcal/mol would swamp
+// any sane learning rate. Multiplying back by the training standard deviation
+// puts the error in kcal/mol.
+//
+// The baseline to beat is **predicting the training mean for every geometry**.
+// On MD17 aspirin that is a much stronger baseline than it sounds: the entire
+// CCSD energy range is a few kcal/mol wide, and the constant predictor already
+// gets within about 5.5 kcal/mol on average.
+//
+// Five numbers below, in order: the baseline's test MSE, the model's test
+// MSE, the model's TRAIN MSE — all three in units of the training variance —
+// then the baseline's and the model's mean absolute error in kcal/mol. The
+// train MSE is there because a small train/test gap is the difference between
+// a result and a memorization.
+
+// %%
+function sq_te(__s: Array<Float like Idx<SW>>, n: Int) -> Float = {
+    let d = fwd(h_te_of(n), __s) - __e_te(n)
+    d * d
+}
+function ab_te(__s: Array<Float like Idx<SW>>, n: Int) -> Float = abs(fwd(h_te_of(n), __s) - __e_te(n))
+// Five scores, five one-line folds. The three that re-run the model need the
+// sample index, and take it from `range<Idx<NTE>>` rather than the split's own
+// index type on purpose: NTE and NTR are the notebook's declared budget, not
+// whatever the store happens to hold. The two baselines need no index at all.
+// They are arithmetic on the stored energies, and `abs(__e_te)` iterates
+// because `__e_te` has an outer dimension and `abs` does not -- the loop is
+// implied by the relative dimensions of the operand and the function, so
+// writing it out would be over-specifying a decision already made.
+let te_mse = reduce(method_for(range<Idx<NTE>>) <@> lambda(n) -> sq_te(final_row, n) |> compute, (+)) / 100.0
+let te_mae = reduce(method_for(range<Idx<NTE>>) <@> lambda(n) -> ab_te(final_row, n) |> compute, (+)) / 100.0
+let tr_mse = reduce(method_for(range<Idx<NTR>>) <@> lambda(n) -> sq1(final_row, n) |> compute, (+)) / 500.0
+let base_mse = reduce(__e_te * __e_te, (+)) / 100.0
+let base_mae = reduce(abs(__e_te), (+)) / 100.0
+let scores = [base_mse, te_mse, tr_mse, base_mae * __stats(1), te_mae * __stats(1)]
+scores
+
+// %% [markdown]
+// ## Verification, part one: the energy does not move
+//
+// Eight rotations, sampled by the same Haar routine the ML oracle's own
+// equivariance tests use, baked into the store as 3x3 matrices. Rotate a test
+// geometry by each one, re-run the whole pipeline — featurization, embedding,
+// three blocks, readout — and the predicted energy must not move.
+//
+// There is no `max` fold in the language (`reduce(A, max)` is BL2001, an
+// unbound name), so the pin is an **indicator count**: how many of the eight
+// deviations exceed a threshold. Zero above 1e-12 AND zero above 1e-13 is the
+// claim; the deviations themselves print above it, and they sit at 1e-15.
+//
+// One bookkeeping note, since it is the classic way to get this wrong. The
+// raw l = 1 basis inside the irreps machinery is ordered **(y, z, x)**, not
+// (x, y, z) — `ml.y_to` takes Cartesian components and applies that
+// permutation internally, which is exactly why the surface of this notebook
+// never has to. Positions, forces and the stored rotation matrices are all
+// plain Cartesian, and they compose plainly. (The store also ships
+// `pos_train_yzx` / `pos_test_yzx`, the permuted copies, for anything that
+// feeds `ml.derive_poly` directly and so does need the raw basis order.)
+
+// %%
+function rot_slot(k: Int, p: Array<Float like Idx<NP3>>, m: Int) -> Float = {
+    let a = m / 3
+    let c = m - a * 3
+    __rot(k, c * 3) * p(a * 3) + __rot(k, c * 3 + 1) * p(a * 3 + 1) + __rot(k, c * 3 + 2) * p(a * 3 + 2)
+}
+// This one wants to be `method_for(range<Idx<NP3>>) <@> lambda(m) ->
+// rot_slot(k, p, m) |> compute` and cannot be: when a kernel captures an
+// ARRAY PARAMETER (`p`) and its body calls a helper that reads a MODULE-LEVEL
+// array (`rot_slot` reads `__rot`), the emitted C++ never declares that
+// module array -- a raw g++ "'__rot' was not declared in this scope", no BL
+// code (gap #28, now with an exact trigger). The `let rec` is the workaround.
+function rot_flat(k: Int, p: Array<Float like Idx<NP3>>) -> Array<Float like Idx<NP3>> = {
+    let rec q: Array<Float like Idx<63>> =
+        match q with
+        | zero -> zero
+        | prefix :: m -> prefix :: rot_slot(k, p, m)
+    q
+}
+// Positions in, energy out -- the trained weights are captured from module
+// scope, so the only parameter is the geometry.
+function energy(p: Array<Float like Idx<NP3>>) -> Float = fwd(hfeat(p), final_row)
+
+let __p0 = pos_te_flat(0)
+let e_ref = energy(__p0)
+function edev(k: Int) -> Float = abs(energy(rot_flat(k, __p0)) - e_ref)
+let __edev = method_for(range<Idx<8>>) <@> lambda(k) -> edev(k) |> compute
+function ind(a: Float, b: Float) -> Float = if a > b then 1.0 else 0.0
+let e_over_1e12 = reduce(method_for(range<Idx<8>>) <@> lambda(k) -> ind(__edev(k), 0.000000000001) |> compute, (+))
+let e_over_1e13 = reduce(method_for(range<Idx<8>>) <@> lambda(k) -> ind(__edev(k), 0.0000000000001) |> compute, (+))
+__edev
+let inv_report = [e_over_1e12, e_over_1e13]
+inv_report
+// EXPECT: inv_report = [0, 0]
+
+// %% [markdown]
+// ## Verification, part two: the forces
+//
+// This is the cell the notebook is for.
+//
+// `energy` above is an ordinary Blade function from 63 numbers to one. Hand it
+// to `ad.grad` and the gradient with respect to those 63 numbers is the
+// negative force on every atom: **F = -dE/dr**, first-order reverse mode, no
+// second derivatives, no force term in the loss. The model was trained on 500
+// energies and has never been shown a force in its life.
+//
+// A force is an l = 1 quantity. If the energy really is O(3)-invariant then
+// its gradient must be O(3)-*equivariant*: rotate the molecule, and every
+// force vector must come out rotated by the same matrix. Nothing in the
+// optimizer arranged this, and nothing could have — it is a consequence of
+// the energy being an invariant function of the geometry, which is precisely
+// the property the `where ml.equiv(O3)` clauses established at compile time.
+//
+// The pin is the same indicator count: of the eight rotations, how many have a
+// relative deviation `|F(R r) - R F(r)| / |F(r)|` above 1e-12, and how many
+// above 1e-13. Both counts are zero; the deviations print above them.
+//
+// The last number is a reality check, and it is deliberately unflattering:
+// the cosine between the predicted force vector and the reference CCSD force
+// on the same geometry. A 249-parameter model trained on 500 energies is not
+// a force field. It transforms correctly; it is not accurate.
+
+// %%
+// `ad.grad` is CALLED here, not entered, so everything after the call is
+// ordinary array code: negating the gradient is whole-array arithmetic and
+// the deviations below are folds over elementwise products. The products
+// are bound before being reduced -- no longer required (gap #44, the
+// codegen refusal of `reduce(A * B, (+))` in expression position, is fixed;
+// both lanes now accept the inline form) but kept since it reads fine either way.
+function force_of(p: Array<Float like Idx<NP3>>) -> Array<Float like Idx<NP3>> = {
+    let mut dp = replicate(NP3, pure(0.0)) |> compute
+    let __e = ad.grad(energy)(p, dp)
+    0.0 - dp
+}
+let __f0 = force_of(__p0)
+let __f0sq = {
+    let sq = __f0 * __f0
+    reduce(sq, (+))
+}
+function fdev(k: Int) -> Float = {
+    let fk = force_of(rot_flat(k, __p0))
+    let rf = rot_flat(k, __f0)
+    let e = fk - rf
+    let sq = e * e
+    sqrt(reduce(sq, (+)) / __f0sq)
+}
+let force_dev = method_for(range<Idx<8>>) <@> lambda(k) -> fdev(k) |> compute
+let f_over_1e12 = reduce(method_for(range<Idx<8>>) <@> lambda(k) -> ind(force_dev(k), 0.000000000001) |> compute, (+))
+let f_over_1e13 = reduce(method_for(range<Idx<8>>) <@> lambda(k) -> ind(force_dev(k), 0.0000000000001) |> compute, (+))
+// The reference forces from the store, for the honesty check.
+let __fdft = {
+    let __row = __f_te(0)
+    method_for(range<Idx<NP3>>) <@> lambda(m) -> __row(m / 3, m - (m / 3) * 3) |> compute
+}
+let f_cos = {
+    let dot = __f0 * __fdft
+    let ref2 = __fdft * __fdft
+    reduce(dot, (+)) / (sqrt(__f0sq) * sqrt(reduce(ref2, (+))))
+}
+force_dev
+f_cos
+let force_ok = [f_over_1e12, f_over_1e13]
+force_ok
+// EXPECT: force_ok = [0, 0]
+
+// %% [markdown]
+// ## What just happened, and what did not
+//
+// Three registers, one compile-time fact.
+//
+// - As a **refusal**: `gate_mix`, the componentwise product that looks like a
+//   gate and is a basis-dependent number, is a program that does not exist.
+// - As a **deduction**: BL4011 writing `where ml.equiv(O3)` on `block_free`,
+//   and on four functions in the model cell that never asked.
+// - As a **number**: the force vectors, obtained from `ad.grad` of a trained
+//   energy, rotating with the molecule to a relative error of order 1e-15 on
+//   all eight test rotations. That is not a well-trained network. It is
+//   floating-point arithmetic doing the only thing the type of the program
+//   allowed it to do.
+//
+// The regression score is the least interesting result here, and it is worth
+// being blunt about it. This model beats the constant predictor by roughly a
+// fifth of the energy variance and lands near 5 kcal/mol mean absolute error.
+// Published MD17 results are two orders of magnitude better — NequIP reaches
+// tens of meV on aspirin — and they get there by two things this notebook
+// deliberately does not do: **training on forces** (each geometry contributes
+// 63 gradient components instead of one energy) and **message passing** (per
+// atom local environments rebuilt layer by layer, rather than one pooled
+// descriptor per molecule). Both are cost, and the cost is the point: this
+// notebook runs its whole descent in an interpreter, in a cell, in under half
+// a minute.
+//
+// A smaller experiment worth reporting: at N = 100 — the low-data corner MD17
+// papers like to quote — no descriptor in this family generalizes at all,
+// including sGDML's own 210 inverse pairwise distances. Ridge regression on
+// every one of them lands *above* the constant-predictor baseline on held-out
+// geometries. Energies alone, at that count, are not enough information about
+// a 21-atom potential-energy surface. The signal appears somewhere between 200
+// and 500 samples, which is why this notebook trains on 500.
+//
+// To poke at the data, regenerate it with
+// `dotnet fsi examples/tools/make_aspirin_zarr.fsx` and read the
+// fortran-order proof it prints. To poke at the model, widen `MSPEC` and watch
+// `W1`, `W2` and `WL` change on their own — the parameter counts were never
+// yours to choose.

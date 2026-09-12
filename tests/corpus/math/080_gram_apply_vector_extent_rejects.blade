@@ -1,0 +1,9 @@
+// TEST: Math gram_apply: x must have B's leading extent (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: x must have B's leading extent
+// gram_apply(A, B, x) contracts x against B's LEADING axis (B is p x n, x has
+// p cells); a literal disagreement is refused at typecheck, like gram's own
+// contracted-dimension check. The dynamic twin is BL8011 (082).
+let A: Array<Float64 like Idx<2>, Idx<3>> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+let x: Array<Float64 like Idx<3>> = [1.0, 2.0, 3.0]
+let y = gram_apply(A, A, x)

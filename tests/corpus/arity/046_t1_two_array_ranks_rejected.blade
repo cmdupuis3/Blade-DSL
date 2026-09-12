@@ -1,0 +1,13 @@
+// TEST: T^1 call mixing two array RANKS (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: share no iteration space
+// The `T^1` twin of 042: one variable, two array arguments of different
+// ranks. Refused for the same reason and by the same predicate -- the caret's
+// value of k changes which shapes are legal in the position, not whether a
+// disagreement between positions is allowed.
+function rs(a: T^1, b: T^1) -> T^1 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let M: Array<Float like Idx<2>, Idx<3>> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+let r = rs(A, M)

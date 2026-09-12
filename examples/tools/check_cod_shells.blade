@@ -1,0 +1,362 @@
+// check_cod_shells.blade — acceptance gate for examples/data/cod_shells.zarr.
+//
+// Reads the store written by make_cod_zarr.fsx and, per sample, recomputes the
+// K=2 l=2 power, the K=3 power, and the K=4 l=4 power of the REAL extracted
+// neighbour shells through ml.derive_poly, then checks three things:
+//   1. DIFFERENTIAL: the compiler's jet powers equal the store's own
+//      F#-spherical-harmonic powers (pow_train/pow_test) to 1e-12 — two
+//      independent implementations of the same invariant.
+//   2. TABLE: every sample's (l3, l4) lands on its class's canonical value
+//      (sc 2/15, fcc 1/120, bcc 8/135, tet l4 8/135 + l3 2/9) within the
+//      generator's labelling tolerance, and every K=2 l=2 power is at machine
+//      zero (the cubic-site-symmetry theorem, on real refinements).
+//   3. EQUIVARIANCE: the l=4 power is invariant under the store's 8 baked
+//      fresh test rotations to 1e-12 (fp re-association is the only slack).
+// All counts of violations must print 0. Zero-padded points contribute
+// exactly zero to every K>=1 moment (derive_poly is homogeneous), so shells
+// with CN < 12 are handled by dividing by the true CN (cnf_*).
+//
+// Run compiled — `blade run` hard-kills at 120 s:
+//   blade compile examples/tools/check_cod_shells.blade
+//   ./examples/tools/check_cod_shells.exe        (ucrt64 on PATH, from repo root)
+import ml as ml
+import zarr as z
+
+let store = z.load("examples/data/cod_shells.zarr")
+type SampTr = store.index.samp_tr
+type SampTe = store.index.samp_te
+type Pt = store.index.pt
+type Xyz = store.index.xyz
+type Klass = store.index.klass
+type PowK = store.index.powk
+type RotK = store.index.rotk
+type Nine = store.index.nine
+
+// `__` marks internal buffers read with computed integer subscripts (the
+// BL4003 tag-note exemption, as in the sibling notebooks). The `_yzx` copies
+// are pre-permuted to the real l=1 order (y, z, x) that ml.derive_poly's
+// irreps basis wants; the plain (x, y, z) copies are for the rotation
+// certificate, where the stored row-major 3x3 matrices act.
+let __ptr: Array<Float like SampTr, Pt, Xyz> = store.vars.pos_train_yzx |> z.read
+let __pte: Array<Float like SampTe, Pt, Xyz> = store.vars.pos_test_yzx |> z.read
+let __cte: Array<Float like SampTe, Pt, Xyz> = store.vars.pos_test |> z.read
+let __cnftr: Array<Float like SampTr> = store.vars.cnf_train |> z.read
+let __cnfte: Array<Float like SampTe> = store.vars.cnf_test |> z.read
+let __ytr: Array<Float like SampTr, Klass> = store.vars.y_train |> z.read
+let __yte: Array<Float like SampTe, Klass> = store.vars.y_test |> z.read
+let __powtr: Array<Float like SampTr, PowK> = store.vars.pow_train |> z.read
+let __powte: Array<Float like SampTe, PowK> = store.vars.pow_test |> z.read
+let __rot: Array<Float like RotK, Nine> = store.vars.rot3 |> z.read
+
+let static PT = [(1, 1, 1)]
+let static SK2 = ml.sym_spec(PT, 2)
+let static SK3 = ml.sym_spec(PT, 3)
+let static SK4 = ml.sym_spec(PT, 4)
+let w2 = [1.0, 1.0]
+let w3 = [1.0, 1.0]
+let w4 = [1.0, 1.0, 1.0]
+
+// Canonical per-class targets (class order: sc, fcc, bcc, tet).
+let t4c = [0.13333333333333333, 0.008333333333333333, 0.05925925925925926, 0.05925925925925926]
+let t3c = [0.0, 0.0, 0.0, 0.2222222222222222]
+
+// One point's jet slot, vector fed in (y, z, x).
+function jet2slot(vy: Float, vz: Float, vx: Float, k: Int) -> Float = {
+    let v: Array<Float like IrrepsIdx<PT>> = [vy, vz, vx]
+    let d = ml.derive_poly(PT, 2, SK2, v, w2)
+    d(k)
+}
+function jet3slot(vy: Float, vz: Float, vx: Float, k: Int) -> Float = {
+    let v: Array<Float like IrrepsIdx<PT>> = [vy, vz, vx]
+    let d = ml.derive_poly(PT, 3, SK3, v, w3)
+    d(k)
+}
+function jet4slot(vy: Float, vz: Float, vx: Float, k: Int) -> Float = {
+    let v: Array<Float like IrrepsIdx<PT>> = [vy, vz, vx]
+    let d = ml.derive_poly(PT, 4, SK4, v, w4)
+    d(k)
+}
+
+// ---- train split: mean jet slot over the shell, then block powers ----
+function j2tr(s: Int, k: Int) -> Float = {
+    let rec t: Array<Float like Pt> =
+        match t with
+        | zero -> zero
+        | prefix :: p -> prefix :: jet2slot(__ptr(s)(p)(0), __ptr(s)(p)(1), __ptr(s)(p)(2), k)
+    reduce(t, (+)) / __cnftr(s)
+}
+function j3tr(s: Int, k: Int) -> Float = {
+    let rec t: Array<Float like Pt> =
+        match t with
+        | zero -> zero
+        | prefix :: p -> prefix :: jet3slot(__ptr(s)(p)(0), __ptr(s)(p)(1), __ptr(s)(p)(2), k)
+    reduce(t, (+)) / __cnftr(s)
+}
+function j4tr(s: Int, k: Int) -> Float = {
+    let rec t: Array<Float like Pt> =
+        match t with
+        | zero -> zero
+        | prefix :: p -> prefix :: jet4slot(__ptr(s)(p)(0), __ptr(s)(p)(1), __ptr(s)(p)(2), k)
+    reduce(t, (+)) / __cnftr(s)
+}
+// K=2 l=2 power: slots 1..5. K=3 power: all 10 slots (the l=1 block of a
+// closed shell is its mean vector = 0, so this is the l=3 power). K=4 l=4:
+// slots 6..14.
+function pow2tr(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<5>> =
+        match t with
+        | zero -> zero
+        | prefix :: k -> prefix :: j2tr(s, k + 1) * j2tr(s, k + 1)
+    reduce(t, (+))
+}
+function pow3tr(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<10>> =
+        match t with
+        | zero -> zero
+        | prefix :: k -> prefix :: j3tr(s, k) * j3tr(s, k)
+    reduce(t, (+))
+}
+function pow4tr(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<9>> =
+        match t with
+        | zero -> zero
+        | prefix :: k -> prefix :: j4tr(s, k + 6) * j4tr(s, k + 6)
+    reduce(t, (+))
+}
+
+// ---- test split, same shape ----
+function j2te(s: Int, k: Int) -> Float = {
+    let rec t: Array<Float like Pt> =
+        match t with
+        | zero -> zero
+        | prefix :: p -> prefix :: jet2slot(__pte(s)(p)(0), __pte(s)(p)(1), __pte(s)(p)(2), k)
+    reduce(t, (+)) / __cnfte(s)
+}
+function j3te(s: Int, k: Int) -> Float = {
+    let rec t: Array<Float like Pt> =
+        match t with
+        | zero -> zero
+        | prefix :: p -> prefix :: jet3slot(__pte(s)(p)(0), __pte(s)(p)(1), __pte(s)(p)(2), k)
+    reduce(t, (+)) / __cnfte(s)
+}
+function j4te(s: Int, k: Int) -> Float = {
+    let rec t: Array<Float like Pt> =
+        match t with
+        | zero -> zero
+        | prefix :: p -> prefix :: jet4slot(__pte(s)(p)(0), __pte(s)(p)(1), __pte(s)(p)(2), k)
+    reduce(t, (+)) / __cnfte(s)
+}
+function pow2te(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<5>> =
+        match t with
+        | zero -> zero
+        | prefix :: k -> prefix :: j2te(s, k + 1) * j2te(s, k + 1)
+    reduce(t, (+))
+}
+function pow3te(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<10>> =
+        match t with
+        | zero -> zero
+        | prefix :: k -> prefix :: j3te(s, k) * j3te(s, k)
+    reduce(t, (+))
+}
+function pow4te(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<9>> =
+        match t with
+        | zero -> zero
+        | prefix :: k -> prefix :: j4te(s, k + 6) * j4te(s, k + 6)
+    reduce(t, (+))
+}
+
+// ---- materialize per-sample powers once ----
+let rec __p2tr: Array<Float like SampTr> =
+    match __p2tr with
+    | zero -> zero
+    | prefix :: s -> prefix :: pow2tr(s)
+let rec __p3tr: Array<Float like SampTr> =
+    match __p3tr with
+    | zero -> zero
+    | prefix :: s -> prefix :: pow3tr(s)
+let rec __p4tr: Array<Float like SampTr> =
+    match __p4tr with
+    | zero -> zero
+    | prefix :: s -> prefix :: pow4tr(s)
+let rec __p2te: Array<Float like SampTe> =
+    match __p2te with
+    | zero -> zero
+    | prefix :: s -> prefix :: pow2te(s)
+let rec __p3te: Array<Float like SampTe> =
+    match __p3te with
+    | zero -> zero
+    | prefix :: s -> prefix :: pow3te(s)
+let rec __p4te: Array<Float like SampTe> =
+    match __p4te with
+    | zero -> zero
+    | prefix :: s -> prefix :: pow4te(s)
+
+// ---- gate 1: differential vs the store's F# powers (running maxima) ----
+function dmax(prev: Float, v: Float) -> Float = if v > prev then v else prev
+let rec __df_tr: Array<Float like SampTr> =
+    match __df_tr with
+    | zero -> zero
+    | prefix :: s -> prefix :: dmax(dmax(dmax(prefix(s - 1),
+        abs(__p2tr(s) - __powtr(s)(0))),
+        abs(__p3tr(s) - __powtr(s)(1))),
+        abs(__p4tr(s) - __powtr(s)(2)))
+let rec __df_te: Array<Float like SampTe> =
+    match __df_te with
+    | zero -> zero
+    | prefix :: s -> prefix :: dmax(dmax(dmax(prefix(s - 1),
+        abs(__p2te(s) - __powte(s)(0))),
+        abs(__p3te(s) - __powte(s)(1))),
+        abs(__p4te(s) - __powte(s)(2)))
+let ntr = extents(__p4tr)
+let nte = extents(__p4te)
+let diff_max_tr = __df_tr(ntr - 1)
+let diff_max_te = __df_te(nte - 1)
+let diffs = [diff_max_tr, diff_max_te]
+diffs
+
+// ---- gate 2: the canonical table, per sample, via the one-hot label ----
+// per-sample targets t4(s) = sum_c y(s)(c) * t4c(c) (indicator arithmetic)
+function tgt4tr(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<4>> =
+        match t with
+        | zero -> zero
+        | prefix :: c -> prefix :: __ytr(s)(c) * t4c(c)
+    reduce(t, (+))
+}
+function tgt3tr(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<4>> =
+        match t with
+        | zero -> zero
+        | prefix :: c -> prefix :: __ytr(s)(c) * t3c(c)
+    reduce(t, (+))
+}
+function tgt4te(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<4>> =
+        match t with
+        | zero -> zero
+        | prefix :: c -> prefix :: __yte(s)(c) * t4c(c)
+    reduce(t, (+))
+}
+function tgt3te(s: Int) -> Float = {
+    let rec t: Array<Float like Idx<4>> =
+        match t with
+        | zero -> zero
+        | prefix :: c -> prefix :: __yte(s)(c) * t3c(c)
+    reduce(t, (+))
+}
+// running maxima of |power - canonical| and of the K=2 l=2 power itself
+let rec __tab_tr: Array<Float like SampTr> =
+    match __tab_tr with
+    | zero -> zero
+    | prefix :: s -> prefix :: dmax(dmax(prefix(s - 1),
+        abs(__p4tr(s) - tgt4tr(s))),
+        abs(__p3tr(s) - tgt3tr(s)))
+let rec __tab_te: Array<Float like SampTe> =
+    match __tab_te with
+    | zero -> zero
+    | prefix :: s -> prefix :: dmax(dmax(prefix(s - 1),
+        abs(__p4te(s) - tgt4te(s))),
+        abs(__p3te(s) - tgt3te(s)))
+let rec __l2_tr: Array<Float like SampTr> =
+    match __l2_tr with
+    | zero -> zero
+    | prefix :: s -> prefix :: dmax(prefix(s - 1), __p2tr(s))
+let rec __l2_te: Array<Float like SampTe> =
+    match __l2_te with
+    | zero -> zero
+    | prefix :: s -> prefix :: dmax(prefix(s - 1), __p2te(s))
+let table_dev_max = [__tab_tr(ntr - 1), __tab_te(nte - 1)]
+table_dev_max
+let l2_power_max = [__l2_tr(ntr - 1), __l2_te(nte - 1)]
+l2_power_max
+
+// per-class mean l3 / l4 over train, printed beside the canonical table
+function clsum4(c: Int) -> Float = {
+    let rec t: Array<Float like SampTr> =
+        match t with
+        | zero -> zero
+        | prefix :: s -> prefix :: __ytr(s)(c) * __p4tr(s)
+    reduce(t, (+))
+}
+function clsum3(c: Int) -> Float = {
+    let rec t: Array<Float like SampTr> =
+        match t with
+        | zero -> zero
+        | prefix :: s -> prefix :: __ytr(s)(c) * __p3tr(s)
+    reduce(t, (+))
+}
+function clcnt(c: Int) -> Float = {
+    let rec t: Array<Float like SampTr> =
+        match t with
+        | zero -> zero
+        | prefix :: s -> prefix :: __ytr(s)(c)
+    reduce(t, (+))
+}
+let rec __mean4: Array<Float like Idx<4>> =
+    match __mean4 with
+    | zero -> zero
+    | prefix :: c -> prefix :: clsum4(c) / clcnt(c)
+let rec __mean3: Array<Float like Idx<4>> =
+    match __mean3 with
+    | zero -> zero
+    | prefix :: c -> prefix :: clsum3(c) / clcnt(c)
+let rec __cnts: Array<Float like Idx<4>> =
+    match __cnts with
+    | zero -> zero
+    | prefix :: c -> prefix :: clcnt(c)
+let class_counts_train = __cnts |> compute
+class_counts_train
+let class_mean_l4_train = __mean4 |> compute
+class_mean_l4_train
+let class_mean_l3_train = __mean3 |> compute
+class_mean_l3_train
+
+// ---- gate 3: l=4 power invariant under the 8 baked fresh rotations ----
+function jet4rot(s: Int, r: Int, p: Int, k: Int) -> Float = {
+    let x = __cte(s)(p)(0)
+    let y = __cte(s)(p)(1)
+    let zz = __cte(s)(p)(2)
+    let rx = __rot(r)(0) * x + __rot(r)(1) * y + __rot(r)(2) * zz
+    let ry = __rot(r)(3) * x + __rot(r)(4) * y + __rot(r)(5) * zz
+    let rz = __rot(r)(6) * x + __rot(r)(7) * y + __rot(r)(8) * zz
+    jet4slot(ry, rz, rx, k)
+}
+function j4rot(s: Int, r: Int, k: Int) -> Float = {
+    let rec t: Array<Float like Pt> =
+        match t with
+        | zero -> zero
+        | prefix :: p -> prefix :: jet4rot(s, r, p, k)
+    reduce(t, (+)) / __cnfte(s)
+}
+function pow4rot(s: Int, r: Int) -> Float = {
+    let rec t: Array<Float like Idx<9>> =
+        match t with
+        | zero -> zero
+        | prefix :: k -> prefix :: j4rot(s, r, k + 6) * j4rot(s, r, k + 6)
+    reduce(t, (+))
+}
+function rotdev(s: Int) -> Float = {
+    let rec t: Array<Float like RotK> =
+        match t with
+        | zero -> zero
+        | prefix :: r -> prefix :: dmax(prefix(r - 1), abs(pow4rot(s, r) - __p4te(s)))
+    let n = extents(t)
+    t(n - 1)
+}
+let rec __rotdev: Array<Float like SampTe> =
+    match __rotdev with
+    | zero -> zero
+    | prefix :: s -> prefix :: dmax(prefix(s - 1), rotdev(s))
+let rot_invariance_max = __rotdev(nte - 1)
+rot_invariance_max
+
+// ---- verdict ----
+let ok_diff = if diff_max_tr < 1.0e-12 && diff_max_te < 1.0e-12 then 1 else 0
+let ok_table = if __tab_tr(ntr - 1) < 3.5e-3 && __tab_te(nte - 1) < 3.5e-3 then 1 else 0
+let ok_l2 = if __l2_tr(ntr - 1) < 1.0e-12 && __l2_te(nte - 1) < 1.0e-12 then 1 else 0
+let ok_rot = if rot_invariance_max < 1.0e-12 then 1 else 0
+let verdict = [ok_diff, ok_table, ok_l2, ok_rot]
+verdict

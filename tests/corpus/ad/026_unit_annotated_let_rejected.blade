@@ -1,0 +1,20 @@
+// TEST: AD unit-annotated let inside a differentiated body rejected (rejects)
+// `let y: Float<meters> = x` with x in km is a conversion site (the checker
+// multiplies by 1000 at the annotated binding), and the normalized statement
+// form the sweeps consume has no annotation slot: the conversion would
+// vanish from the replayed primal and the derivative alike. The normalizer
+// refuses the shape before either sweep runs.
+// ERROR: BL5500
+// ERROR-CONTAINS: unit-carrying type inside the differentiated body
+import ad as ad
+
+Unit meters
+Unit km = 1000 * meters
+
+function f(x: Float<km>) -> Float<meters> = {
+    let y: Float<meters> = x
+    y * 2.0
+}
+
+let (fv, dfx) = ad.grad(f)(2.0)
+fv

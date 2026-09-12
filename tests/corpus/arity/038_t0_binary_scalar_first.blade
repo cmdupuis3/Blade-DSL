@@ -1,0 +1,13 @@
+// TEST: T^0 binary function broadcasts a scalar in the FIRST position
+// ============================================================================
+// Broadcast is position-symmetric, the way `100.0 + A` and `atan2(2.0, A)`
+// are. This is the case that failed the OTHER way round: the scalar came
+// first, so `T` took Float64, monomorphization emitted the all-scalar
+// `double add0_HM_10000_double(double, double)`, and the array was passed
+// into it -- again a clean `blade check` followed by a g++ error.
+// ============================================================================
+function add0(a: T^0, b: T^0) -> T^0 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let r = add0(100.0, A)
+// EXPECT: r = [101.0, 102.0, 103.0]

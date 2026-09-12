@@ -53,6 +53,17 @@ type StructStaticInfo = {
 /// Environment for static evaluation
 type StaticEnv = {
     Values: Map<string, StaticValue>
+    /// The MODULE-LEVEL static values -- the lexical environment every
+    /// `static function` body closes over. `Values` grows with call-frame
+    /// parameters and block-local lets as evaluation descends; a static
+    /// function's body must NOT see those (it was declared at module scope),
+    /// so a call evaluates its body in `Globals` plus its own parameters.
+    /// Before this split a callee read the CALLER's bindings: `static
+    /// function f() = a` invoked from `static function g(a) = f()` returned
+    /// g's argument at compile time and the module's `a` at runtime.
+    /// `resolveStatics` keeps it equal to the top-level `Values` as statics
+    /// fold; every other constructor seeds it with its `Values`.
+    Globals: Map<string, StaticValue>
     Functions: Map<string, StaticFuncDef>
     /// Accumulates names of functions called during evaluation
     CalledFunctions: ref<Set<string>>
@@ -65,6 +76,12 @@ type StaticEnv = {
     /// Constrained-struct registry for fold-time conjunct checks. Empty in
     /// contexts that never fold user struct literals (angle-bracket args).
     Structs: Map<string, StructStaticInfo>
+    /// `type A = Chunked<I, K>` declarations in scope, by alias: the run
+    /// boundaries `[0; ..; N]` (docs/plans/structural/07, decision D2:
+    /// `segments(A)` is statically evaluable). Literal `Idx<n>` inners with
+    /// a literal edge only; anything else is absent here and stays a
+    /// runtime grouping.
+    Segments: Map<string, int64 list>
 }
 
 // Dependency Analysis
@@ -251,7 +268,7 @@ let knownBuiltinNames () : Set<string> =
     let core =
         [ "exp"; "log"; "log10"; "sqrt"; "sin"; "cos"; "tan"
           "sinh"; "cosh"; "tanh"; "asin"; "acos"; "atan"
-          "floor"; "ceil"; "atan2"; "log_base"
+          "floor"; "ceil"; "atan2"; "log_base"; "fma"
           "abs"; "min"; "max"; "length"; "prodsum" ]
     Set.unionMany [ Set.ofList core
                     externalBuiltins.Keys |> Set.ofSeq
@@ -438,6 +455,27 @@ let rec private evalCore (env: StaticEnv) (fuel: Fuel) (depth: int) (expr: Expr)
             // Could be a static function used as a value (shouldn't happen normally)
             Error $"Static evaluation: undefined variable '{name}'"
 
+    // `&&` / `||` SHORT-CIRCUIT, exactly as the runtime does (the interpreter's
+    // IRAnd/IROr arms and C++ `&&`/`||`): the right operand is not visited
+    // when the left one decides. Evaluating both meant `false && (1 / 0 == 1)`
+    // was a static division-by-zero error while the same text at runtime is
+    // simply `false` -- a guard changed meaning by being moved into a
+    // `let static`.
+    | ExprKind.ExprBinOp (_, OpAnd, l, r) ->
+        evalCore env fuel (depth + 1) l |> Result.bind (fun lv ->
+            match lv with
+            | SVBool false -> Ok (SVBool false)
+            | SVBool true ->
+                evalCore env fuel (depth + 1) r |> Result.bind (fun rv -> evalBinOp OpAnd lv rv)
+            | _ -> Error (sprintf "Static evaluation: cannot apply %A to %A" OpAnd lv))
+    | ExprKind.ExprBinOp (_, OpOr, l, r) ->
+        evalCore env fuel (depth + 1) l |> Result.bind (fun lv ->
+            match lv with
+            | SVBool true -> Ok (SVBool true)
+            | SVBool false ->
+                evalCore env fuel (depth + 1) r |> Result.bind (fun rv -> evalBinOp OpOr lv rv)
+            | _ -> Error (sprintf "Static evaluation: cannot apply %A to %A" OpOr lv))
+
     | ExprKind.ExprBinOp (_, op, l, r) ->
         // Both operands are visited at depth + 1 and BOTH draw from the same
         // step pool. Under the old `fuel - 1`-per-child threading they each
@@ -469,10 +507,15 @@ let rec private evalCore (env: StaticEnv) (fuel: Fuel) (depth: int) (expr: Expr)
                 if argVals.Length <> funcDef.Params.Length then
                     Error ($"Static function '{fname}' expects {funcDef.Params.Length} args, got {argVals.Length}")
                 else
+                    // DEFINITION-SITE ENVIRONMENT: the body sees the module's
+                    // statics (`Globals`) and its own parameters -- never the
+                    // caller's parameters or block-locals, which `env.Values`
+                    // also holds at this point. See `StaticEnv.Globals`.
                     let bodyEnv =
                         (funcDef.Params, argVals) ||> List.zip
                         |> List.fold (fun e (p, v) ->
-                            { e with Values = Map.add p v e.Values }) env
+                            { e with Values = Map.add p v e.Values })
+                            { env with Values = env.Globals }
                     // A CALLEE'S BODY IS A CHILD FOR DEPTH PURPOSES even
                     // though it is not one syntactically: it is entered from
                     // this frame and returns to it, so the stack grows exactly
@@ -764,6 +807,10 @@ and private evalBuiltin env fuel depth (name: string) (args: Expr list) : Result
             Ok (SVFloat (mathFns.[name] (asFloat v).Value))
         | _, [a; b] when (Map.containsKey name mathFns2) && (asFloat a).IsSome && (asFloat b).IsSome ->
             Ok (SVFloat (mathFns2.[name] (asFloat a).Value (asFloat b).Value))
+        // fma: the same correctly-rounded FusedMultiplyAdd the interpreter
+        // evaluates, so a static fold and a runtime evaluation agree.
+        | "fma", [a; b; c] when (asFloat a).IsSome && (asFloat b).IsSome && (asFloat c).IsSome ->
+            Ok (SVFloat (System.Math.FusedMultiplyAdd ((asFloat a).Value, (asFloat b).Value, (asFloat c).Value)))
         | "abs", [SVInt n] -> Ok (SVInt (abs n))
         | "abs", [SVFloat f] -> Ok (SVFloat (abs f))
         | "min", [SVInt a; SVInt b] -> Ok (SVInt (min a b))
@@ -891,6 +938,44 @@ let rec private isLambdaExpr (expr: Expr) : bool =
 /// bind their leaf names) plus one StaticFailure per `let static` whose
 /// right-hand side did not evaluate. The Error case is reserved for a
 /// circular dependency among static values.
+/// The static segment tables of a module's `type A = Chunked<I, K>`
+/// declarations: I a `type I = Idx<n>` alias with a literal n (or a literal
+/// `Idx<n>` inline), K a literal edge. Offsets `[0; K; 2K; ..; n]`.
+let segmentTables (decls: Located<Decl> list) : Map<string, int64 list> =
+    let idxExtents =
+        decls |> List.choose (fun d ->
+            match d.Value with
+            | DeclType (TyDeclAlias (name, _, TyIdx { Kind = ExprKind.ExprLit (LitInt n) })) -> Some (name, n)
+            | _ -> None)
+        |> Map.ofList
+    decls |> List.choose (fun d ->
+        match d.Value with
+        | DeclType (TyDeclAlias (name, _, TyChunked (inner, { Kind = ExprKind.ExprLit (LitInt k) }))) when k >= 1L ->
+            let extent =
+                match inner with
+                | TyNamed (i, []) -> Map.tryFind i idxExtents
+                | TyIdx { Kind = ExprKind.ExprLit (LitInt n) } -> Some n
+                | _ -> None
+            extent |> Option.map (fun n ->
+                let cuts = [ for b in 0L .. k .. n - 1L -> b ] @ [ n ]
+                (name, cuts))
+        | _ -> None)
+    |> Map.ofList
+
+/// `segments(A)` in a static position evaluates to the tuple of GROUP SIZES
+/// (what `extents(gk)` answers at run time), so `length(segments(A))` is the
+/// segment count and its sum the axis extent. Registered as a syntactic
+/// builtin: the argument names a type, not a value.
+do registerSyntacticStaticBuiltin "segments" (fun env _ args ->
+    match args with
+    | [ { Kind = ExprKind.ExprVar alias } ] ->
+        (match Map.tryFind alias env.Segments with
+         | Some offsets ->
+             let sizes = offsets |> List.pairwise |> List.map (fun (lo, hi) -> SVInt (hi - lo))
+             Ok (SVTuple sizes)
+         | None -> Error $"Static evaluation: segments({alias}): '{alias}' is not a `Chunked<Idx<n>, k>` alias with literal extent and edge")
+    | _ -> Error "Static evaluation: segments takes one argument, the name of a `Chunked<..>` alias")
+
 let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailure list, string> =
     // Phase 1: Collect static function definitions and static value decls
     let mutable staticFuncs : Map<string, StaticFuncDef> = Map.empty
@@ -954,10 +1039,30 @@ let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailur
 
     // Phase 2: Dependency graph over bound names -- a destructured decl's
     // names share the decl's dependencies -- and topological sort.
+    // A static CALLEE'S body is part of the initializer's dependency set: `let
+    // static a = f()` with `static function f() = z` needs `z` folded before
+    // `a`, and nothing about the call text names `z`. Walked transitively
+    // (f may call g may read z) with a visited set, so a self- or mutually-
+    // recursive static function terminates rather than looping; the callee's
+    // own parameters are its locals and are subtracted, never dependencies.
+    let rec namesThroughStaticCallees (visited: Set<string>) (names: Set<string>) : Set<string> =
+        let callees =
+            names |> Set.filter (fun n -> Map.containsKey n staticFuncs && not (Set.contains n visited))
+        if Set.isEmpty callees then names
+        else
+            let visited' = Set.union visited callees
+            let fromBodies =
+                callees
+                |> Set.toList
+                |> List.map (fun f ->
+                    let fd = staticFuncs.[f]
+                    Set.difference (collectFreeNames fd.Body) (Set.ofList fd.Params))
+                |> Set.unionMany
+            namesThroughStaticCallees visited' (Set.union names fromBodies)
     let deps =
         pending
         |> List.collect (fun pd ->
-            let direct = collectFreeNames pd.Expr
+            let direct = namesThroughStaticCallees Set.empty (collectFreeNames pd.Expr)
             // NAMING A STRUCT PULLS IN THE STRUCT'S OWN STATICS: a static
             // expression that mentions a struct TYPE by name (`idx_card(R)`)
             // is going to fold that struct's field bounds and conjuncts,
@@ -1010,7 +1115,7 @@ let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailur
             |> List.collect (fun pd -> pd.Names |> List.map (fun n -> (n, pd)))
             |> Map.ofList
         let calledRef = ref Set.empty
-        let mutable env = { Values = Map.empty; Functions = staticFuncs; CalledFunctions = calledRef; ProviderRoots = providerRoots; Structs = structInfos }
+        let mutable env = { Values = Map.empty; Globals = Map.empty; Functions = staticFuncs; CalledFunctions = calledRef; ProviderRoots = providerRoots; Structs = structInfos; Segments = segmentTables decls }
         let mutable failures : StaticFailure list = []
         let mutable evaluated = Set.empty
 
@@ -1023,7 +1128,10 @@ let resolveStatics (decls: Located<Decl> list) : Result<StaticEnv * StaticFailur
                 else
                     match evalExpr env maxSteps pd.Expr with
                     | Ok value ->
-                        env <- bindPattern env pd.Pattern value
+                        // Top level: every folded static is a module global,
+                        // so `Globals` tracks `Values` exactly here.
+                        let bound = bindPattern env pd.Pattern value
+                        env <- { bound with Globals = bound.Values }
                     | Error reason ->
                         failures <- failures @ [{ Names = pd.Names; Reason = reason; Span = pd.Span }]
             | _ -> ()

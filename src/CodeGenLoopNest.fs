@@ -1029,6 +1029,8 @@ let rec canonicalKey (nameMap: Map<int, string>) (expr: IRExpr) : string =
         $"(tuple {ek})"
     | IRComplex (re, im) ->
         $"(complex {(canonicalKey nameMap re)} {(canonicalKey nameMap im)})"
+    | IRFma (a, b, c) ->
+        $"(fma {(canonicalKey nameMap a)} {(canonicalKey nameMap b)} {(canonicalKey nameMap c)})"
     | IRFieldAccess (obj, field) ->
         $"(field {(canonicalKey nameMap obj)} {field})"
     | IRStructLit (name, fields) ->
@@ -1279,26 +1281,16 @@ let internal planHaloCarousel
             let rec varIdsOf (e: IRExpr) : Set<int> =
                 let self = match e with IRVar (id, _) -> Set.singleton id | _ -> Set.empty
                 childrenOf e |> List.fold (fun acc c -> Set.union acc (varIdsOf c)) self
-            // Static signed offset of a window-read subscript: w(k) lowers to
-            // Add(w, Lit k) for k >= 0 and Add(w, Neg(Lit k)) for negatives.
-            let offOf = function
-                | IRLit (IRLitInt k) -> Some (int k)
-                | IRUnaryOp (IRNeg, IRLit (IRLitInt k)) -> Some (int -k)
-                | _ -> None
-            // Collect window reads by NODE REFERENCE (the SubstMap contract).
-            let mutable found : (IRExpr * int * IRExpr list * int) list = []   // node, arrId, prefix, k
-            let rec scan (e: IRExpr) =
-                (match e with
-                 | IRIndex (IRVar (aid, _), idxs, _) when not (List.isEmpty idxs) ->
-                     (match List.last idxs with
-                      | IRBinOp (IRElementwise, IRAdd, IRVar (vid, _), offExpr) when vid = wid ->
-                          (match offOf offExpr with
-                           | Some k -> found <- (e, aid, (idxs |> List.take (idxs.Length - 1)), k) :: found
-                           | None -> ())
-                      | _ -> ())
-                 | _ -> ())
-                childrenOf e |> List.iter scan
-            scan codeGen.KernelExpr
+            // Window reads by NODE REFERENCE (the SubstMap contract), from
+            // the one shared scan (IRAccess.windowReadsOf): this ring serves
+            // reads on the LAST axis with a static offset; anything else
+            // simply stays a direct read.
+            let found : (IRExpr * int * IRExpr list * int) list =   // node, arrId, prefix, k
+                Blade.IRAccess.windowReadsOf (function IRVar (vid, _) -> vid = wid | _ -> false) codeGen.KernelExpr
+                |> List.choose (fun r ->
+                    match r.Offset with
+                    | Some k when r.Dim = r.Rank - 1 -> Some (r.Node, r.ArrayId, r.Prefix, k)
+                    | _ -> None)
             // Groups: same array + identically-rendered prefix (outer-window
             // reads etc. -- invariant across the innermost run by the wid check).
             let renderable (aid: int) (prefix: IRExpr list) =
@@ -1353,8 +1345,14 @@ let internal planHaloCarousel
                     warmup <- warmup @
                         [ $"// halo carousel: {arrS} window [{mink}..{maxk}] -- ring of {cap}, head = {idxName}, one write/step"
                           $"""std::array {buf}{{ {(String.concat ", " inits)} }};""" ]
+                    // The tail prefetches the value the NEXT step will read at
+                    // its far edge. On the last step there is no next step, and
+                    // the ordinal is one past the array (the interior shrink
+                    // ends the walk exactly at reach): guard the load. The slot
+                    // it would fill is never read again, so skipping it is exact
+                    // (docs/plans/structural/02, section 1.5).
                     tail <- tail @
-                        [ $"{buf}[({idxName} + {span}UL) & {mask}UL] = {arrS}{prefixS}[(size_t)({wname} + {1 + maxk}L)];" ]
+                        [ $"if ((size_t)({wname} + {1 + maxk}L) < {arrS}.extents[{prefix.Length}]) {buf}[({idxName} + {span}UL) & {mask}UL] = {arrS}{prefixS}[(size_t)({wname} + {1 + maxk}L)];" ]
                     for (node, _, _, k) in reads do
                         subst <- (node, $"{buf}[({idxName} + {k - mink}UL) & {mask}UL]") :: subst)
                 Some (subst, warmup, tail)
@@ -2081,8 +2079,9 @@ type internal FlatGroup = { GRank: int; GSym: SymmetryClass; GExtent: int64 }
 ///
 /// Refused outright: virtual arrays; any non-plain index KIND (compound,
 /// sparse, ragged, dep, group, irreps, orbit -- none of which is a plain
-/// contiguous skeleton the loop bounds describe); reserved `__`-prefixed tags
-/// (halo windows ride one); dependent extents; non-literal extents (only a
+/// contiguous skeleton the loop bounds describe); `__halowin`-prefixed tags
+/// (a halo window's reads are offset from the loop index, so the flat index is
+/// NOT the operand's pool offset); dependent extents; non-literal extents (only a
 /// compile-time constant cell count is emitted); Hermitian and wreath classes
 /// (Hermitian shares symmetric STORAGE but its mirror conjugates, and the
 /// wreath pool is the section 4 iterated-binomial fold, not this product) -- both are
@@ -2092,7 +2091,17 @@ let internal flatShapeSignature (arr: IRArrayType) : FlatGroup list option =
     let groups =
         arr.IndexTypes
         |> List.map (fun ix ->
-            let tagOk = match ix.Tag with Some t -> not (t.StartsWith "__") | None -> true
+            // `__halowin`, not a blanket `__`: every OTHER reserved tag
+            // (__orbidx / __compoundidx / __seq / __group_* / __sparseidx /
+            // __raggedidx*) carries a non-plain IxKind and is already refused by
+            // the `IxKind <> IxKPlain` test beside this one. The blanket form
+            // therefore refused exactly one thing on tag grounds alone: the
+            // anonymous range's `__anon` (Lowering.fs, TypeCheckInfer.fs), which
+            // IS a plain contiguous skeleton -- so `x0 + dx * Float64(0..n)`,
+            // the documented top-rung idiom, missed the flat path that the
+            // identical `Float64(range<I>)` took. Same predicate shape as the
+            // lane-parallel gate in CodeGenBinding.fs.
+            let tagOk = match ix.Tag with Some t -> not (t.StartsWith "__halowin") | None -> true
             if ix.IxKind <> IxKPlain || not tagOk || not ix.Dependencies.IsEmpty then None
             else
                 match ix.Extent with
@@ -2240,12 +2249,13 @@ let tryGenFlatElementwiseNest
                             && e.RankComponent = b.Level
                             && e.ArrayRank = depth
                             && e.ArrayName = (codeGen.InputArrayNames |> List.item e.ArrayPosition)
-                            // A reserved `__`-prefixed slot tag marks a halo
-                            // window / kind sentinel; flatShapeSignature has
-                            // already refused those on the array types, so this
+                            // A `__halowin` slot tag marks a halo window, whose
+                            // reads are OFFSET from the loop index; flatShapeSignature
+                            // has already refused those on the array types, so this
                             // is a belt-and-braces read of the SAME tag through
-                            // the element record.
-                            && (match e.SlotTag with Some t -> not (t.StartsWith "__") | None -> true)))
+                            // the element record -- and it must stay the same
+                            // predicate, or the pair disagrees about `__anon`.
+                            && (match e.SlotTag with Some t -> not (t.StartsWith "__halowin") | None -> true)))
             let cells = flatCellCount sg
             // OpenMP licensing. The flat loop FUSES every level, so threading
             // it threads every dimension -- which only the full licence grants.
@@ -2650,6 +2660,7 @@ let genIncludes () : string list =
      "#include \"rand_runtime.hpp\""
      "#include <exception>"                 // std::exception for main()'s BL8005 catch
      "#include \"blade_runtime.hpp\""        // blade_rt::panic + BLADE_FRAME shadow stack
+     "#include \"blade_run_record.hpp\""     // BLADE_RUN_RECORD: manifest + observed inputs + status at exit
      ]
     // Memcheck instrumentation (BLADE_MEMCHECK=1 only): appended as an extra
     // element, never a placeholder comment, so default output stays
@@ -2775,6 +2786,14 @@ let runtimeHeaderNames : string list =
       // BLADE_FRAME macro. Header-only, host-only (device passes see
       // no-op stubs); deployed unconditionally and included by every program.
       "blade_runtime.hpp"
+      // The run record (BLADE_RUN_RECORD): the baked input manifest paired
+      // at exit with what the run observed and how it ended. Header-only,
+      // host-only; deployed unconditionally and included by every program.
+      "blade_run_record.hpp"
+      // Revision reuse (docs/plans/structural/04): the local tile store's
+      // probe/load/store. INCLUDED only by a program with a tiled binding
+      // (tilesUsedCell); deployed unconditionally like the rest.
+      "blade_tilecache.hpp"
       // Dense linear-algebra dispatch: blade_gemm / blade_syrk plus the
       // gram/matmul adapters, resolving to cblas under -DBLADE_HAS_BLAS and to
       // native fallbacks otherwise. INCLUDED only by programs that actually
@@ -2895,6 +2914,7 @@ let genIncludesExternal () : string list =
      "#include \"rand_runtime.hpp\""
      "#include <exception>"                 // std::exception for main()'s BL8005 catch
      "#include \"blade_runtime.hpp\""        // blade_rt::panic + BLADE_FRAME shadow stack
+     "#include \"blade_run_record.hpp\""     // BLADE_RUN_RECORD: manifest + observed inputs + status at exit
      ]
     // Memcheck instrumentation -- see the sibling include block above.
     @ (if memcheckEnabled () then ["#include \"blade_memcheck.hpp\""] else [])
@@ -3152,11 +3172,15 @@ let rec isFreshPoolForm (e: IRExpr) : bool =
     | IRApplyCombinator _ | IRComposeApply _ -> true
     | IRArrayLit _ -> true
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _ -> true
-    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRMatmul _ -> true
+    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRGramApply _ | IRMatmul _ -> true
     // eigh: BOTH pools it produces are fresh (`allocate<>` under derived names)
     // and neither borrows the operand's `.extents` pointer -- each gets its own
     // table. So an escaping (Q, LAM) need not pin S, and propagation stops here.
     | IREigh _ -> true
+    // lu: (LU, piv) are two fresh pools with their own tables, like eigh's.
+    | IRLu _ -> true
+    // lu_solve: x is a fresh pool, like solve's.
+    | IRLuSolve _ -> true
     // solve: x is a fresh `allocate<>` pool with its own extents table -- it
     // borrows nothing from A or b (b's values are COPIED in, not aliased), so
     // an escaping x need pin neither operand and propagation stops here.
@@ -3267,7 +3291,7 @@ let internal isMaterializedFreshArray (v: IRExpr) : bool =
     | IRCompute inner -> isFreshPoolForm inner
     | IRArrayLit _ -> true
     | IRMask _ | IRSort _ | IRUnique _ | IRIntersect _ | IRUnion _
-    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRMatmul _ | IRSolve _
+    | IRTranspose _ | IRDecompact _ | IRStack _ | IRJoin _ | IRGram _ | IRGramApply _ | IRMatmul _ | IRSolve _ | IRLuSolve _
     | IRArrayNegate _ | IRArrayConjugate _ -> true
     | _ -> false
 
@@ -3457,13 +3481,29 @@ let computeScopeEscapes (ctx: CodeGenContext) (kind: ScopeKind) (scopeLets: (IRI
                 match inferExprType retExpr with
                 | IRTScalar _ | IRTUnit -> []
                 | _ -> collectVarRefsIR retExpr |> Set.toList
+    // A SCALAR-typed let holds no storage, so nothing it read can be aliased
+    // through it: propagation stops there exactly as at a fresh pool. Without
+    // this barrier a kernel capturing `m` in `let m = reduce(y, (+)) / n`
+    // seeded m (capture seed), propagation walked into m's value, and y --
+    // merely READ to compute a scalar -- was pinned and leaked on every call
+    // (measured: the demean / normalize shape leaked its input-sized pool
+    // per invocation).
+    let scalarValued (value: IRExpr) =
+        match inferExprType value with
+        | IRTScalar _ | IRTUnit -> true
+        | _ -> false
     let rec propagate (acc: Set<IRId>) =
         let acc' =
             scopeLets |> List.fold (fun s (id, value) ->
-                if Set.contains id s && not (isFreshPoolForm value)
+                if Set.contains id s && not (isFreshPoolForm value) && not (scalarValued value)
                 then Set.union s (collectVarRefsIR value)
                 else s) acc
-        if acc' = acc then acc else propagate acc'
+        // Scratch reuse: an escaping reuser's storage IS its donor's, so the
+        // donor escapes with it (chains resolve to the root by iteration).
+        let acc'' =
+            Blade.Types.PoolReuseTable.donors ()
+            |> Map.fold (fun s reuser donor -> if Set.contains reuser s then Set.add donor s else s) acc'
+        if acc'' = acc then acc else propagate acc''
     propagate (Set.ofList (assignSeeds @ captureSeeds @ providerSeeds @ retSeeds))
 
 /// Hoist FreshPool-returning calls out of ARGUMENT position into fresh lets.
@@ -3768,6 +3808,30 @@ let registerStreamBufDecls (names: string list) : unit =
             frame.StreamBufNames <- Set.add n frame.StreamBufNames
             registerAlloc (RawAlloc (n, None))
 
+/// SCRATCH REUSE (Blade.Optimize.planPoolReuse, Types.PoolReuseTable): turn
+/// `name`'s pool declaration -- `Array<E, R> name = { allocate<typename
+/// promote<E, R>::type, nullptr>(ext), ext };`, the one line every dense
+/// allocation site emits for a plan-admitted shape -- into an alias of the
+/// donor's data with the reuser's own extents table. Anchored on the NAME,
+/// so it is indifferent to which emitter wrote the line. The flag says
+/// whether a line matched: the caller spares a scope free ONLY then, so an
+/// unexpected declaration shape keeps its own pool and its own free rather
+/// than leaking.
+let rewritePoolAlias (lines: string list) (name: string) (donor: string) : string list * bool =
+    let pat =
+        System.Text.RegularExpressions.Regex(
+            @"^(\s*)Array<(.+?), (\d+)> " + System.Text.RegularExpressions.Regex.Escape name
+            + @" = \{ allocate<typename promote<.+?>::type, nullptr>\((\w+)\), (\w+) \};\s*$")
+    let mutable matched = false
+    let out =
+        lines |> List.map (fun l ->
+            let m = pat.Match l
+            if m.Success && not matched then
+                matched <- true
+                $"{m.Groups.[1].Value}Array<{m.Groups.[2].Value}, {m.Groups.[3].Value}> {name} = {{ {donor}.data, {m.Groups.[4].Value} }}; /* pool reuse: {name} takes {donor}'s dead pool */"
+            else l)
+    (out, matched)
+
 /// Exempt one emitted C++ name from this scope's frees (used for the lifted
 /// `__retN` return temporaries, whose storage leaves with the return value).
 let suppressAllocName (n: string) : unit =
@@ -3848,10 +3912,35 @@ let containsIdentToken (text: string) (name: string) : bool =
         text,
         "(?<![A-Za-z0-9_])" + System.Text.RegularExpressions.Regex.Escape(name) + "(?![A-Za-z0-9_])")
 
-/// Pop the innermost scope and render its frees at `ind`. Iteration is over the
-/// newest-first list, i.e. registration-reverse order. An allocation is skipped
-/// when its owning let escapes or its name was suppressed. An empty survivor list
+/// Render one frame's frees at `ind`. Iteration is over the newest-first
+/// list, i.e. registration-reverse order. An allocation is skipped when its
+/// owning let escapes or its name was suppressed. An empty survivor list
 /// emits no lines at all, so unaffected programs are byte-identical.
+let internal renderFrameFrees (ind: string) (frame: AllocScope) : string list =
+    frame.Allocs
+    |> List.collect (fun a ->
+        let ownerEscapes =
+            match trackedAllocOwner a with
+            | Some oid -> Set.contains oid frame.Escapes
+            | None -> false
+        if ownerEscapes || Set.contains (trackedAllocName a) frame.SuppressNames then []
+        else
+            match a with
+            | PoolAlloc (n, routine, args, ownedExtents, _) ->
+                [ $"{ind}{routine}<{args}>({n}.data, {n}.extents);" ]
+                @ (match ownedExtents with
+                   | Some ex -> [$"{ind}delete[] {ex};"]
+                   | None -> [])
+            | RawAlloc (n, _) -> [$"{ind}delete[] {n};"]
+            | RawArrayData (n, ownedExtents, _) ->
+                [ $"{ind}delete[] {n}.data;" ]
+                @ (match ownedExtents with
+                   | Some ex -> [$"{ind}delete[] {ex};"]
+                   | None -> [])
+            | ShapedAlloc (_, routine, args, _) ->
+                [ $"{ind}nested_array_utilities::{routine}({args});" ])
+
+/// Pop the innermost scope and render its frees at `ind`.
 let popAllocScopeFrees (ind: string) : string list =
     match popAllocScope () with
     | None -> []
@@ -3861,28 +3950,18 @@ let popAllocScopeFrees (ind: string) : string list =
         // brace, so a later nest must re-declare its own buffer.
         let sc = streamBufDeclsCell ()
         sc.Value <- Set.difference sc.Value frame.StreamBufNames
-        frame.Allocs
-        |> List.collect (fun a ->
-            let ownerEscapes =
-                match trackedAllocOwner a with
-                | Some oid -> Set.contains oid frame.Escapes
-                | None -> false
-            if ownerEscapes || Set.contains (trackedAllocName a) frame.SuppressNames then []
-            else
-                match a with
-                | PoolAlloc (n, routine, args, ownedExtents, _) ->
-                    [ $"{ind}{routine}<{args}>({n}.data, {n}.extents);" ]
-                    @ (match ownedExtents with
-                       | Some ex -> [$"{ind}delete[] {ex};"]
-                       | None -> [])
-                | RawAlloc (n, _) -> [$"{ind}delete[] {n};"]
-                | RawArrayData (n, ownedExtents, _) ->
-                    [ $"{ind}delete[] {n}.data;" ]
-                    @ (match ownedExtents with
-                       | Some ex -> [$"{ind}delete[] {ex};"]
-                       | None -> [])
-                | ShapedAlloc (_, routine, args, _) ->
-                    [ $"{ind}nested_array_utilities::{routine}({args});" ])
+        renderFrameFrees ind frame
+
+/// Render the innermost frame's frees at `ind` WITHOUT popping -- the early-exit
+/// path of a `while`-guarded rec-array loop (IRBreakIf) leaves the loop before
+/// the bottom-of-body frees run, so the break emits the frees accumulated SO FAR
+/// this iteration and then breaks. The frame stays live (the non-breaking path
+/// still frees at the bottom), and streamed fiber-buffer declarations are NOT
+/// retired (their C++ names remain in scope past the break).
+let peekAllocScopeFrees (ind: string) : string list =
+    match currentAllocScope () with
+    | None -> []
+    | Some frame -> renderFrameFrees ind frame
 
 /// Generate code to allocate and initialize an array from literal values
 let genArrayLiteral (ctx: CodeGenContext) (varName: string) (elements: IRExpr list) (arrType: IRArrayType) : string list =

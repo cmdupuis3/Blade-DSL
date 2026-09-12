@@ -1,0 +1,16 @@
+// TEST: Same-named functions with defaults across modules
+// MODULE: Main
+// ============================================================================
+// Two imported modules each declare `f` with a different default. The
+// defaults table was keyed by BARE name, so both calls filled the module
+// checked last (`f(20L)` twice), and the merged C++ emitted two
+// `int64_t f(int64_t)` definitions. Qualified imports register defaults
+// under `alias.name`, and a colliding function from a non-main module is
+// emitted as `<module>__<name>`.
+module Main
+import ModA as a
+import ModB as b
+let x = a.f()
+let y = b.f()
+// EXPECT: x = 10
+// EXPECT: y = 20

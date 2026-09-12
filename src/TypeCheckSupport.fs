@@ -177,7 +177,8 @@ let rec collectFreeVars (bound: Set<string>) (expr: Expr) : Set<string> =
     | ExprKind.ExprDecompact (array, _) -> collectFreeVars bound array
     | ExprKind.ExprGram (left, right) ->
         Set.union (collectFreeVars bound left) (collectFreeVars bound right)
-    | ExprKind.ExprBlocked (_, e) -> collectFreeVars bound e
+    | ExprKind.ExprGramApply (left, right, vec) ->
+        Set.unionMany [ collectFreeVars bound left; collectFreeVars bound right; collectFreeVars bound vec ]
     | ExprKind.ExprHalo (_, offsets) -> collectFreeVars bound offsets
     | ExprKind.ExprPartialApp (_, e, _) -> collectFreeVars bound e
     | ExprKind.ExprStatic e -> collectFreeVars bound e
@@ -194,7 +195,14 @@ let rec collectFreeVars (bound: Set<string>) (expr: Expr) : Set<string> =
                 collectFreeVars (Set.add seedStep selfBound) seedExpr
             | None -> Set.empty
         let sliceBound = selfBound |> Set.add def.PrefixVar |> Set.add def.StepVar
-        Set.union seedFree (collectFreeVars sliceBound def.SliceExpr)
+        // The `while` guard scopes like the slice -- prefix/step are its
+        // binders; anything else it reads is a genuine capture. Missing this
+        // walk would silently drop guard captures from closure conversion.
+        let guardFree =
+            match def.Guard with
+            | Some g -> collectFreeVars sliceBound g
+            | None -> Set.empty
+        Set.unionMany [ seedFree; guardFree; collectFreeVars sliceBound def.SliceExpr ]
     // ---- Leaves: nothing to walk, for a stated reason ----
     | ExprKind.ExprWildcard
     | ExprKind.ExprNth
@@ -785,10 +793,15 @@ let rec checkPattern (env: TypeEnv) (expected: IRType) (pat: Pattern)
             // This is a no-payload variant constructor -- treat as PatVariant
             checkPattern env expected (inheritPatSpan pat (PatVariant (name, None)))
         | Some (parentName, Some _) ->
-            // Variant with payload but used without -- treat as variable (may shadow)
-            let varId = env.Builder.FreshId()
-            Ok { Kind = TPatVar (name, varId); Type = expected
-                 Bindings = [(name, varId, expected)] }
+            // Variant with payload, used WITHOUT it. Treating this as a
+            // variable binding (which it used to be) is a trap, not a
+            // feature: `| Some -> ...` silently became an irrefutable
+            // binder named Some, matched EVERYTHING, and killed every arm
+            // after it -- `| None -> ...` below it was dead code with no
+            // diagnostic. A payload-carrying constructor in pattern
+            // position can only sensibly mean the variant test, so demand
+            // the payload be spelled.
+            Error (Other $"pattern '{name}': this constructor of '{parentName}' carries a payload, so a bare '{name}' here would not test the variant -- it would bind a fresh VARIABLE named {name} that matches everything (making every later arm dead). Match it as {name}(p) (or {name}(_) to ignore the payload); rename the binder if a variable is what you meant.")
         | None ->
             let varId = env.Builder.FreshId()
             Ok { Kind = TPatVar (name, varId); Type = expected
@@ -848,6 +861,24 @@ let rec checkPattern (env: TypeEnv) (expected: IRType) (pat: Pattern)
         match Map.tryFind tag env.VariantTags with
         | Some (parentName, payloadTy) ->
             let isEnum = isEnumType env parentName
+            // THE CONSTRUCTOR'S PARENT TYPE MUST BE THE SCRUTINEE'S. Nothing
+            // used to relate the two: `match One with | Three -> ...` (One of
+            // `type A`, Three of `type B`) checked clean and matched at
+            // runtime, because emission compares constructor ORDINALS and
+            // both are zero. A concrete nominal disagreement is refused here;
+            // an open scrutinee type is bound to the parent so it flows.
+            // Anything else (an enum-index scrutinee typed through its tag,
+            // an alias) keeps the historical acceptance.
+            let nominalClash =
+                match env.Subst.Resolve expected with
+                | IRTNamed other when other <> parentName -> Some other
+                | _ -> None
+            match nominalClash with
+            | Some _ -> Error (PatternTypeMismatch (tag, expected))
+            | None ->
+            (match env.Subst.Resolve expected with
+             | IRTInfer _ -> unify env.Subst (IRTNamed parentName) expected |> ignore
+             | _ -> ())
             match payloadPat, payloadTy with
             | Some p, Some ty ->
                 checkPattern env ty p |> Result.map (fun tPayload ->
@@ -879,6 +910,23 @@ let rec checkPattern (env: TypeEnv) (expected: IRType) (pat: Pattern)
             | Some (TDIStruct (_, _, fields, _)) ->
                 fields |> List.map (fun (n, t) -> (n, t)) |> Map.ofList
             | _ -> Map.empty
+        // Same nominal rule as the variant arm: a struct pattern names a
+        // TYPE, and a value of another struct type with the same field
+        // spelling (`A { x = 12 }` against `B { x }`) is not an instance of
+        // it. Refused on a concrete disagreement; an open scrutinee is bound.
+        let nominalClash =
+            if Map.isEmpty fieldTypes then None
+            else
+                match env.Subst.Resolve expected with
+                | IRTNamed other when other <> typeName -> Some other
+                | _ -> None
+        match nominalClash with
+        | Some _ -> Error (PatternTypeMismatch ($"{typeName} {{ ... }}", expected))
+        | None ->
+        (if not (Map.isEmpty fieldTypes) then
+            match env.Subst.Resolve expected with
+            | IRTInfer _ -> unify env.Subst (IRTNamed typeName) expected |> ignore
+            | _ -> ())
         fieldPats |> List.map (fun (fname, fpat) ->
             let fTy = Map.tryFind fname fieldTypes |> Option.defaultValue (env.Subst.Fresh())
             checkPattern env fTy fpat |> Result.map (fun tp -> (fname, tp)))
@@ -923,7 +971,38 @@ let requireArrayArgMinRank (env: TypeEnv) (tArr: TypedExpr) (opName: string) (mi
     match resolved with
     | ArrayElem arrTy -> Ok arrTy
     | IRTInfer vid ->
-        let k = max 1 minRank
+        // RANK PIN. The caret on a `T^k` parameter is an EXACT rank claim,
+        // but it lives in the SUBSTITUTION (`Subst.LookupOrCreateTypeVar`
+        // records it in `arityConstraints`), not in the type: the var itself
+        // is a bare `IRTInfer` that says nothing about rank. Synthesizing
+        // rank-1 for every var therefore refused every abstract parameter of
+        // rank >= 2 at the unify below -- `extents(x)` on a `T^2` param died
+        // with "a `^2` type variable is a rank-2 array, but this position
+        // supplies Array<..>" (rank 1): the checker refusing a shape it had
+        // itself just minted. Read the pin.
+        //
+        // The ARITY PIN ONLY, deliberately -- NOT `GetRankLowerBound`, the
+        // stage-2 deduced bound sitting right beside it. The two are different
+        // kinds of fact and this seam is where the difference is enforced: the
+        // caret is a DECLARATION, so synthesizing its rank is honouring what
+        // the author wrote, while a rank lower bound is accumulated EVIDENCE
+        // from other call sites, and `unify`'s rankBoundViolation exists to
+        // CHECK the synthesis against it. Synthesizing from the bound instead
+        // makes that check vacuous: functions/037 (`z` collects rank 1 from
+        // `total(z)`, rank 2 from `tot2(z)`, then meets `extents(z)`) is a
+        // genuine contradiction reported as BL3009, the dedicated
+        // rank-deduction code, and reading the bound here demoted it to a
+        // BL3001 rank mismatch pointing at an unrelated call.
+        //
+        // MAX rather than the pin outright: an op demanding rank >= minRank
+        // over a var pinned BELOW it (gram on a `T^1`) keeps synthesizing
+        // minRank and keeps failing at unify -- that refusal is correct, and
+        // its message already names both ranks.
+        let pinnedRank =
+            match env.Subst.GetArityConstraint vid with
+            | Some k when k > 0 -> k
+            | _ -> 0
+        let k = max (max 1 minRank) pinnedRank
         let freshIdx i =
             // The minted extent name carries the index record's own fresh id.
             // These names are IDENTITY, not just display: shape
@@ -1085,6 +1164,27 @@ let internal isSynthesizedBuffer (tArr: TypedExpr) : bool =
     | TExprVar (name, _, _) -> name.StartsWith "__"
     | _ -> false
 
+/// The INDEX twin of `isSynthesizedBuffer`: a subscript that mentions a
+/// compiler-reserved `__` name -- a desugarer's loop ordinal, possibly plus
+/// the author's own offset arithmetic -- into a USER array. The reverse-mode
+/// sweep reads the user's `Array<Float like H>` at `__hi3 + 2L` (or at
+/// `__mi7 + (1L + one)`, when the author's window offset was a name) in a
+/// loop it built itself; the author wrote neither the loop nor the
+/// subscript, and the cast the note recommends has no source position to
+/// land on. The surface grammar reserves `__` names for the compiler, so a
+/// subscript mentioning one is never the author's. Only the advisory
+/// warning is affected; the ERROR arms (a differently-tagged index) are not.
+let internal isSynthesizedIndex (tArg: TypedExpr) : bool =
+    let rec mentionsReserved (e: TypedExpr) : bool =
+        match e.Kind with
+        | TExprVar (name, _, _) -> name.StartsWith "__"
+        | TExprBinOp (_, _, l, r) -> mentionsReserved l || mentionsReserved r
+        | TExprUnaryOp (_, x) -> mentionsReserved x
+        | TExprApp (f, args) -> mentionsReserved f || args |> List.exists mentionsReserved
+        | TExprIf (c, t, f) -> mentionsReserved c || mentionsReserved t || mentionsReserved f
+        | _ -> false
+    mentionsReserved tArg
+
 let internal checkArrayIndexTags (env: TypeEnv) (tArr: TypedExpr) (arrTy: IRArrayType) (tArgs: TypedExpr list) : TypeResult<unit> =
     let synthetic = isSynthesizedBuffer tArr
     let slots = slotPerArg arrTy
@@ -1110,7 +1210,7 @@ let internal checkArrayIndexTags (env: TypeEnv) (tArr: TypedExpr) (arrTy: IRArra
                     // BL4003 (index type violation) -- the warning twin of this
                     // very site: the ERROR branch two cases up raises
                     // IndexTagMismatchNamed, which is already BL4003.
-                    if not synthetic then
+                    if not synthetic && not (isSynthesizedIndex tArg) then
                         emitWarning env "BL4003" tArg.Span ($"Array indexed with untagged integer where slot expects tag '{tagName}'. Consider an explicit cast like `(expr : {tagName})` or iterate via `range<{tagName}>` to flow the tag automatically.")
                     None
                 | _ -> None
@@ -1469,6 +1569,134 @@ let firstArgRankClash (subst: Subst) (paramTys: IRType list) (argTys: IRType lis
             match concreteRankOf subst pTy, concreteRankOf subst aTy with
             | Some pr, Some ar when pr <> ar -> Some (i, pr, ar, pTy, aTy)
             | _ -> None)
+
+/// The ABSTRACT-PARAMETER conflict: two argument positions that teach the
+/// SAME open signature type variable two incompatible types.
+///
+/// `function add0(a: T^0, b: T^0)` declares ONE variable in two positions, so
+/// `add0(A, s)` asks `T` to be both `Array<Float64 like Idx<3>>` and
+/// `Float64`. Nothing refused it. Direct application does not unify
+/// parameters against arguments (see `dispatchAppOrIndex`'s FuncElem arm),
+/// which is exactly what keeps HM alive at this seam -- so `T` stays an open
+/// `IRTInfer` and every check here stands down by design: `concreteRankOf`
+/// and `concreteClassOf` both DECLINE an open variable. IR-phase
+/// monomorphization then took the FIRST teaching and silently discarded the
+/// rest (`IRMono.unifyParamWithArg`'s "inconsistent" arm, whose comment said
+/// the IR validator would catch it -- it does not), emitting a specialization
+/// whose parameters all wear the first argument's type against a call site
+/// that hands it the others verbatim. g++ rejected it. That is a typecheck
+/// ESCAPE: `blade check` clean, then a C++ error carrying no BL code at all.
+///
+/// This is the refusal that closes it, and it is deliberately the exact
+/// MIRROR of what monomorphization would drop -- the same structural walk, so
+/// "the specializer would lose this binding" and "the typechecker refuses"
+/// are one predicate rather than two that can drift apart.
+///
+/// COMPATIBILITY is judged by what the emitted monomorph would accept, not by
+/// type equality: the specialization is built from the FIRST teaching, so a
+/// later argument is fine exactly when it flows into that signature without
+/// conversion. Equal types, and scalars that WIDEN -- `add0(2.5, 3)` is
+/// `double add0(double, double)` fed an int64, which C++ promotes and which
+/// works today; `add0(3, 2.5)` is `int64 add0(int64, int64)` fed a double,
+/// which `-Werror=float-conversion` rejects, and so does this. Anything not
+/// determined here (an argument still open, a shape this walk does not model)
+/// stands down rather than guessing, the same discipline as its neighbours.
+///
+/// Reported as (first teaching's position, conflicting position, first type,
+/// conflicting type), all 0-based.
+let firstAbstractVarConflict (subst: Subst) (paramTys: IRType list) (argTys: IRType list)
+                             : (int * int * IRType * IRType) option =
+    // Peel the wrappers that are transparent to a monomorph's C++ signature:
+    // a unit annotation and an index tag are both erased by codegen, so
+    // neither can make two teachings genuinely different shapes.
+    let rec peel (t: IRType) =
+        match subst.Resolve t with
+        | IRTUnitAnnotated (inner, _) -> peel inner
+        | IRTIdxTagged (inner, _) -> peel inner
+        | r -> r
+    let rec compatible (first: IRType) (later: IRType) : bool =
+        let f = peel first
+        let l = peel later
+        if f = l then true
+        else
+            match f, l with
+            | ArrayElem fa, ArrayElem la ->
+                fa.IndexTypes.Length = la.IndexTypes.Length
+                && compatible fa.ElemType la.ElemType
+            // A rank disagreement is the g++-fatal one: an `Array<double, 1>`
+            // parameter cannot be handed a `double`, in either direction.
+            | ArrayElem _, _ | _, ArrayElem _ -> false
+            | IRTScalar fe, IRTScalar le -> promoteElemType fe le = Some fe
+            // Not determined here, or a shape this walk does not model.
+            | _ -> true
+    // Same two stand-downs as `firstArgRankClash`, for the same reasons: a
+    // variadic `Poly<T^r>` pack makes positional pairing meaningless
+    // (monomorphization owns those calls), and under-application is an arity
+    // error whose own message must not be buried.
+    let isVariadic = paramTys |> List.exists (fun t -> (subst.Resolve t).IsIRTPoly)
+    if isVariadic || argTys.Length < paramTys.Length then None
+    else
+        // What each argument position teaches, in `unifyParamWithArg`'s walk
+        // order -- but KEEPING every teaching instead of the first, because
+        // the discarded ones ARE the defect.
+        let teachings = System.Collections.Generic.List<int * int * IRType>()
+        let rec learn (pos: int) (pTy: IRType) (aTy: IRType) =
+            match subst.Resolve pTy, subst.Resolve aTy with
+            | IRTInfer n, t -> teachings.Add((n, pos, t))
+            | ArrayElem pa, ArrayElem aa -> learn pos pa.ElemType aa.ElemType
+            | IRTTuple pts, IRTTuple ats when pts.Length = ats.Length ->
+                List.zip pts ats |> List.iter (fun (p, a) -> learn pos p a)
+            | IRTUnitAnnotated (pi, _), _ -> learn pos pi aTy
+            | _, IRTUnitAnnotated (ai, _) -> learn pos pTy ai
+            | IRTIdxTagged (pi, _), IRTIdxTagged (ai, _) -> learn pos pi ai
+            | _ -> ()
+        appArgPairs paramTys argTys |> List.iter (fun (i, pTy, aTy) -> learn i pTy aTy)
+        let seen = System.Collections.Generic.Dictionary<int, int * IRType>()
+        teachings
+        |> Seq.tryPick (fun (varId, pos, ty) ->
+            match subst.Resolve ty with
+            // An argument whose own type is still open teaches nothing: it
+            // cannot conflict, and pinning it here would be a guess.
+            | IRTInfer _ -> None
+            | resolved ->
+                match seen.TryGetValue varId with
+                | true, (firstPos, firstTy) ->
+                    if compatible firstTy resolved then None
+                    else Some (firstPos, pos, firstTy, resolved)
+                | _ ->
+                    seen.[varId] <- (pos, resolved)
+                    None)
+
+/// The message for a `firstAbstractVarConflict` verdict. Lives beside the
+/// predicate so the eager seam (`dispatchAppOrIndex`) and the post-zonk sweep
+/// (`collectAppRankErrors`) cannot word the same refusal two ways. Routed
+/// through `Other` (BL3999), the channel the sibling caret-arity refusal
+/// already uses -- this is the same family of judgement about what a `T^k`
+/// annotation claims.
+let abstractVarConflictMessage (subst: Subst) (callee: string)
+                               (firstPos: int) (conflictPos: int)
+                               (firstTy: IRType) (conflictTy: IRType) : string =
+    let rankOf t = concreteRankOf subst t |> Option.defaultValue -1
+    let r1 = rankOf firstTy
+    let r2 = rankOf conflictTy
+    let tail =
+        if r1 >= 1 && r2 >= 1 then
+            "two arrays of different ranks share no iteration space, so nothing here can deduce the "
+            + "output rank -- reshape one of them, or spell the iteration you want with "
+            + "`method_for(...) <@> ...`."
+        elif r1 >= 1 || r2 >= 1 then
+            "a scalar BROADCASTS across a rank-0 parameter list -- `f(A, 2.0)` iterates A and lifts the "
+            + "scalar, exactly as `atan2(A, 2.0)` does -- but a `T^k` parameter with k >= 1 is an ARRAY "
+            + "by declaration, so a scalar in that position is the wrong shape. Pass an array of the "
+            + "declared rank, drop the caret where the value is an element, or give that parameter its "
+            + "own concrete type (`b: Float`)."
+        else
+            "the specialization is built from the FIRST argument's type, so a later argument that would "
+            + "have to NARROW into it is refused -- widen the earlier argument, or cast at the call site."
+    $"arguments {firstPos + 1} and {conflictPos + 1} of {callee} disagree about the same abstract "
+    + $"parameter: the signature spells ONE type variable in both positions, and argument "
+    + $"{firstPos + 1} makes it {(ppIRType (subst.Resolve firstTy))} while argument {conflictPos + 1} "
+    + $"makes it {(ppIRType (subst.Resolve conflictTy))}. " + tail
 
 /// The element-CLASS comparison, the twin of `firstArgRankClash` over the
 /// same pairs: the first position whose two classes are both known and
@@ -1960,12 +2188,42 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
                 else
                     Ok (mkTyped (TExprIndex (tFunc, tArgs, identity))
                                 (mkArrayLike { arrTy with IndexTypes = finalSlots }))
-            elif tArgs.Length = arrTy.IndexTypes.Length then
-                Ok (mkTyped (TExprIndex (tFunc, tArgs, identity)) arrTy.ElemType)
             else
-                let remaining = arrTy.IndexTypes |> List.skip tArgs.Length
-                Ok (mkTyped (TExprIndex (tFunc, tArgs, identity))
-                            (mkArrayLike { arrTy with IndexTypes = remaining })))))
+                // COORDINATES, NOT RECORDS. A compact group (`SymIdx<2, n>`,
+                // AntisymIdx, HermitianIdx) is ONE record spanning `Rank`
+                // coordinates, so the supplied count is walked through the
+                // records in flat coordinate order rather than one per
+                // record: `S(1)` over a rank-2 symmetric result used to count
+                // one argument against one record and answer "scalar", and
+                // the emitted `double x = S[1L]` was a row pointer. A count
+                // that lands INSIDE a group has no residual class (the same
+                // refusal the wildcard arm above gives); one that lands on a
+                // record boundary keeps the records after it as the view.
+                let rec walk (coords: int) (recs: IRIndexType list) : Result<IRIndexType list, IRIndexType> =
+                    match recs with
+                    | [] -> Ok []
+                    | _ when coords = 0 -> Ok recs
+                    | ix :: rest ->
+                        let compact =
+                            ix.Rank >= 2 &&
+                            (match ix.Symmetry with
+                             | SymSymmetric | SymAntisymmetric | SymHermitian -> true
+                             | SymNone | SymWreath -> false)
+                        // Only a compact group spans several coordinates
+                        // here; every other record keeps the one-argument-
+                        // per-record accounting it always had (wreath
+                        // partial reads are refused by their own arm above).
+                        let span = if compact then ix.Rank else 1
+                        if coords >= span then walk (coords - span) rest
+                        else Error ix
+                match walk tArgs.Length arrTy.IndexTypes with
+                | Error ix ->
+                    Error (Other (sprintf "a partial read of a compact (SymIdx / AntisymIdx / HermitianIdx) group has no residual class: %d coordinate(s) were supplied but the group spans %d. Supply every coordinate of the group, or decompact(A, d) first and read the freed axis there." tArgs.Length ix.Rank))
+                | Ok [] ->
+                    Ok (mkTyped (TExprIndex (tFunc, tArgs, identity)) arrTy.ElemType)
+                | Ok remaining ->
+                    Ok (mkTyped (TExprIndex (tFunc, tArgs, identity))
+                                (mkArrayLike { arrTy with IndexTypes = remaining })))))
     | FuncElem (paramTys, retTy) ->
         // WIDTH SCHEMA first, so every check below (and the arity accounting,
         // and the emitted TExprApp) sees the regrouped list: `g(b, c)` against
@@ -2142,6 +2400,18 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
         let isVariadic =
             paramTys |> List.exists (fun t -> (env.Subst.Resolve t).IsIRTPoly)
         let argRankClash = firstArgRankClash env.Subst paramTys (tArgs |> List.map (_.Type))
+        // The callee NAME through the application spine, plus how many arguments
+        // earlier groups already consumed -- which is what turns a DECLARED
+        // parameter position into a position in THIS group, so a curried
+        // `f(a)(b)` reaches the check too. Shared by the two checks that read a
+        // name-keyed table of the callee's declaration: mutClash (write
+        // permission) and coIterClash (co-iteration extent agreement).
+        let rec appRootAndOffset (t: TypedExpr) : (string * int) option =
+            match t.Kind with
+            | TExprVar (name, _, _) -> Some (name, 0)
+            | TExprApp (f, args) ->
+                appRootAndOffset f |> Option.map (fun (n, off) -> (n, off + List.length args))
+            | _ -> None
         // mutClash (BL4005) - WRITE PERMISSION, the one check here about the
         // caller's binding form rather than its type. A `mut` parameter writes
         // back into the caller's array, so the caller must hold write access
@@ -2164,12 +2434,6 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
         // needed. `__`-prefixed callees and arguments are exempt (synthesized
         // buffers, e.g. grad()'s out-buffer ABI).
         let mutClash =
-            let rec appRootAndOffset (t: TypedExpr) : (string * int) option =
-                match t.Kind with
-                | TExprVar (name, _, _) -> Some (name, 0)
-                | TExprApp (f, args) ->
-                    appRootAndOffset f |> Option.map (fun (n, off) -> (n, off + List.length args))
-                | _ -> None
             match appRootAndOffset tFunc with
             | Some (fname, offset) when not (fname.StartsWith "__") ->
                 (match env.MutParamPositions.TryGetValue fname with
@@ -2226,6 +2490,77 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
                         | Some pe, Some ae when pe <> ae -> Some (i, d, pe, ae)
                         | _ -> None)
                 | _ -> None)
+        // coIterClash (BL3016) - the CALL-SITE half of the zip agreement
+        // obligation, and the second memory error on this ladder.
+        //
+        // `TypeLower.zipHeadClash` refuses a mismatched zip at the zip, but
+        // only literal-vs-literal. A callee whose parameters are abstract
+        // (`T^1`) has no extents there, so `zip(a, b)` was accepted
+        // unconditionally -- and the co-iteration nest bounds EVERY level by
+        // operand 1 while every operand peels at every level (IRStorage), so
+        // the longer argument's extent is walked over the shorter one's
+        // storage. `addup(q6, p3)` on such a body returned a number computed
+        // from three doubles past the end of `p`.
+        //
+        // The callee's body is invisible here, so the obligation rides
+        // `FuncCoIterObligations` (checkFunctionDecl). Literal-vs-literal only, on
+        // the SHARED (leading) axis, matching every sibling extent check on
+        // this ladder: a symbolic extent reads `.extents[d]` at runtime and
+        // keeps the historical looseness.
+        let coIterClash =
+            match appRootAndOffset tFunc with
+            | Some (fname, offset) ->
+                (match env.FuncCoIterObligations.TryGetValue fname with
+                 | true, obs ->
+                     // THE WHOLE APPLICATION SPINE. When a multi-group
+                     // application reaches this seam as `TExprApp(TExprApp(f,
+                     // [a]), [b])`, the obligation relates a position in the
+                     // EARLIER group to one in this group, and rebasing the
+                     // positions into this group alone dropped the earlier
+                     // arguments. The earlier arguments are recovered from the
+                     // spine and declared positions index the flattened list.
+                     // NOTE the surface curried call `f(a)(b)` does NOT arrive
+                     // this way: the partial application `f(a)` is desugared
+                     // to a lambda before this seam, and inside it `b`'s slot
+                     // is still an open parameter, so -- like the let-bound
+                     // `let h = f(a); h(b)` -- it is the runtime guard's
+                     // (BL8011, functions/128 and /131).
+                     let rec spineArgs (t: TypedExpr) : TypedExpr list =
+                         match t.Kind with
+                         | TExprApp (f, args) -> spineArgs f @ args
+                         | _ -> []
+                     let allArgs = spineArgs tFunc @ tArgs
+                     // Leading-axis extent of an argument, when it is a literal.
+                     let leadExtent (i: int) =
+                         match env.Subst.Resolve (List.item i allArgs).Type with
+                         | ArrayElem aa ->
+                             aa.IndexTypes |> List.tryHead |> Option.bind (fun ix -> tryEvalIntIR ix.Extent)
+                         | _ -> None
+                     // The span to blame is an argument of THIS group; a
+                     // clash partner in an earlier group is named by its
+                     // declared position in the message only.
+                     let hereIdx (declPos: int) = max 0 (declPos - offset)
+                     obs |> List.tryPick (fun (ps, lits) ->
+                         let known =
+                             ps |> List.filter (fun declPos -> declPos >= 0 && declPos < allArgs.Length)
+                                |> List.choose (fun i -> leadExtent i |> Option.map (fun e -> (i, e)))
+                         match known with
+                         | [] -> None
+                         | (i0, e0) :: rest ->
+                             // Argument vs ARGUMENT first: both sides can be
+                             // named as call-site positions, which is the more
+                             // actionable report.
+                             match rest |> List.tryFind (fun (_, e) -> e <> e0) with
+                             | Some (j, ej) -> Some (hereIdx j, fname, i0 + 1, Some (j + 1), e0, ej)
+                             | None ->
+                                 // Then argument vs a literal extent the BODY
+                                 // fixes (a parameter zipped with a concrete
+                                 // array), which has no second position.
+                                 match lits |> List.tryFind (fun l -> l <> e0) with
+                                 | Some l -> Some (hereIdx i0, fname, i0 + 1, None, e0, l)
+                                 | None -> None)
+                 | _ -> None)
+            | None -> None
         // Consumed ahead of the type clashes: a write-permission violation is
         // about the caller's BINDING FORM, so it stands whatever the types do,
         // and reporting it first keeps a `let` that also needs a cast from
@@ -2258,20 +2593,32 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
                                     ppIRType (env.Subst.Resolve pTy),
                                     ppIRType (env.Subst.Resolve aTy)))
         | None, None, None, None ->
-            // The FIFTH check, last because every one above it names the
+            // The FIFTH check: the ABSTRACT-PARAMETER conflict. Ahead of the
+            // element-class one because it is the only check here that can
+            // see an OPEN parameter at all -- every other check on this
+            // ladder stands down on an unresolved `T^k`, which is precisely
+            // how these calls used to reach g++ unjudged. See
+            // firstAbstractVarConflict.
+            let calleeDesc =
+                match tFunc.Kind with
+                | TExprVar (name, _, _) -> $"'{name}'"
+                | _ -> "this function"
+            match firstAbstractVarConflict env.Subst paramTys (tArgs |> List.map (_.Type)) with
+            | Some (firstPos, conflictPos, firstTy, conflictTy) ->
+                atArg conflictPos
+                Error (Other (abstractVarConflictMessage env.Subst calleeDesc
+                                                         firstPos conflictPos firstTy conflictTy))
+            | None ->
+            // The SIXTH check, last because every one above it names the
             // defect more precisely: element CLASS. See firstArgTypeClash.
             match firstArgTypeClash env.Subst paramTys (tArgs |> List.map (_.Type)) with
             | Some (i, pTy, aTy) ->
                 atArg i
-                let callee =
-                    match tFunc.Kind with
-                    | TExprVar (name, _, _) -> $"'{name}'"
-                    | _ -> "this function"
-                Error (ArgTypeMismatch (i + 1, callee,
+                Error (ArgTypeMismatch (i + 1, calleeDesc,
                                         ppIRType (env.Subst.Resolve pTy),
                                         ppIRType (env.Subst.Resolve aTy)))
             | None ->
-            // The SIXTH check, after element class because a wrong-class
+            // The SEVENTH check, after element class because a wrong-class
             // argument that is also the wrong length should be reported as
             // the class error. See `extentClash` above for why this one is a
             // memory error rather than a typing disagreement.
@@ -2279,6 +2626,20 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
             | Some (i, d, pe, ae) ->
                 atArg i
                 Error (ExtentArgMismatch (i + 1, d + 1, pe, ae))
+            | None ->
+            // The EIGHTH check, after the param-vs-arg extent one because that
+            // is the more local story: an argument disagreeing with its own
+            // parameter's declared extent should be told about the parameter,
+            // not about the OTHER argument it is co-iterated with. Blamed on
+            // the second (shorter or longer) argument, since the walk takes its
+            // bound from the first.
+            match coIterClash with
+            | Some (i, fname, posA, Some posB, eA, eB) ->
+                atArg i
+                Error (CoIterArgExtentMismatch (fname, posA, posB, eA, eB))
+            | Some (i, fname, posA, None, eA, bodyExt) ->
+                atArg i
+                Error (CoIterBodyExtentMismatch (fname, posA, eA, bodyExt))
             | None ->
             // Rank propagation (the INFERENCE half of argRankClash's
             // CHECKING): impose the callee param's rank as a LOWER BOUND on
@@ -2367,6 +2728,7 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprSequence es -> es
         | TExprJoin (es, _) -> es
         | TExprComplexLit (re, im) -> [re; im]
+        | TExprFma (a, b, c) -> [a; b; c]
         | TExprMethodFor info -> info.Arrays
         | TExprObjectFor info -> [info.Kernel]
         | TExprApply info -> info.Loop :: info.Kernel :: info.Arrays
@@ -2376,10 +2738,9 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprFunctorMap (f, c) -> [f; c]
         | TExprCompose (_, l, r) -> [l; r]
         | TExprDotDot (lo, hi) -> [lo; hi]
-        | TExprBlocked (_, bs) -> [bs]
         | TExprPure e | TExprCompute e | TExprRead e | TExprFillRandom e | TExprRank e
         | TExprExtents e | TExprReynolds (e, _) -> [e]
-        | TExprRandGen (_, key, pars, weights, _) -> (key :: pars) @ (weights |> Option.map fst |> Option.toList)
+        | TExprRandGen (_, key, pars, weights, address, _) -> (key :: pars) @ (address |> Option.map (fun (s, o) -> [s; o]) |> Option.defaultValue []) @ (weights |> Option.map fst |> Option.toList)
         | TExprGuard (c, b) -> [c; b]
         | TExprMask (a, p) | TExprIntersect (a, p) | TExprUnion (a, p)
         | TExprGroupBy (a, p) | TExprSort (a, p)
@@ -2390,18 +2751,26 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
         | TExprTranspose (a, _, _) -> [a]
         | TExprDecompact (a, _) -> [a]
         | TExprGram (l, r, _) -> [l; r]
+        | TExprGramApply (l, r, x) -> [l; r; x]
         | TExprMatmul (l, r) -> [l; r]
         | TExprEigh a -> [a]
+        | TExprLu a -> [a]
+        | TExprLuSolve (l, p, b, _) -> [l; p; b]
         | TExprSolve (a, b) -> [a; b]
         | TExprArrayNegate a -> [a]
         | TExprArrayConjugate a -> [a]
         | TExprContains (a, v) -> [a; v]
-        | TExprDisplayEmit (_, _, d, _) -> [d]
+        | TExprDisplayEmit (_, _, d, _, idOpt) -> d :: Option.toList idOpt
         | TExprDisplayJson (_, d) -> [d]
         | TExprDisplayNum d -> [d]
         | TExprDisplayStr d -> [d]
         | TExprGroupKeys keys -> keys
         | TExprGroupBucket gk -> [gk]
+        | TExprSegments _ -> []
+        | TExprUngroup (g, _) -> [g]
+        | TExprUngroupRows (rows, _, _) -> rows
+        | TExprSegmentsGrid _ -> []
+        | TExprUngroupGrid (g, _, _) -> [g]
         | TExprStruct (_, fields) -> fields |> List.map snd
         | TExprIndex (arr, idxs, _) -> arr :: idxs
         | TExprBlock (stmts, final) ->
@@ -2414,7 +2783,8 @@ let typedExprChildren (expr: TypedExpr) : TypedExpr list =
                     lo :: hi :: (body |> List.collect stmtExprsOf)
             (stmts |> List.collect stmtExprsOf) @ Option.toList final
         | TExprAssign (l, r) -> [l; r]
-        | TExprConstraintCheck (c, _) -> [c]
+        | TExprConstraintCheck (c, _, _) -> [c]
+        | TExprBreakIf c -> [c]
         | TExprReplicate (c, b) -> [c; b]
         | TExprAlign (es, _) -> es
         | TExprPartialApp (_, a, _) -> [a]
@@ -2493,6 +2863,123 @@ let checkOmpInternalLoop (env: TypeEnv) (paramNames: string list)
                 emitWarning env "BL4001" sp
                     ($"omp({v}: ...) on {owner} licenses the CALLER's iteration over `{v}` (the S-dims an argument contributes when this is used as a kernel), not the loop over `{v}` built inside this body. That loop is licensed by a clause on its OWN kernel -- write `{v} <@> lambda(..) where omp(..) -> ..`. As written the inner loop is emitted SERIAL.")
             | None -> ())
+
+/// The co-iterations this body performs over its own PARAMETERS: the agreement
+/// obligation a zip carries when an operand is an abstract parameter and there
+/// is nothing at the zip to compare. Recorded in
+/// `TypeEnv.FuncCoIterObligations`, discharged on the call-site ladder by
+/// `CoIterArgExtentMismatch` (two arguments disagree) or
+/// `CoIterBodyExtentMismatch` (an argument disagrees with a literal the body
+/// fixes).
+///
+/// `TypeLower.zipHeadClash` already refuses a mismatched zip -- but only
+/// LITERAL vs LITERAL. A body over `T^1` parameters has no extents there, so
+/// `zip(a, b)` was accepted unconditionally and the nest (bounded by operand 1,
+/// every operand peeled at every level -- IRStorage's co-iteration arm) walked
+/// the longer argument's extent over the shorter one's storage.
+///
+/// Two sources, unioned:
+///   * a zip DIRECTLY over parameters. That is the `TExprMethodFor` node with
+///     non-empty SharedIndexTypes, which every co-iterating surface form
+///     resynthesizes to (`zip(a, b) <@> k`, `method_for(zip(a, b))`, `a + b`).
+///   * a CALL to an ALREADY-obligated function passing this body's own
+///     parameters into its obligated positions, so the obligation travels up a
+///     forwarding chain (`outer(x, y) = addup(x, y)` inherits addup's). One
+///     forward pass suffices: a body sees only names bound before it, and
+///     mutual recursion is rejected (BL2001).
+///
+/// Each entry is (parameter positions walked, literal leading extents of the
+/// co-iteration's other operands): all of those must end up equal. An entry
+/// needs at least one PARAMETER -- nothing else defers to the call site -- and
+/// a second operand to disagree with, so `zip(a, a)` records nothing (it agrees
+/// with itself). Both rules make this under-report rather than over-report: a
+/// missed obligation is the status quo, an invented one is a false refusal.
+let coIterObligations (env: TypeEnv) (paramNames: string list)
+                      (body: TypedExpr) : (int list * int64 list) list =
+    let posOf (e: TypedExpr) =
+        match e.Kind with
+        | TExprVar (n, _, _) -> List.tryFindIndex ((=) n) paramNames
+        | _ -> None
+    let litExtentOfType (t: IRType) =
+        match env.Subst.Resolve t with
+        | ArrayElem aa -> aa.IndexTypes |> List.tryHead |> Option.bind (fun ix -> tryEvalIntIR ix.Extent)
+        | _ -> None
+    // The obligation is "the walk takes its bound from OPERAND 1, so a shorter
+    // later operand is read past its end". That is true of a zip, where
+    // `zipSharedRecords` returns operand 1's OWN head record -- and false of
+    // `for (A, B) in range<I>`, which shares the RANGE's records and is bounded
+    // by the range: a 6-array passed there is walked 3 wide and merely has its
+    // tail ignored, which is a different question (and memory-safe). Both
+    // shapes build the same node, so tell them apart by whether the shared head
+    // IS operand 1's head; claiming an out-of-bounds read for the range form
+    // would be a refusal whose stated reason is untrue.
+    let boundByFirstOperand (mfi: TypedMethodForInfo) =
+        match mfi.SharedIndexTypes, mfi.ArrayTypes with
+        | shared :: _, at0 :: _ ->
+            (match at0.IndexTypes with
+             | h0 :: _ -> h0.Id = shared.Id
+             | [] -> false)
+        | _ -> false
+    // One co-iteration, split into the PARAMETER positions it walks and the
+    // literal leading extents of its other operands. A parameter zipped against
+    // a CONCRETE array is the same hole with one side already known --
+    // `function wsum(a: T^1) = reduce(zip(a, weights3) <@> (*), (+))` walked
+    // `a`'s extent over `weights3` and summed three doubles past its end -- so
+    // the body's own literals travel with the obligation.
+    let obligationOf (operands: TypedExpr list) (types: IRArrayType list) =
+        if List.length operands <> List.length types then None else
+        let ps = operands |> List.choose posOf |> List.distinct |> List.sort
+        let lits =
+            List.zip operands types
+            |> List.choose (fun (o, t) ->
+                match posOf o with
+                // A parameter has nothing concrete here -- that is the whole
+                // point; it is what defers to the call site.
+                | Some _ -> None
+                | None -> t.IndexTypes |> List.tryHead |> Option.bind (fun ix -> tryEvalIntIR ix.Extent))
+            |> List.distinct
+        // Needs a PARAMETER (nothing else defers) and a second walked operand
+        // for it to disagree with. `zip(a, a)` gives one position and no
+        // literal, and agrees with itself.
+        if List.isEmpty ps || List.length ps + List.length lits < 2 then None
+        else Some (ps, lits)
+    let atNode (e: TypedExpr) =
+        match e.Kind with
+        | TExprMethodFor mfi when not (List.isEmpty mfi.SharedIndexTypes)
+                                  && mfi.Arrays.Length >= 2
+                                  && boundByFirstOperand mfi ->
+            obligationOf mfi.Arrays mfi.ArrayTypes |> Option.toList
+        // Forwarding. Only the DIRECT `f(a, b)` head is read: a curried head
+        // would need the declared position rebased by the earlier groups'
+        // width (mutClash's appRootAndOffset), and guessing it wrong would
+        // blame the wrong argument. Missing it just leaves the status quo.
+        | TExprApp (f, args) ->
+            (match f.Kind with
+             | TExprVar (callee, _, _) ->
+                 (match env.FuncCoIterObligations.TryGetValue callee with
+                  | true, obs ->
+                      obs |> List.choose (fun (ps, lits) ->
+                          let mapped = ps |> List.choose (fun k -> List.tryItem k args)
+                          // An argument that is one of OUR parameters keeps
+                          // deferring; one whose extent is already concrete
+                          // DISCHARGES into a literal every other operand of
+                          // that co-iteration must match.
+                          let ps' = mapped |> List.choose posOf |> List.distinct |> List.sort
+                          let lits' =
+                              mapped
+                              |> List.choose (fun a ->
+                                  match posOf a with
+                                  | Some _ -> None
+                                  | None -> litExtentOfType a.Type)
+                          let allLits = (lits @ lits') |> List.distinct
+                          if List.isEmpty ps' || List.length ps' + List.length allLits < 2 then None
+                          else Some (ps', allLits))
+                  | _ -> [])
+             | _ -> [])
+        | _ -> []
+    let rec walk (e: TypedExpr) =
+        atNode e @ (typedExprChildren e |> List.collect walk)
+    walk body |> List.distinct
 
 /// True if any node in the typed subtree still has an UNRESOLVED type (an
 /// inference variable, possibly under a unit-annotation wrapper).
@@ -2614,6 +3101,61 @@ let isUnaryIntrinsic (name: string) : bool =
 /// would eta-expand to a one-parameter lambda and then fail arity inside its
 /// own body. The canonical list lives in Grad.fs beside the adjoint rules.
 let isBinaryIntrinsic (name: string) : bool = Blade.Grad.isBinaryMathIntrinsic name
+
+/// Conservative effect summary of a TYPED body (Blade.Effects; plan-fortran-
+/// killer-2.md section 3 step 3). Every node contributes its OWN effect and
+/// the join of its children's, over `typedExprChildren` (exhaustive over the
+/// typed grammar, so no node's subtree is skipped):
+///
+///   - a call's head, peeled through a curried spine, is a declared function
+///     (FuncEffects by binder id; the function being summarized reads as pure
+///     for its own recursive calls -- assume-guarantee, sound for a join
+///     lattice), a directly applied lambda (its body), or anything else --
+///     a lambda-valued variable, a higher-order parameter, a qualified name
+///     -- which is Unknown. Intrinsic calls never reach here as TExprApp: the
+///     checker rewrites them to TExprUnaryOp / TExprBinOp / TExprFma.
+///   - an apply combinator's kernel is called per cell, so it contributes
+///     like a call head (its lambda body is also a child).
+///   - assignment statements and expressions: Mutates. Display nodes:
+///     EmitsOutput. A provider read: ReadsExternal.
+///   - MayFail: indexing (BL8006), reduce (BL8003), solve/eigh (BL8007),
+///     match (BL8002), constraint checks and guards (BL8001), lgamma/digamma
+///     (BL8008). Honest rather than useful: nearly every array body may
+///     fail, which is why REPEATABLE admits it and MOVABLE does not.
+let effectsOfBody (env: TypeEnv) (selfId: IRId option) (body: TypedExpr) : Blade.Effects.EffectSummary =
+    let rec stmtMutates (s: TypedStmt) : bool =
+        match s with
+        | TStmtAssign _ -> true
+        | TStmtForIn (_, _, _, _, inner) -> inner |> List.exists stmtMutates
+        | TStmtLet _ | TStmtExpr _ -> false
+    let rec calleeSummary (head: TypedExpr) : Blade.Effects.EffectSummary =
+        match head.Kind with
+        | TExprApp (f, _) -> calleeSummary f
+        | TExprVar (_, vid, _) when selfId = Some vid -> Blade.Effects.noEffects
+        | TExprVar (_, vid, _) when env.DeclaredFuncIds.Contains vid ->
+            (match env.FuncEffects.TryGetValue vid with
+             | true, s -> s
+             | _ -> Blade.Effects.unknown)
+        | TExprLambda info -> go info.Body
+        | _ -> Blade.Effects.unknown
+    and go (e: TypedExpr) : Blade.Effects.EffectSummary =
+        let own =
+            match e.Kind with
+            | TExprApp (f, _) -> calleeSummary f
+            | TExprApply info -> calleeSummary info.Kernel
+            | TExprObjectFor info -> calleeSummary info.Kernel
+            | TExprAssign _ -> Blade.Effects.mutates
+            | TExprBlock (stmts, _) when stmts |> List.exists stmtMutates -> Blade.Effects.mutates
+            | TExprDisplayEmit _ | TExprDisplayJson _ | TExprDisplayNum _ | TExprDisplayStr _ ->
+                Blade.Effects.emitsOutput
+            | TExprRead _ -> Blade.Effects.readsExternal
+            | TExprUnaryOp (OpMath ("lgamma" | "digamma"), _) -> Blade.Effects.mayFail
+            | TExprIndex _ | TExprTupleIndex _ | TExprReduce _ | TExprSolve _ | TExprEigh _
+            | TExprLu _ | TExprLuSolve _
+            | TExprMatch _ | TExprConstraintCheck _ | TExprGuard _ -> Blade.Effects.mayFail
+            | _ -> Blade.Effects.noEffects
+        typedExprChildren e |> List.fold (fun acc c -> Blade.Effects.join acc (go c)) own
+    go body
 
 /// Rejection message shared by the two orientations of the same unimplemented
 /// shape: a `zip(...)` sitting beside other arrays in ONE operand pack
@@ -2889,34 +3431,63 @@ let rec internal unitAnnoError (env: TypeEnv) (ty: TypeExpr) : TypeError option 
 /// defaults, full-arity in declared order, fewer than required args, or a
 /// `_` placeholder -- partial application owns those); Some (Error e) when
 /// routing itself is invalid.
+/// The binding identity of every free name a parameter-default list reads in
+/// the scope it is DECLARED in: free name -> VarId. Recorded next to
+/// `FuncDefaults` (TypeEnv.FuncDefaultCaptures) so `tryFillDefaultArgs` can
+/// refuse a splice whose call site binds one of those names differently.
+/// The callable's own parameters are excluded -- a default may read the
+/// REQUIRED ones, and those are bound by the splice itself -- and a name with
+/// no binding here (an intrinsic, a function registered outside `Variables`)
+/// records nothing, so it is never checked.
+let internal defaultCaptureIdentities (env: TypeEnv) (parms: (string * Expr option) list) : Map<string, IRId> =
+    let own = parms |> List.map fst |> Set.ofList
+    parms
+    |> List.choose snd
+    |> List.map (collectFreeVars own)
+    |> List.fold Set.union Set.empty
+    |> Set.toList
+    |> List.choose (fun n ->
+        match Map.tryFind n env.Variables with
+        | Some vi -> Some (n, vi.VarId)
+        | None -> None)
+    |> Map.ofList
+
 let internal tryFillDefaultArgs (env: TypeEnv) (callSpan: Span) (func: Expr) (args: Expr list) : TypeResult<Expr> option =
     let calleeName =
         match func.Kind with
         | ExprKind.ExprVar n -> n
         | ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, fname) -> alias + "." + fname
         | _ -> "lambda"
+    // (lookup key, param infos). FuncDefaultCaptures is consulted under the
+    // same key, so the two tables cannot disagree about which declaration a
+    // call resolved to.
     let paramInfos =
         match func.Kind with
         | ExprKind.ExprVar name ->
             (match env.FuncDefaults.TryGetValue name with
-             | true, ps -> Some ps
+             | true, ps -> Some (name, ps)
              | _ -> None)
-        // Module-QUALIFIED callee (`plot.contourf(...)`): declarations inside
-        // an imported module registered their defaults under the BARE
-        // function name (checkFunctionDecl runs inside that module), so the
-        // field name is the lookup key. Shares FuncDefaults' documented
-        // name-keyed shadowing weakness.
-        | ExprKind.ExprField ({ Kind = ExprKind.ExprVar _ }, fname) ->
-            (match env.FuncDefaults.TryGetValue fname with
-             | true, ps -> Some ps
-             | _ -> None)
+        // Module-QUALIFIED callee (`a.f(...)`): a qualified import registers
+        // the module's defaults under `alias.name` (checkDecl's DeclImport
+        // arm), consulted FIRST -- two imported modules each declaring `f`
+        // with different defaults used to share one bare-name entry, and
+        // both calls got whichever module was checked last. The bare field
+        // name stays as the fallback for callees with no module export
+        // behind them (a provider alias, a let-bound lambda).
+        | ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, fname) ->
+            (match env.FuncDefaults.TryGetValue (alias + "." + fname) with
+             | true, ps -> Some (alias + "." + fname, ps)
+             | _ ->
+                 match env.FuncDefaults.TryGetValue fname with
+                 | true, ps -> Some (fname, ps)
+                 | _ -> None)
         // Immediately-applied lambda literal: its params are right here.
         | ExprKind.ExprLambda (parms, _, _) when parms |> List.exists (_.Default.IsSome) ->
-            Some (parms |> List.map (fun p -> (p.Name, p.Type, p.Default)))
+            Some ("lambda", parms |> List.map (fun p -> (p.Name, p.Type, p.Default)))
         | _ -> None
     match paramInfos with
     | None -> None
-    | Some ps ->
+    | Some (defaultsKey, ps) ->
         let total = ps.Length
         let required = ps |> List.takeWhile (fun (_, _, d) -> Option.isNone d) |> List.length
         let k = args.Length
@@ -3032,6 +3603,33 @@ let internal tryFillDefaultArgs (env: TypeEnv) (callSpan: Span) (func: Expr) (ar
         let fills = slotExprsAndFills |> List.filter snd |> List.map fst
         let requiredArgs = args |> List.truncate required
         let requiredNames = ps |> List.truncate required |> List.map (fun (n, _, _) -> n)
+        // DECLARATION-SITE MEANING. A filled default is re-inferred HERE, so
+        // a free name it reads resolves in the caller's scope. That is only
+        // the declaration's meaning when the caller binds that name to the
+        // SAME thing; a caller parameter or local of the same spelling
+        // (`function g(k) = f()` against `function f(x = k)`) is a different
+        // binding, and the splice used to read it silently. Identities were
+        // recorded when the callable was declared (FuncDefaultCaptures);
+        // required-parameter references are the splice's own business and
+        // are excluded, exactly as the recording excluded them.
+        let shadowed =
+            match env.FuncDefaultCaptures.TryGetValue defaultsKey with
+            | true, captures when not (Map.isEmpty captures) ->
+                List.zip trailingSlots slotAssign
+                |> List.tryPick (fun ((slotName, _, dflt), assigned) ->
+                    match assigned, dflt with
+                    | None, Some d ->
+                        collectFreeVars (Set.ofList requiredNames) d
+                        |> Set.toList
+                        |> List.tryPick (fun n ->
+                            match Map.tryFind n captures, Map.tryFind n env.Variables with
+                            | Some declId, Some vi when vi.VarId <> declId -> Some (slotName, n)
+                            | _ -> None)
+                    | _ -> None)
+            | _ -> None
+        match shadowed with
+        | Some (slotName, n) -> Some (Error (DefaultParamShadowed (calleeName, slotName, n)))
+        | None ->
         // Only fills can reference params, and only REQUIRED ones (scope rule).
         let referencedNames =
             let free =
@@ -3084,9 +3682,11 @@ let internal tryFlattenFactoryChain (env: TypeEnv) (func: Expr) (args: Expr list
         let isDefaultsCallee =
             match baseFn.Kind with
             | ExprKind.ExprVar name -> env.FuncDefaults.ContainsKey name
-            // Module-qualified base (`plot.contourf(...)(...)`): defaults are
-            // registered under the bare name (see tryFillDefaultArgs).
-            | ExprKind.ExprField ({ Kind = ExprKind.ExprVar _ }, fname) -> env.FuncDefaults.ContainsKey fname
+            // Module-qualified base (`plot.contourf(...)(...)`): the
+            // `alias.name` entry a qualified import registers, else the bare
+            // name (see tryFillDefaultArgs).
+            | ExprKind.ExprField ({ Kind = ExprKind.ExprVar alias }, fname) ->
+                env.FuncDefaults.ContainsKey (alias + "." + fname) || env.FuncDefaults.ContainsKey fname
             | _ -> false
         if not isDefaultsCallee then None
         else

@@ -1,0 +1,5 @@
+// TEST: A Chunk Edge Outside 1..N Is Refused (rejects)
+// ERROR: BL3999
+// ERROR-CONTAINS: chunk edge must be between 1 and the axis extent 10
+type I = Idx<10>
+type CI = Chunked<I, 0>

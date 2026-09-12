@@ -1,0 +1,8 @@
+// TEST: Where Repro With Cuda (rejects)
+// ============================================================================
+// A device kernel's contraction and rounding are the GPU's own; the
+// reproducibility demand cannot be discharged there. Order-independent
+// (checked at the end of the clause), so `cuda, repro` refuses identically.
+
+function f(a: Float64) where repro, cuda = a * 2.0
+// ERROR-CONTAINS: `repro` cannot be combined with `cuda`

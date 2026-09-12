@@ -1,0 +1,15 @@
+// TEST: Comm licensed on Hermitian sum kernel
+// `x * conj(y) + conj(x) * y` is z + conj(z): the swap image of each
+// addend is the OTHER one with its factors commuted, so the mirror rule's
+// commutative cross-match proves the whole body PInv -- genuinely
+// symmetric (and always real-valued), NOT merely PConj. Declared comm is
+// licensed and the identity mirror is correct: s(1, 0) reads the stored
+// (22, 0) and that IS the truth. Guards the cross-matched mirror arm: a
+// positionwise-only comparison would deduce PConj here and wrongly refuse
+// a sound, useful kernel (twice the real part of the Hermitian product).
+let A: Array<Complex128 like Idx<2>> = [complex(1.0, 2.0), complex(3.0, 4.0)]
+let s = method_for(A, A) <@> lambda(x, y) where comm(x, y) -> x * conj(y) + conj(x) * y |> compute
+let s01 = s(0, 1)
+let s10 = s(1, 0)
+// EXPECT: s01 = (22,0)
+// EXPECT: s10 = (22,0)

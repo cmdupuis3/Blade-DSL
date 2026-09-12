@@ -115,7 +115,7 @@ alternative's cost census, and the three probe results.
   arrays erase.
 - Diagnostics: **join existing families first** (the Sparse/Orb shortcut — all
   eight sparse subscript-form errors map to BL4003, runtime reads to BL8003).
-  Mint only: **BL4019** (tree read of indeterminate depth), **BL4021**
+  Mint only: **BL4022** (tree read of indeterminate depth), **BL4021**
   (*invalid tree shape* — registered in P2 with that title, covering BOTH the
   non-static shape, which steers to the future `DynTreeIdx`, and the malformed
   degree sequence; one code, two mistakes told apart by the message text, on
@@ -123,14 +123,18 @@ alternative's cost census, and the three probe results.
   graph arc **BL8012** (`acyclic` construction check — BL8010/BL8011 are
   already occupied by interpreter panic codes in `Interp/Numerics.fs` despite
   not being in the registry; do not reuse them).
-- **BL4019 DEFERRED at P5, and the reason is that it is currently UNMINTABLE.**
+- **The indeterminate-depth code is DEFERRED at P5, and the reason is that it
+  is currently UNMINTABLE.** (It was reserved as BL4019 until the master
+  merge; BL4019 and BL4020 went to the halo-reach and constrained-domain
+  refusals while this branch was open, so the next free code is **BL4022**.
+  Nothing was minted here, so the renumber costs no pin.)
   Not "not yet needed" — *unregisterable without breaking the build*. With
   dynamic coordinates fully refused, every path is literal, so leaf-vs-internal
   is decided at compile time by `treeForwardChecked` and both outcomes already
   have their own messages (`must end at a leaf` for an internal node, `outside
   [0,d)` for out-of-arity; `trees/108`, `trees/107`, `trees/109`). A registered
   code needs a `protocol/data/diagnostics.json` entry whose `examples[]` names a
-  corpus file that literally contains the string `BL4019`, and **no reachable
+  corpus file that literally contains the string `BL4022`, and **no reachable
   site can produce one** — so minting it now buys a code with no reachable
   message and a guaranteed-red Surface block. It becomes mintable the moment
   dynamic coordinates land, which is the same phase that needs
@@ -245,7 +249,7 @@ order is **not** phase order — `src/TreeRank.fs` goes beside `OrbRank.fs`
 | **P1** | **LANDED bf6705a** — 73 brute-force pins; one recorded deviation (`*Checked` = domain-checked, not OrbRank's overflow contract). `src/TreeRank.fs` — dependency-free pure-integer bijection: shape validation (`degrees` well-formedness), cardinality/size/off tables, `forward`/`backward` rank–unrank, `subtree` partial-path resolution | ~400-700 lines | `tests/Test_TreeRank.fs` + `blade test treerank`: round-trip pinned against **brute-force** DFS enumeration of every valid path (the OrbRank discipline), incl. degenerate shapes (single leaf, all-leaf, deep-narrow, wide-shallow) |
 | **P2** — LANDED 60744b5 | Type-level registration, no storage: `IxKTree` + tag pair; lexer + parser with named reject paths; `TyTreeIdx`; `TypeLower` (placeholder idiom); `placementOf`; `Unify`; `IndexTypeValidator`; `Zonk`. Declaration + printing only; every *use* refuses loudly | ~600-900 lines, ~12 files | corpus `trees/` (its OWN category, not `index-types/`): parse OK; bad-shape rejects (empty / non-static / malformed `degrees` → BL4021; the parser's `TreeIdx<>` path → BL1999); the rendered class reaches the user through refusal messages, pinned with `ERROR-CONTAINS`; `checkKindAgreement` green; **T1 alias-laundering probe green; T2 pinned at the TYPE level only** — the three value-level strictness seams are physically unconstructible while every use refuses, so they are recorded as a P3 gate obligation in `trees/013`'s header |
 | **P3+P4** — LANDED 26ab8fd (merged) | The two phases merged because corpus `// EXPECT:` pins validate through the CODEGEN lane, so an interp-only P3 can land no pinned value test. Outcome, and it is much smaller than the estimate: **~200 lines, 4 files, and NO back-end edits at all.** Construction turned out to be free — a tree binding is an ordinary rank-1 dense `Array<T,1>` that checks through the generic annotated-literal arm, so P3's construction work was *deleting* P2's let-annotation door. Reads fold at TYPECHECK: `T((c0,c1,...))` recovers the degree sequence from the Tag, resolves the leaf offset through `TreeRank.treeForwardChecked`, and rewrites to a constant subscript — so both lanes consume the same `IRLit` and are byte-identical by construction. `extents`, print and `reduce` needed zero edits. New `TreeIdxPath` error (BL4003, no new code). | ~200 lines, 4 files | `blade test trees` 28/0/0 skipped; `blade test treerank` 73/0 unchanged; **`blade test interp trees` 29/0 with every value-producing file reporting "values identical"** — that per-file report IS the byte comparison the P4 row demanded; `blade test diff-oracle trees` SKIPS (it is a pinned-oracle-binary lane, and no `oracle/Blade.exe` is pinned in this checkout — it is not an interp-vs-codegen differential); full `blade test` green |
-| **P5** — LANDED | Derived dense axes, the pool retype, the open signature door, and static view composition — still with **no back-end edits**. `LeafIdx<S>`/`NodeIdx<S>` lower to PLAIN dense `Idx` records (Tag `None`, `IxKPlain`): `LeafIdx<crystal>` unifying with `Idx<5>` is the feature, since bulk numerics keep every optimization only if the axis is indistinguishable from a hand-written one. `leaves(T)` is a shadowable plain-call intrinsic that returns the SAME node with a new `.Type` — zero copy, zero nodes — which **permanently retires** the `method_for` limitation: `method_for(leaves(T)) <@> f` is an ordinary dense loop. The signature door is DELETED (P3's own result answers the ABI objection: nothing about a tree is decided at run time, and the callee folds against its own declared type). View composition `T((p))((q))` ≡ `T((p ++ q))` is a pre-typing SURFACE splice over the whole curried spine, so the landed fold is untouched and the nested-view identity holds by construction. **Escaping views CUT** — a bound partial path needs a real runtime object plus a new IR node in both lanes; it refuses through the existing "must end at a leaf". BL4019 **deferred as unmintable** (see §3). | ~330 lines, 10 files | `blade test trees` 41/0/0; `treerank` 73/0 unchanged; `interp trees` 42/0 with `values identical` on all 18 value-producing files; full `blade test` green; `surface.json` regenerated for two keywords, `diagnostics.json` untouched |
+| **P5** — LANDED | Derived dense axes, the pool retype, the open signature door, and static view composition — still with **no back-end edits**. `LeafIdx<S>`/`NodeIdx<S>` lower to PLAIN dense `Idx` records (Tag `None`, `IxKPlain`): `LeafIdx<crystal>` unifying with `Idx<5>` is the feature, since bulk numerics keep every optimization only if the axis is indistinguishable from a hand-written one. `leaves(T)` is a shadowable plain-call intrinsic that returns the SAME node with a new `.Type` — zero copy, zero nodes — which **permanently retires** the `method_for` limitation: `method_for(leaves(T)) <@> f` is an ordinary dense loop. The signature door is DELETED (P3's own result answers the ABI objection: nothing about a tree is decided at run time, and the callee folds against its own declared type). View composition `T((p))((q))` ≡ `T((p ++ q))` is a pre-typing SURFACE splice over the whole curried spine, so the landed fold is untouched and the nested-view identity holds by construction. **Escaping views CUT** — a bound partial path needs a real runtime object plus a new IR node in both lanes; it refuses through the existing "must end at a leaf". The indeterminate-depth code (BL4022) **deferred as unmintable** (see §3). | ~330 lines, 10 files | `blade test trees` 41/0/0; `treerank` 73/0 unchanged; `interp trees` 42/0 with `values identical` on all 18 value-producing files; full `blade test` green; `surface.json` regenerated for two keywords, `diagnostics.json` untouched |
 | **P6** | Diagnostics through all five touch points; `docs/features.md` row; **formalism §3.2/§3.3 amended** (see risks); README row | small | `blade test surface` (full suite only) |
 | **P7 (deferred arc)** | Graph arc: G1-dependent — `where acyclic(g)` + BL8012 check; `retree`/`flatten`; walk corpus (`let rec` walks, `guard` collapse) | unscoped | corpus for each; the walk examples in the feature doc §5 compile as written |
 | **P8 (deferred arc)** | Sibling symmetry (`sym[...]` — iteration license only, per the design's negative storage result); `DynTreeIdx`; hash-consing | unscoped | P8 starts with math pins, not emitters |
@@ -255,7 +259,7 @@ Phase rows get their outcome edited in place as they land, icechunk-style.
 ## 6. v1 refusals (loud, specific, by name)
 
 Non-static shapes (BL4021, steers to `DynTreeIdx`); reads of indeterminate
-depth (BL4019, names the three ways out); out-of-arity dynamic child at
+depth (BL4022, names the three ways out); out-of-arity dynamic child at
 runtime (BL8003 family); shapes over a cardinality ceiling; writing a deduced
 tree class down as an annotation (the BL4003/BL4015 precedent); `transpose` of
 a tree; `collapse(k)` on the node axis; provider I/O; CUDA and LLVM lanes

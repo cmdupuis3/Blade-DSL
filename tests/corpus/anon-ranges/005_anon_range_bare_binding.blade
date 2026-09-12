@@ -1,0 +1,10 @@
+// TEST: Anon Range Bare Binding
+// A bare `let` of an anonymous range materializes the iota it denotes.
+let xs = 0..5
+let x2 = xs(2)
+let ys = 3..7
+let y0 = ys(0)
+// EXPECT: xs = [0, 1, 2, 3, 4]
+// EXPECT: x2 = 2
+// EXPECT: ys = [3, 4, 5, 6]
+// EXPECT: y0 = 3

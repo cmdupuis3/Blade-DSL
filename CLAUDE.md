@@ -85,7 +85,9 @@ The binary is `bin/Release/net10.0/Blade.exe` (below, `blade` = that exe or
 blade check prog.blade        # typecheck only
 blade emit prog.blade         # emit C++ without compiling
 blade compile prog.blade      # produce an executable
-blade run prog.blade          # compile and run (--verbose, --mpi N, --memcheck)
+blade run prog.blade          # compile and run (--verbose, --mpi N, --memcheck, --run-record out.json,
+                              #                  --print a,b -- print only these top-level bindings)
+blade plan prog.blade         # optimization decisions + the input manifest (--json)
 blade test                    # full default suite
 ```
 
@@ -143,8 +145,12 @@ final-newline fixing — these are byte-pinned assets; never auto-reformat them.
 | `BLADE_MEMCHECK` | non-`0` → ASan-instrumented Debug profile (clang64 preferred, MSVC fallback) |
 | `BLADE_OMP_THREADS` | `1`/`0`/`off` **suppresses OMP pragma emission**; runtime thread count is plain `OMP_NUM_THREADS` |
 | `BLADE_FP_REASSOC` | `1`/`on` licenses reassociated (lane-parallel) fold codegen |
+| `BLADE_AD_HALO_GATHER` | reverse-mode rule for a `halo` stencil map: unset/`1` keeps the map and emits the GATHER adjoint (default); `0`/`off` lowers it into the construction loop and scatters. Same function either way; `blade test access` compares the two byte-for-byte |
 | `BLADE_MARCH` / `BLADE_FP_CONTRACT` | g++ `-march=` (default `native`) / `-ffp-contract=` (default `fast`) |
 | `BLADE_STDLIB` | extra stdlib search root |
+| `BLADE_PRINT` | which top-level bindings the program prints (comma/space separated); unset = all of them, the default every corpus pin reads. Set by `--print a,b` on any verb. Read by BOTH lanes (codegen's print pass and the interpreter's), so a differential run compares like with like; a name that is no binding refuses BL7004. It changes the EMISSION, so the exe cache keys on it for free |
+| `BLADE_TILE_CACHE` | revision reuse (structural/04): unset = OFF; `1`/`on` = `%LOCALAPPDATA%\Blade\tile-cache`, an absolute path = that store. Read by the COMPILER (plans tiled bindings) and by the COMPILED PROGRAM (probe/load/store); `BLADE_TILE_CACHE_VERBOSE=1` prints the planner's admissions and the run's `[tiles]`/`[chunks]` census |
+| `BLADE_RUN_RECORD` | read by the COMPILED PROGRAM at exit: path of the JSON run record (input manifest + observed size/mtime per input, executable/compiler identity, FP policy and library routes from the `-DBLADE_RR_*` build defines, RNG generator, ok / BLxxxx status). `blade run --run-record path` sets it |
 | `NETCDF_DIR` | NetCDF provider include/link root |
 
 ## Writing Blade: language essentials
@@ -222,12 +228,31 @@ first-class construct:
 | peel the innermost axis (partial reduction) | bare `reduce(A, (+))` — the default is `axes = 1`, so on rank ≥ 2 it returns an array, not a scalar | manual row loops |
 | several statistics in ONE pass | `reduce((L <@> k1) <&!> (L <@> k2) <&!> (L <@> k3), (+))` then tuple-destructure | separate passes |
 | filter / WHERE | `mask(xs, pred)` + `compound(data, mask)`; compose masks with `&&`/`\|\|` | a filter loop |
+| iterate a constrained index domain (a band, a triangle, a selection rule) | `static struct Band { i: Int<min=0, max=n-1>, j: Int<min=0, max=n-1> } where abs(i - j) <= w` then `method_for(range<Band>) <@> lambda(i, j) -> ...` -- linear conjuncts enumerate in closed form, only the solutions are visited (reads `R((i, j))`, `reduce(R, (+))`) | a dense nest with an `if` in the kernel; a mask over the whole box |
 | stencil / lags / rolling window | `method_for(halo<I, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1))` | index arithmetic with edge guards |
-| index generation | `range<Idx<8>>` virtual array | materialized iota |
+| index generation | `0..8` anonymous range (a first-class rank-1 array), or `range<I>` when the named tag should flow | materialized iota; `method_for(range) <@> lambda(i) -> i \|> compute` |
+| coordinate axis / linspace | `x0 + dx * Float64(0..n)` — implicit lifting over the range | `method_for(range<I>) <@> lambda(j) -> x0 + dx * Float64(j)` for a body that is just affine in the index |
+| sum/product of an index range | `reduce(0..n, (+))` | wrapping the range in a map first |
 | numeric width/class conversion | `Float64(n)`, `Float32(x)`, `Int64(floor(x))` — scalar type name in call position; arrays lift elementwise | `* 1.0` fudges; implicit int→float mixes (warn BL3020); bare `Int64(x)` on a float (BL3019 — the rounding must be visible at the cast site) |
 | pipeline of stages | compose values: `object_for(f) >>@ object_for(g)`, apply with `<@>`, materialize with `\|> compute` | eager temporaries per stage |
 | recurrence / time-stepping / running state | `let rec` recursive array (see below) | `let mut` + a loop |
+| iterate to convergence (trip count not known up front) | the inductive arm's `while` guard over a BUDGET extent: `\| prefix :: n while <cond> -> prefix :: <step>` — frozen once the guard goes false, runtime BL8010 if the budget runs out with it still true | a `while` loop; running the full budget unconditionally and hoping |
 | symmetric pairwise stats (covariance, comoments) | `where comm(a, b)` kernels, `reynolds(...)`, `gram(R, R)` | hand-written triangular loops |
+| several solves against one matrix (right-hand sides, transposed systems) | `let f = m.lu(A)` once, then `m.lu_solve(f, b)` / `m.lu_solve_t(f, b)` per side -- the factorization is a VALUE (a tuple of the L\U factor and the pivots), bitwise `m.solve` | `m.solve(A, b)` per side, refactoring A each time |
+| Jacobian actions of an array-valued function, no Jacobian formed (Newton-Krylov, sensitivities) | `ad.jvp(f)(args..., seeds...)` = `(y, J v)`; `ad.vjp(f)(args..., w, buffers...)` accumulates `Jᵀ w` (the body's value a NAMED array); through `m.lu_solve(f, b)` both are one more solve against the same factors | a dense Jacobian by finite differences; differentiating the factorization |
+| random draws that survive chunking, reordering, restart (Monte Carlo sample identity) | `import rand as r` then `r.uniform_at(key, stream, offset, n)` (and `normal_at`, `gamma_at`, ...): cell i is logical sample `offset + i`, a pure function of its address, so a chunk drawn alone equals the same slice of the whole | `r.uniform(key, n)` sliced -- sequenced draws shift when the fill's extent or order changes |
+| apply a Gram operator to a vector (`(A Bᴴ) x`) | `gram_apply(A, B, x)` -- two rank-1 temporaries, never the N×N matrix; differentiates (the adjoint action is a `gram_apply` too) | `gram(A, B)` then `decompact` then a row `prodsum` -- forms and reads the whole matrix once |
+| per-chunk / per-file work over a chunked or multi-file axis | `type CI = Chunked<I, K>` (or `Chunked<s.index.d, store>`, `Chunked<s1.index.d, [[s1, store], [s2, store]]>`), then `let seg = segments(CI)` / `files(T)` and `group_by(a, seg)` for per-run kernels; `ungroup(g)` restores the axis, `ungroup([v1, v2], T)` names a multi-store variable (docs/features/sql.md 7c) | hand-computed offsets; `join` (mints a fresh axis) |
+| normalized / weighted pairwise sums (kernel smoothing, softmax rows) | a per-row kernel over `range<I>` whose body NAMES the deferred producer and folds it with a reduction join: `let w = method_for(xs) <@> k; let z, u = object_for(<&!>) <@> (reduce(w, (+)), prodsum(w, v)); u / z` -- or a tuple-state fold for the one-pass online form (`examples/10`) | an M x N weight array then two partial folds |
+
+Pick the highest idiom rung the body admits: implicit lifting over a range
+(`x0 + dx * Float64(0..n)`) beats `method_for(range<...>) <@> lambda`, which in
+turn beats `let rec` — but only when the body really is arithmetic in the
+index. `method_for(range<...>)` stays the right spelling when the kernel is a
+block or a gather/conditional, when the loop composes with combinators
+(`>>@`, `<&!>`, multi-operand `method_for(range<I>, A, B)`), when the range is
+multi-slot (`range<Y, X>`) or non-plain (`SymIdx`/`CompoundIdx`/`halo`), or
+when you want the named index tag to flow into the result.
 
 Real code (from `examples/` and `tests/corpus/` — these compile):
 

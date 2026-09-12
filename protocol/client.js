@@ -512,6 +512,35 @@ function createClient(dependencies, label) {
     });
   }
 
+  /**
+   * THE RENDER FAST PATH: recompute an evaluated session under a new camera
+   * without re-running it (see serveProto.encodeRender). `bindings` are the
+   * camera binding names the figure's layout declared; `values` are the new
+   * numbers, positionally.
+   *
+   * Resolves with `{id, ok, cached, frames, elapsedMs, exitCode, stderr}`.
+   * `cached:true` is the steady state and means the executable was reused --
+   * the whole reason this command exists. The frames themselves arrive on the
+   * display bus as live events, not in the response.
+   *
+   * Rejects like eval(): `err.protocolError === true` means the process
+   * answered LIVE but predates this command, and the caller should fall back
+   * to re-running the camera cell.
+   *
+   * @param {string} session
+   * @param {string[]} bindings
+   * @param {number[]} values
+   * @param {string} [cwd]
+   * @param {{timeoutMs?: number}} [opts] default the full tier's -- the FIRST
+   *   call compiles, every one after is a re-run
+   */
+  function render(session, bindings, values, cwd, opts) {
+    const ms = (opts && opts.timeoutMs) || DEFAULT_TIMEOUT_MS.full;
+    return ensureReady().then(() => {
+      if (!proc) throw new Error("blade ide serve unavailable");
+      return sendRequest((id) => proto.encodeRender(id, session, bindings, values, cwd), ms);
+    });
+  }
   /** Tear down the current process (best-effort clean `shutdown` first) and
    *  reset ALL state so the next check()/eval() re-probes from scratch. Safe
    *  to call when nothing is running. Also doubles as this client's "kill and
@@ -535,7 +564,7 @@ function createClient(dependencies, label) {
     handshake = null;
   }
 
-  return { available, check, checkCells, eval: evalCode, resetSession, renderPlot, dispose };
+  return { available, check, checkCells, eval: evalCode, render, resetSession, renderPlot, dispose };
 }
 
 module.exports = { createClient };

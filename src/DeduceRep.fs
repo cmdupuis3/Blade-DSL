@@ -666,7 +666,7 @@ let private statusOf (ctx: RepCtx) : Map<IRId, RepStatusT> -> TypedExpr -> RepSt
         // SOUNDNESS: virtual arrays ENUMERATE INDICES, no rep structure.
         // (Perm can't say this unconditionally -- `range<Idx<N>>` IS its
         // node index set -- hence a rule.)
-        | TExprRange _ | TExprReverse _ | TExprBlocked _ -> TInv (TInvAgg None)
+        | TExprRange _ | TExprReverse _ -> TInv (TInvAgg None)
         | TExprDotDot _ -> TInv (TInvAgg None)
 
         // -- everything else -- nothing established; TOpaque propagates,

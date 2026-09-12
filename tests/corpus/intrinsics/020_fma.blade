@@ -1,0 +1,44 @@
+// TEST: Intrinsics Fma
+// ============================================================================
+// fma(a, b, c) = a*b + c with ONE rounding: the first TERNARY math
+// intrinsic, and the one arithmetic node whose value is bit-identical on
+// every lane by construction. It is its own node (TExprFma -> IRFma), never
+// a binop chain, so no pass can split the fusion; codegen renders std::fma,
+// the interpreter Math.FusedMultiplyAdd, the LLVM lane llvm.fma.f64 -- all
+// correctly rounded -- so this file pins the same digits whether the build
+// has -ffp-contract=fast (the default) or off, unlike `a * b + c`, which
+// only agrees under the differential gates' BLADE_FP_CONTRACT=off pin.
+//
+// The reason to have it: error-free transformations. 0.1 * 10.0 is not
+// exactly 1 in binary, and the residual is exactly what fma exposes and
+// what the split expression rounds away to 0. TwoProd -- p = a*b,
+// e = fma(a, b, -p) -- makes (p, e) an EXACT representation of a*b, the
+// building block of double-double arithmetic (examples/mandelbrot.bladenb's
+// perturbation renderer).
+// ============================================================================
+let residual = fma(0.1, 10.0, -1.0)
+// EXPECT: residual = 5.55111512312578e-17
+let split_is_zero = 0.1 * 10.0 - 1.0 == 0.0
+// EXPECT: split_is_zero = true
+
+// TwoProd: the product's rounding error, exactly.
+let a = 1.0 / 3.0
+let p = a * 3.0
+let e = fma(a, 3.0, 0.0 - p)
+let twoprod = [p, e]
+// EXPECT: twoprod = [1, -5.55111512312578e-17]
+
+// Exact when the answer is representable.
+let plain = fma(2.0, 3.0, 4.0)
+// EXPECT: plain = 10
+
+// In a kernel, over an array: the map is ordinary; only the node is fused.
+type I4 = Idx<4>
+let xs: Array<Float64 like I4> = [0.1, 0.2, 0.3, 0.4]
+let ys = method_for(xs) <@> lambda(x) -> fma(x, 10.0, -1.0) |> compute
+// EXPECT: ys = [5.55111512312578e-17, 1, 2, 3]
+
+// A user function named fma shadows the intrinsic, like abs/complex.
+function fma(u: Float64, v: Float64) -> Float64 = u - v
+let shadowed = fma(5.0, 2.0)
+// EXPECT: shadowed = 3

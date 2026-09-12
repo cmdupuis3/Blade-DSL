@@ -69,7 +69,7 @@ let private runDiffCase (outputDir: string) (caseName: string) (edgiSrc: string)
                 cpsi.UseShellExecute <- false
                 cpsi.WorkingDirectory <- Path.GetDirectoryName(srcAbs)
                 use cproc = Process.Start(cpsi)
-                let cerr = cproc.StandardError.ReadToEndAsync()
+                let cerr = Blade.Runtime.readToEndOffPool cproc.StandardError
                 // WaitForExit(ms) returns false on TIMEOUT, in which case
                 // ExitCode throws / is meaningless. Honor the boolean.
                 let cExited = cproc.WaitForExit(60000)
@@ -87,10 +87,10 @@ let private runDiffCase (outputDir: string) (caseName: string) (edgiSrc: string)
                     rpsi.UseShellExecute <- false
                     rpsi.WorkingDirectory <- Path.GetDirectoryName(exeAbs)
                     use rproc = Process.Start(rpsi)
-                    let rout = rproc.StandardOutput.ReadToEndAsync()
+                    let rout = Blade.Runtime.readToEndOffPool rproc.StandardOutput
                     // stderr was redirected but never drained: a program that
                     // fills the stderr pipe would deadlock instead of failing.
-                    let rerr = rproc.StandardError.ReadToEndAsync()
+                    let rerr = Blade.Runtime.readToEndOffPool rproc.StandardError
                     let rExited = rproc.WaitForExit(30000)
                     if not rExited then
                         (try rproc.Kill(true) with _ -> ())

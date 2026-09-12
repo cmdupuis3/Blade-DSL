@@ -1,0 +1,11 @@
+// TEST: distinct type variables are not a conflict and are not lifted
+// `T` and `U` are two variables, so an array in one position and a scalar in
+// the other asks neither of them to be two things: there is nothing to
+// reconcile and nothing to lift. The call keeps its existing meaning -- `T`
+// specializes at the array type and the body's own array/scalar broadcast
+// does the work. The negative control for the lift's SHARED-variable trigger.
+function mix(a: T^0, b: U^0) -> T^0 = a + b
+
+let A: Array<Float like Idx<3>> = [1.0, 2.0, 3.0]
+let r = mix(A, 2.0)
+// EXPECT: r = [3.0, 4.0, 5.0]

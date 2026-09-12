@@ -63,6 +63,7 @@ type AliasEnv = Map<string, TypeExpr>
 /// True iff `ty` is an index type, directly or via alias resolution.
 let rec isIndexType (env: AliasEnv) (ty: TypeExpr) : bool =
     match ty with
+    | TyChunked (inner, _) -> isIndexType env inner
     | TyIdx _ | TySymIdx _ | TyAntisymIdx _ | TyOrbIdx _ | TyHermitianIdx _
     | TyBoundedIdx _ | TyEnumIdx _ | TyCompoundIdx _ | TySparseIdx _
     | TyDepIdx _ | TyRaggedIdx _ | TyRaggedIdxOpaque
@@ -96,6 +97,7 @@ let rec isAliasedIndexType (env: AliasEnv) (ty: TypeExpr) : bool =
 /// True iff `ty` is an anonymous (raw) index type, not aliased.
 let isAnonymousIndexType (ty: TypeExpr) : bool =
     match ty with
+    | TyChunked _ -> false
     | TyIdx _ | TySymIdx _ | TyAntisymIdx _ | TyOrbIdx _ | TyHermitianIdx _
     | TyBoundedIdx _ | TyEnumIdx _ | TyCompoundIdx _ | TySparseIdx _
     | TyDepIdx _ | TyRaggedIdx _ | TyRaggedIdxOpaque

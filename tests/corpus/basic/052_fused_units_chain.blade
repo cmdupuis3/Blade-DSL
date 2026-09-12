@@ -1,0 +1,19 @@
+// TEST: Fused Units Chain
+// ============================================================================
+// Unit-annotated element types fuse like bare ones: units live in the
+// element type and the output unit judgment happened at the binop site, so
+// the composed kernel needs no unit reasoning of its own. The unit algebra
+// still checks: meters plus (meters/seconds times seconds).
+
+Unit meters
+Unit seconds
+type I = Idx<4>
+let pos: Array<Float<meters> like I> = method_for(range<I>) <@> lambda(i) -> Float64(i) * 2.0 |> compute
+let vel: Array<Float<meters / seconds> like I> = method_for(range<I>) <@> lambda(i) -> Float64(i) * 0.5 |> compute
+let dt: Float<seconds> = 3.0
+
+let moved = pos + vel * dt
+// EXPECT: moved = [0, 3.5, 7, 10.5]
+
+let tot = reduce(moved, (+))
+// EXPECT: tot = 21
