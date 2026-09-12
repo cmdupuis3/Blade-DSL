@@ -1,0 +1,25 @@
+// TEST: method_for over a tree operand (rejects)
+// A tree array's cells ARE a flat rank-1 pool, so iterating it is meaningful --
+// but method_for PRODUCES an array inheriting this operand's index record, and
+// an inherited tree slot reaches output-storage classification, the
+// identity/grouping machinery, fusion and exprTypeIfKnown's HM-argument
+// whitelist, none of which has a tree reading yet (and whose failure mode there
+// is a BL6001 spray, not a refusal). reduce (file 105) is unaffected: it
+// CONSUMES the pool and yields a scalar.
+//
+// The clean spelling arrives with the derived dense leaf axis, where the type
+// is a plain Idx and every existing optimization applies unchanged.
+//
+// P5: IT LANDED, and the verdict is re-taken and KEPT. `leaves(T)` retypes this
+// very pool onto LeafIdx at zero cost, and file 123 runs exactly the map this
+// file refuses. So the refusal is no longer a limitation waiting on a phase --
+// it is a permanent, cheap boundary between two jobs over one pool: path
+// addressing keeps the tree slot, bulk numerics take the leaf axis, and the
+// user says which in one visible call. The refusal message now names it.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let U = method_for(T) <@> lambda(x) -> x * 2.0 |> compute
+// ERROR: BL4003
+// ERROR-CONTAINS: a method_for / object_for operand

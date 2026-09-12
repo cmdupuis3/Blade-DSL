@@ -1,0 +1,14 @@
+// TEST: TreeIdx reads through a chained alias
+// The P2 alias-laundering probe (008), promoted from "still refuses" to "still
+// WORKS": a two-step alias must carry the degree sequence all the way to the
+// fold, or the offset comes out WRONG rather than the program failing. That is
+// the failure mode this file exists to catch -- the shape lives only in the
+// Tag, and a lost tag is a silent bad address, not a diagnostic.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+type Aliased = CrystalIdx
+let T: Array<Float64 like Aliased> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let v = T((1, 2))
+let n = extents(T)
+// EXPECT: v = 5
+// EXPECT: n = 5

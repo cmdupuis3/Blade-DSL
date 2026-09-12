@@ -1,0 +1,11 @@
+// TEST: TreeIdx malformed shape has a trailing tail (rejects)
+// The genuine TAIL case, as distinct from 004's open slots: the walk CLOSES
+// and the sequence continues. [0, 0] makes the root a leaf, so the tree is
+// done after one node and the second entry belongs to no tree. Different
+// failure, different message -- "closes early" rather than "truncated".
+// REJECT-AT: lower
+let static tail = [0, 0]
+type TailIdx = TreeIdx<tail>
+function f(x: Float64) -> Array<Float64 like TailIdx> = { x }
+// ERROR: BL4021
+// ERROR-CONTAINS: closes early

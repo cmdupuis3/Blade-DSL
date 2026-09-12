@@ -1,0 +1,19 @@
+// TEST: TreeIdx whole-path reads on crystal
+// The five complete root-to-leaf paths, in preorder. Each folds to its leaf
+// offset AT TYPECHECK -- the shape is static and rides the Tag, so the offset
+// is a compile-time constant -- and the read that survives is an ordinary flat
+// subscript. That is what makes the two lanes byte-identical here by
+// construction rather than by agreement: both consume the same IRLit.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let a = T((0, 0))
+let b = T((0, 1))
+let c = T((1, 0))
+let d = T((1, 1))
+let e = T((1, 2))
+// EXPECT: a = 1
+// EXPECT: b = 2
+// EXPECT: c = 3
+// EXPECT: d = 4
+// EXPECT: e = 5

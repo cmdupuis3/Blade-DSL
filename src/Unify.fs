@@ -144,6 +144,26 @@ type TypeError =
     /// member, and is the actionable half of the diagnostic.
     | PgIrrepsIdxSpec of detail: string
     | PgIrrepsIdxSpecFn of func: string * detail: string
+    /// A `TreeIdx<shape>` whose shape does not resolve to a well-formed
+    /// preorder degree sequence -- non-static, non-integer, empty, or a
+    /// sequence whose prefix walk does not close. ONE case for both mistakes
+    /// (BL4018's RaggedLensMismatch/RaggedLensNotStatic precedent): the
+    /// `detail` string, produced at lowering by StaticEval or
+    /// `TreeRank.validateDegrees`, is what differentiates them.
+    | TreeIdxShape of detail: string
+    | TreeIdxShapeFn of func: string * detail: string
+    /// A well-formed `TreeIdx<s>` in a position P2 cannot serve. Every USE
+    /// refuses in this phase: storage, reads, iteration and folds land in P3-P5.
+    /// `where_` names the site, `shape` renders the class -- the
+    /// OrbitStorageUnsupported shape verbatim, and it joins BL4003 the same way.
+    | TreeIdxUnsupported of shape: string * where_: string
+    /// A STATIC tree path that is not a complete root-to-leaf path of its
+    /// shape: an out-of-arity child, an over-long path, or one that stops at an
+    /// internal node. `detail` is `TreeRank.treeForwardChecked`'s message,
+    /// which names the failing STEP rather than reporting a bare bad offset.
+    /// Joins BL4003 (the index type is well formed; this READ is out of domain)
+    /// -- the OrbitSubscriptArity precedent, one family over.
+    | TreeIdxPath of shape: string * detail: string
     /// `Base<_>` outside parameter position. `where` names the site.
     | TagWildcardNotParam of where_: string
     // Symmetry / compact-group violations (BL4004)
@@ -869,6 +889,17 @@ let indexPairIncompatible (i1: IRIndexType) (i2: IRIndexType) : bool =
     match i1.Tag, i2.Tag with
     | Some (BlockSpecTag (s1, n1)), Some (BlockSpecTag (s2, n2)) ->
         s1 <> s2 || (match n1, n2 with
+                     | Some a, Some b -> a <> b
+                     | _ -> false)
+    // TREE identity, checked BEFORE the synthetic-tag exemption below for the
+    // same reason the block-spec arm is: `__tree:` starts with "__", so the
+    // exemption would classify it synthetic and let two DIFFERENT shapes unify.
+    // Identity is the degree SEQUENCE plus the optional nominative alias --
+    // equal leaf count does not make two tree spaces interchangeable, exactly as
+    // equal total_dim does not for irreps. Aliases nominative (two named aliases
+    // differ); anon-vs-named compatible.
+    | Some (TreeTag (n1, d1)), Some (TreeTag (n2, d2)) ->
+        d1 <> d2 || (match n1, n2 with
                      | Some a, Some b -> a <> b
                      | _ -> false)
     | Some t1, Some t2 when t1 <> t2

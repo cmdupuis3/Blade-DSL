@@ -83,6 +83,13 @@ let memfreeStressTests = Blade.Tests.Corpus.category "memfree-stress"
 /// `Blade.Tests.RunAll.deferredConcreteTests`, like memfree.
 let deferredConcreteTests = Blade.Tests.Corpus.category "deferred-concrete"
 
+/// trees -- `TreeIdx<shape>` type-level registration (plan-graphs-trees.md P2).
+/// MIXED category: declaration positives plus "(rejects)" probes for bad shapes
+/// and for every USE, so no asRejectProbes wrapper. Declared here (not in a
+/// Test_*.fs) on the memfree precedent -- the category's only consumers are
+/// `allTests` below and CliSelfTests' key map.
+let treeTests = Blade.Tests.Corpus.category "trees"
+
 /// The wholly-negative categories carry no "(rejects)" marker in their own
 /// `// TEST:` names -- every file in them is meant to be refused, so the marker
 /// would be noise -- and Runner's classifier keys on exactly that marker. The
@@ -103,7 +110,7 @@ let private asRejectProbes (tests: (string * string) list) =
 let allTests =
     basicTests @ intrinsicsTests @ castsTests @ adTests @ adJvpTests @ adJvpCombTests @ mlE2eTests @ mlOpsTests @ mlEquivTests @ loopTests @ symmetryTests @ reynoldsTests @ arityTests @ functionTests
     @ structTests @ structAbortTests @ structMutualTests @ sumTypeTests @ interfaceTests @ moduleTests @ guardTests @ guardCombinatorTests @ zeroCombinatorTests @ sequenceCombinatorTests @ tupleViewTests @ tupleTests @ replicateTests @ anonRangeTests @ recursiveArrayTests @ segmentsTests @ bracketedTests
-    @ indexTypeTests @ mutabilityTests @ asRejectProbes mutabilityErrorTests @ staticTests @ pplTests @ mathTests @ randTests @ displayTests @ asRejectProbes displayErrorTests @ spectraTests @ fallbackTests @ stackJoinTests @ sgsTests @ unitTests @ asRejectProbes unitErrorTests
+    @ indexTypeTests @ treeTests @ mutabilityTests @ asRejectProbes mutabilityErrorTests @ staticTests @ pplTests @ mathTests @ randTests @ displayTests @ asRejectProbes displayErrorTests @ spectraTests @ fallbackTests @ stackJoinTests @ sgsTests @ unitTests @ asRejectProbes unitErrorTests
     @ foreignKeyTests @ maskTests @ setOpTests @ uniqueContainsTests @ semijoinTests @ groupByTests @ sortTests @ reduceTests @ extentsTests @ extentsMultiRankTests @ regressionTests @ sqlCombinedTests @ v24dProbes
     @ inferenceProbes
     @ funcArrayTests
@@ -203,6 +210,15 @@ let runAllTestsFullWith (extraBlocks: (unit -> Blade.Tests.TestHarness.BlockResu
     // mismatch. Plus the hand-unrolled depth-2 E/B/A nest, the depth-1
     // triangular-offset anchors, and the int64 wall at depth 3 / n = 1000.
     let orbRank = Blade.Tests.OrbRankReview.runOrbRankTests ()
+    // The TreeIdx bijection layer (TreeRank.fs, plan-graphs-trees P1): shape
+    // validation, the derived preorder tables, and the path <-> leaf-offset
+    // pair, pinned against a brute-force recursion over an INDEPENDENT
+    // nested-shape ADT — as a SET and as an ORDER, since the leaf-offset order
+    // is contractually the lexicographic order on paths and a forward/backward
+    // round trip cannot catch that convention drifting. Plus subtree
+    // contiguity over every node, the degenerate shapes (single leaf, flat,
+    // deep-narrow, wide-shallow) and a seeded-random sweep.
+    let treeRank = Blade.Tests.TreeRankReview.runTreeRankTests ()
     // Compiler-native CG tables (WignerTables.fs) vs closed forms (ML arc).
     let wigner = Blade.Tests.WignerTablesReview.runWignerTablesTests ()
     // Sym^j(V_l) occurrence tables (SymPowerTables.fs, stage 2b-i): exact
@@ -509,7 +525,7 @@ let runAllTestsFullWith (extraBlocks: (unit -> Blade.Tests.TestHarness.BlockResu
     let blocks =
         [ yield r1; yield r2; yield attrs; yield subst
           yield normalize; yield unify; yield validateArrow; yield displayFrames; yield grRender
-          yield shape; yield oracles; yield orbRank; yield wigner; yield symPower; yield polyOracle; yield lieTables; yield permSpec; yield permOracle; yield structIdxSpec; yield structIdxOracle; yield pointSpec; yield pgOracle; yield cartBridge; yield spans; yield diagCore; yield diagCorpus; yield certSuggest; yield repDiff; yield repCheck; yield repReject; yield alloc; yield orbWreath
+          yield shape; yield oracles; yield orbRank; yield treeRank; yield wigner; yield symPower; yield polyOracle; yield lieTables; yield permSpec; yield permOracle; yield structIdxSpec; yield structIdxOracle; yield pointSpec; yield pgOracle; yield cartBridge; yield spans; yield diagCore; yield diagCorpus; yield certSuggest; yield repDiff; yield repCheck; yield repReject; yield alloc; yield orbWreath
           yield ompPragma; yield linalgEmit; yield linalgProbe; yield blasTier; yield doctorBlock; yield setupBlock; yield factoryFlat; yield gatherElision; yield lapackEmit; yield shapeSpec; yield flatPath; yield optimizeLayer; yield randMirror; yield accessLayer; yield moduleResolve; yield providerDesugar; yield runRecord
           match omp with Some b -> yield b | None -> ()
           match ompReduce with Some b -> yield b | None -> ()

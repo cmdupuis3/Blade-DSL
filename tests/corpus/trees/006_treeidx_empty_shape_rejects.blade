@@ -1,0 +1,7 @@
+// TEST: TreeIdx empty shape (rejects)
+// A tree has at least one node. `[]` folds to an empty static list, which
+// degreesOfStatic refuses before TreeRank sees it.
+// REJECT-AT: lower
+type EmptyIdx = TreeIdx<[]>
+function f(x: Float64) -> Array<Float64 like EmptyIdx> = { x }
+// ERROR: BL4021

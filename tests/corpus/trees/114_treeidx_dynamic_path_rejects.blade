@@ -1,0 +1,13 @@
+// TEST: TreeIdx path with a non-literal coordinate (rejects)
+// v1 folds the path to a leaf offset at COMPILE time, so every child selector
+// must be a literal. A computed coordinate is a dynamic path -- a later phase,
+// and one that also has to answer the leaf-versus-subtree question a static
+// path answers for free.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let k = 1
+let bad = T((k, 0))
+// ERROR: BL4003
+// ERROR-CONTAINS: compile-time integer literal

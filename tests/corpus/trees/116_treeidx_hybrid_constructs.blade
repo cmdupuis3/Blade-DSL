@@ -1,0 +1,13 @@
+// TEST: a tree slot beside an ordinary slot constructs
+// MEASURED, and it was an open question going in: the HYBRID annotation is
+// accepted. `Array<F64 like CrystalIdx, Idx<2>>` is a rank-2 dense pool whose
+// leading slot happens to carry a tree Tag -- the generic annotated-literal arm
+// reads the nesting as [5; 2], which agrees with (leaf count, 2), and nothing
+// in allocation, layout, teardown or printing dispatches on IxKTree.
+//
+// Composing in the TYPE is therefore free. The READ is what is not free, and
+// file 117 pins that half.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let F: Array<Float64 like CrystalIdx, Idx<2>> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]
+// EXPECT: F = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]

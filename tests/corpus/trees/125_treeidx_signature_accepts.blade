@@ -1,0 +1,20 @@
+// TEST: a tree type crosses a function boundary and folds inside the callee
+// P5 opens the signature door P2 planted and P3/P4 kept. The ABI objection the
+// old comment raised -- "the shape rides the CALLER's Tag and the signature
+// does not transport it" -- is answered by P3's own result: nothing about a
+// tree is decided at run time. The callee receives an Array<T,1>, and a path
+// read inside it folds against the CALLEE'S OWN DECLARED tree type, which is
+// concrete and sits right there in the signature. There is nothing to
+// transport.
+//
+// What replaces the door is narrower and lives post-zonk: files 111 and 126
+// pin the two ways a tree must NOT cross a boundary.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+function pick(t: Array<Float64 like CrystalIdx>) -> Float64 = { t((1, 2)) }
+function build() -> Array<Float64 like CrystalIdx> = { T }
+let v = pick(T)
+let w = pick(build())
+// EXPECT: v = 5
+// EXPECT: w = 5

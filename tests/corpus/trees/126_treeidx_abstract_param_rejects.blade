@@ -1,0 +1,21 @@
+// TEST: a tree argument reaching an abstract parameter (rejects)
+// The LAUNDERING half of the open signature door's safety guard, and it is not
+// speculative: this program compiled and ran, printing 15, before the guard
+// existed. A `T^1` parameter would read the pool as an ordinary rank-1 array --
+// true of the STORAGE, false of the TYPE -- and the callee could then return
+// it, alias it, or hand it to a loop former, with the tree identity gone in one
+// step.
+//
+// Caught post-zonk rather than eagerly, for collectAppRankErrors' reason: an
+// abstract parameter is not closed at its call site, so the eager check in
+// dispatchAppOrIndex cannot see it (concreteClassOf declines on arrays by
+// design). The message names the way out, which is leaves(T) plus a LeafIdx
+// parameter (file 121).
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+function h(x: T^1) -> Float64 = { reduce(x, (+)) }
+let v = h(T)
+// ERROR: BL4003
+// ERROR-CONTAINS: whose parameter declares no tree slot

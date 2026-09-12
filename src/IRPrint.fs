@@ -99,6 +99,10 @@ and ppIndexType (idx: IRIndexType) =
     match idx with
     | IrrepsIdxLike rendered -> ppIrrepsPower idx rendered
     | PgIrrepsIdxLike rendered -> ppIrrepsPower idx rendered
+    // A tree record is always Rank 1 / SymNone, so it renders as itself. NOT
+    // through ppIrrepsPower: no surface spelling puts a tree under a symmetric
+    // power, and pretending otherwise would print a type that does not parse.
+    | TreeIdxLike rendered -> rendered
     | _ ->
         match idx.Symmetry with
         | SymNone -> $"Idx<{extentStr}>"
@@ -170,6 +174,10 @@ and ppIndexTypeIn (names: Map<IRId, string>) (idx: IRIndexType) =
     match idx with
     | IrrepsIdxLike rendered -> ppIrrepsPower idx rendered
     | PgIrrepsIdxLike rendered -> ppIrrepsPower idx rendered
+    // A tree record is always Rank 1 / SymNone, so it renders as itself, and
+    // `TreeIdxLike` already folds the alias name in from the Tag -- so the two
+    // printers agree by construction without consulting `names`.
+    | TreeIdxLike rendered -> rendered
     | _ ->
         match idx.Symmetry with
         // A plain alias keeps the documented `Idx<Lat>` form: that type's one

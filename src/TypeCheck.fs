@@ -198,6 +198,17 @@ let checkModule (env: TypeEnv) (modul: ModuleDecl) : TypedModule * TypeEnv * Com
             zonked.Decls |> List.collect declExprs
                          |> List.collect (collectAppRankErrors currentEnv.Subst)
         else []
+    // Tree-slot laundering and same-rank tree-shape mismatch at direct
+    // applications -- the safety half of P5's open signature door, sharing this
+    // sweep's zonked-module reasoning and its cascade suppression (a failed decl
+    // binds a fresh var, and calls through it would report tree noise over the
+    // real root cause). See collectAppTreeErrors: both refusals were measured to
+    // pass silently before it existed.
+    let treeArgErrors =
+        if List.isEmpty errors && List.isEmpty staticAssertErrors then
+            zonked.Decls |> List.collect declExprs
+                         |> List.collect (collectAppTreeErrors currentEnv.Subst)
+        else []
     // Misplaced provider writes: structural, inference-independent (an
     // unresolved receiver simply fails the IRTNamed match), so unlike the rank
     // sweep it runs even when the module already has errors.
@@ -210,7 +221,7 @@ let checkModule (env: TypeEnv) (modul: ModuleDecl) : TypedModule * TypeEnv * Com
     let groupKeysErrors =
         zonked.Decls |> List.collect declGroupKeysRoots
                      |> List.collect (fun (pos, e) -> collectGroupKeysEscapes currentEnv.Subst pos e)
-    (zonked, currentEnv, staticAssertErrors @ List.rev errors @ rankErrors @ writeErrors @ groupKeysErrors)
+    (zonked, currentEnv, staticAssertErrors @ List.rev errors @ rankErrors @ treeArgErrors @ writeErrors @ groupKeysErrors)
 
 let checkProgram (program: Program) : TypedProgram * IRBuilder * CompileError list * string list =
     let env = emptyEnv ()

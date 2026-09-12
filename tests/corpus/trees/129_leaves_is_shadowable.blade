@@ -1,0 +1,14 @@
+// TEST: a user binding named leaves shadows the intrinsic
+// leaves() is a plain-call intrinsic on the abs/complex precedent, which means
+// it costs no keyword, no parser arm and no surface.json entry -- and it means
+// `leaves` stays an ordinary name a program may bind. That is not a loophole,
+// it is the reason the intrinsic is guarded on lookupVar: `leaves` is a
+// plausible user variable, and a keyword would have taken it away.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+function leaves(n: Int64) -> Int64 = { n + 1 }
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let k = leaves(41)
+let v = T((1, 2))
+// EXPECT: k = 42
+// EXPECT: v = 5

@@ -149,6 +149,16 @@ type IxKind =
                             // block-spec member (point groups); same
                             // parameterized-tag discipline as IxKIrreps, over a
                             // DIFFERENT frozen prefix (O(3) format is byte-frozen).
+    | IxKTree               // "__tree:<name>:<payload>": one slot whose DOMAIN is
+                            // complete root-to-leaf paths of a static tree. Same
+                            // PARAMETERIZED-tag discipline as IxKIrreps (the
+                            // preorder degree sequence rides IN the tag, so it is
+                            // index-space identity), over its own frozen prefix.
+                            // Extent = the LEAF count (= cardinality); the degree
+                            // sequence lives ONLY in the Tag -- putting it in
+                            // Extent would make two distinct shape bindings with
+                            // equal values start unifying (plan trap T10).
+    | IxKErrorTreeBadShape  // "__error_tree_bad_shape": typecheck error marker
     | IxKErrorRaggedNoPrior // "__error_ragged_no_prior": typecheck error marker
     | IxKErrorIrrepsBadSpec // "__error_irreps_bad_spec": typecheck error marker
     | IxKErrorPgIrrepsBadSpec // "__error_pgirreps_bad_spec": typecheck error marker
@@ -175,9 +185,11 @@ let ixKindSentinel (k: IxKind) : string option =
     | IxKIrreps -> None     // parameterized tag (mkIrrepsTag), no single sentinel;
                             // Tag missing the prefix FAILS validator agreement (intended)
     | IxKPgIrreps -> None   // ditto (mkPgIrrepsTag)
+    | IxKTree -> None       // ditto (mkTreeTag)
     | IxKErrorRaggedNoPrior -> Some "__error_ragged_no_prior"
     | IxKErrorIrrepsBadSpec -> Some "__error_irreps_bad_spec"
     | IxKErrorPgIrrepsBadSpec -> Some "__error_pgirreps_bad_spec"
+    | IxKErrorTreeBadShape -> Some "__error_tree_bad_shape"
 
 // IrrepsIdx tag encoding: the spec payload rides IN the Tag string. Tag
 // equality is already index-space identity everywhere, so no side registry
@@ -260,6 +272,50 @@ let (|PgIrrepsTag|_|) (tag: string) : (string * string option * (string * int) l
                 let entries = rest2.Substring(sepN + 1).Split '|' |> Array.toList |> List.map entryOf
                 if group <> "" && List.forall Option.isSome entries then
                     Some (group, (if name = "" then None else Some name), List.map Option.get entries)
+                else None
+
+// TreeIdx tag encoding -- the THIRD parameterized-tag member, and the same
+// discipline as the two above for the same reason: tag equality is already
+// index-space identity everywhere, so the shape rides IN the Tag and needs no
+// side registry and no new IRIndexTypeG field. Format:
+// "__tree:<name>:<payload>", <name> = alias ("" if anonymous), <payload> =
+// "d0,d1,d2,..." -- the PREORDER DEGREE SEQUENCE, which the feature doc 2.3
+// establishes as the canonical internal form (size, off, cardinality, depth,
+// the leaf set and every subtree shape are derivable from it in one pass).
+// Pure string ops; core stays TreeRank-free, `Blade.TreeRank` owns the math.
+//
+// The payload is NEVER empty: `TreeRank.validateDegrees` requires at least one
+// node, and the single-leaf shape is "0".
+
+let treeTagPrefix = "__tree:"
+
+/// Serialize a preorder degree sequence (+ optional alias name) into its
+/// canonical Tag.
+let mkTreeTag (aliasName: string option) (degrees: int list) : string =
+    let payload = degrees |> List.map string |> String.concat ","
+    $"""{treeTagPrefix}{(defaultArg aliasName "")}:{payload}"""
+
+/// Parse a tree Tag back into (alias name option, preorder degree sequence).
+/// Total: any string not produced by mkTreeTag yields None.
+let (|TreeTag|_|) (tag: string) : (string option * int list) option =
+    if not (tag.StartsWith treeTagPrefix) then None
+    else
+        let rest = tag.Substring treeTagPrefix.Length
+        match rest.IndexOf ':' with
+        | -1 -> None
+        | sep ->
+            let name = rest.Substring(0, sep)
+            let body = rest.Substring(sep + 1)
+            if body = "" then None
+            else
+                let entries =
+                    body.Split ',' |> Array.toList
+                    |> List.map (fun s ->
+                        match System.Int32.TryParse s with
+                        | true, v when v >= 0 -> Some v
+                        | _ -> None)
+                if List.forall Option.isSome entries then
+                    Some ((if name = "" then None else Some name), List.map Option.get entries)
                 else None
 
 // Halo window tag encoding. Like IrrepsIdx, the payload rides IN the Tag:
@@ -588,8 +644,10 @@ let ixKindOfTag (tag: string option) : IxKind =
     | Some "__error_ragged_no_prior" -> IxKErrorRaggedNoPrior
     | Some "__error_irreps_bad_spec" -> IxKErrorIrrepsBadSpec
     | Some "__error_pgirreps_bad_spec" -> IxKErrorPgIrrepsBadSpec
+    | Some "__error_tree_bad_shape" -> IxKErrorTreeBadShape
     | Some t when t.StartsWith irrepsTagPrefix -> IxKIrreps
     | Some t when t.StartsWith pgIrrepsTagPrefix -> IxKPgIrreps
+    | Some t when t.StartsWith treeTagPrefix -> IxKTree
     // A provider pool tag REPLACES the record's kind sentinel, so it has to
     // decode back to the kind the record actually carries. The wreath spelling
     // stands in for "__orbidx"; the depth-1 spelling falls through to IxKPlain
@@ -1167,6 +1225,25 @@ let (|PgIrrepsIdxLike|_|) (ix: IRIndexTypeG<'Ext>) : string option =
                   | Some n -> $"{n} (= {core})"
                   | None -> core)
         | _ -> Some "PgIrrepsIdx<?>"
+
+/// Render an IxKTree record's identity for diagnostics and type echo: the
+/// round-trippable `TreeIdx<[2, 2, 0, 0, 3, 0, 0, 0]>`, prefixed with the alias
+/// if present. None for non-tree records (a pre-match arm ahead of Symmetry
+/// dispatch, exactly like the two block-spec projections above).
+let (|TreeIdxLike|_|) (ix: IRIndexTypeG<'Ext>) : string option =
+    if ix.IxKind <> IxKTree then None
+    else
+        match ix.Tag with
+        | Some (TreeTag (nameOpt, degrees)) ->
+            let payload = degrees |> List.map string |> String.concat ", "
+            let core = $"TreeIdx<[{payload}]>"
+            Some (match nameOpt with
+                  | Some n -> $"{n} (= {core})"
+                  | None -> core)
+        | _ ->
+            // Kind says tree but the tag is missing/unparseable -- a state
+            // validateIR rejects; render a placeholder rather than crash.
+            Some "TreeIdx<?>"
 
 // ---------------------------------------------------------------------------
 // Enumerable constrained domains (docs/plans/structural/06)

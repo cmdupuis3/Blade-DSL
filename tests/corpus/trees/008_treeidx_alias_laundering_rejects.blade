@@ -1,0 +1,28 @@
+// TEST: a chained TreeIdx alias keeps its tree slot (rejects)
+// TRAP T1: a structural TypeExpr walk that lacks the TreeIdx arm treats the
+// type as ABSENT, and the sneaky case is alias-body laundering -- `type B = A`
+// carries the arm into positions the walk never probes. If registerTypeDecl's
+// TyTreeIdx arm is missing, B registers as a plain TDIAlias and the tree slot
+// is gone, which is the failure this file exists to catch.
+//
+// P5 REWROTE THE PROBE, not the claim. The original caught the laundering with
+// the function-signature door, which P5 removed -- a tree type crossing a
+// boundary is now legal (file 125), so that pin went dead. The abstract-param
+// guard is the replacement and it is a STRICTER T1 gate: it fires only if the
+// argument still carries a tree slot at the call site, having survived two
+// alias hops AND the whole zonk. A laundered alias would present as a plain
+// dense array, the guard would decline, and this program would compile --
+// exactly the silent pass the file is here to prevent.
+//
+// The ERROR-CONTAINS doubles as the PRINTING pin: TreeIdxLike's rendering has
+// to reach a user-visible message through a two-step alias chain.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+type Aliased = CrystalIdx
+
+let T: Array<Float64 like Aliased> = [1.0, 2.0, 3.0, 4.0, 5.0]
+function f(t: T^1) -> Float64 = { reduce(t, (+)) }
+let v = f(T)
+// ERROR: BL4003
+// ERROR-CONTAINS: TreeIdx<[2, 2, 0, 0, 3, 0, 0, 0]>

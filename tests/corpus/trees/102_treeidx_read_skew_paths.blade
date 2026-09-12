@@ -1,0 +1,30 @@
+// TEST: TreeIdx whole-path reads on a non-uniform shape
+// skew's leaves sit at depths 1, 2 and 3 -- (0) and (2,1) are both leaves at
+// different depths, which is the whole point of the type. Preorder over leaves
+// is lexicographic over paths, so the storage order IS the path order.
+//
+// MEASURED, not assumed: the parser has no 1-tuple form, so `S((0))` is a
+// PARENTHESIZED SCALAR and reaches the fold as the one-element path -- the
+// bare-scalar spelling `S(0)` is the identical program, pinned below beside it.
+// That spelling is self-limiting rather than special-cased: it only resolves
+// when the root's c-th child is a leaf, and otherwise gives the
+// "ends at internal node" refusal (file 108).
+let static skew = [3, 0, 2, 0, 2, 0, 0, 3, 1, 0, 0, 0]
+type SkewIdx = TreeIdx<skew>
+let S: Array<Float64 like SkewIdx> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+let p0 = S((0))
+let q0 = S(0)
+let p1 = S((1, 0))
+let p2 = S((1, 1, 0))
+let p3 = S((1, 1, 1))
+let p4 = S((2, 0, 0))
+let p5 = S((2, 1))
+let p6 = S((2, 2))
+// EXPECT: p0 = 10
+// EXPECT: q0 = 10
+// EXPECT: p1 = 20
+// EXPECT: p2 = 30
+// EXPECT: p3 = 40
+// EXPECT: p4 = 50
+// EXPECT: p5 = 60
+// EXPECT: p6 = 70

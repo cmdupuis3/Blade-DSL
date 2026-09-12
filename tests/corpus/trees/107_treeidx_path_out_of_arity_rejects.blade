@@ -1,0 +1,11 @@
+// TEST: TreeIdx path names a child that does not exist (rejects)
+// Node 1 of crystal (the root's child 0) has 2 children, so child 2 is out of
+// arity. TreeRank names the failing STEP rather than reporting a bad offset,
+// which is the whole reason the checked door exists beside the guard-free one.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let bad = T((0, 2))
+// ERROR: BL4003
+// ERROR-CONTAINS: step 1: child 2 outside [0,2) at node 1

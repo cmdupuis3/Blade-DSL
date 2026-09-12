@@ -1,0 +1,20 @@
+// TEST: TreeIdx shape mismatch at a declared return type (rejects)
+// T2 seam 3, RE-RUN as its P3/P4 header demanded. Unlike seam 2 (file 111),
+// this one was never open: with the signature door gone, the body's WideIdx
+// value meets the declared DeepIdx return through the ordinary return unify,
+// and unify is where the TreeTag arm lives. So the refusal simply moved from
+// BL4003 (the door) to BL3001 (the mismatch), which is the same code seam 1
+// measures for let-ascription in file 110.
+//
+// Worth stating plainly, because it is the asymmetry the T2 probe set exists to
+// expose: unify-based positions were always safe, and the direct-application
+// position was not.
+// REJECT-AT: lower
+let static wide = [5, 0, 0, 0, 0, 0]
+let static deep = [2, 2, 0, 0, 3, 0, 0, 0]
+type WideIdx = TreeIdx<wide>
+type DeepIdx = TreeIdx<deep>
+let A: Array<Float64 like WideIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+function g() -> Array<Float64 like DeepIdx> = { A }
+// ERROR: BL3001
+// ERROR-CONTAINS: WideIdx (= TreeIdx<[5, 0, 0, 0, 0, 0]>)

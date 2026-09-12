@@ -1,0 +1,13 @@
+// TEST: reading a tree slot combined with a trailing index slot (rejects)
+// The other half of file 116. A tree slot composes with ordinary slots in the
+// TYPE for free, but the read needs the trailing subscripts to SURVIVE the path
+// fold -- the fold rewrites the whole subscript to one literal, and a residual
+// trailing coordinate has nowhere to go in that rewrite. That is the
+// residual-view shape, and it belongs with the partial paths.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let F: Array<Float64 like CrystalIdx, Idx<2>> = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]
+let bad = F((1, 2), 0)
+// ERROR: BL4003
+// ERROR-CONTAINS: combined with other index slots

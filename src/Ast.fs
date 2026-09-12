@@ -319,6 +319,31 @@ type TypeExpr =
     // the two carry different payloads, print differently, and must never
     // unify with each other even at equal extent.
     | TyPgIrrepsIdx of group: Ident * spec: Expr
+    /// TreeIdx<shape>: a single index slot whose DOMAIN is complete
+    /// root-to-leaf paths of a static tree (P0 decision: one tuple slot, the
+    /// SparseIdx precedent). `shape` is a static expression -- a `let static`
+    /// name or an inline array literal -- holding the PREORDER DEGREE
+    /// SEQUENCE (`[2, 2, 0, 0, 3, 0, 0, 0]`), resolved at lowering via
+    /// StaticEval and validated by `Blade.TreeRank.validateDegrees`. Cardinality
+    /// is the LEAF count, not the node count. The nested-`leaf` literal sugar
+    /// (feature doc 2.1) is deferred; this is the `TySparseIdx of keys: Expr`
+    /// shape -- payloads that are values ride as `Expr`.
+    | TyTreeIdx of shape: Expr
+    /// LeafIdx<shape> / NodeIdx<shape>: the DERIVED DENSE axes of a tree
+    /// (feature doc 3.6). Both take the same static degree-sequence payload
+    /// TreeIdx does and lower to a PLAIN dense Idx record -- LeafIdx's extent
+    /// is the cardinality (leaf count), NodeIdx's is the node count.
+    ///
+    /// Ordinary Idx BY DESIGN, not by omission. The whole value of a leaf axis
+    /// is that `leaves(T)` produces something that flows into every already
+    /// written Idx-typed function and kernel; a nominal tag here would make it
+    /// flow into nothing and put the user back to hand-copying extents, which
+    /// is the problem these axes exist to solve. The nominal identity lives on
+    /// the TREE type, and `leaves(T)` is the visible opt-out. A user who wants
+    /// a nominal leaf axis writes `type Leaves = LeafIdx<crystal>`, which takes
+    /// the ordinary nominative-alias path like any other Idx alias.
+    | TyLeafIdx of shape: Expr
+    | TyNodeIdx of shape: Expr
     // halo<Inner, [offsets]> in TYPE position: a stencil traversal
     // transformer wrapping an inner index type, legal only as a range<> slot
     // (n-D separable composition: range<halo<Lat,[..]>, halo<Lon,[..]>>).

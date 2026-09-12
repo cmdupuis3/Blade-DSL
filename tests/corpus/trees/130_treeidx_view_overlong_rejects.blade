@@ -1,0 +1,19 @@
+// TEST: composing past a leaf (rejects)
+// The composition rewrite claims the WHOLE curried spine, not just two groups,
+// and this file is why that matters. A spine the rewrite declines folds its
+// inner prefix to a SCALAR and then applies the next group to it -- which
+// typechecks, because over-applying a scalar is an old and general hole
+// (`A(0)(0)` on a plain rank-1 array passes `check` too) -- and then dies in
+// g++ with "expression cannot be used as a function", a compiler-internal
+// message about a user's typo.
+//
+// Claiming the whole spine means the spliced path (0,0,0) meets TreeRank's own
+// answer instead: (0,0) is already a leaf, so a third step asks a childless
+// node for a child.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let bad = T((0))((0))((0))
+// ERROR: BL4003
+// ERROR-CONTAINS: step 2: child 0 outside [0,0) at node 2

@@ -1,0 +1,19 @@
+// TEST: TreeIdx shape mismatch across let-ascription (rejects)
+// T2 seam 1, the value-level probe P2's 013 recorded as a P3 obligation. Both
+// shapes have 5 leaves, so equal CARDINALITY must not make two tree spaces
+// interchangeable -- identity is the degree sequence, carried in the Tag. This
+// is also what the Unify TreeTag arm exists for: `__tree:` starts with "__",
+// so the synthetic-tag exemption would otherwise wave it through.
+//
+// MEASURED: this seam surfaces as BL3001 (TypeMismatch), NOT as the BL4003
+// index-type family -- ascription overwrites rather than unifies, and what
+// fires is the ordinary annotation-vs-value check with both classes rendered.
+// REJECT-AT: lower
+let static wide = [5, 0, 0, 0, 0, 0]
+let static deep = [2, 2, 0, 0, 3, 0, 0, 0]
+type WideIdx = TreeIdx<wide>
+type DeepIdx = TreeIdx<deep>
+let A: Array<Float64 like WideIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let B: Array<Float64 like DeepIdx> = A
+// ERROR: BL3001
+// ERROR-CONTAINS: WideIdx (= TreeIdx<[5, 0, 0, 0, 0, 0]>)

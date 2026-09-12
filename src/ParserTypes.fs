@@ -181,6 +181,15 @@ and parseTypeAtom (tokens: Token list) : ParseResult<TypeExpr> =
     | Some (TokKeyword KwPgIrrepsIdx) ->
         parseIndexType tokens
 
+    | Some (TokKeyword KwTreeIdx) ->
+        parseIndexType tokens
+
+    | Some (TokKeyword KwLeafIdx) ->
+        parseIndexType tokens
+
+    | Some (TokKeyword KwNodeIdx) ->
+        parseIndexType tokens
+
     | Some (TokKeyword KwHalo) ->
         // halo<Inner, [offsets]> in TYPE position: a range<> slot only.
         // Deliberately not in parseIndexType -- `Array<T like halo<..>>` must
@@ -684,6 +693,73 @@ and parseIndexType (tokens: Token list) : ParseResult<TypeExpr> =
          | _ ->
              let line, col = currentPos afterLt
              error "PgIrrepsIdx: expected a point-group NAME as the first argument -- PgIrrepsIdx<C4, SPEC>" line col)
+
+    // TreeIdx<shape>: shape is a static-expression argument -- a `let static`
+    // name or an inline array literal of preorder child counts
+    // (TreeIdx<[2, 2, 0, 0, 3, 0, 0, 0]>), resolved at lowering via StaticEval.
+    // Same grammar slot as IrrepsIdx<spec> / SparseIdx<keys>, so call syntax
+    // (TreeIdx<gen(3)>) is deliberately out: bind a `let static` first.
+    //
+    // NAMED REJECT PATHS (the OrbIdx bracket-grammar precedent -- three
+    // dedicated reject tests): an EMPTY payload and an UNCLOSED bracket are
+    // both reachable from a plausible typo and both die inside
+    // parseSimpleExpr/expectGt with a message about tokens rather than about
+    // trees. Catch them here, where the word `TreeIdx` is still in hand.
+    | Some (TokKeyword KwTreeIdx) ->
+        advance tokens |> expect (TokOp "<") >>= fun _ afterLt ->
+        (match peek afterLt with
+         | Some (TokOp ">") | Some (TokOp ">>") ->
+             let line, col = currentPos afterLt
+             error "TreeIdx<>: a tree shape argument is required -- a `let static` name or an \
+inline preorder degree sequence, as in TreeIdx<[2, 2, 0, 0, 3, 0, 0, 0]>" line col
+         | _ ->
+             parseSimpleExpr afterLt >>= fun shapeExpr afterShape ->
+             match peek afterShape with
+             | Some (TokOp ">") | Some (TokOp ">>") ->
+                 expectGt afterShape >>= fun _ remaining ->
+                 success (TyTreeIdx shapeExpr) remaining
+             | _ ->
+                 let line, col = currentPos afterShape
+                 error "TreeIdx<shape>: expected '>' to close the shape argument" line col)
+
+    // LeafIdx<shape> / NodeIdx<shape>: the DERIVED DENSE axes, same payload
+    // grammar as TreeIdx above and the same two named reject paths. Two
+    // keywords rather than one parameterized former, on the IrrepsIdx /
+    // PgIrrepsIdx precedent: they produce DIFFERENT extents from one payload,
+    // so a shared former would need a discriminator argument and read worse.
+    | Some (TokKeyword KwLeafIdx) ->
+        advance tokens |> expect (TokOp "<") >>= fun _ afterLt ->
+        (match peek afterLt with
+         | Some (TokOp ">") | Some (TokOp ">>") ->
+             let line, col = currentPos afterLt
+             error "LeafIdx<>: a tree shape argument is required -- a `let static` name or an \
+inline preorder degree sequence, as in LeafIdx<[2, 2, 0, 0, 3, 0, 0, 0]>" line col
+         | _ ->
+             parseSimpleExpr afterLt >>= fun shapeExpr afterShape ->
+             match peek afterShape with
+             | Some (TokOp ">") | Some (TokOp ">>") ->
+                 expectGt afterShape >>= fun _ remaining ->
+                 success (TyLeafIdx shapeExpr) remaining
+             | _ ->
+                 let line, col = currentPos afterShape
+                 error "LeafIdx<shape>: expected '>' to close the shape argument" line col)
+
+    | Some (TokKeyword KwNodeIdx) ->
+        advance tokens |> expect (TokOp "<") >>= fun _ afterLt ->
+        (match peek afterLt with
+         | Some (TokOp ">") | Some (TokOp ">>") ->
+             let line, col = currentPos afterLt
+             error "NodeIdx<>: a tree shape argument is required -- a `let static` name or an \
+inline preorder degree sequence, as in NodeIdx<[2, 2, 0, 0, 3, 0, 0, 0]>" line col
+         | _ ->
+             parseSimpleExpr afterLt >>= fun shapeExpr afterShape ->
+             match peek afterShape with
+             | Some (TokOp ">") | Some (TokOp ">>") ->
+                 expectGt afterShape >>= fun _ remaining ->
+                 success (TyNodeIdx shapeExpr) remaining
+             | _ ->
+                 let line, col = currentPos afterShape
+                 error "NodeIdx<shape>: expected '>' to close the shape argument" line col)
 
     | Some (TokIdent name0) ->
         // Named index type alias (e.g. type RegionIdx = Idx<3>; ...like RegionIdx),

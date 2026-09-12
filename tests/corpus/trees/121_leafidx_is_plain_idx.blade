@@ -1,0 +1,16 @@
+// TEST: LeafIdx unifies with a bare Idx of the same extent
+// The identity decision, made falsifiable. LeafIdx<crystal> IS Idx<5> -- Tag
+// None, IxKPlain -- and that is the feature, not a leak: the whole value of a
+// leaf axis is that it flows into every already-written Idx-typed function and
+// kernel. A nominal tag here would make it flow into nothing and put the user
+// back to hand-copying extents, which is the problem these axes exist to solve.
+//
+// The nominal identity stays on the TREE type, one level up, and leaves() is
+// the explicit opt-out. A user who wants a nominal leaf axis writes
+// `type Leaves = LeafIdx<crystal>` and gets the ordinary alias tag, exactly
+// like any other Idx alias.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+function total(v: Array<Float64 like Idx<5>>) -> Float64 = { reduce(v, (+)) }
+let L: Array<Float64 like LeafIdx<crystal>> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let s = total(L)
+// EXPECT: s = 15

@@ -1,0 +1,12 @@
+// TEST: TreeIdx path with a wildcard coordinate (rejects)
+// A hole frees a coordinate, which makes this a PARTIAL path -- a set of
+// leaves, not a cell. Same verdict as the too-short path (file 108) reached
+// from the other spelling, and refused with its own wording so the two
+// mistakes stay distinguishable in the message.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let bad = T((0, _))
+// ERROR: BL4003
+// ERROR-CONTAINS: a wildcard `_` frees a coordinate

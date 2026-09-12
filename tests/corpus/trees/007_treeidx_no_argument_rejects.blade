@@ -1,0 +1,6 @@
+// TEST: TreeIdx with no shape argument (rejects)
+// The parser's named reject path -- `TreeIdx<>` dies naming trees, not tokens.
+// REJECT-AT: lower
+type NoArg = TreeIdx<>
+// ERROR: BL1999
+// ERROR-CONTAINS: a tree shape argument is required

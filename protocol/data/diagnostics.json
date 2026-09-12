@@ -628,6 +628,19 @@
       ],
       "docs": []
     },
+    "BL4021": {
+      "title": "invalid tree shape",
+      "explanation": "A `TreeIdx<shape>` whose shape argument is not a well-formed preorder degree sequence. The shape is the child count of each node in depth-first order -- `[[leaf, leaf], [leaf, leaf, leaf]]` is `[2, 2, 0, 0, 3, 0, 0, 0]` -- and it must be a compile-time value: a `let static` binding or an inline literal. Two different mistakes share this code and are told apart by the message. First, the shape does not statically evaluate, or evaluates to something that is not a list of non-negative integers. A tree carries its whole shape in its type, so cardinality, every subtree size and every node arity are compile-time constants; a shape computed at run time can be neither honoured nor compared, which is the same refusal a runtime RaggedIdx lens gets. Second, the shape evaluates to integers that do not describe a tree: the prefix walk closes before the sequence ends (a trailing tail belonging to no tree), or the sequence ends before the walk closes (child slots nothing fills). Note that cardinality is the LEAF count, not the node count -- the value domain of a tree index is complete root-to-leaf paths.",
+      "fix": "Bind the shape as a `let static` and write the preorder child counts directly: `let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]` then `type CrystalIdx = TreeIdx<crystal>`. A generated shape may come from a `static function`, since statics fold at compile time. If the sequence is rejected as malformed, check that it sums to nodes - 1: every entry opens that many child slots, the root starts with one slot open, and the count must reach exactly zero on the last node. A shape only the running program knows is the planned DynTreeIdx and is not available yet.",
+      "examples": [
+        "tests/corpus/trees/003_treeidx_nonstatic_shape_rejects.blade",
+        "tests/corpus/trees/004_treeidx_malformed_open_rejects.blade"
+      ],
+      "docs": [
+        "docs/features/graphs-trees.md",
+        "docs/plans/plan-graphs-trees.md"
+      ]
+    },
     "BL5000": {
       "title": "ml elaboration error",
       "explanation": "The `ml` domain elaborator refused a construct: a non-static configuration where a compile-time spec is required, a gated block reached in the wrong order, a bad derivation order, or an op whose arguments do not fit its spec.",

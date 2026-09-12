@@ -1,0 +1,15 @@
+// TEST: reduce over a tree folds the flat leaf axis
+// Replaces P2's 012, whose header said a different code arriving here was the
+// signal to revisit: P3 makes the operand constructible and reduce needs no arm
+// at all. The pool is rank-1 dense, so both lanes fold it with the machinery
+// they already have, and neither inspects IxKind on this path. The fold order
+// is preorder over leaves, which IS lexicographic over paths.
+//
+// The asymmetry with method_for (file 113) is deliberate: reduce CONSUMES the
+// pool and yields a scalar, while method_for PRODUCES an array that would
+// inherit the tree slot.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let total = reduce(T, (+))
+// EXPECT: total = 15

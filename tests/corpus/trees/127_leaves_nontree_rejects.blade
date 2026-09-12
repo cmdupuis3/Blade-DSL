@@ -1,0 +1,16 @@
+// TEST: leaves() of an array with no tree slot (rejects)
+// leaves() retypes a tree's pool onto its leaf axis; an ordinary dense array is
+// already that, so there is nothing to retype and the honest answer is to say
+// so and point at the argument.
+//
+// MEASURED: this arrives as BL3999, not the BL4003 index-type family. That is
+// deliberate rather than incidental -- BL4003's message template opens with
+// "<class> is a declarable index class", and there is no class here to name, so
+// routing a plain array through it would produce confident nonsense about the
+// user's own type. The hybrid case (a tree slot BESIDE other slots) does have a
+// class to name and keeps BL4003.
+// REJECT-AT: lower
+let G: Array<Float64 like Idx<5>> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let bad = leaves(G)
+// ERROR: BL3999
+// ERROR-CONTAINS: which has no tree slot

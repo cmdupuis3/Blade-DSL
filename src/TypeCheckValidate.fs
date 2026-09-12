@@ -294,6 +294,94 @@ let rec internal collectAppRankErrors (subst: Subst) (expr: TypedExpr) : Compile
         | _ -> []
     here @ (typedExprChildren expr |> List.collect (collectAppRankErrors subst))
 
+/// The safety half of P5's open function-signature door, and it is NOT
+/// speculative: both refusals below were MEASURED to pass silently before this
+/// sweep existed.
+///
+/// Two mistakes, one site, because both are the same seam -- direct application
+/// does NOT unify plain-call arguments, so nothing on the eager path ever
+/// compares an argument's index record against its parameter's.
+///
+///  1. LAUNDERING. A tree-slotted argument reaching a parameter that declares no
+///     tree slot -- an abstract `T^r`, or a plain `Array<T like I>` of matching
+///     rank. The callee would read the pool as an ordinary rank-1 array, which
+///     is true of the STORAGE and false of the TYPE: it could then return it,
+///     alias it, or hand it to a loop former, and the tree identity is gone in
+///     one step. Measured: `function h(x: T^1)` applied to a tree binding
+///     compiled and ran.
+///
+///  2. SILENT MISADDRESSING. Both sides tree-slotted, different shapes. This is
+///     the one the phase plan flagged as its top risk and it landed exactly
+///     there: `f(A)` with a `[5,0,0,0,0,0]` argument and a `[2,2,0,0,3,0,0,0]`
+///     parameter compiled, ran, and returned a value -- the callee folded the
+///     path (1,2) against the PARAMETER's degree sequence and read offset 4 of
+///     an array that has no such path. Equal cardinality is what let it through,
+///     which is precisely the coincidence tree identity exists to reject.
+///     `Unify`'s TreeTag arm already decides this correctly; it simply is never
+///     asked on this path.
+///
+/// Runs on the ZONKED module for `collectAppRankErrors`' reason: an abstract
+/// parameter is not closed at its call site, so the eager half in
+/// `dispatchAppOrIndex`'s FuncElem arm cannot see it (`firstArgTypeClash`'s
+/// `concreteClassOf` declines on arrays by design). A MATCHING concrete tree
+/// parameter is fine and is the whole point of opening the door.
+let rec internal collectAppTreeErrors (subst: Subst) (expr: TypedExpr) : CompileError list =
+    // The tree slot of a type, as (rendered class, degree sequence). Both are
+    // needed: the rendering names the class in the message, the sequence is the
+    // identity.
+    let treeOf (t: IRType) : (string * string option * int list) option =
+        match subst.Resolve t with
+        | ArrayElem at ->
+            at.IndexTypes
+            |> List.tryPick (fun ix ->
+                if ix.IxKind <> IxKTree then None
+                else
+                    match ix, ix.Tag with
+                    | TreeIdxLike rendered, Some (TreeTag (nameOpt, degrees)) -> Some (rendered, nameOpt, degrees)
+                    | TreeIdxLike rendered, _ -> Some (rendered, None, [])
+                    | _ -> None)
+        | _ -> None
+    // EXACTLY `Unify.indexPairIncompatible`'s TreeTag predicate, restated here
+    // rather than approximated: identity is the degree SEQUENCE plus the
+    // optional nominative alias, so two NAMED aliases of the same shape differ
+    // while anon-vs-named stays compatible. Keeping the two rules in step is the
+    // point of this sweep -- it exists only because direct application never
+    // asks unify, not because it wants a different answer.
+    let treeIdentityDiffers (n1, d1) (n2, d2) =
+        d1 <> d2 || (match n1, n2 with
+                     | Some a, Some b -> a <> b
+                     | _ -> false)
+    let here =
+        match expr.Kind with
+        | TExprApp (tFunc, tArgs) ->
+            (match subst.Resolve tFunc.Type with
+             | FuncElem (paramTys, _) ->
+                 let n = min paramTys.Length tArgs.Length
+                 List.zip (paramTys |> List.truncate n) (tArgs |> List.truncate n)
+                 |> List.indexed
+                 |> List.choose (fun (i, (pTy, arg)) ->
+                     let mk detail =
+                         Some { Error = TreeIdxUnsupported (detail |> fst, detail |> snd)
+                                Span = arg.Span; Context = []; Code = None }
+                     match treeOf arg.Type, treeOf pTy with
+                     | Some (rendered, _, _), None ->
+                         mk (rendered,
+                             $"argument {i + 1}, whose parameter declares no tree slot -- an abstract or \
+plain-array parameter would read the pool as an ordinary dense array and could then return, alias or \
+iterate it with the tree identity gone. Declare the parameter over the same tree type, or pass \
+leaves(T) and declare the parameter over LeafIdx")
+                     | Some (aRend, aName, aDeg), Some (pRend, pName, pDeg)
+                            when treeIdentityDiffers (aName, aDeg) (pName, pDeg) ->
+                         mk (aRend,
+                             $"argument {i + 1}, whose parameter declares the DIFFERENT tree type {pRend} -- \
+a tree's identity is its degree sequence plus its nominative alias, and neither an equal leaf count nor \
+an equal shape under another name makes two tree spaces interchangeable. The callee would fold its paths \
+against its OWN type and read cells this argument does not have at those offsets")
+                     | _ -> None)
+             | _ -> [])
+        | _ -> []
+    here @ (typedExprChildren expr |> List.collect (collectAppTreeErrors subst))
+
 /// Post-check sweep for MISPLACED provider writes.
 ///
 /// `alias.write("path", A)` is a module-level DECLARATION form, not an

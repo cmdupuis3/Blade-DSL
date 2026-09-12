@@ -1939,6 +1939,96 @@ let rec internal dispatchAppOrIndex (env: TypeEnv) (tFunc: TypedExpr) (tArgs: Ty
              let ix = arrTy.IndexTypes |> List.find (fun ix -> ix.Symmetry = SymWreath)
              Error (OrbitStorageUnsupported (ppOrbitLevels (orbitLevelsOf ix),
                                              "array subscript of a wreath group combined with other index slots")))
+    // TREE SUBSCRIPT AT A STATIC PATH -- the P3/P4 read primitive.
+    //
+    // `T((c0, c1, ...))` names a complete root-to-leaf path, and because the
+    // shape is static and rides the Tag, the leaf offset is a COMPILE-TIME
+    // CONSTANT. So this arm builds no tree-shaped IR node at all: it folds the
+    // path to its offset and hands back an ORDINARY rank-1 subscript. That is
+    // what makes both back ends need nothing -- the C++ lane falls through
+    // compoundRead / wreathRead / lazyCompactRead / densePartialSubview to
+    // `rawSubscript` (T[k] -> data[k]) and the interpreter's `indexArray` takes
+    // its dense peel. They are byte-identical by construction, because both
+    // consume the same IRLit.
+    //
+    // A BARE SCALAR `T(c)` is the one-element path -- the parser has no 1-tuple
+    // form, so `T((0))` is a parenthesized scalar and arrives here the same
+    // way. It is self-limiting rather than special-cased: the fold accepts it
+    // only when the root's c-th child is a LEAF, and otherwise produces the
+    // "ends at internal node" message, which is the right answer.
+    //
+    // Everything NOT a static complete path refuses here: a non-literal
+    // coordinate (dynamic paths), a wildcard (partial views), a path that stops
+    // at an internal node (a subtree), an over-long or out-of-arity path (a
+    // domain error TreeRank names by STEP).
+    | ArrayElem arrTy when
+        not (List.isEmpty tArgs)
+        && arrTy.IndexTypes |> List.exists (fun ix -> ix.IxKind = IxKTree) ->
+        (match arrTy.IndexTypes with
+         | [ ix ] when ix.IxKind = IxKTree ->
+             let rendered = match ix with TreeIdxLike r -> r | _ -> "TreeIdx<?>"
+             // Recover the degree sequence from the Tag -- the ONE place the
+             // shape lives; it is deliberately not in Extent, which holds the
+             // leaf COUNT so that two coincidentally-equal cardinalities stay
+             // distinct types.
+             (match ix.Tag with
+              | Some (TreeTag (_, degrees)) ->
+                  let litOf (a: TypedExpr) =
+                      match a.Kind with
+                      | TExprLit (LitInt n) when n >= 0L && n <= 1000000L -> Some (int n)
+                      | _ -> None
+                  let pathOf (args: TypedExpr list) : Result<int list, string> =
+                      match args with
+                      | [ { Kind = TExprTuple comps } ] ->
+                          if comps |> List.exists _.Kind.IsTExprWildcard then
+                              Error "a wildcard `_` frees a coordinate, which is a PARTIAL path"
+                          else
+                              let ls = comps |> List.map litOf
+                              if not ls.IsEmpty && ls |> List.forall Option.isSome
+                              then Ok (ls |> List.map Option.get)
+                              else Error "every child selector must be a compile-time integer literal"
+                      | [ single ] ->
+                          (match litOf single with
+                           | Some c -> Ok [ c ]
+                           | None ->
+                               if single.Kind.IsTExprWildcard then
+                                   Error "a wildcard `_` frees a coordinate, which is a PARTIAL path"
+                               else
+                                   Error "every child selector must be a compile-time integer literal")
+                      | _ ->
+                          Error "a tree read takes ONE argument -- the whole path as a single tuple, as in T((0, 1)) with inner parentheses"
+                  (match pathOf tArgs with
+                   | Error why -> Error (TreeIdxUnsupported (rendered, $"this array subscript ({why})"))
+                   | Ok path ->
+                       (match Blade.TreeRank.treeTables degrees
+                              |> Result.bind (fun t -> Blade.TreeRank.treeForwardChecked t path) with
+                        | Error detail ->
+                            // TreeRank names the failing STEP, the arity it
+                            // violated, or the internal node it stopped at.
+                            Error (TreeIdxPath (rendered, detail))
+                        | Ok off ->
+                            // The read, as a plain literal subscript. Span
+                            // carried from the original argument so diagnostics
+                            // and tooling still point at the path as written.
+                            let offLit =
+                                { (List.head tArgs) with
+                                    Kind = TExprLit (LitInt (int64 off))
+                                    Type = IRTScalar ETInt64 }
+                            let identity = match tFunc.Kind with TExprVar (_, _, id) -> id | _ -> None
+                            Ok (mkTyped (TExprIndex (tFunc, [ offLit ], identity)) arrTy.ElemType)))
+              | _ ->
+                  // Kind says tree but the tag is missing or unparseable -- a
+                  // state validateIR rejects. Refuse rather than fold against
+                  // nothing.
+                  Error (TreeIdxUnsupported (rendered, "this array subscript (the shape is not recoverable from the index type)")))
+         | _ ->
+             let ix = arrTy.IndexTypes |> List.find (fun ix -> ix.IxKind = IxKTree)
+             let rendered = match ix with TreeIdxLike r -> r | _ -> "TreeIdx<?>"
+             // A tree slot beside other slots is the hybrid form. Free in the
+             // TYPE, but the read needs the trailing subscripts to survive the
+             // path fold, which is a residual-view shape -- later, with the
+             // partial paths.
+             Error (TreeIdxUnsupported (rendered, "an array subscript of a tree slot combined with other index slots")))
     // FULL-ARITY READ OF A COMPACT GROUP -- same hole the wreath arm above
     // closes. A rank-k compact slot (SymIdx/AntisymIdx/HermitianIdx) is ONE
     // index record spanning k dims and takes k FLAT subscripts, so `A(i,j)`

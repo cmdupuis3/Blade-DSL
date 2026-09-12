@@ -1,0 +1,12 @@
+// TEST: TreeIdx path runs past a leaf (rejects)
+// (0,0) is already a leaf, so a third step asks a childless node for a child.
+// The step index and the empty arity interval are both in the message: an
+// over-long path is not a separate rule, it is the arity rule reaching a
+// degree-0 node.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let bad = T((0, 0, 0))
+// ERROR: BL4003
+// ERROR-CONTAINS: step 2: child 0 outside [0,0) at node 2

@@ -1,0 +1,22 @@
+// TEST: TreeIdx path stops at an internal node (rejects)
+// (1) reaches an internal node with 3 children. That names a SUBTREE, not a
+// cell -- subtree views are a later phase, and refusing here is what keeps the
+// value/view distinction from being introduced silently.
+//
+// This is also the arm that makes the bare-scalar one-element path (file 102)
+// self-limiting: `T((1))` and `T(1)` are the same program, and both land here
+// on a shape whose depth-1 children are not leaves.
+//
+// P5 note: this pin SURVIVED the arrival of path composition, which is one of
+// the reasons composition was done as a surface splice. `T((1))((2))` is a
+// complete path and folds (file 118); `T((1))` alone has no second application
+// to splice, so it still reaches this fold and still gets this answer. File 119
+// pins the same text for the case that motivated it -- binding a partial path,
+// which is the escaping subtree view P5 cut.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let bad = T((1))
+// ERROR: BL4003
+// ERROR-CONTAINS: must end at a leaf

@@ -1,0 +1,10 @@
+// TEST: TreeIdx range slot refuses (rejects)
+// The third front-end door: range<> names an iteration space with no annotation
+// to catch, so without its own arm this reaches buildRawLoopLevels' backstop and
+// surfaces as a BL9001 internal error -- accurate, but about the wrong party.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let r = range<CrystalIdx>
+// ERROR: BL4003
+// ERROR-CONTAINS: range<> iteration slot

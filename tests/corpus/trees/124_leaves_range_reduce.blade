@@ -1,0 +1,19 @@
+// TEST: range over LeafIdx iterates, and reduce folds the retyped pool
+// Two consequences of the derived axes being PLAIN Idx records, both free.
+//
+// `range<LeafIdx<S>>` is what discharges this phase's "derived dense axes"
+// clause on its own: because the axis lowers to a plain Idx, range over it is
+// the most-travelled path in the language and needs no `preorder<S>` virtual
+// array at all. (`postorder` is a genuine PERMUTATION rather than a range, so
+// it needs a real virtual-array kind with its own element mapping -- that one
+// is deferred, and this file is why it does not block anything.)
+//
+// reduce over leaves(T) agrees with reduce over T (file 105): same storage,
+// same order, and the retype does not touch data.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let R = method_for(range<LeafIdx<crystal>>) <@> lambda(i) -> Float64(i) * 10.0 |> compute
+let s = reduce(leaves(T), (+))
+// EXPECT: R = [0, 10, 20, 30, 40]
+// EXPECT: s = 15

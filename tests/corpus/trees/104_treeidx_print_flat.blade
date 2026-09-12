@@ -1,0 +1,11 @@
+// TEST: TreeIdx prints flat in preorder
+// Rank 1, so the rank-2-nests / everything-else-flat regime prints the flat
+// preorder run. Nothing in either printer dispatches on IxKTree -- the one
+// IxKind-sensitive print site is the compound/sparse suppression, and a tree
+// matches neither -- so this is the dense route, unchanged. No print carve-out
+// in v1: a structure-revealing form would be a corpus-wide pin change bought
+// for cosmetics.
+let static skew = [3, 0, 2, 0, 2, 0, 0, 3, 1, 0, 0, 0]
+type SkewIdx = TreeIdx<skew>
+let S: Array<Float64 like SkewIdx> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+// EXPECT: S = [10, 20, 30, 40, 50, 60, 70]

@@ -106,6 +106,16 @@
          its eventual consumer (the checked sibling of `binomI64`, IR.fs:2438),
          and nothing it needs compiles later. -->
     <Compile Include="src/OrbRank.fs" />
+    <!-- TreeIdx storage/indexing bijections (docs/plans/plan-graphs-trees.md
+         P1, pure-function layer): degree-sequence validation, the derived
+         preorder tables (sizes / leaf counts / leaf offsets / parent / depth /
+         the child CSR), and the path <-> leaf-offset pair with partial-path
+         subtree resolution. Dependency-free on the same policy as OrbRank.fs
+         above — FSharp.Core only, no Blade module opened — so proofs/ scripts
+         can `#load` it standalone; sits beside OrbRank for the same reason
+         (IR.fs/IRStorage.fs are its eventual consumers, and nothing it needs
+         compiles later). -->
+    <Compile Include="src/TreeRank.fs" />
     <!-- The IR, seven layers. IR.fs keeps the whole hot surface (core types
          and constructors, the module/builder model, the analysis context, the
          canonical ExprShape walkers, typeOf) so downstream `open Blade.IR`
@@ -477,6 +487,13 @@
          E/B/A nest and the depth-1 triangular-offset anchors. Pure integer,
          in-process, no Blade source pipeline. (Also `blade test orbrank`.) -->
     <Compile Include="tests/Test_OrbRank.fs" />
+    <!-- The TreeIdx bijection layer (src/TreeRank.fs): the path <-> leaf-offset
+         pair, the derived preorder tables and subtree contiguity, pinned
+         against a BRUTE-FORCE recursion over an independent nested-shape ADT —
+         content and order, since leaf-offset order IS lexicographic order on
+         paths. Pure integer, in-process, no Blade source pipeline.
+         (Also `blade test treerank`.) -->
+    <Compile Include="tests/Test_TreeRank.fs" />
     <Compile Include="tests/OrbWreathTests.fs" />
     <Compile Include="tests/Test_Mutability.fs" />
     <Compile Include="tests/Test_Static.fs" />

@@ -2588,6 +2588,12 @@ let rec internal dispatchTest (rest: string list) : int =
         // brute-force canonicalization as SET and ORDER (a read->write roundtrip can't catch an order mismatch).
         let failed = (Blade.Tests.OrbRankReview.runOrbRankTests ()).Failed
         if failed = 0 then 0 else 1
+    | [ "treerank" ] | [ "tree-rank" ] ->
+        // TreeIdx shape validation, the derived preorder tables, and the
+        // path <-> leaf-offset pair (src/TreeRank.fs), pinned against a
+        // brute-force recursion over an independent nested-shape ADT as SET and ORDER, plus subtree contiguity.
+        let failed = (Blade.Tests.TreeRankReview.runTreeRankTests ()).Failed
+        if failed = 0 then 0 else 1
     | [ "sympower" ] | [ "sympower-tables" ] ->
         // T_{j,l} Sym-power occurrence tables (SymPowerTables.fs): exact
         // rational kernel/Gram pins, the realization phase rule, realCG completeness.
@@ -2859,6 +2865,7 @@ let rec internal dispatchTest (rest: string list) : int =
             | "deferred-concrete" | "deferredconcrete" -> Some ("Deferred Concrete", Blade.Tests.RunAll.deferredConcreteTests)
             | "memfree" -> Some ("Mem Free", Blade.Tests.RunAll.memfreeTests)
             | "memfree-stress" | "memfreestress" -> Some ("Mem Free Stress", Blade.Tests.RunAll.memfreeStressTests)
+            | "trees" -> Some ("Trees", Blade.Tests.RunAll.treeTests)
             | _ -> None
         match categoryTests with
         | Some (name, tests) ->

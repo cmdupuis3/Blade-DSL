@@ -1,0 +1,9 @@
+// TEST: TreeIdx non-static shape (rejects)
+// A tree carries its whole shape in its type, so the shape must fold at
+// compile time. A plain `let` does not. The refusal steers to DynTreeIdx.
+// REJECT-AT: lower
+let runtime_shape = [2, 0, 0]
+type BadIdx = TreeIdx<runtime_shape>
+function f(x: Float64) -> Array<Float64 like BadIdx> = { x }
+// ERROR: BL4021
+// ERROR-CONTAINS: statically evaluable

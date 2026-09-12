@@ -1,0 +1,10 @@
+// TEST: TreeIdx constructs from a flat literal
+// P3 removes P2's let-annotation door, and construction turns out to need no
+// new code in either lane: the pool IS a flat rank-1 array of cardinality
+// (LEAF count, not node count), so crystal's 8 nodes and 5 leaves mean a
+// 5-cell literal holding the leaves in preorder. Storage, allocation and
+// teardown are the ordinary dense path -- only the TYPE carries treeness.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+// EXPECT: T = [1, 2, 3, 4, 5]

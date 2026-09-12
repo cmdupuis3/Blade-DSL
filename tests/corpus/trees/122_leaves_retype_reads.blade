@@ -1,0 +1,24 @@
+// TEST: leaves(T) retypes the pool onto the leaf axis
+// ZERO-COPY and zero-node: leaves() returns the SAME typed expression with a
+// new type. A tree binding is already an ordinary rank-1 dense array whose
+// cells are the leaves in preorder, and LeafIdx is a plain Idx over the leaf
+// count, so the two types describe byte-identical storage -- the retype is a
+// statement about ADDRESSING, not about data. Nothing is emitted, nothing is
+// copied, and neither back end learns a thing.
+//
+// The offsets pinned here are the preorder leaf order, the same order file 101
+// pins through the path fold. leaves() cannot disagree with extents(T) either:
+// the leaf axis inherits the tree record's own Extent rather than re-deriving
+// the cardinality from a second source.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let P = leaves(T)
+let p0 = P(0)
+let p4 = P(4)
+let np = extents(P)
+let nt = extents(T)
+// EXPECT: p0 = 1
+// EXPECT: p4 = 5
+// EXPECT: np = 5
+// EXPECT: nt = 5

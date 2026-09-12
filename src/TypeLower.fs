@@ -97,6 +97,30 @@ let evalStaticIntExpr (env: TypeEnv) (expr: Expr) : int option =
 let evalStaticValueExpr (env: TypeEnv) (expr: Expr) : Result<StaticEval.StaticValue, string> =
     StaticEval.evalExpr (staticEnvOf env) StaticEval.maxSteps expr
 
+/// Decode a folded static value into a PREORDER DEGREE SEQUENCE. A static array
+/// literal folds to `SVTuple [SVInt ...]` (the same shape MLStatics.specOfStatic
+/// decodes one level deeper), so this is that decode with scalar entries.
+/// STRUCTURE only -- whether the sequence describes a real tree is
+/// `Blade.TreeRank.validateDegrees`' job, and the two failures get different
+/// messages on purpose.
+let degreesOfStatic (what: string) (v: StaticEval.StaticValue) : Result<int list, string> =
+    let entryOf (e: StaticEval.StaticValue) =
+        match e with
+        | StaticEval.SVInt d when d >= 0L && d <= 1000000L -> Ok (int d)
+        | StaticEval.SVInt d -> Error $"{what}: child count {d} is out of range (0 .. 1000000)"
+        | _ -> Error $"{what}: every entry must be an integer child count"
+    match v with
+    | StaticEval.SVTuple [] ->
+        // No `{what}:` prefix here -- `what` IS the noun the sentence needs
+        // ("the shape is empty"), and the labelled form read "the shape: the
+        // shape is empty".
+        Error $"{what} is empty -- a tree has at least one node (the single leaf is [0])"
+    | StaticEval.SVTuple entries ->
+        entries |> List.fold (fun acc e ->
+            acc |> Result.bind (fun ds -> entryOf e |> Result.map (fun d -> ds @ [d]))) (Ok [])
+    | _ ->
+        Error $"{what}: expected a static array of preorder child counts, e.g. [2, 2, 0, 0, 3, 0, 0, 0]"
+
 /// Dist provenance of a surface expression: the union of the provenance
 /// sets of every variable reachable in it (conservative -- an
 /// over-approximated source set can only make independence HARDER to
@@ -702,8 +726,9 @@ let rec lowerTypeExpr (env: TypeEnv) (ty: TypeExpr) : IRType =
             | _ -> false
         if isAllString then IRTScalar ETString else IRTScalar ETInt64
 
-    | TyDepIdx _ | TyRaggedIdx _ | TyRaggedIdxOpaque | TyIrrepsIdx _ | TyPgIrrepsIdx _ | TySparseIdx _ ->
-        // DepIdx/RaggedIdx/IrrepsIdx/PgIrrepsIdx/SparseIdx in non-index position --
+    | TyDepIdx _ | TyRaggedIdx _ | TyRaggedIdxOpaque | TyIrrepsIdx _ | TyPgIrrepsIdx _ | TySparseIdx _
+    | TyTreeIdx _ | TyLeafIdx _ | TyNodeIdx _ ->
+        // DepIdx/RaggedIdx/IrrepsIdx/PgIrrepsIdx/SparseIdx/TreeIdx in non-index position --
         // the pg member takes PARITY with the O(3) one here: same known gap,
         // same treatment. Defensive fallback matching TyCompoundIdx/TyEquivIdx:
         // wrap in a single-index Array so the IR shape is consistent. Real
@@ -1168,6 +1193,73 @@ and lowerIndexType env (_position: int) (ty: TypeExpr) : IRIndexType =
         { Id = id; Rank = rank; Extent = IRSparseKeys source
           Symmetry = SymNone; Tag = Some "__sparseidx"; IxKind = IxKSparse
           Kind = SDimension; Dependencies = [] }
+    | TyTreeIdx shapeExpr ->
+        // TreeIdx<shape>: ONE slot whose domain is complete root-to-leaf paths.
+        // The shape resolves under the full static contract (the IrrepsIdx
+        // route); the payload is the PREORDER DEGREE SEQUENCE, the canonical
+        // internal form (feature doc 2.3). Extent = LEAF count, because the
+        // value domain is complete paths -- NOT the node count, which is the
+        // easy off-by-a-lot here.
+        //
+        // Two validations, in order, because the mistakes differ: the value
+        // must FOLD and be a list of non-negative ints (degreesOfStatic), and
+        // the sequence must describe a real tree -- the prefix walk closing
+        // exactly (TreeRank.validateDegrees, via treeTables which runs it).
+        //
+        // lowerIndexType has NO error channel, so a failure lowers to the
+        // marker record consumed by irTypeBadTreeDetail at let-binding /
+        // function-signature sites (the ragged-no-prior pattern), the failure
+        // detail smuggled in the IRParam extent. NEVER `failwith` here -- that
+        // is the SparseIdx mistake one arm up, and it turns a user typo into a
+        // compiler crash with no span.
+        (match evalStaticValueExpr env shapeExpr
+               |> Result.mapError (fun e -> $"the shape is not statically evaluable ({e}). \
+A tree shape must be a `let static` binding or an inline literal; a shape computed at run time \
+is the future DynTreeIdx, not this one")
+               |> Result.bind (degreesOfStatic "the shape")
+               |> Result.bind (fun degs ->
+                    Blade.TreeRank.treeTables degs |> Result.map (fun t -> (degs, t))) with
+         | Ok (degs, tables) ->
+             mkTreeIndexRecord id None degs (Blade.TreeRank.cardinality tables)
+         | Error detail ->
+             mkTreeErrorRecord id detail)
+    | TyLeafIdx shapeExpr | TyNodeIdx shapeExpr ->
+        // The DERIVED DENSE axes. Same static payload as TreeIdx above and the
+        // same two validations in the same order, but the record produced is an
+        // ORDINARY dense Idx: Tag = None, IxKPlain, extent a folded literal.
+        //
+        // That is the design, not a shortcut. These axes exist so that bulk
+        // numerics over a tree's pool keep every optimization the language
+        // already has, and that requires them to be INDISTINGUISHABLE from a
+        // hand-written Idx<n> -- `LeafIdx<crystal>` unifying with `Idx<5>` is
+        // the feature, not a leak. The nominal identity stays on the TREE type,
+        // and `leaves(T)` is the visible, explicit opt-out; a user who wants a
+        // nominal leaf axis writes `type Leaves = LeafIdx<crystal>` and gets
+        // the ordinary alias tag like any other Idx.
+        //
+        // LeafIdx takes the CARDINALITY (leaf count), NodeIdx the NODE count --
+        // the one payload, two extents, which is why these are two keywords and
+        // not one former with a discriminator.
+        //
+        // The bad-shape marker channel is shared with TreeIdx: a malformed
+        // sequence is the same mistake whichever former named it, so it plants
+        // the same IxKErrorTreeBadShape record and surfaces as the same BL4021.
+        let isLeaf = (match ty with TyLeafIdx _ -> true | _ -> false)
+        (match evalStaticValueExpr env shapeExpr
+               |> Result.mapError (fun e -> $"the shape is not statically evaluable ({e}). \
+A tree shape must be a `let static` binding or an inline literal; a shape computed at run time \
+is the future DynTreeIdx, not this one")
+               |> Result.bind (degreesOfStatic "the shape")
+               |> Result.bind Blade.TreeRank.treeTables with
+         | Ok tables ->
+             let n =
+                 if isLeaf then Blade.TreeRank.cardinality tables
+                 else Blade.TreeRank.nodeCount tables
+             { Id = id; Rank = 1; Extent = IRLit (IRLitInt (int64 n))
+               Symmetry = SymNone; Tag = None; IxKind = IxKPlain
+               Kind = SDimension; Dependencies = [] }
+         | Error detail ->
+             mkTreeErrorRecord id detail)
     | _ ->
         { Id = id; Rank = 1; Extent = IRParam ("?", 0, IRTNat None); Symmetry = SymNone
           Tag = None; IxKind = IxKPlain; Kind = SDimension; Dependencies = [] }

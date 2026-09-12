@@ -1,0 +1,10 @@
+// TEST: TreeIdx inline literal shape declares
+// The second spelling: the sequence written straight into the type slot, no
+// `let static` name. Same grammar slot IrrepsIdx<[(0,0,2)]> uses.
+type FlatIdx = TreeIdx<[3, 0, 0, 0]>
+
+// A single leaf is the degenerate legal shape: one node, no children.
+type LeafOnly = TreeIdx<[0]>
+
+let sentinel = 1
+// EXPECT: sentinel = 1

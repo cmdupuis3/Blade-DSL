@@ -356,6 +356,17 @@ module Codes =
             // closed form and is not capped; a small non-linear one is
             // tabled with a BL4010 advisory.
             "BL4020", "constrained domain not enumerable"
+            // BL4021: a `TreeIdx<shape>` whose shape is not a well-formed
+            // preorder degree sequence. TWO mistakes under one code (BL4018's
+            // shape one entry up): the shape does not statically evaluate at all
+            // -- a tree shape is a `let static` value and from nowhere else, so a
+            // run-time shape can be neither honoured nor compared, and that lane
+            // is the future DynTreeIdx -- or it evaluates and is not a tree: a
+            // negative or non-integer entry, an empty sequence, a walk that
+            // closes before the sequence ends (a tail belonging to no tree), or
+            // a sequence that ends before the walk closes (child slots nothing
+            // fills). The message names which.
+            "BL4021", "invalid tree shape"
             // BL5xxx: elaborators
             "BL5000", "ml elaboration error"
             "BL5100", "ppl elaboration error"

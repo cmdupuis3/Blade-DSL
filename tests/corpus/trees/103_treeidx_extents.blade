@@ -1,0 +1,17 @@
+// TEST: TreeIdx extents is the leaf count
+// Cardinality is the LEAF count, not the node count: the value domain is
+// complete paths. crystal has 8 nodes and 5 leaves; skew has 12 and 7. Both
+// lanes take this from the slot's Extent, which mkTreeIndexRecord set to the
+// leaf count and which the construction check validated the literal against --
+// so the agreement is structural, and this file asserts it rather than
+// assuming it.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+let static skew = [3, 0, 2, 0, 2, 0, 0, 3, 1, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+type SkewIdx = TreeIdx<skew>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let S: Array<Float64 like SkewIdx> = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+let nt = extents(T)
+let ns = extents(S)
+// EXPECT: nt = 5
+// EXPECT: ns = 7

@@ -1,0 +1,17 @@
+// TEST: LeafIdx and NodeIdx declare over a tree shape
+// The derived dense axes. One payload, two extents -- which is why they are two
+// keywords and not one former with a discriminator: LeafIdx takes the
+// CARDINALITY (leaf count), NodeIdx the NODE count. crystal has 8 nodes and 5
+// leaves, and the two must not be confused, which is the easy off-by-a-lot in
+// this whole module.
+//
+// Both lower to an ORDINARY dense Idx record. File 121 makes that falsifiable.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type Leaves = LeafIdx<crystal>
+type Nodes = NodeIdx<crystal>
+let L: Array<Float64 like Leaves> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let N: Array<Int64 like Nodes> = [0, 1, 2, 3, 4, 5, 6, 7]
+let nl = extents(L)
+let nn = extents(N)
+// EXPECT: nl = 5
+// EXPECT: nn = 8

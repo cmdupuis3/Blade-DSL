@@ -1,0 +1,24 @@
+// TEST: TreeIdx path composition equals the spliced path
+// The nested-view identity T((0))((1)) == T((0, 1)), which P5 owes. It holds by
+// CONSTRUCTION rather than by two code paths agreeing: the composition is a
+// pure SURFACE rewrite performed before either application is typed, so the
+// landed single-path fold does all the work and there is no second fold to
+// disagree with the first.
+//
+// Deliberately syntactic. This phase ships no subtree VALUE -- an escaping view
+// would need a real runtime object and a new IR node in both lanes -- so the
+// only way two applications can compose is textually, which is exactly what the
+// rewrite recognises. File 119 pins the other side of that line.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let a = T((0))((1))
+let a_flat = T((0, 1))
+let b = T((1))((2))
+let b_flat = T((1, 2))
+let c = T((1))((0))
+// EXPECT: a = 2
+// EXPECT: a_flat = 2
+// EXPECT: b = 5
+// EXPECT: b_flat = 5
+// EXPECT: c = 3

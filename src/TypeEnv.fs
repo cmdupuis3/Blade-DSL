@@ -980,6 +980,32 @@ complex half)." where_
     | IrrepsIdxSpecFn (func, detail) -> $"function '{func}': IrrepsIdx: {detail}. The spec must be a static array of (l, parity, mult) int triples -- a `let static` binding or an inline literal like IrrepsIdx<[(0, 0, 2), (1, 1, 2)]>."
     | PgIrrepsIdxSpec detail -> $"PgIrrepsIdx: {detail}. The form is PgIrrepsIdx<GROUP, SPEC> with GROUP a registered point group and SPEC a static array of (LABEL_NAME, mult) tuples -- a `let static` binding or an inline literal like PgIrrepsIdx<C4, [(\"A\", 1), (\"E\", 2)]>."
     | PgIrrepsIdxSpecFn (func, detail) -> $"function '{func}': PgIrrepsIdx: {detail}. The form is PgIrrepsIdx<GROUP, SPEC> with GROUP a registered point group and SPEC a static array of (LABEL_NAME, mult) tuples -- a `let static` binding or an inline literal like PgIrrepsIdx<C4, [(\"A\", 1), (\"E\", 2)]>."
+    | TreeIdxShape detail -> $"TreeIdx: {detail}. The shape is a PREORDER DEGREE SEQUENCE -- the child count of each node in depth-first order -- as a `let static` binding or an inline literal: `let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]` then `TreeIdx<crystal>`. A well-formed sequence sums to nodes - 1 and its prefix walk closes exactly at the last node."
+    | TreeIdxShapeFn (func, detail) -> $"function '{func}': TreeIdx: {detail}. The shape is a PREORDER DEGREE SEQUENCE -- the child count of each node in depth-first order -- as a `let static` binding or an inline literal: `let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]` then `TreeIdx<crystal>`. A well-formed sequence sums to nodes - 1 and its prefix walk closes exactly at the last node."
+    // Voice matched to OrbitStorageUnsupported above: name the site, say what
+    // the class CAN do today, name what is missing, and steer. No
+    // "lands in a later phase" hand-waving -- the user gets the state of the
+    // world and a next move.
+    | TreeIdxUnsupported (shape, where_) ->
+        sprintf "%s: %s is a declarable index class whose cells are its LEAVES, addressed by a \
+complete root-to-leaf path. What works today is a tree-typed BINDING and STATIC whole-path reads \
+of it: `let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]`, `type CrystalIdx = TreeIdx<crystal>`, \
+`let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]` (the literal holds the \
+leaves in preorder), then `T((1, 2))` -- whose path folds to a leaf offset at COMPILE time, \
+which is exactly why the path has to be literal. `extents`, printing and `reduce` all read the \
+pool as the flat rank-1 array it is. This site is not one of those: it needs an address the \
+compiler cannot fold, or it would hand a tree slot to machinery that has no reading for one. \
+For BULK work take the derived dense leaf axis: `leaves(T)` retypes the very same storage onto \
+`LeafIdx<shape>`, an ordinary `Idx` over the leaf count -- zero copy, nothing emitted -- so \
+`method_for(leaves(T)) <@> f` and every other array form run with every existing optimization \
+intact. A tree IS a flat array with an addressing scheme, and `leaves` is how you ask for the \
+array half." where_ shape
+    | TreeIdxPath (shape, detail) ->
+        sprintf "%s: %s. A tree index's domain is its COMPLETE root-to-leaf paths -- \
+every step must name an existing child of the node it reaches, and the path must end at a leaf. \
+A path that stops at an internal node names a SUBTREE, not a cell; subtree views are a later \
+phase. The valid paths of a shape are exactly its leaves in preorder, which is also the order \
+the array's flat storage holds them in." shape detail
     | ComplexArity got -> $"complex expects exactly two float components -- complex(re, im) -- got {got} argument(s)"
     | CumulantOrderExceeds (order, carried) -> $"cumulant: order {order} exceeds the dist's carried order {carried} -- insufficient stochastic order. Construct with a higher order (dist(A, {order})) or project a carried component."
     | DistOrderDisagree (op, leftOrder, rightOrder) -> $"dist {op}: orders disagree ({leftOrder} vs {rightOrder}) -- carry the same stochastic order on both sides"
@@ -1113,6 +1139,11 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // that the literal contradicts. The fix is to reconcile two
             // spellings of one shape, not to stop using RaggedIdx.
             | RaggedLensMismatch _ | RaggedLensNotStatic _ -> "BL4018"
+            // BL4021: one code, two mistakes, BL4018's precedent one line up --
+            // a non-static shape and a malformed degree sequence are both
+            // "invalid tree shape", and the message text is what tells them
+            // apart. The `detail` string carries it.
+            | TreeIdxShape _ | TreeIdxShapeFn _ -> "BL4021"
             | HaloOffsetOutsideSet _ -> "BL4019"
             // BL4020: a constrained domain that no route can enumerate --
             // not closed-form (class B) and over the box cap for a table.
@@ -1132,6 +1163,7 @@ let diagnosticOfCompileError (e: CompileError) : Blade.Diagnostics.Diagnostic =
             // both backends refuse, in the front end.
             | OrbitStorageUnsupported _ | OrbitSubscriptArity _
             | OrbitDecompactPartial _ | OrbitFoldUnsupported _
+            | TreeIdxUnsupported _ | TreeIdxPath _
             | IrrepsIdxSpec _ | IrrepsIdxSpecFn _
             | PgIrrepsIdxSpec _ | PgIrrepsIdxSpecFn _ | TagWildcardNotParam _
             | BoundsInverted _ | BoundsOnAggregate _ -> "BL4003"

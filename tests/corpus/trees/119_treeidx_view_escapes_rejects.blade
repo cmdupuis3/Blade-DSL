@@ -1,0 +1,17 @@
+// TEST: a TreeIdx partial path bound to a name (rejects)
+// The line P5 draws. Composition (file 118) works because it is textual and the
+// intermediate never needs a type; BINDING a partial path asks for a subtree
+// VALUE, which needs a real runtime object (pointer + length) and therefore a
+// new IR node in both lanes -- the back-end work this module has consistently
+// found unnecessary. Cut deliberately, not forgotten.
+//
+// No new refusal was needed: with no second application to splice, `T((1))`
+// reaches the landed fold and gets the answer that was already correct -- a
+// path that stops at an internal node names a subtree, not a cell.
+// REJECT-AT: lower
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let sub = T((1))
+// ERROR: BL4003
+// ERROR-CONTAINS: must end at a leaf

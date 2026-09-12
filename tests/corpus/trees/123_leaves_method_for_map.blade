@@ -1,0 +1,15 @@
+// TEST: method_for over leaves(T) maps the tree pool
+// THE SANCTIONED BULK ROUTE, finally demonstrable -- and the reason the
+// method_for refusal (file 113) is permanently cheap rather than a standing
+// limitation. `method_for(leaves(T))` is an ordinary dense loop over an
+// ordinary dense array, so vectorization, omp, BLAS routing and fusion all
+// apply unchanged, and no tree slot ever enters a loop former.
+//
+// That is the whole shape of the trade: path addressing and bulk numerics are
+// two different jobs over ONE pool, and leaves() is the visible, zero-cost
+// place the user says which one they want.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+let T: Array<Float64 like CrystalIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+let U = method_for(leaves(T)) <@> lambda(x) -> x * 2.0 |> compute
+// EXPECT: U = [2, 4, 6, 8, 10]

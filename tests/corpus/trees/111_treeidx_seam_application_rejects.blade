@@ -1,0 +1,26 @@
+// TEST: TreeIdx shape mismatch at a direct application (rejects)
+// T2 seam 2, RE-RUN as its P3/P4 header demanded once the signature door
+// opened -- and the re-run found the gap that header existed to catch.
+//
+// MEASURED, with the door open and before any guard was added: this program
+// COMPILED AND RAN, printing 5. The callee folded its path (1,2) against its
+// OWN degree sequence and read offset 4 of an argument that has no such path.
+// Equal leaf counts (5 and 5) are what let it through -- exactly the
+// coincidence tree identity exists to reject -- and nothing on the eager path
+// ever compared the two records, because direct application does not unify
+// plain-call arguments. That is the entire content of the T2 seam, and it was
+// real.
+//
+// The refusal now comes from the post-zonk sweep, which is where an abstract
+// parameter is closed and comparable. Unify's TreeTag arm always decided this
+// correctly; it simply was never asked on this path.
+// REJECT-AT: lower
+let static wide = [5, 0, 0, 0, 0, 0]
+let static deep = [2, 2, 0, 0, 3, 0, 0, 0]
+type WideIdx = TreeIdx<wide>
+type DeepIdx = TreeIdx<deep>
+let A: Array<Float64 like WideIdx> = [1.0, 2.0, 3.0, 4.0, 5.0]
+function f(t: Array<Float64 like DeepIdx>) -> Float64 = { t((1, 2)) }
+let v = f(A)
+// ERROR: BL4003
+// ERROR-CONTAINS: whose parameter declares the DIFFERENT tree type

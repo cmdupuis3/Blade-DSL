@@ -1,0 +1,15 @@
+// TEST: LeafIdx over a malformed degree sequence (rejects)
+// The derived axes share TreeIdx's bad-shape channel, deliberately: a malformed
+// sequence is the same mistake whichever former named it, so LeafIdx plants the
+// same marker record and surfaces as the same BL4021 with the same text.
+//
+// The sharing is what makes the registerTypeDecl carve-out necessary. LeafIdx
+// aliases take the ORDINARY nominative path (the alias name becomes the tag),
+// and without an explicit exemption for the error marker that overwrite would
+// drop the error kind and the smuggled detail, turning this file's BL4021 into
+// a plain index alias over a placeholder extent.
+// REJECT-AT: lower
+type BadLeaf = LeafIdx<[2, 0]>
+let L: Array<Float64 like BadLeaf> = [1.0, 2.0]
+// ERROR: BL4021
+// ERROR-CONTAINS: truncated degree sequence

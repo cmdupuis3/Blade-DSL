@@ -618,6 +618,37 @@ its rank does (docs/plan-orbit-index-types.md section 7.2), so a class this wide
       Symmetry = SymWreath; Tag = Some "__orbidx"; IxKind = IxKOrbit
       Kind = SDimension; Dependencies = [] }
 
+/// Build a `TreeIdx<s>` index record: ONE slot (the P0 decision -- a path lives
+/// in one slot, the SparseIdx precedent), Rank = 1, Extent = the LEAF COUNT
+/// (= cardinality: the value domain is COMPLETE paths, so leaves are the cells),
+/// dense (SymNone), with the whole shape carried as IDENTITY in a parameterized
+/// Tag. Tag and IxKind are stamped TOGETHER here so `IRValidate.checkKindAgreement`
+/// cannot catch them disagreeing -- the one construction point, like
+/// `mkWreathIndexRecord`.
+///
+/// `degrees` must already have passed `Blade.TreeRank.validateDegrees`; `leafCount`
+/// must be `TreeRank.cardinality` of the same sequence. The sequence is NOT stored
+/// anywhere but the Tag (plan trap T10: putting it in Extent would change index-type
+/// IDENTITY, so two distinct shape bindings with equal values would start unifying).
+let mkTreeIndexRecord (id: IRId) (aliasName: string option) (degrees: int list) (leafCount: int) : IRIndexType =
+    { Id = id; Rank = 1
+      Extent = IRLit (IRLitInt (int64 leafCount))
+      Symmetry = SymNone; Tag = Some (mkTreeTag aliasName degrees)
+      IxKind = IxKTree; Kind = SDimension; Dependencies = [] }
+
+/// The bad-shape MARKER record (`TypeLower` has no error channel -- the
+/// RaggedIdx/IrrepsIdx plant-a-placeholder idiom). The failure detail is
+/// smuggled in the marker's IRParam extent and read back by
+/// `irTypeBadTreeDetail` at the annotation consumers.
+///
+/// NEVER `failwith` here (the SparseIdx mistake, plan section 4 "Middle"): a
+/// malformed shape is a user error with a source span, not a compiler crash.
+let mkTreeErrorRecord (id: IRId) (detail: string) : IRIndexType =
+    { Id = id; Rank = 1
+      Extent = IRParam (detail, 0, IRTNat None)
+      Symmetry = SymNone; Tag = Some "__error_tree_bad_shape"
+      IxKind = IxKErrorTreeBadShape; Kind = SDimension; Dependencies = [] }
+
 /// Level-1 placement classification of a full index type. Today this derives
 /// purely from the symmetry class (placementClassOf); it is the seam where
 /// tabulated detection (CompoundIdx / SparseIdx, from the index type's typedef)
@@ -635,6 +666,15 @@ let placementOf (ix: IRIndexType) : PlacementClass =
     // iterated as an ordinary dense 1-D loop. Rank >= 2 is still a masked
     // product space needing the tabulated (materialized child index) path.
     | IRCompoundProject _ -> if ix.Rank <= 1 then placementClassOf ix.Symmetry else PlaceTabulated
+    // A tree's CELLS are its leaves, stored flat in preorder with every cell
+    // present and no compression -- so placement is DENSE. What is new is the
+    // subscript (a path folds to a leaf offset through the degree tables), and a
+    // subscript translation is not a placement class; this is the IxKIrreps
+    // reading one family over. Stated EXPLICITLY rather than reached through the
+    // fall-through below, which would have answered the same thing silently
+    // (plan trap T6: placementOf is one of the two catch-alls that would
+    // quietly classify a new kind as plain dense).
+    | _ when ix.IxKind = IxKTree -> PlaceDense
     | _ -> placementClassOf ix.Symmetry
 
 /// Compute the promoted element type for two numeric types per section 3.4.2.
@@ -1306,7 +1346,7 @@ let indexSpacesMatch (a: IndexSpaceInfo) (b: IndexSpaceInfo) : bool =
 /// their own storage/iteration. SymNone is NOT a kind -- "no class
 /// assigned", resolving to plain dense only when no tag claims it. New
 /// kinds (Enum, CG, ...) add an arm here.
-let (|IxSymmetryLike|IxCompound|IxDep|IxRagged|IxDense|) (ix: IRIndexType) =
+let (|IxSymmetryLike|IxCompound|IxDep|IxRagged|IxTree|IxDense|) (ix: IRIndexType) =
     match ix.Symmetry with
     // A wreath class groups with symmetry-like: compact storage over a
     // permutation group with a +-1 character needs canonicalization/compact
@@ -1329,6 +1369,16 @@ let (|IxSymmetryLike|IxCompound|IxDep|IxRagged|IxDense|) (ix: IRIndexType) =
          | IxKOrbit -> IxSymmetryLike
          | IxKDep | IxKDepInner | IxKDepOuter -> IxDep
          | IxKRagged | IxKRaggedInline | IxKRaggedOpaque -> IxRagged
+         // IxKTree gets its OWN family rather than grouping with dense, even
+         // though a tree's cells are dense (see placementOf above). The
+         // difference is the SUBSCRIPT: a tree slot is addressed by a PATH that
+         // folds through the degree tables, not by an ordinal. Grouping it dense
+         // would give every consumer reached through this pattern a plausible
+         // dense reading of a record it has no addressing for -- the same
+         // silent-miscompile shape the wreath arm above refuses. This is the ONE
+         // FS0025-exhaustive dispatch point in the tree feature, so a future
+         // consumer that forgets trees fails the BUILD rather than the runtime.
+         | IxKTree -> IxTree
          | IxKPlain | IxKGroupOuter | IxKGroupMember | IxKSeq
          // IxKIrreps is dense BY DESIGN: every cell of the irreps space is
          // stored (extent = total_dim(spec), no compression); the block
@@ -1337,7 +1387,7 @@ let (|IxSymmetryLike|IxCompound|IxDep|IxRagged|IxDense|) (ix: IRIndexType) =
          // reason -- extent = pg_total_dim(spec), every cell stored.
          | IxKIrreps | IxKPgIrreps
          | IxKErrorRaggedNoPrior | IxKErrorIrrepsBadSpec
-         | IxKErrorPgIrrepsBadSpec -> IxDense)
+         | IxKErrorPgIrrepsBadSpec | IxKErrorTreeBadShape -> IxDense)
 
 
 // IR Declarations

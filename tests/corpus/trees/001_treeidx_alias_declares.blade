@@ -1,0 +1,11 @@
+// TEST: TreeIdx alias declares
+// The P2 surface in full: a `let static` preorder degree sequence, an alias
+// over it, and nothing else. The shape is the crystal of feature doc 2.1 --
+// [[leaf, leaf], [leaf, leaf, leaf]] -- in its canonical internal form. 8
+// nodes, 5 leaves, so the index type's cardinality is 5.
+let static crystal = [2, 2, 0, 0, 3, 0, 0, 0]
+type CrystalIdx = TreeIdx<crystal>
+
+// The declaration alone must typecheck. A value over the type is a P3 story.
+let sentinel = 5
+// EXPECT: sentinel = 5

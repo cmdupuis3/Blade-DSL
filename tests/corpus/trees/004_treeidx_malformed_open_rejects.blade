@@ -1,0 +1,8 @@
+// TEST: TreeIdx malformed shape leaves slots open (rejects)
+// [2, 0] opens two child slots at the root and supplies one node. The prefix
+// walk ends with pending > 0 -- the sequence stops before the tree closes.
+// REJECT-AT: lower
+let static bad = [2, 0]
+type BadIdx = TreeIdx<bad>
+function f(x: Float64) -> Array<Float64 like BadIdx> = { x }
+// ERROR: BL4021
